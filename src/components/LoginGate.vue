@@ -6,18 +6,19 @@ import AppButton from './AppButton.vue';
 
 import { useAuthStore } from '../stores/auth-store';
 import { AUTH_STATE } from '../constants/states';
+import { APP_PASSWORD_ONLY } from '../defines';
 import ThundermailLogo from './ThundermailLogo.vue';
 
 const authStore = useAuthStore();
 
-const showPasswordForm = ref(false);
+const showPasswordForm = ref(APP_PASSWORD_ONLY);
 const username = ref('');
 const password = ref('');
 
-// App-password sign-in stays available but is no longer surfaced by
-// default. It opts in via ?app-password in the URL or a persisted
-// localStorage flag, so power users / non-OIDC setups can still reach it.
+// App-password sign-in is enabled by explicit deployment configuration,
+// ?app-password in the URL, or a persisted localStorage opt-in.
 const appPasswordEnabled = computed(() => {
+  if (APP_PASSWORD_ONLY) return true;
   if (typeof window === 'undefined') return false;
   try {
     if (new URLSearchParams(window.location.search).has('app-password')) return true;
@@ -80,6 +81,7 @@ function togglePassword() {
 
         <template v-else>
           <AppButton
+            v-if="!APP_PASSWORD_ONLY"
             size="default"
             class="login-card__signin"
             :disabled="!authStore.isOidcReady"
@@ -88,10 +90,9 @@ function togglePassword() {
             Sign In
           </AppButton>
 
-          <!-- App-password sign-in is hidden by default now that OIDC is
-               the norm, but the flow is fully intact. Reveal the entry
-               point with ?app-password in the URL or by setting
-               localStorage['stormbox.appPassword']='1'. -->
+          <!-- App-password sign-in is hidden by default. A deployment can
+               make it the only login mode, while power users can reveal
+               the entry point with ?app-password or localStorage. -->
           <button
             v-if="!showPasswordForm && appPasswordEnabled"
             class="login-card__link"
@@ -125,6 +126,7 @@ function togglePassword() {
                 Sign in
               </AppButton>
               <button
+                v-if="!APP_PASSWORD_ONLY"
                 class="login-card__link"
                 type="button"
                 @click="togglePassword"

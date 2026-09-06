@@ -1,0 +1,16 @@
+name = "stormbox-byk-jmap-bridge"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+workers_dev = false
+preview_urls = false
+
+# The account is supplied through CLOUDFLARE_ACCOUNT_ID so this fork
+# does not commit account-specific identifiers.
+routes = [
+  { pattern = "jmap.byk.im", custom_domain = true },
+]
+
+# Authorization headers and WebSocket credential query parameters pass
+# through this Worker. Keep request observability disabled.
+[observability]
+enabled = false

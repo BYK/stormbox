@@ -6,6 +6,7 @@
  *                                proxy with first-party CORS, plus
  *                                /jmap/ws WebSocket upgrade auth bridge
  *                                (credential-on-URL → Authorization)
+ *   jmap.byk.im               → same bridge for the personal fork
  *
  * The two halves share the same Cloudflare account, the same trust
  * boundary, the same observability-off requirement (Authorization
@@ -23,8 +24,7 @@
  * What this Worker does NOT do:
  *   - It is not same-origin with the SPA. The HTTP half handles
  *     CORS itself (preflight short-circuit + Allow-Origin echo for
- *     allowlisted origins). The SPA at webmail.* stays untouched on
- *     GitHub Pages.
+ *     allowlisted origins). The paired SPAs remain separate deployments.
  *   - No logging. Observability is disabled in wrangler.toml so the
  *     bearer-bearing WebSocket upgrade URLs and the Authorization-
  *     bearing HTTP requests never land in Cloudflare Logs.

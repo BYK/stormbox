@@ -85,9 +85,13 @@ from the same origin with `/jmap/ws`.
 To override product links, set `VITE_ACCOUNTS_URL`, `VITE_APPOINTMENT_URL`, or
 `VITE_SEND_URL`. To override sender logo lookup, set
 `VITE_SENDER_AVATAR_PROXY_URL`; an empty value keeps the initials-only fallback.
+Deployments whose origin is not registered with the configured OIDC client can
+set `VITE_APP_PASSWORD_ONLY=1` to show the app-password form directly and skip
+OIDC initialization.
 
 ```bash
 VITE_JMAP_SERVER_URL=https://your-jmap-bridge-or-server.com
+VITE_APP_PASSWORD_ONLY=1
 VITE_SENDER_AVATAR_PROXY_URL=https://your-avatar-proxy.com
 ```
 
@@ -178,4 +182,3 @@ stormbox/
 - **wa-sqlite**: browser-local SQLite storage.
 - **Squire**: rich-text compose editor.
 - **@tanstack/vue-virtual**: virtualized message lists.
-

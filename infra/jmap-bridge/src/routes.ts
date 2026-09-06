@@ -2,18 +2,18 @@
  * Upstream routing + CORS allowlist shared by every code path in
  * `stormbox-jmap-bridge`.
  *
- * The Worker terminates on two production hostnames as Workers
- * Custom Domains:
+ * The Worker terminates on production hostnames as Workers Custom
+ * Domains:
  *
  *   jmap.stage-thundermail.com     → handle HTTP /jmap/* + /.well-known/jmap and /jmap/ws
  *   jmap.thundermail.com           → handle HTTP /jmap/* + /.well-known/jmap and /jmap/ws
+ *   jmap.byk.im                     → personal fork backed by Thundermail production
  *
- * The webmail SPA lives at `webmail.*.thundermail.com` and is served
- * by GitHub Pages (untouched by Cloudflare). Because the SPA and the
- * bridge are NOT same-origin, the HTTP half handles CORS itself:
+ * Each webmail SPA and its bridge are NOT same-origin, so the HTTP
+ * half handles CORS itself:
  * preflights are answered directly, and `Access-Control-*` headers
  * are merged into every response. The allowlist per route is the
- * SPA's webmail origin plus localhost for vite dev hitting stage.
+ * SPA's paired webmail origin plus localhost for Vite dev hitting stage.
  */
 
 export interface Route {
@@ -69,6 +69,19 @@ export const PROD_ROUTE: Route = {
 };
 
 /**
+ * Personal fork deployment. It uses Thundermail production as the
+ * upstream while keeping the browser-facing bridge and SPA inside the
+ * byk.im zone.
+ */
+export const BYK_ROUTE: Route = {
+  upstream: 'https://mail.thundermail.com',
+  stalwartOrigin: 'https://mail.thundermail.com',
+  httpBridgeOrigin: 'https://jmap.byk.im',
+  wsBridgeOrigin: 'wss://jmap.byk.im',
+  allowedOrigins: new Set(['https://webmail.byk.im']),
+};
+
+/**
  * Header that lets smoke tests against `*.workers.dev` pick the
  * prod upstream. Only honoured when the request reached the Worker
  * on a `*.workers.dev` hostname; bound production routes never
@@ -78,6 +91,9 @@ export const TEST_UPSTREAM_HEADER = 'x-jmap-bridge-test-upstream';
 
 export function selectRoute(request: Request): Route | null {
   const host = new URL(request.url).hostname;
+  if (host === 'jmap.byk.im') {
+    return BYK_ROUTE;
+  }
   if (host === 'jmap.thundermail.com') {
     return PROD_ROUTE;
   }

@@ -4,6 +4,9 @@ A single Cloudflare Worker that fronts both halves of Stormbox's
 JMAP transport on `jmap.*.thundermail.com`: the HTTP proxy with
 first-party CORS and the `/jmap/ws` WebSocket auth bridge.
 
+The BYK fork additionally exposes the same bridge on `jmap.byk.im`,
+paired exclusively with the SPA at `webmail.byk.im`.
+
 ## Why it exists
 
 **WebSocket half.** Stalwart authenticates the `/jmap/ws` upgrade
@@ -84,6 +87,10 @@ Unknown origins receive no `Access-Control-*` headers; the browser
 will block the response from reaching the SPA, which is the desired
 behaviour. The Worker is never an open CORS oracle.
 
+WebSocket upgrades do not use CORS preflights. The bridge therefore
+requires an `Origin` header and checks it against the same route
+allowlist before reading or forwarding URL credentials.
+
 ## What the two halves share
 
 - Same upstream selection (`mail.*` stage/prod by hostname).
@@ -128,6 +135,7 @@ infra/jmap-bridge/
 | Command                       | What it does                                              | When to use            |
 |-------------------------------|-----------------------------------------------------------|------------------------|
 | `npm run deploy`              | Publish to `*.workers.dev` only. No production hostname.  | Local smoke testing.   |
+| `npm run deploy:byk`          | Publish the BYK fork to the `jmap.byk.im` custom domain. | Personal deployment. |
 | `npm run deploy:production`   | Publish under `[env.production]`, binding the two jmap.* custom domains. | Real production deploy.|
 
 The default `wrangler deploy` cannot accidentally claim a
@@ -187,8 +195,10 @@ curl -i -X OPTIONS \
 # Stage WebSocket upgrade through the same Worker (HTTP/1.1 needed so
 # Cloudflare doesn't strip the Upgrade header at the edge)
 basic=$(printf 'user:pass' | base64 -w0)
-wscat -c "$BRIDGE/jmap/ws?basic=$basic" -s jmap   # workers.dev test
-wscat -c "wss://jmap.stage-thundermail.com/jmap/ws?basic=$basic" -s jmap   # production
+wscat -c "$BRIDGE/jmap/ws?basic=$basic" -s jmap \
+  -o https://webmail.stage-thundermail.com
+wscat -c "wss://jmap.stage-thundermail.com/jmap/ws?basic=$basic" -s jmap \
+  -o https://webmail.stage-thundermail.com
 ```
 
 Expected: HTTP responses carry `apiUrl` and friends pointing at the

@@ -10,7 +10,7 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 
 import { initOidc, getOidc } from '../services/auth';
-import { JMAP_SERVER_URL, JMAP_WS_PROXY_URL } from '../defines';
+import { APP_PASSWORD_ONLY, JMAP_SERVER_URL, JMAP_WS_PROXY_URL } from '../defines';
 import { AUTH_STATE } from '../constants/states';
 import type { AuthState } from '../constants/states';
 import { getRepositoryAsync } from '../composables/useRepository';
@@ -85,6 +85,10 @@ export const useAuthStore = defineStore('auth', () => {
    */
   async function initialize(): Promise<void> {
     if (status.value !== AUTH_STATE.IDLE) {
+      return;
+    }
+    if (APP_PASSWORD_ONLY) {
+      status.value = AUTH_STATE.OIDC_READY;
       return;
     }
     status.value = AUTH_STATE.OIDC_LOADING;

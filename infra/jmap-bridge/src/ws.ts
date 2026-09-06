@@ -21,6 +21,14 @@ export async function handleWebSocketUpgrade(request: Request, route: Route): Pr
     return new Response(null, { status: 426 });
   }
 
+  // Browsers do not preflight WebSocket upgrades, so CORS does not
+  // protect this path. Require the browser-supplied Origin header and
+  // enforce the same exact-origin allowlist as the HTTP bridge.
+  const origin = request.headers.get('origin');
+  if (origin === null || !route.allowedOrigins.has(origin)) {
+    return new Response('WebSocket origin is not allowed', { status: 403 });
+  }
+
   const url = new URL(request.url);
 
   // Only `/jmap/*` is in scope. Anything else is almost certainly a

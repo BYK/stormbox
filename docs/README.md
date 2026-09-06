@@ -4,6 +4,8 @@ This directory is the human entry point for project documentation.
 
 ## Architecture
 
+- [BYK Cloudflare deployment](byk-cloudflare-deployment.md): personal Pages
+  and JMAP bridge configuration.
 - [Performance and architecture notes](architecture/performance.md): current
   runtime shape, cache behavior, and performance work.
 - [SQLite storage design](architecture/sqlite-storage.md): local cache schema,
