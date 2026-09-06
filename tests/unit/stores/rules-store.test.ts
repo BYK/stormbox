@@ -83,7 +83,7 @@ describe('rules store', () => {
   it('queues and runs a state-checked durable mutation before reloading', async () => {
     const repo = {
       getMailRules: vi.fn(async () => snapshot()),
-      insertPendingMutation: vi.fn(async () => ({ id: 93 })),
+      insertPendingMutation: vi.fn(async (_input: any) => ({ id: 93 })),
       runMutation: vi.fn(async () => ({ attempted: 1, succeeded: 1, failed: 0 })),
       getPendingMutationError: vi.fn(),
     };
