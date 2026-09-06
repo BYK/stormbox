@@ -19,6 +19,8 @@
  *   'setMailboxSubscription' / 'createMailbox' / 'updateMailbox' /
  *   'destroyMailbox'   Mailbox/set subscription toggle, create,
  *                      rename/move, and destroy (RFC 8621 §2.5)
+ *   'setSieveRules'    SieveScript upload, validation, and activation
+ *                      through JMAP for Sieve (RFC 9661)
  *
  * Move and destroy delegate the cache effect to the protocol-neutral
  * OUTBOX_APPLY_MOVE_BATCH / OUTBOX_APPLY_DESTROY_BATCH DB handlers,
@@ -64,6 +66,7 @@ import {
   reconcileContactCards,
 } from './contacts';
 import { base64ToBytes, extractDataUriImages } from '../../../utils/inline-images';
+import { runSetSieveRules } from './sieve';
 
 export const MUTATION_TYPES = Object.freeze({
   SET_KEYWORDS: 'setKeywords',
@@ -79,6 +82,7 @@ export const MUTATION_TYPES = Object.freeze({
   CREATE_MAILBOX: 'createMailbox',
   UPDATE_MAILBOX: 'updateMailbox',
   DESTROY_MAILBOX: 'destroyMailbox',
+  SET_SIEVE_RULES: 'setSieveRules',
 });
 
 type FolderId = number;
@@ -195,7 +199,19 @@ export async function drainOutbox({
 export async function processMutationRow({
   transport, account, handlers, row, useWebSocket = false,
 }): Promise<{ ok: boolean; error?: any; response?: any; result?: any }> {
-  const request = JSON.parse(row.request_json);
+  let request;
+  try {
+    request = JSON.parse(row.request_json);
+  } catch {
+    return {
+      ok: false,
+      error: {
+        type: 'invalidArguments',
+        message: 'The durable mutation payload is not valid JSON.',
+        terminal: true,
+      },
+    };
+  }
   switch (row.mutation_type) {
     case MUTATION_TYPES.SET_KEYWORDS:
       return runSetKeywords({ transport, handlers, row, request, useWebSocket });
@@ -223,6 +239,8 @@ export async function processMutationRow({
       return runUpdateMailbox({ transport, handlers, request, useWebSocket });
     case MUTATION_TYPES.DESTROY_MAILBOX:
       return runDestroyMailbox({ transport, handlers, request, useWebSocket });
+    case MUTATION_TYPES.SET_SIEVE_RULES:
+      return runSetSieveRules({ transport, account, request, useWebSocket });
     default:
       return { ok: false, error: { type: 'unsupportedMutation', mutation_type: row.mutation_type } };
   }

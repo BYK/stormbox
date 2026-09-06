@@ -27,6 +27,7 @@ import BulkOperationOverlay from './components/BulkOperationOverlay.vue';
 import ThundermailLogo from './components/ThundermailLogo.vue';
 import AccountAvatarMenu from './components/AccountAvatarMenu.vue';
 import WelcomeModal from './components/WelcomeModal.vue';
+import MailRulesDialog from './components/MailRulesDialog.vue';
 
 const authStore = useAuthStore();
 const mailStore = useMailStore();
@@ -92,8 +93,11 @@ const folderListWidth = ref(DEFAULT_COLUMN_WIDTHS.folderList);
 const messageListWidth = ref(DEFAULT_COLUMN_WIDTHS.messageList);
 const folderListHidden = ref(false);
 const showWelcomeModal = ref(false);
+const showMailRules = ref(false);
 const shortcutsEnabled = computed(() =>
-  authStore.status === AUTH_STATE.CONNECTED && !showWelcomeModal.value,
+  authStore.status === AUTH_STATE.CONNECTED
+  && !showWelcomeModal.value
+  && !showMailRules.value,
 );
 const windowWidth = ref(typeof window === 'undefined' ? COMPACT_READING_WIDTH : window.innerWidth);
 const wantsMessageDetailView = computed(() =>
@@ -195,6 +199,7 @@ watch(() => authStore.status, (status) => {
     return;
   }
   showWelcomeModal.value = false;
+  showMailRules.value = false;
 }, { immediate: true });
 
 function startCompose() {
@@ -693,7 +698,10 @@ function clamp(value: number, min: number, max: number) {
           <Sun v-if="theme === 'dark'" :size="18" :stroke-width="1.75" aria-hidden="true" />
           <Moon v-else :size="18" :stroke-width="1.75" aria-hidden="true" />
         </button>
-        <AccountAvatarMenu @show-welcome-modal="showWelcomeModalAgain" />
+        <AccountAvatarMenu
+          @show-mail-rules="showMailRules = true"
+          @show-welcome-modal="showWelcomeModalAgain"
+        />
       </div>
     </div>
 
@@ -789,6 +797,7 @@ function clamp(value: number, min: number, max: number) {
     <ComposeDialog />
     <StoreErrorToast />
     <BulkOperationOverlay />
+    <MailRulesDialog v-if="showMailRules" @close="showMailRules = false" />
     <WelcomeModal
       v-if="showWelcomeModal"
       @dismiss="dismissWelcomeModal"

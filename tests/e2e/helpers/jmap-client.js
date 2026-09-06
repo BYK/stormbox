@@ -143,7 +143,11 @@ export async function downloadBlob(jmap, { blobId, type = 'application/octet-str
   return Buffer.from(await response.arrayBuffer());
 }
 
-export async function jmapRequest(jmap, methodCalls) {
+export async function jmapRequest(jmap, methodCalls, using = [
+  'urn:ietf:params:jmap:core',
+  'urn:ietf:params:jmap:mail',
+  'urn:ietf:params:jmap:submission',
+]) {
   const response = await fetchWithTls(jmap.apiUrl, {
     method: 'POST',
     headers: {
@@ -151,11 +155,7 @@ export async function jmapRequest(jmap, methodCalls) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      using: [
-        'urn:ietf:params:jmap:core',
-        'urn:ietf:params:jmap:mail',
-        'urn:ietf:params:jmap:submission',
-      ],
+      using,
       methodCalls,
     }),
   });

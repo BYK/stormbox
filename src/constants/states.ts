@@ -105,6 +105,7 @@ export const MUTATION_TYPE = {
   CREATE_MAILBOX: 'createMailbox',
   UPDATE_MAILBOX: 'updateMailbox',
   DESTROY_MAILBOX: 'destroyMailbox',
+  SET_SIEVE_RULES: 'setSieveRules',
 } as const;
 export type MutationType = (typeof MUTATION_TYPE)[keyof typeof MUTATION_TYPE];
 

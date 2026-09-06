@@ -46,6 +46,7 @@ import { processMutationRow } from './outbox';
 import { OutboxRunner } from './outbox-runner';
 import { maxObjectsInGet } from './limits';
 import { bytesToBase64 } from '../../../utils/inline-images';
+import { getMailRules } from './sieve';
 
 const SUBSCRIBED_TYPES = [
   'Mailbox',
@@ -982,6 +983,14 @@ export class JmapBackend {
       transport: this.transport,
       account: this.account,
       handlers: this.handlers,
+      useWebSocket: this._wsReady(),
+    });
+  }
+
+  async getMailRules() {
+    return getMailRules({
+      transport: this.transport,
+      account: this.account,
       useWebSocket: this._wsReady(),
     });
   }
