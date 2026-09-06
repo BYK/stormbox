@@ -14,6 +14,7 @@ Connect the Pages project to `BYK/stormbox` and use:
 
 | Setting | Value |
 | --- | --- |
+| Pages project | `stormbox-byk` |
 | Production branch | `agent/mail-rules-jmap-sieve` |
 | Build command | `npm run build` |
 | Build output | `dist` |
