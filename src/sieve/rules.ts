@@ -81,7 +81,14 @@ export function createEmptyRule(): MailRule {
 }
 
 export function cloneRuleDocument(document: MailRuleDocument): MailRuleDocument {
-  return structuredClone(document);
+  return {
+    version: 1,
+    rules: document.rules.map((rule) => ({
+      ...rule,
+      conditions: rule.conditions.map((condition) => ({ ...condition })),
+      actions: rule.actions.map((action) => ({ ...action })),
+    })),
+  };
 }
 
 export function normalizeRuleDocument(input: unknown): MailRuleDocument {
