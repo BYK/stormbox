@@ -304,12 +304,18 @@ describe('auth-store', () => {
   });
 
   describe('isStaff', () => {
-    function loggedInOidc(email: string | undefined) {
+    function loggedInOidc(
+      email: string | undefined,
+      recoveryEmail: string | undefined,
+    ) {
       return {
         isUserLoggedIn: true,
         getTokens: vi.fn().mockResolvedValue({
           ...oidcTokens('token', 1_000),
-          decodedIdToken: email === undefined ? {} : { email },
+          decodedIdToken: {
+            ...(email === undefined ? {} : { email }),
+            ...(recoveryEmail === undefined ? {} : { recovery_email: recoveryEmail }),
+          },
         }),
         subscribeToTokensChange: vi.fn(() => ({
           unsubscribeFromTokensChange: vi.fn(),
@@ -325,29 +331,38 @@ describe('auth-store', () => {
       ['someone@gmail.com', false],
       ['someone@thunderbird.net.evil.com', false],
       ['thunderbird.net', false],
-    ])('is derived from the OIDC email claim: %s -> %s', async (email, expected) => {
-      authService.getOidc.mockReturnValue(loggedInOidc(email));
+    ])('is derived from the OIDC recovery_email claim: %s -> %s', async (recoveryEmail, expected) => {
+      authService.getOidc.mockReturnValue(loggedInOidc(
+        'mailbox@stage-thundermail.com',
+        recoveryEmail,
+      ));
       __setRepositoryForTests(makeRepo());
       const authStore = useAuthStore();
 
       await expect(authStore.connectViaOidc()).resolves.toBe(true);
-      expect(authStore.email).toBe(email);
+      expect(authStore.email).toBe('mailbox@stage-thundermail.com');
+      expect(authStore.recoveryEmail).toBe(recoveryEmail);
       expect(authStore.isStaff).toBe(expected);
     });
 
-    it('is false without an email claim and after reset', async () => {
-      authService.getOidc.mockReturnValue(loggedInOidc(undefined));
+    it('ignores the standard email claim and clears the recovery email on reset', async () => {
+      authService.getOidc.mockReturnValue(loggedInOidc(
+        'staffer@thunderbird.net',
+        undefined,
+      ));
       __setRepositoryForTests(makeRepo());
       const authStore = useAuthStore();
 
       await expect(authStore.connectViaOidc()).resolves.toBe(true);
-      expect(authStore.email).toBeNull();
+      expect(authStore.email).toBe('staffer@thunderbird.net');
+      expect(authStore.recoveryEmail).toBeNull();
       expect(authStore.isStaff).toBe(false);
 
-      authStore.email = 'late@thunderbird.net';
+      authStore.recoveryEmail = 'late@thunderbird.net';
       expect(authStore.isStaff).toBe(true);
       authStore.$reset();
       expect(authStore.email).toBeNull();
+      expect(authStore.recoveryEmail).toBeNull();
       expect(authStore.isStaff).toBe(false);
     });
 
@@ -361,6 +376,7 @@ describe('auth-store', () => {
       })).resolves.toBe(true);
       expect(authStore.username).toBe('boss@thunderbird.net');
       expect(authStore.email).toBeNull();
+      expect(authStore.recoveryEmail).toBeNull();
       expect(authStore.isStaff).toBe(false);
     });
   });

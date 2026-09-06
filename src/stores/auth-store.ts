@@ -53,6 +53,10 @@ function isAtLeastAsFresh(candidate: BearerAuth, current: BearerAuth): boolean {
   return candidate.expiresAt >= current.expiresAt;
 }
 
+function stringClaim(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
 function parseServerUrl(): { origin: string; hostname: string } {
   try {
     const url = new URL(JMAP_SERVER_URL);
@@ -68,10 +72,12 @@ export const useAuthStore = defineStore('auth', () => {
   const username = ref<string | null>(null);
   /** OIDC ID-token `email` claim; null for password sign-in. */
   const email = ref<string | null>(null);
+  /** OIDC ID-token `recovery_email` claim; null when unavailable. */
+  const recoveryEmail = ref<string | null>(null);
   const error = ref<string | null>(null);
 
   /** Global staff flag: gates staff-only UI, carries no other behaviour. */
-  const isStaff = computed(() => isStaffEmail(email.value));
+  const isStaff = computed(() => isStaffEmail(recoveryEmail.value));
 
   const serverOrigin = computed(() => parseServerUrl().origin);
   const serverHostname = computed(() => parseServerUrl().hostname);
@@ -192,8 +198,14 @@ export const useAuthStore = defineStore('auth', () => {
       status.value = AUTH_STATE.FAILED;
       return false;
     }
-    const emailClaim = tokens?.decodedIdToken?.email ?? null;
-    const connected = await _connect(initialAuth, emailClaim, emailClaim);
+    const emailClaim = stringClaim(tokens?.decodedIdToken?.email);
+    const recoveryEmailClaim = stringClaim(tokens?.decodedIdToken?.recovery_email);
+    const connected = await _connect(
+      initialAuth,
+      emailClaim,
+      emailClaim,
+      recoveryEmailClaim,
+    );
     if (!connected || generation !== tokenSyncGeneration || accountId.value == null) {
       if (generation === tokenSyncGeneration) stopTokenSync();
       return false;
@@ -207,6 +219,7 @@ export const useAuthStore = defineStore('auth', () => {
         accountId.value = null;
         username.value = null;
         email.value = null;
+        recoveryEmail.value = null;
         clearStorageQuota();
         status.value = AUTH_STATE.FAILED;
         error.value = 'Could not initialize renewable JMAP authentication.';
@@ -371,6 +384,7 @@ export const useAuthStore = defineStore('auth', () => {
     auth: ConnectAuth,
     displayName: string | null,
     emailClaim: string | null = null,
+    recoveryEmailClaim: string | null = null,
   ): Promise<boolean> {
     status.value = AUTH_STATE.CONNECTING;
     error.value = null;
@@ -385,6 +399,7 @@ export const useAuthStore = defineStore('auth', () => {
       accountId.value = result.accountId;
       username.value = displayName;
       email.value = emailClaim;
+      recoveryEmail.value = recoveryEmailClaim;
       status.value = AUTH_STATE.CONNECTED;
       refreshStorageQuota().catch(() => {});
       return true;
@@ -406,6 +421,7 @@ export const useAuthStore = defineStore('auth', () => {
     accountId.value = null;
     username.value = null;
     email.value = null;
+    recoveryEmail.value = null;
     error.value = null;
     status.value = AUTH_STATE.IDLE;
     clearStorageQuota();
@@ -434,6 +450,7 @@ export const useAuthStore = defineStore('auth', () => {
     accountId,
     username,
     email,
+    recoveryEmail,
     isStaff,
     error,
     serverOrigin,

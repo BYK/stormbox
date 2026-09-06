@@ -124,6 +124,43 @@ async function configureClient(token) {
   }
 }
 
+async function configureRecoveryEmailMapper(token) {
+  const clients = await request(
+    `${KEYCLOAK_BASE}/admin/realms/${REALM}/clients?clientId=${encodeURIComponent(OIDC_CLIENT_ID)}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  const clientId = clients?.[0]?.id;
+  if (!clientId) throw new Error(`OIDC client ${OIDC_CLIENT_ID} was not created`);
+
+  const endpoint = `${KEYCLOAK_BASE}/admin/realms/${REALM}/clients/${clientId}/protocol-mappers/models`;
+  const mappers = await request(endpoint, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const mapper = {
+    name: 'recovery_email',
+    protocol: 'openid-connect',
+    protocolMapper: 'oidc-usermodel-property-mapper',
+    consentRequired: false,
+    config: {
+      'user.attribute': 'email',
+      'claim.name': 'recovery_email',
+      'jsonType.label': 'String',
+      'id.token.claim': 'true',
+      'access.token.claim': 'true',
+      'userinfo.token.claim': 'true',
+      'introspection.token.claim': 'true',
+      multivalued: 'false',
+    },
+  };
+  const existing = mappers.find((item) =>
+    item.name === mapper.name || item.config?.['claim.name'] === 'recovery_email');
+  await request(existing?.id ? `${endpoint}/${existing.id}` : endpoint, {
+    method: existing?.id ? 'PUT' : 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ ...mapper, ...(existing?.id ? { id: existing.id } : {}) }),
+  });
+}
+
 async function findUser(token, username) {
   const users = await request(
     `${KEYCLOAK_BASE}/admin/realms/${REALM}/users?username=${encodeURIComponent(username)}&exact=true`,
@@ -197,6 +234,7 @@ export async function configureKeycloak() {
   const token = await adminToken();
   await configureRealm(token);
   await configureClient(token);
+  await configureRecoveryEmailMapper(token);
   // Ensure the dedicated e2e account exists. It stays separate from
   // the developer account so Playwright sweeps and fixtures never
   // mutate a human's local mailbox.

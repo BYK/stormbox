@@ -102,7 +102,7 @@ afterEach(() => {
 describe('staff chunk loading', () => {
   it('renders the gear and dialog for a non-staff session without evaluating any staff module', async () => {
     const authStore = useAuthStore();
-    authStore.email = 'someone@gmail.com';
+    authStore.recoveryEmail = 'someone@gmail.com';
     const wrapper = mountApp();
     await flushPromises();
     expect(wrapper.find('[data-settings-gear]').exists()).toBe(true);
@@ -119,7 +119,7 @@ describe('staff chunk loading', () => {
 
     // Becoming staff loads both: the celebration host right away, the
     // section once the dialog shows it.
-    authStore.email = 'boss@thunderbird.net';
+    authStore.recoveryEmail = 'boss@thunderbird.net';
     await vi.waitFor(() => {
       expect(dialog!.querySelector('[data-staff-settings]')).not.toBeNull();
     });

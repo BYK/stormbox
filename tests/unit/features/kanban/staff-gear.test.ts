@@ -153,7 +153,7 @@ afterEach(() => {
 
 describe('staff settings in the gear dialog', () => {
   it('non-staff get the gear but no staff section and nothing kanban-related', async () => {
-    useAuthStore().email = 'someone@gmail.com';
+    useAuthStore().recoveryEmail = 'someone@gmail.com';
     const wrapper = mountApp();
     await flushPromises();
 
@@ -170,8 +170,8 @@ describe('staff settings in the gear dialog', () => {
     expect(audio.preloadCelebrationAudio).not.toHaveBeenCalled();
   });
 
-  it('shows no staff section when the account has no email claim (password login)', async () => {
-    useAuthStore().email = null;
+  it('shows no staff section when the account has no recovery_email claim', async () => {
+    useAuthStore().recoveryEmail = null;
     const wrapper = mountApp();
     await flushPromises();
     await wrapper.get('[data-settings-gear]').trigger('click');
@@ -180,7 +180,7 @@ describe('staff settings in the gear dialog', () => {
   });
 
   it('the gear sits between feedback and the theme toggle; the list is untouched while locked', async () => {
-    useAuthStore().email = 'boss@thunderbird.net';
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
     localStorage.setItem('stormbox.theme.v1', 'dark');
     const wrapper = mountApp();
     await flushPromises();
@@ -196,7 +196,7 @@ describe('staff settings in the gear dialog', () => {
   });
 
   it('staff see a rule and "Staff settings" below the shared rows', async () => {
-    useAuthStore().email = 'boss@thunderbird.net';
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
     const wrapper = mountApp();
     await flushPromises();
     await openStaffSettings(wrapper);
@@ -215,7 +215,7 @@ describe('staff settings in the gear dialog', () => {
   });
 
   it('gear opens the code box for staff; a wrong code is rejected and changes nothing', async () => {
-    useAuthStore().email = 'boss@thunderbird.net';
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
     const wrapper = mountApp();
     await flushPromises();
 
@@ -246,7 +246,7 @@ describe('staff settings in the gear dialog', () => {
   });
 
   it('the code "kanban" unlocks: board replaces the list, music + fireworks + seeding start together', async () => {
-    useAuthStore().email = 'boss@thunderbird.net';
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
     const wrapper = mountApp();
     await flushPromises();
     await openStaffSettings(wrapper);
@@ -274,7 +274,7 @@ describe('staff settings in the gear dialog', () => {
   });
 
   it('docks a volume pill for the whole celebration: it outlives the fireworks until the clip ends', async () => {
-    useAuthStore().email = 'boss@thunderbird.net';
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
     const wrapper = mountApp();
     await flushPromises();
     expect(document.body.querySelector('[data-kanban-volume]')).toBeNull();
@@ -310,7 +310,7 @@ describe('staff settings in the gear dialog', () => {
   });
 
   it('after unlocking the gear shows a switch; toggling never celebrates or seeds again', async () => {
-    useAuthStore().email = 'boss@thunderbird.net';
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
     const wrapper = mountApp();
     await flushPromises();
     await openStaffSettings(wrapper);
@@ -340,7 +340,7 @@ describe('staff settings in the gear dialog', () => {
   });
 
   it('a persisted flag renders the board on load without any celebration', async () => {
-    useAuthStore().email = 'boss@thunderbird.net';
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
     localStorage.setItem(kanbanStorageKey(1), JSON.stringify({ unlocked: true, enabled: true, columns: [null, null] }));
     const wrapper = mountApp();
     await flushPromises();
@@ -351,7 +351,7 @@ describe('staff settings in the gear dialog', () => {
   });
 
   it('a column selection hides the reading pane, exactly like the list\'s checkbox selection', async () => {
-    useAuthStore().email = 'boss@thunderbird.net';
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
     localStorage.setItem(kanbanStorageKey(1), JSON.stringify({ unlocked: true, enabled: true, columns: [null, null] }));
     const mailStore = useMailStore();
     mailStore.selectedMessageId = 42;
@@ -374,7 +374,7 @@ describe('staff settings in the gear dialog', () => {
   });
 
   it('records a seeding failure without breaking the board', async () => {
-    useAuthStore().email = 'boss@thunderbird.net';
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
     seed.seedKanbanFolders.mockRejectedValueOnce(new Error('serverFail'));
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const wrapper = mountApp();
@@ -395,7 +395,7 @@ describe('staff settings in the gear dialog', () => {
   });
 
   it('offers a retry after a failed seed that does not celebrate again', async () => {
-    useAuthStore().email = 'boss@thunderbird.net';
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
     seed.seedKanbanFolders.mockRejectedValueOnce(new Error('serverFail'));
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const wrapper = mountApp();
@@ -428,7 +428,7 @@ describe('staff settings in the gear dialog', () => {
 
 describe('settings dialog keyboard', () => {
   it('closes on Escape and on the backdrop; Enter in the code box submits', async () => {
-    useAuthStore().email = 'boss@thunderbird.net';
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
     const wrapper = mountApp();
     await flushPromises();
     await openStaffSettings(wrapper);

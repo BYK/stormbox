@@ -97,7 +97,7 @@ beforeEach(() => {
   const authStore = useAuthStore();
   authStore.status = AUTH_STATE.CONNECTED;
   authStore.accountId = 1;
-  authStore.email = 'someone@gmail.com';
+  authStore.recoveryEmail = 'someone@gmail.com';
 });
 
 afterEach(() => {
@@ -140,7 +140,7 @@ describe('settings gear and dialog', () => {
   });
 
   it('staff get a rule and Staff settings with the feature code below', async () => {
-    useAuthStore().email = 'boss@thunderbird.net';
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
     const wrapper = mountApp();
     await flushPromises();
     const panel = await openSettings(wrapper);

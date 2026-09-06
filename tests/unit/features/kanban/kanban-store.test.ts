@@ -18,10 +18,10 @@ import {
   useKanbanStore,
 } from '../../../../src/features/kanban/kanban-store';
 
-function signIn(accountId: number, email = 'boss@thunderbird.net') {
+function signIn(accountId: number, recoveryEmail = 'boss@thunderbird.net') {
   const authStore = useAuthStore();
   authStore.accountId = accountId;
-  authStore.email = email;
+  authStore.recoveryEmail = recoveryEmail;
   return authStore;
 }
 
@@ -112,7 +112,7 @@ describe('kanban-store', () => {
     expect(kanban.unlocked).toBe(true);
     expect(kanban.enabled).toBe(false);
 
-    authStore.email = 'boss@thunderbird.net';
+    authStore.recoveryEmail = 'boss@thunderbird.net';
     await nextTick();
     expect(kanban.enabled).toBe(true);
   });

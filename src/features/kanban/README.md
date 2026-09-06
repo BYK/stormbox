@@ -51,8 +51,9 @@ when `authStore.isStaff`). With the flag off, nothing in Stormbox changes.
   `operations/create-emails.ts`: the `Email/set create` outbox operation used
   by seeding. Checkpointed and at-most-once: an outcome the client cannot
   read is terminal (`createEmailsOutcomeUnknown`), never replayed.
-- `src/stores/auth-store.ts` + `src/constants/staff.ts`: `email` and
-  `isStaff` (the global staff flag).
+- `src/stores/auth-store.ts` + `src/constants/staff.ts`: the OIDC
+  `recovery_email` claim and `isStaff` (the global staff flag). The standard
+  `email` claim remains the mailbox address used by existing behavior.
 - `src/stores/mail-store.ts`: optional `sourceFolderId` on `moveMessages` /
   `transferModeForFolder`, and `sourceFolderId` / `rows` options on the bulk
   actions (`markManySeen`, `archiveMessages`, `junkMessages`,

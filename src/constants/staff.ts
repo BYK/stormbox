@@ -1,9 +1,8 @@
 /**
  * Email domains whose signed-in users count as staff. The match is on
- * the OIDC ID-token `email` claim, never on the username. The RFC 2606
- * reserved domains are included so the local dev stack's accounts
- * (`admin@example.org` carries the email claim `admin@example.com`)
- * qualify without touching Keycloak; no real user can hold them.
+ * the OIDC ID-token `recovery_email` claim, never on the username. The
+ * RFC 2606 reserved domains allow local test accounts to qualify; no
+ * real user can hold them.
  */
 export const STAFF_EMAIL_DOMAINS: readonly string[] = Object.freeze([
   'thunderbird.net',
