@@ -11,7 +11,7 @@ import {
 import type { MailRuleDocument, SieveRuleCapabilities } from '../../../src/sieve/rules';
 
 const ALL_CAPABILITIES: SieveRuleCapabilities = {
-  sieveExtensions: ['copy', 'fileinto', 'imap4flags', 'mailboxid'],
+  sieveExtensions: ['copy', 'fileinto', 'imap4flags', 'mailbox', 'mailboxid'],
   maxSizeScript: 100_000,
   maxNumberRedirects: 4,
 };
@@ -51,7 +51,7 @@ describe('mail-rule Sieve compiler', () => {
     const source = compileRules(input, ALL_CAPABILITIES);
 
     expect(source).toContain(MANAGED_SCRIPT_MARKER);
-    expect(source).toContain('require ["copy", "fileinto", "imap4flags", "mailboxid"];');
+    expect(source).toContain('require ["copy", "fileinto", "imap4flags", "mailbox", "mailboxid"];');
     expect(source).toContain('if allof (address :contains "From" "@example.com", header :matches "Subject" "*invoice*") {');
     expect(source).toContain('fileinto :mailboxid "mailbox-42" "Finance/Invoices";');
     expect(source).toContain('addflag "\\\\Seen";');
@@ -95,6 +95,24 @@ describe('mail-rule Sieve compiler', () => {
     });
     expect(source).toContain('fileinto "Finance/Invoices";');
     expect(source).not.toContain(':mailboxid');
+  });
+
+  it('declares Stalwart’s advertised mailbox compatibility capability for mailboxid', () => {
+    const input = document();
+    input.rules[0].actions = [input.rules[0].actions[0]];
+
+    const source = compileRules(input, {
+      ...ALL_CAPABILITIES,
+      sieveExtensions: ['fileinto', 'mailbox', 'mailboxid'],
+    });
+    expect(source).toContain('require ["fileinto", "mailbox", "mailboxid"];');
+
+    const standardsOnlySource = compileRules(input, {
+      ...ALL_CAPABILITIES,
+      sieveExtensions: ['fileinto', 'mailboxid'],
+    });
+    expect(standardsOnlySource).toContain('require ["fileinto", "mailboxid"];');
+    expect(standardsOnlySource).not.toContain('"mailbox",');
   });
 
   it('rejects missing action extensions, invalid headers, and oversized scripts', () => {

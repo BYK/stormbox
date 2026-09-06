@@ -365,6 +365,10 @@ function compileAction(
       requireExtension('fileinto', extensions, required, 'Moving messages');
       if (extensions.has('mailboxid')) {
         required.add('mailboxid');
+        // Stalwart currently checks :mailboxid against the RFC 5490 "mailbox"
+        // capability as well. Declare it when advertised so its authoritative
+        // SieveScript/validate call accepts an otherwise RFC 9042 script.
+        if (extensions.has('mailbox')) required.add('mailbox');
         return `fileinto :mailboxid ${sieveString(action.mailboxId)} ${sieveString(action.mailboxName)};`;
       }
       return `fileinto ${sieveString(action.mailboxName)};`;
