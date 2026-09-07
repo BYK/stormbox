@@ -25,7 +25,10 @@
  */
 
 import { DB_RPC } from '../../../db/protocol';
-import { SERVICE_KIND } from '../../../constants/states';
+import {
+  MUTATION_RECOVERY_POLICIES,
+  SERVICE_KIND,
+} from '../../../constants/states';
 import { wlog } from '../../../db/worker-log';
 import { ingestSession } from './session';
 import { syncMailboxes, syncMailboxChanges } from './mailboxes';
@@ -37,15 +40,28 @@ import {
 import { fetchEmailBodies } from './bodies';
 import { syncIdentities } from './identities';
 import { syncQuota } from './quota';
+import { pageCompleteQuery } from './query-paging';
 import {
+  inventoryAddressBook,
   syncAddressBooks,
   syncContacts,
   syncContactCardChanges,
 } from './contacts';
-import { processMutationRow } from './outbox';
+import { MUTATION_TYPES, processMutationRow } from './outbox';
 import { OutboxRunner } from './outbox-runner';
-import { maxObjectsInGet } from './limits';
+import { loadScheduleCapability } from './schedule-capability';
+import {
+  scheduleClockWindow,
+  SUBMISSION_RELEASE_OBSERVATION_DELAY_MS,
+} from './schedule-time';
+import { readScheduledMailboxRemoteId } from './scheduled-mailbox';
+import { syncSubmissionsForAccount } from './submissions';
+import { hasFileNodeCapability, syncSettingsFromServer } from './settings';
+import { syncContactsTrashFromServer } from './contacts-trash';
+import { attachmentTransferLimits, maxObjectsInGet } from './limits';
 import { bytesToBase64 } from '../../../utils/inline-images';
+import { addressKey } from '../../../utils/address-key';
+import { createContactUid } from '../../../utils/contact-uid';
 import { getMailRules } from './sieve';
 
 const SUBSCRIBED_TYPES = [
@@ -54,9 +70,25 @@ const SUBSCRIBED_TYPES = [
   'Thread',
   'Identity',
   'EmailDelivery',
+  'EmailSubmission',
   'AddressBook',
   'ContactCard',
 ];
+
+const SUBMISSION_WAKE_MIN_MS = 1_000;
+// Far-out schedules are periodically re-derived without overflowing the
+// 32-bit setTimeout budget.
+const SUBMISSION_WAKE_MAX_MS = 6 * 60 * 60_000;
+// A settled submission whose local move/cancel is still draining gets
+// one short recheck instead of waiting for the next natural trigger.
+const SUBMISSION_SETTLED_RECHECK_MS = 15_000;
+
+const CONTACTS_TRASH_GATED_MUTATIONS = new Set([
+  MUTATION_TYPES.WHITELIST_SENDER,
+  MUTATION_TYPES.DELETE_CONTACT,
+  MUTATION_TYPES.CONTACT_BATCH,
+  MUTATION_TYPES.CONTACT_TRASH,
+]);
 
 // How many mailbox-window views the startup / push catch-up reconciles
 // by recency. The inbox view is always reconciled in addition to these
@@ -72,6 +104,48 @@ const ACTIVE_VIEW_REFRESH_LIMIT = 5;
 // folder into backoff over a few ticks instead of issuing one failing
 // round trip per folder per tick.
 const INDEXER_MAX_FAILED_ATTEMPTS_PER_TICK = 3;
+const DRAFT_SAVE_MAX_ATTEMPTS = 3;
+const UNSAFE_TO_REPLAY_MUTATION_TYPES = MUTATION_RECOVERY_POLICIES
+  .map(({ mutationType }) => mutationType);
+const REPLAYABLE_MUTATION_PHASES = [
+  ...new Set(MUTATION_RECOVERY_POLICIES.flatMap(({ replayablePhases }) => replayablePhases)),
+];
+const COMPLETED_MUTATION_PHASES = [
+  ...new Set(MUTATION_RECOVERY_POLICIES.flatMap(({ completedPhases }) => completedPhases)),
+];
+
+// Concurrent account starts can briefly create overlapping backend instances.
+// The shared handler map identifies one local database, so automatic historical
+// promotion is serialized per database and account (CS-3.13).
+const RECIPIENT_IMPORT_INFLIGHT = new WeakMap<
+  Record<string, (params: any) => Promise<any>>,
+  Map<number, Promise<any>>
+>();
+
+type ContactsTrashReadiness =
+  | { ok: true }
+  | { ok: false; error: any };
+
+function contactsTrashReadinessError(error: any): any {
+  if (error && typeof error.type === 'string') return error;
+  return {
+    type: 'contactsTrashUnavailable',
+    message: error?.message ?? String(error),
+  };
+}
+
+function transferTooLargeError(
+  message: string,
+  maxBytes: number,
+  actualBytes: number,
+) {
+  const error: any = new Error(message);
+  error.type = 'tooLarge';
+  error.status = 413;
+  error.maxBytes = maxBytes;
+  error.actualBytes = actualBytes;
+  return error;
+}
 
 export class JmapBackend {
   transport: any;
@@ -101,6 +175,8 @@ export class JmapBackend {
   outboxRunner: any;
   _outboxRunnerOptions: any;
   _bootstrappedPromise: Promise<void> | null;
+  _contactsTrashReady: boolean;
+  _contactsTrashRefresh: Promise<ContactsTrashReadiness> | null;
   _stateChangeInflight: Promise<void> | null;
   _stateChangePending: { changed: Record<string, Record<string, string>>; pushState: string | null } | null;
   _stateChangeRetryPending: { changed: Record<string, Record<string, string>>; pushState: string | null } | null;
@@ -111,6 +187,10 @@ export class JmapBackend {
   _reconnectAttempts: number;
   _reconnectBaseDelayMs: number;
   _reconnectMaxDelayMs: number;
+  _submissionSyncInflight: Promise<void> | null;
+  _submissionSyncQueued: boolean;
+  _submissionSyncFailures: number;
+  _submissionWakeTimer: any;
 
   constructor({ transport, serverOrigin, handlers, options = {} }: {
     transport: any;
@@ -196,6 +276,8 @@ export class JmapBackend {
     this.outboxRunner = null;
     this._outboxRunnerOptions = options.outboxRunnerOptions ?? null;
     this._bootstrappedPromise = null;
+    this._contactsTrashReady = false;
+    this._contactsTrashRefresh = null;
     // StateChange serialization. The transport delivers push frames
     // by firing each registered listener synchronously, without
     // awaiting the Promise the listener returns; if it awaited we
@@ -227,6 +309,66 @@ export class JmapBackend {
     this._reconnectAttempts = 0;
     this._reconnectBaseDelayMs = options.reconnectBaseDelayMs ?? 1_000;
     this._reconnectMaxDelayMs = options.reconnectMaxDelayMs ?? 30_000;
+    // Submission-sync serialization, same single-flight + trailing-pass
+    // pattern as StateChange. The wake timer targets the account's
+    // nearest pending sendAt.
+    this._submissionSyncInflight = null;
+    this._submissionSyncQueued = false;
+    this._submissionSyncFailures = 0;
+    this._submissionWakeTimer = null;
+  }
+
+  _resetContactsTrashReadiness() {
+    this._contactsTrashReady = false;
+  }
+
+  _refreshContactsTrash(): Promise<ContactsTrashReadiness> {
+    if (this._contactsTrashRefresh) return this._contactsTrashRefresh;
+    const refresh = this.ensureContactsTrash()
+      .then(() => {
+        this._contactsTrashReady = true;
+        return { ok: true as const };
+      })
+      .catch((error) => {
+        this._contactsTrashReady = false;
+        wlog.warn('jmap-backend', 'contacts trash refresh failed', error);
+        return {
+          ok: false as const,
+          error: contactsTrashReadinessError(error),
+        };
+      })
+      .finally(() => {
+        if (this._contactsTrashRefresh === refresh) {
+          this._contactsTrashRefresh = null;
+        }
+      });
+    this._contactsTrashRefresh = refresh;
+    return refresh;
+  }
+
+  async _contactsTrashReadyForMutation(): Promise<ContactsTrashReadiness> {
+    if (this._contactsTrashReady) return { ok: true };
+    if (!this._started) {
+      return {
+        ok: false,
+        error: { type: 'contactsTrashUnavailable' },
+      };
+    }
+    return this._refreshContactsTrash();
+  }
+
+  async _processMutationRow(row: any) {
+    if (CONTACTS_TRASH_GATED_MUTATIONS.has(row.mutation_type)) {
+      const readiness = await this._contactsTrashReadyForMutation();
+      if (!readiness.ok) return readiness;
+    }
+    return processMutationRow({
+      transport: this.transport,
+      account: this.account,
+      handlers: this.handlers,
+      row,
+      useWebSocket: this._wsReady(),
+    });
   }
 
   /**
@@ -257,6 +399,7 @@ export class JmapBackend {
       [this.account, ...this.sharedAccounts].map((a) => [a.remote_account_id, a]),
     );
     wlog.info('jmap-backend', `account ingested id=${this.account.id} remote=${this.account.remote_account_id} services=${this.services.map((s) => s.serviceKind).join(',')} shared=${this.sharedAccounts.length}`);
+    this._resetContactsTrashReadiness();
 
     // Build the runner once the account row exists. processRow gets
     // the current transport / useWebSocket at call time so the
@@ -274,6 +417,15 @@ export class JmapBackend {
     // Stalwart.
     const runnerOptions = {
       ...(this._outboxRunnerOptions ?? {}),
+      maxAttemptsByType: {
+        [MUTATION_TYPES.SAVE_DRAFT]: DRAFT_SAVE_MAX_ATTEMPTS,
+        ...(this._outboxRunnerOptions?.maxAttemptsByType ?? {}),
+      },
+      // These writes have irreversible or ambiguous calls. Their durable
+      // phases route recovered rows through protocol-specific verification.
+      unsafeToReplayTypes: UNSAFE_TO_REPLAY_MUTATION_TYPES,
+      replayablePhases: REPLAYABLE_MUTATION_PHASES,
+      completedPhases: COMPLETED_MUTATION_PHASES,
       onForegroundChange: (delta) => {
         this._foregroundFolderWindowCount = Math.max(
           0,
@@ -284,15 +436,17 @@ export class JmapBackend {
     this.outboxRunner = new OutboxRunner({
       accountId: this.account.id,
       handlers: this.handlers,
-      processRow: (row) => processMutationRow({
-        transport: this.transport,
-        account: this.account,
-        handlers: this.handlers,
-        row,
-        useWebSocket: this._wsReady(),
-      }),
+      processRow: (row) => this._processMutationRow(row),
       options: runnerOptions,
     });
+    // Reclaim rows stranded in_flight by an earlier crash. Migration 002
+    // only covers the boot that applied it, so this has to run on every
+    // start or a crashed row is stuck forever.
+    try {
+      await this.outboxRunner.recoverStranded();
+    } catch (err) {
+      wlog.warn('jmap-backend', 'stranded outbox recovery failed', err);
+    }
 
     const mbResult = await syncMailboxes({
       transport: this.transport,
@@ -319,11 +473,6 @@ export class JmapBackend {
     }
 
     this._started = true;
-
-    // Drain anything left over from a previous session. The migration
-    // already reset in_flight -> pending; this just kicks the loop so
-    // those rows go out without waiting for the next user action.
-    this.outboxRunner.notify();
 
     // Fire-and-forget background bootstrap: identities, contacts, then
     // open the WebSocket. The UI is already painting from the folder
@@ -366,6 +515,16 @@ export class JmapBackend {
       wlog.warn('jmap-backend', 'syncIdentities failed; continuing bootstrap', err);
     }
 
+    try {
+      await this.ensureSettings();
+    } catch (err) {
+      wlog.warn('jmap-backend', 'settings sync failed; continuing bootstrap', err);
+    }
+
+    await this._refreshContactsTrash();
+    // Sweep persisted mutations after remote trash has had its startup sync.
+    this.outboxRunner?.notify();
+
     if (this._hasContactsService()) {
       try {
         const abResult = await syncAddressBooks({
@@ -385,10 +544,43 @@ export class JmapBackend {
       }
     }
 
+    let recipientUsage: { scanned: number; ranked: number } | null = null;
+    try {
+      const usage = await this._refreshRecipientUsage();
+      recipientUsage = usage;
+      wlog.info(
+        'jmap-backend',
+        `recipient usage -> scanned ${usage.scanned}, ranked ${usage.ranked}`,
+      );
+    } catch (err) {
+      wlog.warn('jmap-backend', 'recipient usage rebuild failed; continuing bootstrap', err);
+    }
+
+    if (recipientUsage && this._hasContactsService()) {
+      try {
+        const result = await this.importRecentRecipients(recipientUsage.scanned);
+        const status = result.alreadyImported
+          ? 'already complete'
+          : (result.deferred ? 'deferred' : 'completed');
+        wlog.info(
+          'jmap-backend',
+          `recent recipient import -> ${status}, considered ${result.considered}`,
+        );
+      } catch (err) {
+        wlog.warn('jmap-backend', 'recent recipient import failed; continuing bootstrap', err);
+      }
+    }
+
+    // Each step above swallows its own failure, so teardown cannot stop
+    // this chain by making a call fail. Check for it directly instead:
+    // everything below either opens a socket or arms something that
+    // outlives this function, and a stopped backend must do neither.
+    if (!this._started) return;
+
     if (this.useWebSocket) {
       const pushState = await this._loadPushState();
       try {
-        await this.transport.openWebSocket(SUBSCRIBED_TYPES, pushState);
+        await this.transport.openWebSocket(this._subscribedTypes(), pushState);
         wlog.info('jmap-backend', 'WebSocket open, push enabled');
         // Now that the WS is up, any pending mutations that failed
         // mid-restart (or that landed on disk while we were on HTTP)
@@ -398,6 +590,9 @@ export class JmapBackend {
         wlog.warn('jmap-backend', 'WebSocket unavailable; staying on HTTP', err);
       }
     }
+    // stop() unsubscribes these; re-check so a teardown that happened
+    // while the socket was opening does not get them back.
+    if (!this._started) return;
     this._unsubStateChange = this.transport.onStateChange(
       (change) => this._onStateChange(change),
     );
@@ -421,7 +616,19 @@ export class JmapBackend {
         );
       });
     }
+    // Catch up on schedules that released or were canceled while this
+    // client was away, and arm the nearest-sendAt wake-up. Nothing later
+    // in bootstrap depends on it, so it does not gate bootstrapped().
+    void this._syncSubmissionsWithRetry('startup submission sync failed');
     this._scheduleMetadataIndexer(1_000);
+  }
+
+  authenticationUpdated() {
+    if (!this._started
+        || !this.useWebSocket
+        || !this._unsubClose
+        || this.transport.isWebSocketOpen()) return;
+    this._onTransportClose({});
   }
 
   async stop() {
@@ -437,6 +644,7 @@ export class JmapBackend {
     // scheduling. Same reasoning for cancelling any pending
     // reopen timer up front.
     this._started = false;
+    this._resetContactsTrashReadiness();
     if (this._reconnectTimer) {
       clearTimeout(this._reconnectTimer);
       this._reconnectTimer = null;
@@ -449,6 +657,16 @@ export class JmapBackend {
       clearTimeout(this._indexerTimer);
       this._indexerTimer = null;
     }
+    if (this._submissionWakeTimer) {
+      clearTimeout(this._submissionWakeTimer);
+      this._submissionWakeTimer = null;
+    }
+    this._submissionSyncFailures = 0;
+    // Cancel in-flight network calls before waiting on the runner.
+    // OutboxRunner.stop() awaits the in-flight drain, and a drain
+    // parked on a request that the server never answers would hold
+    // teardown open for the whole request deadline.
+    this.transport.abort();
     if (this.outboxRunner) {
       await this.outboxRunner.stop();
       this.outboxRunner = null;
@@ -485,12 +703,18 @@ export class JmapBackend {
     this._foregroundFolderWindowCount += 1;
     try {
       const folder = await this._loadFolder(folderId);
+      this._maybeSyncSubmissionsForFolder(folder);
+      const defaultSort = await this._defaultSortFor(folder);
+      const sortProp = range.sortProp ?? defaultSort.sortProp;
+      const sortAscending = range.sortAscending
+        ?? (range.sortProp == null ? defaultSort.sortAscending : false);
       const r = await syncFolderWindow({
         transport: this.transport,
         account: this._accountForFolder(folder),
         folder,
         handlers: this.handlers,
-        sortProp: range.sortProp ?? this._defaultSortPropFor(folder),
+        sortProp,
+        sortAscending,
         position: range.offset ?? 0,
         limit: range.limit ?? 100,
         anchor: range.anchor ?? null,
@@ -506,6 +730,36 @@ export class JmapBackend {
     } finally {
       this._foregroundFolderWindowCount = Math.max(0, this._foregroundFolderWindowCount - 1);
     }
+  }
+
+  /**
+   * Opening the Scheduled mailbox is a natural moment for the schedule
+   * columns to be fresh (the user is looking right at them), so it
+   * triggers a fire-and-forget submission pass alongside the normal
+   * window sync.
+   */
+  _maybeSyncSubmissionsForFolder(folder: any) {
+    if (!folder || Number(folder.account_id) !== Number(this.account?.id)) return;
+    void (async () => {
+      const scheduledRemoteId = await readScheduledMailboxRemoteId(
+        this.handlers,
+        this.account.id,
+      );
+      if (!scheduledRemoteId || folder.remote_id !== scheduledRemoteId) return;
+      await this._syncSubmissionsWithRetry('scheduled-folder submission sync failed');
+    })().catch((err) => {
+      this._handleSubmissionSyncFailure('scheduled-folder submission sync failed', err);
+    });
+  }
+
+  async _hasTrackedSchedules(accountId: number): Promise<boolean> {
+    const rows = await this.handlers[DB_RPC.QUERY]({
+      sql: `SELECT 1 FROM messages
+             WHERE account_id = ? AND scheduled_undo_status IS NOT NULL
+             LIMIT 1`,
+      params: [accountId],
+    });
+    return rows.length > 0;
   }
 
   async ensureMessageBody(messageId) {
@@ -642,7 +896,10 @@ export class JmapBackend {
   async ensureFolderIndex(folderId: number, options: any = {}) {
     const folder = await this._loadFolder(folderId);
     const folderAccount = this._accountForFolder(folder);
-    const sortProp = options.sortProp ?? this._defaultSortPropFor(folder);
+    const defaultSort = await this._defaultSortFor(folder);
+    const sortProp = options.sortProp ?? defaultSort.sortProp;
+    const sortAscending = options.sortAscending
+      ?? (options.sortProp == null ? defaultSort.sortAscending : false);
     const limit = Math.max(1, Math.min(Number(options.limit ?? 100), 500));
     const maxChunks = Math.max(1, Number(options.maxChunks ?? 1));
     // Caller can opt out of mid-tick yielding (foreground callers
@@ -663,7 +920,14 @@ export class JmapBackend {
         // the same gap with the latest progress.
         break;
       }
-      const gap = await this._nextQueryViewGap({ folder, sortProp, startAt: offset, total, limit });
+      const gap = await this._nextQueryViewGap({
+        folder,
+        sortProp,
+        sortAscending,
+        startAt: offset,
+        total,
+        limit,
+      });
       if (!gap) break;
       const result = await syncFolderWindow({
         transport: this.transport,
@@ -671,6 +935,7 @@ export class JmapBackend {
         folder,
         handlers: this.handlers,
         sortProp,
+        sortAscending,
         position: gap.offset,
         limit: gap.limit,
         collapseThreads: false,
@@ -894,9 +1159,9 @@ export class JmapBackend {
   }
 
   async _queryViewProgress(folder) {
-    const sortProp = this._defaultSortPropFor(folder);
+    const { sortProp, sortAscending } = await this._defaultSortFor(folder);
     const filterJson = JSON.stringify({ inMailbox: folder.remote_id });
-    const sortJson = JSON.stringify([{ property: sortProp, isAscending: false }]);
+    const sortJson = JSON.stringify([{ property: sortProp, isAscending: sortAscending }]);
     const views = await this.handlers[DB_RPC.QUERY]({
       sql: `SELECT id, total
               FROM query_views
@@ -960,6 +1225,49 @@ export class JmapBackend {
     });
   }
 
+  /**
+   * Live FUTURERELEASE capability for the compose scheduling UI. Forces
+   * a session refetch so the answer (and the transport's server clock
+   * reference) is current at the moment the user opens the dialog.
+   */
+  async getScheduleCapability() {
+    return loadScheduleCapability(this.transport, this.account);
+  }
+
+  async ensureSettings() {
+    const result = await syncSettingsFromServer({
+      transport: this.transport,
+      account: this.account,
+      handlers: this.handlers,
+      useWebSocket: this._wsReady(),
+    });
+    if (result.ok === false) {
+      const error: any = new Error(
+        result.error.message ?? `Settings FileNode sync failed (${result.error.type})`,
+      );
+      Object.assign(error, result.error);
+      throw error;
+    }
+    return result;
+  }
+
+  async ensureContactsTrash() {
+    const result = await syncContactsTrashFromServer({
+      transport: this.transport,
+      account: this.account,
+      handlers: this.handlers,
+      useWebSocket: this._wsReady(),
+    });
+    if (result.ok === false) {
+      const error: any = new Error(
+        result.error.message ?? `Contacts trash FileNode sync failed (${result.error.type})`,
+      );
+      Object.assign(error, result.error);
+      throw error;
+    }
+    return result;
+  }
+
   async ensureAddressbooks() {
     if (!this._hasContactsService()) {
       return { count: 0, state: null };
@@ -968,6 +1276,21 @@ export class JmapBackend {
       transport: this.transport,
       account: this.account,
       handlers: this.handlers,
+      useWebSocket: this._wsReady(),
+    });
+  }
+
+  async inventoryAddressbook(addressbookId: number) {
+    if (!this._hasContactsService()) {
+      const error: any = new Error('Address book service is not available');
+      error.type = 'addressBookServerUnavailable';
+      throw error;
+    }
+    return inventoryAddressBook({
+      transport: this.transport,
+      account: this.account,
+      handlers: this.handlers,
+      addressbookId,
       useWebSocket: this._wsReady(),
     });
   }
@@ -985,6 +1308,120 @@ export class JmapBackend {
       handlers: this.handlers,
       useWebSocket: this._wsReady(),
     });
+  }
+
+  /**
+   * Serialize automatic historical promotion across overlapping bootstraps.
+   * Ranking refreshes remain read-only with respect to contacts (CS-3.13).
+   */
+  importRecentRecipients(scanned: number) {
+    const accountId = Number(this.account?.id);
+    if (!Number.isFinite(accountId)) {
+      throw new Error('Recent recipient import requires a local account');
+    }
+    let imports = RECIPIENT_IMPORT_INFLIGHT.get(this.handlers);
+    if (!imports) {
+      imports = new Map();
+      RECIPIENT_IMPORT_INFLIGHT.set(this.handlers, imports);
+    }
+    const current = imports.get(accountId);
+    if (current) return current;
+    const tracked = this._importRecentRecipients(scanned);
+    imports.set(accountId, tracked);
+    const clear = () => {
+      if (imports.get(accountId) === tracked) imports.delete(accountId);
+    };
+    void tracked.then(clear, clear);
+    return tracked;
+  }
+
+  async _importRecentRecipients(scanned: number) {
+    const prior = await this.handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: this.account.id,
+      objectType: 'RecentRecipientContactImport',
+    });
+    if (prior?.state) {
+      return { considered: 0, alreadyImported: true, deferred: false };
+    }
+    if (scanned <= 0) {
+      return { considered: 0, alreadyImported: false, deferred: true };
+    }
+    const rows = await this.handlers[DB_RPC.QUERY]({
+      sql: `WITH recent AS (
+              SELECT m.id AS message_id,
+                     MAX(COALESCE(m.sent_at, fm.sort_sent_at)) AS sent_at
+                FROM messages m
+                JOIN folder_messages fm ON fm.message_id = m.id
+                JOIN folders f ON f.id = fm.folder_id
+               WHERE m.account_id = ?
+                 AND f.account_id = ?
+                 AND f.role = 'sent'
+                 AND COALESCE(m.sent_at, fm.sort_sent_at) IS NOT NULL
+               GROUP BY m.id
+               ORDER BY sent_at DESC, m.id DESC
+               LIMIT 300
+            )
+            SELECT r.message_id, r.sent_at, ma.kind, ma.name, ma.email
+              FROM recent r
+              JOIN message_addresses ma ON ma.message_id = r.message_id
+             WHERE ma.email IS NOT NULL
+             ORDER BY r.sent_at DESC, r.message_id DESC, ma.kind, ma.position`,
+      params: [this.account.id, this.account.id],
+    });
+    const ownedRows = await this.handlers[DB_RPC.QUERY]({
+      sql: `SELECT email FROM identities WHERE account_id = ?
+            UNION
+            SELECT primary_email AS email FROM accounts
+             WHERE id = ? AND primary_email IS NOT NULL`,
+      params: [this.account.id, this.account.id],
+    });
+    const owned = new Set(ownedRows.map((row) => addressKey(row.email)).filter(Boolean));
+    const byMessage = new Map<number, any[]>();
+    for (const row of rows) {
+      const messageId = Number(row.message_id);
+      const list = byMessage.get(messageId) ?? [];
+      list.push(row);
+      byMessage.set(messageId, list);
+    }
+    const recipients = new Map<
+      string,
+      { email: string; name: string | null; sourceSentAt: number; uid: string }
+    >();
+    for (const addresses of byMessage.values()) {
+      if (!addresses.some((row) => row.kind === 'from' && owned.has(addressKey(row.email)))) {
+        continue;
+      }
+      for (const row of addresses) {
+        if (row.kind !== 'to' && row.kind !== 'cc' && row.kind !== 'bcc') continue;
+        const key = addressKey(row.email);
+        if (!key || owned.has(key) || recipients.has(key)) continue;
+        recipients.set(key, {
+          email: String(row.email).trim(),
+          name: row.name?.trim() || null,
+          sourceSentAt: Number(row.sent_at),
+          uid: createContactUid(),
+        });
+      }
+    }
+
+    if (recipients.size > 0) {
+      const inserted = await this.handlers[DB_RPC.PENDING_MUTATION_INSERT]({
+        accountId: this.account.id,
+        mutationType: MUTATION_TYPES.WHITELIST_SENDER,
+        targetMessageId: null,
+        requestJson: JSON.stringify({ senders: [...recipients.values()] }),
+      });
+      const result = await this.runMutation(inserted.id);
+      if ((result?.failed ?? 0) > 0 || (result?.succeeded ?? 0) === 0) {
+        throw new Error('Recent recipient import did not complete');
+      }
+    }
+    await this.handlers[DB_RPC.SYNC_STATE_SET]({
+      accountId: this.account.id,
+      objectType: 'RecentRecipientContactImport',
+      state: JSON.stringify({ completedAt: Date.now() }),
+    });
+    return { considered: recipients.size, alreadyImported: false, deferred: false };
   }
 
   async getMailRules() {
@@ -1009,19 +1446,145 @@ export class JmapBackend {
     return this.outboxRunner.runMutation(mutationId);
   }
 
-  /**
-   * Download a blob (e.g. an inline cid: image) and return it base64-
-   * encoded so it crosses the worker RPC boundary as plain JSON. The UI
-   * builds a data: URL from this to render the part. Returns null when
-   * the account is not bootstrapped yet.
-   */
-  async downloadBlob({ blobId, type, name }) {
-    if (!this.account || !blobId) return null;
-    const bytes = await this.transport.download({
-      accountId: this.account.remote_account_id,
+  attachmentLimits(localAccountId: number) {
+    const account = this._accountForLocalId(localAccountId);
+    return attachmentTransferLimits(this.transport, account);
+  }
+
+  async uploadComposeAttachment({
+    accountId,
+    blob,
+    type,
+    totalAttachmentBytes,
+    signal,
+    onProgress,
+  }: {
+    accountId: number;
+    blob: Blob;
+    type?: string;
+    totalAttachmentBytes?: number;
+    signal?: AbortSignal;
+    onProgress?: (progress: any) => void;
+  }) {
+    const account = this._accountForLocalId(accountId);
+    if (typeof Blob === 'undefined' || !(blob instanceof Blob)) {
+      const error: any = new TypeError('Compose attachment upload requires a Blob or File');
+      error.type = 'invalidBlob';
+      throw error;
+    }
+    const limits = attachmentTransferLimits(this.transport, account);
+    if (blob.size > limits.maxSizeUpload) {
+      throw transferTooLargeError(
+        `Attachment is ${blob.size} bytes, exceeding the ${limits.maxSizeUpload} byte upload limit`,
+        limits.maxSizeUpload,
+        blob.size,
+      );
+    }
+    const totalBytes = totalAttachmentBytes ?? blob.size;
+    if (
+      !Number.isSafeInteger(totalBytes)
+      || totalBytes < blob.size
+      || totalBytes < 0
+    ) {
+      const error: any = new RangeError(
+        'totalAttachmentBytes must be a non-negative safe integer at least as large as the uploaded Blob',
+      );
+      error.type = 'invalidAttachmentTotal';
+      throw error;
+    }
+    if (totalBytes > limits.maxSizeAttachmentsPerEmail) {
+      throw transferTooLargeError(
+        `Attachments total ${totalBytes} bytes, exceeding the ${limits.maxSizeAttachmentsPerEmail} byte message limit`,
+        limits.maxSizeAttachmentsPerEmail,
+        totalBytes,
+      );
+    }
+    const result = await this.transport.upload({
+      accountId: account.remote_account_id,
+      type: type || blob.type || 'application/octet-stream',
+      body: blob,
+      signal,
+      onProgress,
+    });
+    if (
+      typeof result?.accountId !== 'string'
+      || typeof result?.blobId !== 'string'
+      || !result.blobId
+      || typeof result?.type !== 'string'
+      || !Number.isSafeInteger(result?.size)
+      || result.size < 0
+    ) {
+      const error: any = new Error('JMAP upload returned invalid metadata');
+      error.type = 'invalidUploadResponse';
+      throw error;
+    }
+    return result;
+  }
+
+  async downloadAttachment({
+    accountId,
+    blobId,
+    type,
+    name,
+    maxBytes,
+    truncateAtMaxBytes = false,
+    signal,
+    onProgress,
+  }: {
+    accountId: number;
+    blobId: string;
+    type?: string;
+    name?: string;
+    maxBytes?: number;
+    truncateAtMaxBytes?: boolean;
+    signal?: AbortSignal;
+    onProgress?: (progress: any) => void;
+  }) {
+    const account = this._accountForLocalId(accountId);
+    if (!blobId) {
+      const error: any = new TypeError('Attachment download requires a blobId');
+      error.type = 'invalidBlobId';
+      throw error;
+    }
+    return this.transport.downloadBlob({
+      accountId: account.remote_account_id,
       blobId,
       type: type ?? undefined,
       name: name ?? undefined,
+      maxBytes,
+      truncateAtMaxBytes,
+      signal,
+      onProgress,
+    });
+  }
+
+  /**
+   * Compatibility path for inline cid: images and truncated draft bodies.
+   */
+  async downloadBlob({
+    accountId,
+    blobId,
+    type,
+    name,
+    signal,
+    onProgress,
+  }: {
+    accountId: number;
+    blobId: string;
+    type?: string;
+    name?: string;
+    signal?: AbortSignal;
+    onProgress?: (progress: any) => void;
+  }) {
+    if (!blobId) return null;
+    const account = this._accountForLocalId(accountId);
+    const bytes = await this.transport.download({
+      accountId: account.remote_account_id,
+      blobId,
+      type: type ?? undefined,
+      name: name ?? undefined,
+      signal,
+      onProgress,
     });
     return { base64: bytesToBase64(bytes), type: type ?? null };
   }
@@ -1056,12 +1619,19 @@ export class JmapBackend {
 
   async _reconnect() {
     if (!this._started) return;
+    this._resetContactsTrashReadiness();
     let pushState = this.transport.lastPushState;
     if (!pushState) {
-      pushState = await this._loadPushState();
+      try {
+        pushState = await this._loadPushState();
+      } catch (err) {
+        wlog.warn('jmap-backend', `reconnect push-state load failed: ${(err as any)?.message ?? err}`);
+        if (this._started && !this._reconnectTimer) this._onTransportClose({});
+        return;
+      }
     }
     try {
-      await this.transport.openWebSocket(SUBSCRIBED_TYPES, pushState);
+      await this.transport.openWebSocket(this._subscribedTypes(), pushState);
     } catch (err) {
       wlog.warn('jmap-backend', `WebSocket reopen failed: ${(err as any)?.message ?? err}`);
       // openWebSocket may have failed before the underlying socket
@@ -1075,9 +1645,18 @@ export class JmapBackend {
     if (!this._started) return;
     wlog.info('jmap-backend', 'WebSocket reopened');
     this._reconnectAttempts = 0;
-    // Drain any mutations that piled up while disconnected and
-    // catch up on any state changes the server may have buffered.
-    // Mirrors the startup catch-up path.
+    // An Identity push emitted while the socket was down is not replayed,
+    // and there is no delta call for identities to fall back on, so a
+    // reconnect is the only chance to notice an alias that changed while we
+    // were away (CS-4.6).
+    await this.ensureIdentities().catch((err) => {
+      wlog.warn('jmap-backend', `reconnect identity refresh failed`, err);
+    });
+    await this.ensureSettings().catch((err) => {
+      wlog.warn('jmap-backend', 'reconnect settings refresh failed', err);
+    });
+    await this._refreshContactsTrash();
+    // Apply queued contact work only after pulling deletions from other clients.
     this.outboxRunner?.notify();
     for (const account of this._sessionAccounts()) {
       await this._refreshActiveQueryViews(account).catch((err) => {
@@ -1088,6 +1667,105 @@ export class JmapBackend {
         );
       });
     }
+    await this._refreshRecipientUsage().catch((err) => {
+      wlog.warn('jmap-backend', 'reconnect recipient usage refresh failed', err);
+    });
+    // EmailSubmission pushes emitted while the socket was down are not
+    // replayed either; one pass re-reads whatever settled meanwhile.
+    await this._syncSubmissionsWithRetry('reconnect submission sync failed');
+  }
+
+  // ----- Send Later submission sync ------------------------------------
+
+  _handleSubmissionSyncFailure(label: string, error: unknown) {
+    wlog.warn('jmap-backend', label, error);
+    this._armSubmissionWake(Date.now() + this._submissionRetryDelayMs());
+  }
+
+  _syncSubmissionsWithRetry(label: string): Promise<void> {
+    return this._syncSubmissions().catch((error) => {
+      this._handleSubmissionSyncFailure(label, error);
+    });
+  }
+
+  /**
+   * Run one level-based submission-sync pass for the primary account
+   * (compose only schedules from it). Single-flight with a trailing
+   * re-run, mirroring the StateChange pattern: triggers may fire as
+   * often as they like — push, reconnect, Scheduled-folder open, wake
+   * timer — and collapse into at most one queued follow-up pass.
+   *
+   * Each pass re-arms the wake timer from its own result, so the timer
+   * always reflects the latest nearest pending sendAt.
+   */
+  _syncSubmissions(): Promise<void> {
+    if (!this._started || !this.account) return Promise.resolve();
+    if (this._submissionSyncInflight) {
+      this._submissionSyncQueued = true;
+      return this._submissionSyncInflight;
+    }
+    this._submissionSyncInflight = (async () => {
+      try {
+        do {
+          this._submissionSyncQueued = false;
+          const result = await syncSubmissionsForAccount({
+            transport: this.transport,
+            account: this.account,
+            handlers: this.handlers,
+            useWebSocket: this._wsReady(),
+          });
+          if (result.unresolvedSettled) this.outboxRunner?.notify();
+          const clock = scheduleClockWindow(this.transport);
+          const pendingWakeAt = result.nearestPendingAt == null
+            ? null
+            : Date.now() + Math.max(
+              result.nearestPendingAt
+                + SUBMISSION_RELEASE_OBSERVATION_DELAY_MS
+                - clock.lowerMs,
+              0,
+            );
+          const settledWakeAt = result.unresolvedSettled
+            ? Date.now() + SUBMISSION_SETTLED_RECHECK_MS
+            : null;
+          this._armSubmissionWake(
+            settledWakeAt == null
+              ? pendingWakeAt
+              : Math.min(settledWakeAt, pendingWakeAt ?? Infinity),
+          );
+        } while (this._submissionSyncQueued && this._started);
+        this._submissionSyncFailures = 0;
+      } catch (error) {
+        this._submissionSyncFailures += 1;
+        throw error;
+      } finally {
+        this._submissionSyncInflight = null;
+      }
+    })();
+    return this._submissionSyncInflight;
+  }
+
+  _submissionRetryDelayMs() {
+    return Math.min(
+      SUBMISSION_SETTLED_RECHECK_MS
+        * 2 ** Math.max(0, this._submissionSyncFailures - 1),
+      SUBMISSION_WAKE_MAX_MS,
+    );
+  }
+
+  _armSubmissionWake(wakeAt: number | null) {
+    if (this._submissionWakeTimer) {
+      clearTimeout(this._submissionWakeTimer);
+      this._submissionWakeTimer = null;
+    }
+    if (!this._started || wakeAt == null || !Number.isFinite(wakeAt)) return;
+    const delay = Math.min(
+      Math.max(wakeAt - Date.now(), SUBMISSION_WAKE_MIN_MS),
+      SUBMISSION_WAKE_MAX_MS,
+    );
+    this._submissionWakeTimer = setTimeout(() => {
+      this._submissionWakeTimer = null;
+      void this._syncSubmissionsWithRetry('submission wake-up sync failed');
+    }, delay);
   }
 
   // ----- StateChange dispatch -----------------------------------------
@@ -1108,6 +1786,14 @@ export class JmapBackend {
    */
   _onStateChange(change) {
     if (!this.account) return;
+    if (
+      Object.hasOwn(
+        change?.changed?.[this.account.remote_account_id] ?? {},
+        'FileNode',
+      )
+    ) {
+      this._resetContactsTrashReadiness();
+    }
     if (this._stateChangeRetryPending) {
       change = mergeStateChange(this._stateChangeRetryPending, change);
       this._stateChangeRetryPending = null;
@@ -1202,7 +1888,26 @@ export class JmapBackend {
     let needViewRefresh = false;
     const viewRefreshTypes: string[] = [];
     const failedTypes: Record<string, string> = {};
-    for (const type of Object.keys(types)) {
+    // Contact deletions must land before Email events from the same push so an
+    // older Sent change cannot recreate a card another client just removed.
+    // Address books precede cards because card membership depends on them.
+    const priority = new Map([
+      ['AddressBook', 0],
+      ['ContactCard', 1],
+      ['FileNode', 2],
+      ['Identity', 3],
+      ['Mailbox', 4],
+      ['Email', 5],
+      ['EmailDelivery', 6],
+      ['Thread', 7],
+      // After Email so a released schedule's mailbox move is already in
+      // the cache when the submission pass reads placements.
+      ['EmailSubmission', 8],
+    ]);
+    const orderedTypes = Object.keys(types).sort(
+      (left, right) => (priority.get(left) ?? 99) - (priority.get(right) ?? 99),
+    );
+    for (const type of orderedTypes) {
       try {
         switch (type) {
           case 'Mailbox': {
@@ -1225,18 +1930,30 @@ export class JmapBackend {
                 repairArchive: account.id === this.account.id,
               });
             }
+            if (
+              account.id === this.account.id
+              && !Object.hasOwn(types, 'EmailSubmission')
+              && await this._hasTrackedSchedules(account.id)
+            ) {
+              void this._syncSubmissionsWithRetry(
+                'mailbox-triggered submission sync failed',
+              );
+            }
             break;
           }
           case 'Email': {
             const sync = await this._loadSyncStateFor(account, 'Email');
             if (sync?.state) {
-              await syncEmailChanges({
+              const result = await syncEmailChanges({
                 transport: this.transport,
                 account,
                 handlers: this.handlers,
                 sinceState: sync.state,
                 useWebSocket: this._wsReady(),
               });
+              if (result.needsFullSync && account.id === this.account.id) {
+                await this._refreshRecipientUsage({ resetEmailState: true });
+              }
             }
             needViewRefresh = true;
             viewRefreshTypes.push(type);
@@ -1245,6 +1962,9 @@ export class JmapBackend {
           case 'EmailDelivery':
             needViewRefresh = true;
             viewRefreshTypes.push(type);
+            break;
+          case 'EmailSubmission':
+            if (account.id === this.account.id) await this._syncSubmissions();
             break;
           case 'Identity':
             if (account.id === this.account.id) await this.ensureIdentities();
@@ -1267,8 +1987,24 @@ export class JmapBackend {
               useWebSocket: this._wsReady(),
             });
             if (result.needsFullSync) await this.ensureContacts();
+            await this.handlers[DB_RPC.RECIPIENT_USAGE_REBUILD]({
+              accountId: this.account.id,
+            });
             break;
           }
+          case 'FileNode':
+            if (account.id === this.account.id) {
+              let fileNodeError: unknown = null;
+              try {
+                await this.ensureSettings();
+              } catch (error) {
+                fileNodeError = error;
+              }
+              const trashRefresh = await this._refreshContactsTrash();
+              if (trashRefresh.ok === false) fileNodeError ??= trashRefresh.error;
+              if (fileNodeError) throw fileNodeError;
+            }
+            break;
           default:
             break;
         }
@@ -1308,6 +2044,99 @@ export class JmapBackend {
       this._stateChangeRetryPending = null;
       if (pending && this._started) this._onStateChange(pending);
     }, this._stateChangeRetryDelayMs);
+  }
+
+  /**
+   * Refresh the latest Sent metadata and replace the local ranking cache.
+   * This path never creates contacts; it is safe after a user deletes one.
+   */
+  async _refreshRecipientUsage({ resetEmailState = false } = {}) {
+    const sent = await this.handlers[DB_RPC.FOLDER_BY_ROLE]({
+      accountId: this.account.id,
+      role: 'sent',
+    });
+    if (!sent) return { scanned: 0, ranked: 0 };
+    let baselineEmailState: string | null = null;
+    const paging = await pageCompleteQuery({
+      pageSize: 300,
+      maxPosition: 300,
+      readPage: async ({ position, limit }) => {
+        const page = await syncFolderWindow({
+          transport: this.transport,
+          account: this.account,
+          folder: sent,
+          handlers: this.handlers,
+          sortProp: 'sentAt',
+          position,
+          limit,
+          useWebSocket: this._wsReady(),
+        });
+        const total = page.total == null ? null : Number(page.total);
+        return {
+          ids: page.ids,
+          queryState: typeof page.queryState === 'string' ? page.queryState : null,
+          total: total != null && Number.isFinite(total) ? total : null,
+          position: Number.isFinite(page.position) ? Number(page.position) : null,
+          value: page,
+        };
+      },
+      visitPage: ({ value: page }) => {
+        if (baselineEmailState == null) {
+          if (!page.emailState) {
+            throw new Error('Sent snapshot did not include an Email object state');
+          }
+          baselineEmailState = page.emailState;
+        }
+      },
+    });
+    if (
+      paging.complete === false
+      && (paging.reason === 'queryStateChanged' || paging.reason === 'queryTotalChanged')
+    ) {
+      throw new Error('Sent query changed while rebuilding recipient usage');
+    }
+    if (
+      (paging.complete === false && paging.reason === 'queryStateMissing')
+      || (
+        paging.complete
+        && paging.total != null
+        && paging.position < paging.total
+        && !paging.queryState
+      )
+    ) {
+      throw new Error('Sent query did not provide stable paging state');
+    }
+    if (paging.complete === false) {
+      if (paging.reason === 'cursorStalled') {
+        throw new Error('Sent query changed while rebuilding recipient usage');
+      }
+      throw new Error('Sent query did not complete while rebuilding recipient usage');
+    }
+    const current = await this.handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: this.account.id,
+      objectType: 'Email',
+    });
+    if (baselineEmailState && (resetEmailState || !current?.state)) {
+      await this.handlers[DB_RPC.SYNC_STATE_SET]({
+        accountId: this.account.id,
+        objectType: 'Email',
+        state: baselineEmailState,
+      });
+      const catchup = await syncEmailChanges({
+        transport: this.transport,
+        account: this.account,
+        handlers: this.handlers,
+        sinceState: baselineEmailState,
+        useWebSocket: this._wsReady(),
+      });
+      if (catchup.needsFullSync) {
+        throw new Error('Sent snapshot changes catch-up was incomplete');
+      }
+    }
+    return this.handlers[DB_RPC.RECIPIENT_USAGE_REBUILD]({
+      accountId: this.account.id,
+      limit: 300,
+    });
   }
 
   async _refreshActiveQueryViews(account = this.account) {
@@ -1350,6 +2179,7 @@ export class JmapBackend {
       if (!folder) continue;
       const sortJson = JSON.parse(view.sort_json);
       const sortProp = sortJson?.[0]?.property ?? 'receivedAt';
+      const sortAscending = sortJson?.[0]?.isAscending === true;
       const result = view.query_state
         ? await syncFolderWindowChanges({
           transport: this.transport,
@@ -1358,6 +2188,7 @@ export class JmapBackend {
           handlers: this.handlers,
           sinceQueryState: view.query_state,
           sortProp,
+          sortAscending,
           collapseThreads: !!view.collapse_threads,
           useWebSocket: this._wsReady(),
         })
@@ -1369,6 +2200,7 @@ export class JmapBackend {
           folder,
           handlers: this.handlers,
           sortProp,
+          sortAscending,
           collapseThreads: !!view.collapse_threads,
           useWebSocket: this._wsReady(),
         });
@@ -1429,15 +2261,28 @@ export class JmapBackend {
     return this.services.some((s) => s.serviceKind === SERVICE_KIND.JMAP_CONTACTS);
   }
 
+  _subscribedTypes() {
+    return hasFileNodeCapability(this.transport, this.account)
+      ? [...SUBSCRIBED_TYPES, 'FileNode']
+      : SUBSCRIBED_TYPES;
+  }
+
   _wsReady() {
     return this.useWebSocket && !!this.transport._ws && this.transport._ws.readyState === 1;
   }
 
-  _defaultSortPropFor(folder) {
-    if (folder?.role === 'sent' || folder?.role === 'drafts') {
-      return 'sentAt';
+  async _defaultSortFor(folder) {
+    const scheduledRemoteId = await readScheduledMailboxRemoteId(
+      this.handlers,
+      Number(folder?.account_id),
+    );
+    if (scheduledRemoteId && folder?.remote_id === scheduledRemoteId) {
+      return { sortProp: 'sentAt', sortAscending: true };
     }
-    return 'receivedAt';
+    if (folder?.role === 'sent' || folder?.role === 'drafts') {
+      return { sortProp: 'sentAt', sortAscending: false };
+    }
+    return { sortProp: 'receivedAt', sortAscending: false };
   }
 
   /**
@@ -1453,6 +2298,18 @@ export class JmapBackend {
     if (mapped) return mapped;
     if (Number(this.account?.id) === localAccountId) return this.account;
     throw new Error(`Folder ${folder?.id ?? '(unknown)'} belongs to an unavailable account`);
+  }
+
+  _accountForLocalId(localAccountId: number) {
+    const normalized = Number(localAccountId);
+    const mapped = this._accountsByLocalId.get(normalized);
+    if (mapped) return mapped;
+    if (Number(this.account?.id) === normalized) return this.account;
+    const error: any = new Error(
+      `JMAP account ${localAccountId ?? '(unknown)'} is unavailable`,
+    );
+    error.type = 'accountUnavailable';
+    throw error;
   }
 
   _sessionAccounts() {
@@ -1497,9 +2354,16 @@ export class JmapBackend {
     });
   }
 
-  async _nextQueryViewGap({ folder, sortProp, startAt = 0, total = 0, limit = 100 }) {
+  async _nextQueryViewGap({
+    folder,
+    sortProp,
+    sortAscending = false,
+    startAt = 0,
+    total = 0,
+    limit = 100,
+  }) {
     const filterJson = JSON.stringify({ inMailbox: folder.remote_id });
-    const sortJson = JSON.stringify([{ property: sortProp, isAscending: false }]);
+    const sortJson = JSON.stringify([{ property: sortProp, isAscending: sortAscending }]);
     const views = await this.handlers[DB_RPC.QUERY]({
       sql: `SELECT id, total
               FROM query_views
