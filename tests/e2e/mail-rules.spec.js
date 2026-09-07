@@ -21,7 +21,7 @@ test.skip(!localStackEnabled, skipLocalStackMessage);
 
 const CORE = 'urn:ietf:params:jmap:core';
 const SIEVE = 'urn:ietf:params:jmap:sieve';
-const MANAGED_MARKER = '# stormbox-managed: mail-rules/v1';
+const MANAGED_MARKER = '# stormbox-managed: mail-rules/v2';
 const RULE_NAME = 'MailRulesE2E visual rule';
 const CONDITION_VALUE = 'MailRulesE2E';
 
@@ -59,7 +59,9 @@ async function restoreScripts(jmap, before) {
     {
       accountId: jmap.accountId,
       ...(Object.keys(update).length > 0 ? { update } : {}),
-      onSuccessActivateScript: activeBefore,
+      ...(activeBefore
+        ? { onSuccessActivateScript: activeBefore }
+        : { onSuccessDeactivateScript: true }),
     },
     'restoreScripts',
   ]]);
@@ -73,7 +75,9 @@ async function restoreScripts(jmap, before) {
       {
         accountId: jmap.accountId,
         destroy: createdIds,
-        onSuccessActivateScript: activeBefore,
+        ...(activeBefore
+          ? { onSuccessActivateScript: activeBefore }
+          : { onSuccessDeactivateScript: true }),
       },
       'removeCreatedScripts',
     ]]);
@@ -107,6 +111,13 @@ test.describe('JMAP Sieve mail rules e2e', () => {
       const rule = dialog.locator('.mail-rule').last();
       await rule.locator('input[aria-label="Rule name"]').fill(RULE_NAME);
       await rule.locator('input[aria-label="Condition value"]').fill(CONDITION_VALUE);
+      await rule.getByRole('button', { name: 'Group' }).click();
+      const nestedGroup = rule.locator('.condition-group--nested');
+      await nestedGroup.getByLabel('Nested condition match mode').click();
+      await nestedGroup.locator('[data-rule-option="any"]').click();
+      await nestedGroup.getByLabel('Condition value').fill('lead@example.com');
+      await nestedGroup.getByRole('button', { name: 'Condition' }).click();
+      await nestedGroup.getByLabel('Condition value').nth(1).fill('manager@example.com');
       await dialog.locator('[data-mail-rules-save]').click();
 
       const takeover = page.getByRole('alertdialog', { name: 'Activate Stormbox rules?' });
@@ -139,13 +150,15 @@ test.describe('JMAP Sieve mail rules e2e', () => {
       })).toString('utf8');
       expect(source).toContain(MANAGED_MARKER);
       expect(source).toContain(CONDITION_VALUE);
+      expect(source).toContain('anyof (address :contains "From" "lead@example.com", address :contains "From" "manager@example.com")');
 
       await dialog.getByRole('button', { name: 'Close', exact: true }).click();
       await expect(dialog).toBeHidden({ timeout: 5_000 });
       dialog = await openRulesDialog(page);
       const savedRule = dialog.locator('.mail-rule').filter({ hasText: RULE_NAME });
       await expect(savedRule.locator('input[aria-label="Rule name"]')).toHaveValue(RULE_NAME);
-      await expect(savedRule.locator('input[aria-label="Condition value"]')).toHaveValue(CONDITION_VALUE);
+      await expect(savedRule.locator('input[aria-label="Condition value"]').first()).toHaveValue(CONDITION_VALUE);
+      await expect(savedRule.locator('.condition-group--nested')).toHaveCount(1);
       await dialog.getByRole('button', { name: 'Close', exact: true }).click();
     } finally {
       await restoreScripts(jmap, before);

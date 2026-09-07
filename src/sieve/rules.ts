@@ -1,10 +1,24 @@
+import { parseSieve } from './parser';
+import type {
+  SieveCommand, SieveIfStatement, SieveStatement, SieveTest, SieveValue,
+} from './parser';
+
 export const SIEVE_CAPABILITY = 'urn:ietf:params:jmap:sieve';
 export const MANAGED_SCRIPT_NAME = 'Stormbox Mail Rules';
-export const MANAGED_SCRIPT_MARKER = '# stormbox-managed: mail-rules/v1';
+export const MANAGED_SCRIPT_MARKER = '# stormbox-managed: mail-rules/v2';
 
+const LEGACY_MANAGED_SCRIPT_MARKER = '# stormbox-managed: mail-rules/v1';
 const DATA_PREFIX = '# stormbox-data: ';
-const DATA_CHUNK_SIZE = 72;
 const BASE64URL_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+const MAX_TEST_DEPTH = 20;
+const MAX_TEST_NODES = 500;
+const VISUAL_REQUIRE_EXTENSIONS = new Set([
+  'copy',
+  'fileinto',
+  'imap4flags',
+  'mailbox',
+  'mailboxid',
+]);
 
 export type RuleMatch = 'all' | 'any';
 export type RuleField = 'from' | 'to' | 'toCc' | 'subject' | 'header';
@@ -12,11 +26,23 @@ export type RuleOperator = 'is' | 'contains' | 'matches';
 
 export interface MailRuleCondition {
   id: string;
+  type: 'condition';
+  negated: boolean;
   field: RuleField;
   operator: RuleOperator;
   value: string;
   headerName?: string;
 }
+
+export interface MailRuleConditionGroup {
+  id: string;
+  type: 'group';
+  negated: boolean;
+  match: RuleMatch;
+  conditions: MailRuleTest[];
+}
+
+export type MailRuleTest = MailRuleCondition | MailRuleConditionGroup;
 
 export type MailRuleAction =
   | { id: string; type: 'move'; mailboxId: string; mailboxName: string }
@@ -30,13 +56,13 @@ export interface MailRule {
   name: string;
   enabled: boolean;
   match: RuleMatch;
-  conditions: MailRuleCondition[];
+  conditions: MailRuleTest[];
   actions: MailRuleAction[];
   stopProcessing: boolean;
 }
 
 export interface MailRuleDocument {
-  version: 1;
+  version: 2;
   rules: MailRule[];
 }
 
@@ -44,6 +70,10 @@ export interface SieveRuleCapabilities {
   sieveExtensions: string[];
   maxSizeScript?: number | null;
   maxNumberRedirects?: number | null;
+}
+
+export interface CompileRulesOptions {
+  managed?: boolean;
 }
 
 export class RuleValidationError extends Error {
@@ -54,7 +84,7 @@ export class RuleValidationError extends Error {
 }
 
 export function emptyRuleDocument(): MailRuleDocument {
-  return { version: 1, rules: [] };
+  return { version: 2, rules: [] };
 }
 
 export function newRuleId(prefix = 'rule'): string {
@@ -71,6 +101,8 @@ export function createEmptyRule(): MailRule {
     match: 'all',
     conditions: [{
       id: newRuleId('condition'),
+      type: 'condition',
+      negated: false,
       field: 'from',
       operator: 'contains',
       value: '',
@@ -82,17 +114,26 @@ export function createEmptyRule(): MailRule {
 
 export function cloneRuleDocument(document: MailRuleDocument): MailRuleDocument {
   return {
-    version: 1,
+    version: 2,
     rules: document.rules.map((rule) => ({
       ...rule,
-      conditions: rule.conditions.map((condition) => ({ ...condition })),
+      conditions: rule.conditions.map(cloneRuleTest),
       actions: rule.actions.map((action) => ({ ...action })),
     })),
   };
 }
 
+function cloneRuleTest(test: MailRuleTest): MailRuleTest {
+  if (test.type === 'condition') return { ...test };
+  return { ...test, conditions: test.conditions.map(cloneRuleTest) };
+}
+
 export function normalizeRuleDocument(input: unknown): MailRuleDocument {
-  if (!isRecord(input) || input.version !== 1 || !Array.isArray(input.rules)) {
+  if (
+    !isRecord(input)
+    || (input.version !== 1 && input.version !== 2)
+    || !Array.isArray(input.rules)
+  ) {
     throw new RuleValidationError('The managed rule data has an unsupported format.');
   }
 
@@ -103,6 +144,7 @@ export function normalizeRuleDocument(input: unknown): MailRuleDocument {
     }
     const id = requiredId(value.id, `Rule ${ruleIndex + 1}`, seenRuleIds);
     const name = requiredText(value.name, `Rule ${ruleIndex + 1} needs a name.`);
+    rejectControlCharacters(name, `Rule ${ruleIndex + 1} name`);
     const match = value.match === 'all' || value.match === 'any' ? value.match : null;
     if (!match) throw new RuleValidationError(`Rule “${name}” has an invalid match mode.`);
     if (!Array.isArray(value.conditions) || value.conditions.length === 0) {
@@ -112,9 +154,9 @@ export function normalizeRuleDocument(input: unknown): MailRuleDocument {
       throw new RuleValidationError(`Rule “${name}” needs at least one action.`);
     }
 
-    const seenConditionIds = new Set<string>();
+    const testContext = { seenIds: new Set<string>(), nodes: 0 };
     const conditions = value.conditions.map((condition, conditionIndex) =>
-      normalizeCondition(condition, name, conditionIndex, seenConditionIds));
+      normalizeRuleTest(condition, name, `${conditionIndex + 1}`, testContext, 1));
     const seenActionIds = new Set<string>();
     const actions = value.actions.map((action, actionIndex) =>
       normalizeAction(action, name, actionIndex, seenActionIds));
@@ -130,20 +172,25 @@ export function normalizeRuleDocument(input: unknown): MailRuleDocument {
     } satisfies MailRule;
   });
 
-  return { version: 1, rules };
+  return { version: 2, rules };
 }
 
 export function isManagedRulesScript(script: string): boolean {
-  return script.split(/\r?\n/).some((line) => line.trimEnd() === MANAGED_SCRIPT_MARKER);
+  return script.split(/\r?\n/).some((line) => {
+    const value = line.trimEnd();
+    return value === MANAGED_SCRIPT_MARKER || value === LEGACY_MANAGED_SCRIPT_MARKER;
+  });
 }
 
 /**
- * Return null for a foreign script. A script carrying Stormbox's marker
- * is owned by this editor; malformed metadata throws so callers never
- * silently replace a managed script they can no longer understand.
+ * Return null for an unmarked script. Version 2 is reconstructed from
+ * executable source; version 1 metadata is retained as a migration path.
  */
 export function parseManagedRules(script: string): MailRuleDocument | null {
   if (!isManagedRulesScript(script)) return null;
+  if (script.split(/\r?\n/).some((line) => line.trimEnd() === MANAGED_SCRIPT_MARKER)) {
+    return parseVisualRules(script);
+  }
   const chunks = script
     .split(/\r?\n/)
     .filter((line) => line.startsWith(DATA_PREFIX))
@@ -151,18 +198,327 @@ export function parseManagedRules(script: string): MailRuleDocument | null {
   if (chunks.length === 0 || chunks.some((chunk) => !/^[A-Za-z0-9_-]+$/.test(chunk))) {
     throw new RuleValidationError('The Stormbox rule metadata is missing or malformed.');
   }
+  let legacyDocument: MailRuleDocument;
   try {
     const json = new TextDecoder().decode(decodeBase64Url(chunks.join('')));
-    return normalizeRuleDocument(JSON.parse(json));
+    legacyDocument = normalizeRuleDocument(JSON.parse(json));
   } catch (error) {
     if (error instanceof RuleValidationError) throw error;
     throw new RuleValidationError('The Stormbox rule metadata could not be decoded.');
   }
+
+  const executableDocument = parseVisualRules(script);
+  const enabledLegacyDocument: MailRuleDocument = {
+    version: 2,
+    rules: legacyDocument.rules.filter((rule) => rule.enabled),
+  };
+  if (!sameRuleSemantics(enabledLegacyDocument, executableDocument)) {
+    throw new RuleValidationError(
+      'The legacy Stormbox metadata differs from its executable Sieve. Preserve the script and resolve the mismatch before saving.',
+    );
+  }
+  let executableIndex = 0;
+  return normalizeRuleDocument({
+    version: 2,
+    rules: legacyDocument.rules.map((rule) => (
+      rule.enabled ? executableDocument.rules[executableIndex++] : rule
+    )),
+  });
+}
+
+export function parseVisualRules(script: string): MailRuleDocument {
+  const parsed = parseSieve(script);
+  for (const statement of parsed.statements) {
+    if (statement.type !== 'command' || statement.name !== 'require') continue;
+    if (statement.arguments.length !== 1) {
+      throw notVisualizable(script, statement, 'The require command is malformed');
+    }
+    const extensions = stringValues(statement.arguments[0]);
+    const unsupported = extensions.find((extension) =>
+      !VISUAL_REQUIRE_EXTENSIONS.has(extension.toLowerCase()));
+    if (extensions.length === 0 || unsupported) {
+      throw notVisualizable(
+        script,
+        statement,
+        `Required extension “${unsupported ?? 'unknown'}” is not safe to rewrite visually`,
+      );
+    }
+  }
+  const rules: MailRule[] = [];
+  const statements = parsed.statements.filter((statement) =>
+    statement.type !== 'command' || statement.name !== 'require');
+
+  if (
+    statements.length === 1
+    && statements[0].type === 'command'
+    && statements[0].name === 'keep'
+    && statements[0].arguments.length === 0
+  ) return emptyRuleDocument();
+
+  for (const statement of statements) {
+    if (statement.type !== 'if') {
+      throw notVisualizable(script, statement, `Top-level “${statement.name}” is not represented by the visual editor`);
+    }
+    rules.push(ruleFromIf(script, statement, rules.length));
+  }
+
+  return normalizeRuleDocument({ version: 2, rules });
+}
+
+function ruleFromIf(source: string, statement: SieveIfStatement, index: number): MailRule {
+  let visualStatement = statement;
+  let enabled = true;
+  if (isFalseTest(statement.branches[0]?.test)) {
+    const commands = statement.branches[0]?.commands ?? [];
+    if (
+      statement.branches.length !== 1
+      || statement.elseCommands
+      || commands.length !== 1
+      || commands[0].type !== 'if'
+    ) {
+      throw notVisualizable(source, statement, 'This false branch is not a generated disabled rule');
+    }
+    enabled = false;
+    visualStatement = commands[0];
+  }
+
+  if (visualStatement.branches.length !== 1 || visualStatement.elseCommands) {
+    throw notVisualizable(source, visualStatement, 'elsif and else branches are not represented yet');
+  }
+
+  const root = testFromSieve(source, visualStatement.branches[0].test);
+  const { actions, stopProcessing } = actionsFromCommands(
+    source,
+    visualStatement.branches[0].commands,
+  );
+  const label = ruleLabel(statement.comments, index, enabled);
+  return {
+    id: newRuleId(),
+    name: label,
+    enabled,
+    match: root.type === 'group' && !root.negated ? root.match : 'all',
+    conditions: root.type === 'group' && !root.negated ? root.conditions : [root],
+    actions,
+    stopProcessing,
+  };
+}
+
+function testFromSieve(source: string, test: SieveTest): MailRuleTest {
+  if (test.type === 'not') {
+    const visual = testFromSieve(source, test.test);
+    visual.negated = !visual.negated;
+    return visual;
+  }
+  if (test.type === 'allof' || test.type === 'anyof') {
+    return {
+      id: newRuleId('group'),
+      type: 'group',
+      negated: false,
+      match: test.type === 'allof' ? 'all' : 'any',
+      conditions: test.tests.map((child) => testFromSieve(source, child)),
+    };
+  }
+
+  if (!['address', 'header'].includes(test.name)) {
+    throw notVisualizable(source, test, `Test “${test.name}” is not represented by the visual editor`);
+  }
+  const { operator, positional } = visualMatchArguments(source, test);
+
+  const headers = stringValues(positional[0]);
+  const values = stringValues(positional[1]);
+  if (headers.length === 0 || values.length === 0) {
+    throw notVisualizable(source, test, `Test “${test.name}” has unsupported header or value lists`);
+  }
+  const normalizedHeaders = headers.map((header) => header.toLowerCase());
+  let targets: Array<{ field: RuleField; headerName?: string }>;
+  if (
+    test.name === 'address'
+    && normalizedHeaders.length === 2
+    && normalizedHeaders.includes('to')
+    && normalizedHeaders.includes('cc')
+  ) {
+    targets = [{ field: 'toCc' }];
+  } else if (test.name === 'address' && normalizedHeaders.every((header) => ['from', 'to'].includes(header))) {
+    targets = normalizedHeaders.map((header) => ({ field: header as 'from' | 'to' }));
+  } else if (test.name === 'header') {
+    targets = headers.map((header, index) => (
+      normalizedHeaders[index] === 'subject'
+        ? { field: 'subject' }
+        : { field: 'header', headerName: header }
+    ));
+  } else {
+    throw notVisualizable(source, test, `Test “${test.name}” targets headers the visual editor cannot combine`);
+  }
+
+  const conditions = targets.flatMap((target) => values.map<MailRuleCondition>((value) => ({
+    id: newRuleId('condition'),
+    type: 'condition',
+    negated: false,
+    field: target.field,
+    operator,
+    value,
+    ...(target.headerName ? { headerName: target.headerName } : {}),
+  })));
+  if (conditions.length === 1) return conditions[0];
+  return {
+    id: newRuleId('group'),
+    type: 'group',
+    negated: false,
+    match: 'any',
+    conditions,
+  };
+}
+
+function visualMatchArguments(
+  source: string,
+  test: Extract<SieveTest, { type: 'call' }>,
+): { operator: RuleOperator; positional: SieveValue[] } {
+  let operator: RuleOperator = 'is';
+  let matchTypeSeen = false;
+  let comparatorSeen = false;
+  let addressPartSeen = false;
+  let index = 0;
+
+  while (test.arguments[index]?.type === 'tag') {
+    const tag = test.arguments[index].value;
+    if ([':is', ':contains', ':matches'].includes(tag)) {
+      if (matchTypeSeen) {
+        throw notVisualizable(source, test, `Test “${test.name}” has more than one match type`);
+      }
+      matchTypeSeen = true;
+      operator = tag.slice(1) as RuleOperator;
+      index += 1;
+      continue;
+    }
+    if (tag === ':comparator') {
+      const comparator = test.arguments[index + 1];
+      if (
+        comparatorSeen
+        || comparator?.type !== 'string'
+        || comparator.value.toLowerCase() !== 'i;ascii-casemap'
+      ) {
+        throw notVisualizable(source, test, `Test “${test.name}” uses an unsupported comparator`);
+      }
+      comparatorSeen = true;
+      index += 2;
+      continue;
+    }
+    if (test.name === 'address' && tag === ':all') {
+      if (addressPartSeen) {
+        throw notVisualizable(source, test, 'The address test has more than one address part');
+      }
+      addressPartSeen = true;
+      index += 1;
+      continue;
+    }
+    throw notVisualizable(source, test, `Test “${test.name}” uses unsupported match arguments`);
+  }
+
+  const positional = test.arguments.slice(index);
+  if (positional.length !== 2 || positional.some((value) => value.type === 'tag')) {
+    throw notVisualizable(source, test, `Test “${test.name}” uses unsupported match arguments`);
+  }
+  return { operator, positional };
+}
+
+function actionsFromCommands(
+  source: string,
+  commands: SieveStatement[],
+): { actions: MailRuleAction[]; stopProcessing: boolean } {
+  const actions: MailRuleAction[] = [];
+  let stopProcessing = false;
+  commands.forEach((command, index) => {
+    if (command.type !== 'command') {
+      throw notVisualizable(source, command, 'Nested control blocks are not represented as rule actions');
+    }
+    if (command.name === 'stop') {
+      if (command.arguments.length > 0 || index !== commands.length - 1) {
+        throw notVisualizable(source, command, 'stop must be the final action in a visual rule');
+      }
+      stopProcessing = true;
+      return;
+    }
+    actions.push(...actionsFromCommand(source, command));
+  });
+  if (actions.length === 0) {
+    throw notVisualizable(source, commands[0], 'A visual rule needs at least one supported action');
+  }
+  return { actions, stopProcessing };
+}
+
+function actionsFromCommand(source: string, command: SieveCommand): MailRuleAction[] {
+  const tags = command.arguments.filter((value) => value.type === 'tag').map((value) => value.value);
+  const positional = command.arguments.filter((value) => value.type !== 'tag');
+  if (command.name === 'discard' && tags.length === 0 && positional.length === 0) {
+    return [{ id: newRuleId('action'), type: 'discard' }];
+  }
+  if (command.name === 'fileinto' && tags.every((tag) => tag === ':mailboxid')) {
+    const strings = positional.flatMap(stringValues);
+    if (tags.length === 0 && strings.length === 1) {
+      return [{
+        id: newRuleId('action'), type: 'move', mailboxId: '', mailboxName: strings[0],
+      }];
+    }
+    if (tags.length === 1 && strings.length === 2) {
+      return [{
+        id: newRuleId('action'), type: 'move', mailboxId: strings[0], mailboxName: strings[1],
+      }];
+    }
+  }
+  if (command.name === 'addflag' && tags.length === 0 && positional.length === 1) {
+    const flags = stringValues(positional[0]);
+    if (flags.length > 0 && flags.every((flag) => ['\\seen', '\\flagged'].includes(flag.toLowerCase()))) {
+      return flags.map<MailRuleAction>((flag) => ({
+        id: newRuleId('action'),
+        type: flag.toLowerCase() === '\\seen' ? 'markRead' : 'star',
+      }));
+    }
+  }
+  if (command.name === 'redirect' && tags.length === 1 && tags[0] === ':copy' && positional.length === 1) {
+    const addresses = stringValues(positional[0]);
+    if (addresses.length === 1) {
+      return [{ id: newRuleId('action'), type: 'redirect', address: addresses[0] }];
+    }
+  }
+  throw notVisualizable(source, command, `Action “${command.name}” is not represented by the visual editor`);
+}
+
+function stringValues(value: SieveValue): string[] {
+  if (value.type === 'string') return [value.value];
+  if (value.type === 'stringList') return value.values;
+  return [];
+}
+
+function isFalseTest(test: SieveTest | undefined): boolean {
+  return test?.type === 'call' && test.name === 'false' && test.arguments.length === 0;
+}
+
+function ruleLabel(comments: string[], index: number, enabled: boolean): string {
+  const prefixes = enabled ? [/^Rule:\s*(.+)$/i] : [/^Disabled rule:\s*(.+)$/i, /^Rule:\s*(.+)$/i];
+  for (const comment of [...comments].reverse()) {
+    for (const pattern of prefixes) {
+      const match = comment.match(pattern);
+      if (match?.[1]?.trim()) return match[1].trim();
+    }
+  }
+  return `Rule ${index + 1}`;
+}
+
+function notVisualizable(
+  source: string,
+  node: { range: { start: number } } | undefined,
+  message: string,
+): RuleValidationError {
+  const offset = node?.range.start ?? 0;
+  const before = source.slice(0, offset);
+  const line = before.split(/\r\n|\r|\n/).length;
+  return new RuleValidationError(`${message} at line ${line}.`);
 }
 
 export function compileRules(
   input: unknown,
   capabilities: SieveRuleCapabilities,
+  { managed = true }: CompileRulesOptions = {},
 ): string {
   const document = normalizeRuleDocument(input);
   validateRedirectBudget(document, capabilities.maxNumberRedirects);
@@ -171,27 +527,27 @@ export function compileRules(
   const blocks: string[] = [];
 
   for (const rule of document.rules) {
-    if (!rule.enabled) continue;
     const test = compileRuleTest(rule);
     const actionLines = rule.actions.map((action) =>
       `  ${compileAction(action, extensions, required)}`);
     if (rule.stopProcessing) actionLines.push('  stop;');
     const label = rule.name.replace(/[\r\n]+/g, ' ').trim();
-    blocks.push([
-      `# Rule: ${label}`,
-      `if ${test} {`,
-      ...actionLines,
-      '}',
-    ].join('\r\n'));
+    const ruleBlock = [`if ${test} {`, ...actionLines, '}'];
+    if (rule.enabled) {
+      blocks.push([`# Rule: ${label}`, ...ruleBlock].join('\r\n'));
+    } else {
+      blocks.push([
+        `# Disabled rule: ${label}`,
+        'if false {',
+        ...ruleBlock.map((line) => `  ${line}`),
+        '}',
+      ].join('\r\n'));
+    }
   }
 
-  const encoded = encodeBase64Url(new TextEncoder().encode(JSON.stringify(document)));
-  const metadataLines = chunkString(encoded, DATA_CHUNK_SIZE)
-    .map((chunk) => `${DATA_PREFIX}${chunk}`);
   const lines = [
-    '# Stormbox managed mail rules. Edit these rules in Stormbox.',
-    MANAGED_SCRIPT_MARKER,
-    ...metadataLines,
+    '# Stormbox-compatible mail rules. The Sieve source is authoritative.',
+    ...(managed ? [MANAGED_SCRIPT_MARKER] : []),
     '',
   ];
   if (required.size > 0) {
@@ -245,15 +601,40 @@ export function uniqueManagedScriptName(existingNames: Iterable<string | null | 
   throw new RuleValidationError('Could not choose a unique managed script name.');
 }
 
-function normalizeCondition(
+function normalizeRuleTest(
   input: unknown,
   ruleName: string,
-  index: number,
-  seenIds: Set<string>,
-): MailRuleCondition {
+  path: string,
+  context: { seenIds: Set<string>; nodes: number },
+  depth: number,
+): MailRuleTest {
   if (!isRecord(input)) {
-    throw new RuleValidationError(`Condition ${index + 1} in “${ruleName}” is malformed.`);
+    throw new RuleValidationError(`Condition ${path} in “${ruleName}” is malformed.`);
   }
+  context.nodes += 1;
+  if (context.nodes > MAX_TEST_NODES) {
+    throw new RuleValidationError(`Rule “${ruleName}” has more than ${MAX_TEST_NODES} conditions and groups.`);
+  }
+  if (depth > MAX_TEST_DEPTH) {
+    throw new RuleValidationError(`Rule “${ruleName}” has condition groups nested more than ${MAX_TEST_DEPTH} levels.`);
+  }
+
+  if (input.type === 'group') {
+    const id = requiredId(input.id, `Condition group ${path} in “${ruleName}”`, context.seenIds);
+    const match = input.match === 'all' || input.match === 'any' ? input.match : null;
+    if (!match || !Array.isArray(input.conditions) || input.conditions.length === 0) {
+      throw new RuleValidationError(`Condition group ${path} in “${ruleName}” is malformed.`);
+    }
+    return {
+      id,
+      type: 'group',
+      negated: input.negated === true,
+      match,
+      conditions: input.conditions.map((condition, index) =>
+        normalizeRuleTest(condition, ruleName, `${path}.${index + 1}`, context, depth + 1)),
+    };
+  }
+
   const field = ['from', 'to', 'toCc', 'subject', 'header'].includes(String(input.field))
     ? input.field as RuleField
     : null;
@@ -261,23 +642,25 @@ function normalizeCondition(
     ? input.operator as RuleOperator
     : null;
   if (!field || !operator) {
-    throw new RuleValidationError(`Condition ${index + 1} in “${ruleName}” is not supported.`);
+    throw new RuleValidationError(`Condition ${path} in “${ruleName}” is not supported.`);
   }
-  const value = requiredText(
+  const value = requiredSieveText(
     input.value,
-    `Condition ${index + 1} in “${ruleName}” needs a value.`,
+    `Condition ${path} in “${ruleName}” needs a value.`,
   );
-  rejectControlCharacters(value, `Condition ${index + 1} in “${ruleName}”`);
+  rejectControlCharacters(value, `Condition ${path} in “${ruleName}”`);
   const condition: MailRuleCondition = {
-    id: requiredId(input.id, `Condition ${index + 1} in “${ruleName}”`, seenIds),
+    id: requiredId(input.id, `Condition ${path} in “${ruleName}”`, context.seenIds),
+    type: 'condition',
+    negated: input.negated === true,
     field,
     operator,
     value,
   };
   if (field === 'header') {
-    const headerName = requiredText(
+    const headerName = requiredSieveText(
       input.headerName,
-      `Custom header condition ${index + 1} in “${ruleName}” needs a header name.`,
+      `Custom header condition ${path} in “${ruleName}” needs a header name.`,
     );
     if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(headerName)) {
       throw new RuleValidationError(`“${headerName}” is not a valid header field name.`);
@@ -299,11 +682,8 @@ function normalizeAction(
   const id = requiredId(input.id, `Action ${index + 1} in “${ruleName}”`, seenIds);
   switch (input.type) {
     case 'move': {
-      const mailboxId = requiredText(
-        input.mailboxId,
-        `Move action ${index + 1} in “${ruleName}” needs a folder.`,
-      );
-      const mailboxName = requiredText(
+      const mailboxId = typeof input.mailboxId === 'string' ? input.mailboxId : '';
+      const mailboxName = requiredSieveText(
         input.mailboxName,
         `Move action ${index + 1} in “${ruleName}” needs a folder fallback name.`,
       );
@@ -312,7 +692,7 @@ function normalizeAction(
       return { id, type: 'move', mailboxId, mailboxName };
     }
     case 'redirect': {
-      const address = requiredText(
+      const address = requiredSieveText(
         input.address,
         `Forward action ${index + 1} in “${ruleName}” needs an email address.`,
       );
@@ -332,10 +712,23 @@ function normalizeAction(
 }
 
 function compileRuleTest(rule: MailRule): string {
-  const tests = rule.conditions.map(compileCondition);
-  if (tests.length === 1) return tests[0];
-  const keyword = rule.match === 'all' ? 'allof' : 'anyof';
-  return `${keyword} (${tests.join(', ')})`;
+  return compileTestGroup(rule.match, rule.conditions, false);
+}
+
+function compileRuleTestNode(test: MailRuleTest): string {
+  if (test.type === 'group') {
+    return compileTestGroup(test.match, test.conditions, test.negated);
+  }
+  const compiled = compileCondition(test);
+  return test.negated ? `not ${compiled}` : compiled;
+}
+
+function compileTestGroup(match: RuleMatch, tests: MailRuleTest[], negated: boolean): string {
+  const compiled = tests.map(compileRuleTestNode);
+  const expression = compiled.length === 1
+    ? compiled[0]
+    : `${match === 'all' ? 'allof' : 'anyof'} (${compiled.join(', ')})`;
+  return negated ? `not ${expression}` : expression;
 }
 
 function compileCondition(condition: MailRuleCondition): string {
@@ -363,7 +756,7 @@ function compileAction(
   switch (action.type) {
     case 'move':
       requireExtension('fileinto', extensions, required, 'Moving messages');
-      if (extensions.has('mailboxid')) {
+      if (action.mailboxId && extensions.has('mailboxid')) {
         required.add('mailboxid');
         // Stalwart currently checks :mailboxid against the RFC 5490 "mailbox"
         // capability as well. Declare it when advertised so its authoritative
@@ -410,6 +803,13 @@ function requiredText(value: unknown, message: string): string {
   return value.trim();
 }
 
+function requiredSieveText(value: unknown, message: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new RuleValidationError(message);
+  }
+  return value;
+}
+
 function requiredId(value: unknown, label: string, seen: Set<string>): string {
   const id = requiredText(value, `${label} needs an identifier.`);
   if (seen.has(id)) throw new RuleValidationError(`${label} has a duplicate identifier.`);
@@ -421,28 +821,6 @@ function rejectControlCharacters(value: string, label: string): void {
   if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(value)) {
     throw new RuleValidationError(`${label} contains a line break or control character.`);
   }
-}
-
-function chunkString(value: string, size: number): string[] {
-  const chunks: string[] = [];
-  for (let offset = 0; offset < value.length; offset += size) {
-    chunks.push(value.slice(offset, offset + size));
-  }
-  return chunks;
-}
-
-function encodeBase64Url(bytes: Uint8Array): string {
-  let out = '';
-  for (let i = 0; i < bytes.length; i += 3) {
-    const a = bytes[i];
-    const b = i + 1 < bytes.length ? bytes[i + 1] : 0;
-    const c = i + 2 < bytes.length ? bytes[i + 2] : 0;
-    out += BASE64URL_ALPHABET[a >> 2];
-    out += BASE64URL_ALPHABET[((a & 3) << 4) | (b >> 4)];
-    if (i + 1 < bytes.length) out += BASE64URL_ALPHABET[((b & 15) << 2) | (c >> 6)];
-    if (i + 2 < bytes.length) out += BASE64URL_ALPHABET[c & 63];
-  }
-  return out;
 }
 
 function decodeBase64Url(value: string): Uint8Array {
@@ -462,6 +840,48 @@ function decodeBase64Url(value: string): Uint8Array {
     }
   }
   return new Uint8Array(bytes);
+}
+
+function sameRuleSemantics(left: MailRuleDocument, right: MailRuleDocument): boolean {
+  return left.rules.length === right.rules.length
+    && left.rules.every((rule, index) => sameRule(rule, right.rules[index]));
+}
+
+function sameRule(left: MailRule, right: MailRule): boolean {
+  return left.name === right.name
+    && left.enabled === right.enabled
+    && (left.conditions.length < 2 || left.match === right.match)
+    && left.stopProcessing === right.stopProcessing
+    && left.conditions.length === right.conditions.length
+    && left.conditions.every((test, index) => sameTest(test, right.conditions[index]))
+    && left.actions.length === right.actions.length
+    && left.actions.every((action, index) => sameAction(action, right.actions[index]));
+}
+
+function sameTest(left: MailRuleTest, right: MailRuleTest): boolean {
+  if (left.type !== right.type || left.negated !== right.negated) return false;
+  if (left.type === 'condition' && right.type === 'condition') {
+    return left.field === right.field
+      && left.operator === right.operator
+      && left.value === right.value
+      && left.headerName === right.headerName;
+  }
+  if (left.type !== 'group' || right.type !== 'group') return false;
+  return left.match === right.match
+    && left.conditions.length === right.conditions.length
+    && left.conditions.every((test, index) => sameTest(test, right.conditions[index]));
+}
+
+function sameAction(left: MailRuleAction, right: MailRuleAction): boolean {
+  if (left.type !== right.type) return false;
+  if (left.type === 'move' && right.type === 'move') {
+    return left.mailboxName === right.mailboxName
+      && (!left.mailboxId || !right.mailboxId || left.mailboxId === right.mailboxId);
+  }
+  if (left.type === 'redirect' && right.type === 'redirect') {
+    return left.address === right.address;
+  }
+  return true;
 }
 
 function isRecord(value: unknown): value is Record<string, any> {

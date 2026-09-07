@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   compileRules,
   emptyRuleDocument,
+  MANAGED_SCRIPT_MARKER,
   MANAGED_SCRIPT_NAME,
   SIEVE_CAPABILITY,
 } from '../../../src/sieve/rules';
@@ -40,14 +41,15 @@ function session() {
 
 function ruleDocument(): MailRuleDocument {
   return {
-    version: 1,
+    version: 2,
     rules: [{
       id: 'rule-1',
       name: 'Read receipts',
       enabled: true,
       match: 'all',
       conditions: [{
-        id: 'condition-1', field: 'subject', operator: 'contains', value: 'Receipt',
+        id: 'condition-1', type: 'condition', negated: false,
+        field: 'subject', operator: 'contains', value: 'Receipt',
       }],
       actions: [{ id: 'action-1', type: 'markRead' }],
       stopProcessing: true,
@@ -73,7 +75,7 @@ describe('JMAP Sieve rules backend', () => {
     expect(transport.requests).toHaveLength(0);
   });
 
-  it('loads managed metadata while preserving a foreign active script', async () => {
+  it('loads a managed script while preserving an unselected active script', async () => {
     const transport = new MockTransport(session());
     transport.handle('SieveScript/get', () => ({
       accountId: 'acct-1',
@@ -89,17 +91,100 @@ describe('JMAP Sieve rules backend', () => {
       notFound: [],
     }));
     transport.handleDownload(({ blobId }) => (
-      blobId === 'blob-managed' ? managedSource() : 'require ["fileinto"];\r\nkeep;\r\n'
+      blobId === 'blob-managed' ? managedSource() : 'vacation "Away";\r\n'
     ));
 
     const result = await getMailRules({ transport, account: ACCOUNT });
 
     expect(result.supported).toBe(true);
     expect(result.state).toBe('sieve-state-1');
-    expect(result.document).toEqual(ruleDocument());
+    expect(withoutIds(result.document)).toEqual(withoutIds(ruleDocument()));
     expect(result.managedScript).toMatchObject({ id: 'managed', isActive: false });
     expect(result.foreignActiveScript).toEqual({ id: 'foreign', name: 'Handwritten filters' });
     expect(result.capabilities.sieveExtensions).toEqual(EXTENSIONS);
+  });
+
+  it('visualizes and updates a compatible existing active script in place', async () => {
+    const transport = new MockTransport(session());
+    let setRequest: any = null;
+    transport.handle('SieveScript/get', () => ({
+      accountId: 'acct-1',
+      state: 'sieve-state-1',
+      list: [{
+        id: 'personal', name: 'Personal filters', blobId: 'blob-personal', isActive: true,
+      }],
+    }));
+    transport.handleDownload(() => [
+      'require ["imap4flags"];',
+      '# Rule: Important projects',
+      'if allof (anyof (address :contains "From" "@example.com", header :contains "Subject" "Project"), not header :contains "X-Spam" "yes") {',
+      '  addflag "\\\\Flagged";',
+      '  stop;',
+      '}',
+      '',
+    ].join('\r\n'));
+    transport.handle('SieveScript/validate', () => ({ accountId: 'acct-1', error: null }));
+    transport.handle('SieveScript/set', (params) => {
+      setRequest = params;
+      return {
+        accountId: 'acct-1', oldState: 'sieve-state-1', newState: 'sieve-state-2',
+        updated: { personal: null },
+      };
+    });
+
+    const loaded = await getMailRules({ transport, account: ACCOUNT });
+    expect(loaded.managedScript).toBeNull();
+    expect(loaded.editableScript).toMatchObject({ id: 'personal', isActive: true });
+    expect(loaded.foreignActiveScript).toBeNull();
+    expect(loaded.document.rules[0]).toMatchObject({
+      name: 'Important projects',
+      match: 'all',
+      conditions: [{ type: 'group', match: 'any' }, { type: 'condition', negated: true }],
+    });
+
+    const result = await runSetSieveRules({
+      transport,
+      account: ACCOUNT,
+      request: { document: loaded.document, expectedState: 'sieve-state-1' },
+    });
+    expect(result.ok).toBe(true);
+    expect(setRequest).toMatchObject({
+      update: { personal: { blobId: 'blob-1' } },
+      onSuccessActivateScript: 'personal',
+    });
+    expect(setRequest.create).toBeUndefined();
+    expect(new TextDecoder().decode(transport.uploads[0].body))
+      .not.toContain(MANAGED_SCRIPT_MARKER);
+  });
+
+  it('prefers a compatible active script over an inactive managed script', async () => {
+    const transport = new MockTransport(session());
+    transport.handle('SieveScript/get', () => ({
+      accountId: 'acct-1',
+      state: 'sieve-state-1',
+      list: [
+        {
+          id: 'personal', name: 'Personal filters', blobId: 'blob-personal', isActive: true,
+        },
+        {
+          id: 'managed', name: MANAGED_SCRIPT_NAME, blobId: 'blob-managed', isActive: false,
+        },
+      ],
+    }));
+    transport.handleDownload(({ blobId }) => (
+      blobId === 'blob-managed'
+        ? managedSource()
+        : 'if header :contains "Subject" "Active" { discard; stop; }\r\n'
+    ));
+
+    const loaded = await getMailRules({ transport, account: ACCOUNT });
+    expect(loaded.editableScript).toMatchObject({ id: 'personal', isActive: true });
+    expect(loaded.managedScript).toBeNull();
+    expect(loaded.foreignActiveScript).toBeNull();
+    expect(loaded.document.rules[0]).toMatchObject({
+      conditions: [{ value: 'Active' }],
+      actions: [{ type: 'discard' }],
+    });
   });
 
   it('requires explicit takeover, then validates and activates a new managed script', async () => {
@@ -113,7 +198,7 @@ describe('JMAP Sieve rules backend', () => {
       }],
       notFound: [],
     }));
-    transport.handleDownload(() => 'keep;\r\n');
+    transport.handleDownload(() => 'vacation "Away";\r\n');
     transport.handle('SieveScript/validate', () => ({ accountId: 'acct-1', error: null }));
     transport.handle('SieveScript/set', (params) => {
       setRequest = params;
@@ -153,7 +238,7 @@ describe('JMAP Sieve rules backend', () => {
       accountId: 'acct-1', type: 'application/sieve',
     });
     expect(new TextDecoder().decode(transport.uploads[0].body))
-      .toContain('# stormbox-managed: mail-rules/v1');
+      .toContain('# stormbox-managed: mail-rules/v2');
     expect(setRequest).toMatchObject({
       accountId: 'acct-1',
       ifInState: 'sieve-state-1',
@@ -240,3 +325,11 @@ describe('JMAP Sieve rules backend', () => {
       methodCalls[0][0] === 'SieveScript/set')).toBe(false);
   });
 });
+
+function withoutIds(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutIds);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => key !== 'id')
+    .map(([key, item]) => [key, withoutIds(item)]));
+}

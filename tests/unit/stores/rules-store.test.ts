@@ -15,6 +15,7 @@ import {
   __setRepositoryForTests,
 } from '../../../src/composables/useRepository';
 import { MUTATION_TYPE } from '../../../src/constants/states';
+import { compileRules } from '../../../src/sieve/rules';
 import type { MailRuleDocument } from '../../../src/sieve/rules';
 import { useAuthStore } from '../../../src/stores/auth-store';
 import {
@@ -24,14 +25,15 @@ import {
 
 function document(): MailRuleDocument {
   return {
-    version: 1,
+    version: 2,
     rules: [{
       id: 'rule-1',
       name: 'Receipts',
       enabled: true,
       match: 'all',
       conditions: [{
-        id: 'condition-1', field: 'subject', operator: 'contains', value: 'Receipt',
+        id: 'condition-1', type: 'condition', negated: false,
+        field: 'subject', operator: 'contains', value: 'Receipt',
       }],
       actions: [{ id: 'action-1', type: 'markRead' }],
       stopProcessing: true,
@@ -51,6 +53,7 @@ function snapshot(overrides: Record<string, unknown> = {}) {
     },
     scripts: [],
     managedScript: null,
+    editableScript: null,
     foreignActiveScript: null,
     document: document(),
     parseError: null,
@@ -110,6 +113,38 @@ describe('rules store', () => {
     expect(repo.runMutation).toHaveBeenCalledWith(7, 93);
     expect(repo.getMailRules).toHaveBeenCalledTimes(2);
     expect(store.saving).toBe(false);
+  });
+
+  it('sizes an editable external script without adding a managed marker', async () => {
+    const input = document();
+    const capabilities = {
+      sieveExtensions: ['imap4flags'],
+      maxSizeScript: null,
+      maxNumberRedirects: 4,
+    };
+    const externalSource = compileRules(input, capabilities, { managed: false });
+    const externalSnapshot = snapshot({
+      capabilities: {
+        ...capabilities,
+        maxSizeScript: new TextEncoder().encode(externalSource).length,
+      },
+      editableScript: { id: 'personal', name: 'Personal filters', isActive: true },
+    });
+    const repo = {
+      getMailRules: vi.fn(async () => externalSnapshot),
+      insertPendingMutation: vi.fn(async () => ({ id: 95 })),
+      runMutation: vi.fn(async () => ({ attempted: 1, succeeded: 1, failed: 0 })),
+      getPendingMutationError: vi.fn(),
+    };
+    __setRepositoryForTests(repo);
+    useAuthStore().accountId = 7;
+    const store = useRulesStore();
+    await store.load();
+
+    await expect(store.save(input)).resolves.toMatchObject({
+      editableScript: { id: 'personal' },
+    });
+    expect(repo.insertPendingMutation).toHaveBeenCalledOnce();
   });
 
   it('surfaces the typed terminal error left by the outbox', async () => {
