@@ -155,8 +155,9 @@ test.describe('JMAP Sieve mail rules e2e', () => {
       await dialog.getByRole('button', { name: 'Close', exact: true }).click();
       await expect(dialog).toBeHidden({ timeout: 5_000 });
       dialog = await openRulesDialog(page);
-      const savedRule = dialog.locator('.mail-rule').filter({ hasText: RULE_NAME });
-      await expect(savedRule.locator('input[aria-label="Rule name"]')).toHaveValue(RULE_NAME);
+      const savedRuleName = dialog.getByDisplayValue(RULE_NAME, { exact: true });
+      const savedRule = dialog.locator('.mail-rule').filter({ has: savedRuleName });
+      await expect(savedRuleName).toHaveValue(RULE_NAME);
       await expect(savedRule.locator('input[aria-label="Condition value"]').first()).toHaveValue(CONDITION_VALUE);
       await expect(savedRule.locator('.condition-group--nested')).toHaveCount(1);
       await dialog.getByRole('button', { name: 'Close', exact: true }).click();
