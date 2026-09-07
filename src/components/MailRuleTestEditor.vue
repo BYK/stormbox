@@ -142,7 +142,7 @@ function onTextInput(
         class="condition-group__match"
         :model-value="match"
         :options="matchOptions"
-        :aria-label="root ? 'Condition match mode' : 'Nested condition match mode'"
+        :control-label="root ? 'Condition match mode' : 'Nested condition match mode'"
         :disabled="disabled"
         @update:model-value="updateMatch"
       />
@@ -194,7 +194,7 @@ function onTextInput(
           <MailRuleSelect
             :model-value="condition.field"
             :options="fieldOptions"
-            aria-label="Condition field"
+            control-label="Condition field"
             :disabled="disabled"
             @update:model-value="updateField(index, $event)"
           />
@@ -210,7 +210,7 @@ function onTextInput(
           <MailRuleSelect
             :model-value="condition.operator"
             :options="operatorOptions"
-            aria-label="Condition operator"
+            control-label="Condition operator"
             :disabled="disabled"
             @update:model-value="updateOperator(index, $event)"
           />

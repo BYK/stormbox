@@ -19,7 +19,7 @@ describe('MailRuleSelect', () => {
       props: {
         modelValue: 'all',
         options,
-        ariaLabel: 'Condition mode',
+        controlLabel: 'Condition mode',
       },
     });
     const summary = wrapper.get('summary');
@@ -55,7 +55,7 @@ describe('MailRuleSelect', () => {
       props: {
         modelValue: 'all',
         options,
-        ariaLabel: 'Condition mode',
+        controlLabel: 'Condition mode',
       },
     });
 
@@ -72,7 +72,7 @@ describe('MailRuleSelect', () => {
       props: {
         modelValue: 'all',
         options,
-        ariaLabel: 'Condition mode',
+        controlLabel: 'Condition mode',
       },
     });
     const summary = wrapper.get('summary');

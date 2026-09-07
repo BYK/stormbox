@@ -318,6 +318,9 @@ function testFromSieve(source: string, test: SieveTest): MailRuleTest {
       conditions: test.tests.map((child) => testFromSieve(source, child)),
     };
   }
+  if (test.type !== 'call') {
+    throw notVisualizable(source, test, `Test “${test.type}” is not represented by the visual editor`);
+  }
 
   if (!['address', 'header'].includes(test.name)) {
     throw notVisualizable(source, test, `Test “${test.name}” is not represented by the visual editor`);
@@ -379,8 +382,10 @@ function visualMatchArguments(
   let addressPartSeen = false;
   let index = 0;
 
-  while (test.arguments[index]?.type === 'tag') {
-    const tag = test.arguments[index].value;
+  while (true) {
+    const argument = test.arguments[index];
+    if (argument?.type !== 'tag') break;
+    const tag = argument.value;
     if ([':is', ':contains', ':matches'].includes(tag)) {
       if (matchTypeSeen) {
         throw notVisualizable(source, test, `Test “${test.name}” has more than one match type`);
