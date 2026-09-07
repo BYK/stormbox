@@ -113,7 +113,7 @@ test.describe('JMAP Sieve mail rules e2e', () => {
       await rule.locator('input[aria-label="Condition value"]').fill(CONDITION_VALUE);
       await rule.getByRole('button', { name: 'Group' }).click();
       const nestedGroup = rule.locator('.condition-group--nested');
-      await nestedGroup.getByLabel('Nested condition match mode').click();
+      await nestedGroup.locator('summary[aria-label="Nested condition match mode"]').click();
       await nestedGroup.locator('[data-rule-option="any"]').click();
       await nestedGroup.getByLabel('Condition value').fill('lead@example.com');
       await nestedGroup.getByRole('button', { name: 'Condition' }).click();
