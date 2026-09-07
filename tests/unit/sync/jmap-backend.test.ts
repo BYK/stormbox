@@ -3,7 +3,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { bootTestEngine } from '../../../src/db/bootstrap-memory';
 import { makeHandlers } from '../../../src/db/handlers';
 import { DB_RPC } from '../../../src/db/protocol';
-import { SERVICE_KIND } from '../../../src/constants/states';
+import {
+  MUTATION_TYPE,
+  SERVICE_KIND,
+} from '../../../src/constants/states';
 import { JmapBackend } from '../../../src/sync/backends/jmap/backend';
 import { JmapTransport, JMAP_CAPS } from '../../../src/sync/backends/jmap/transport';
 import { syncFolderWindow } from '../../../src/sync/backends/jmap/messages';
@@ -132,6 +135,7 @@ describe('JmapBackend.start', () => {
       serverOrigin: 'https://mail.example.com',
       handlers,
     });
+    const ensureSettings = vi.spyOn(backend, 'ensureSettings');
 
     const startPromise = backend.start();
     // Start opens the WS once mailboxes/identities/contacts are synced;
@@ -145,6 +149,7 @@ describe('JmapBackend.start', () => {
     // contacts, and the WebSocket bootstrap continue in the background;
     // wait for that chain before checking their effects.
     await backend.bootstrapped();
+    expect(ensureSettings).toHaveBeenCalled();
 
     const accounts = await handlers[DB_RPC.ACCOUNT_LIST]();
     expect(accounts).toHaveLength(1);
@@ -1327,9 +1332,12 @@ describe('JmapBackend StateChange dispatch', () => {
       'ContactCard/get': () => ({ list: [], state: 'cc' }),
     };
     const fetchMock = vi.fn(makeJmapHandlers(scenario));
+    let bearerToken = 'initial-token';
     const transport = new JmapTransport({
       sessionUrl: 'https://mail.example.com/.well-known/jmap',
-      getAuthHeader: async () => 'Bearer test',
+      getAuthHeader: async () => `Bearer ${bearerToken}`,
+      getWsCredential: async () => ({ kind: 'bearer', token: bearerToken }),
+      wsProxyUrl: 'wss://proxy.example.com/jmap/ws',
       fetch: fetchMock,
       WebSocketImpl: FakeWebSocket,
     });
@@ -1347,6 +1355,11 @@ describe('JmapBackend StateChange dispatch', () => {
     await startPromise;
     await backend.bootstrapped();
     const ws1 = await FakeWebSocket._waitForInstance();
+    expect(new URL(ws1.url).searchParams.get('access_token')).toBe('initial-token');
+
+    bearerToken = 'rotated-token';
+    backend.authenticationUpdated();
+    expect(FakeWebSocket.instances).toHaveLength(1);
 
     // Establish a pushState so the reopen handshake should resume
     // from it. The transport stores _lastPushState from incoming
@@ -1378,6 +1391,7 @@ describe('JmapBackend StateChange dispatch', () => {
     const enable = JSON.parse(ws2.sent[0]);
     expect(enable['@type']).toBe('WebSocketPushEnable');
     expect(enable.pushState).toBe('push-original');
+    expect(new URL(ws2.url).searchParams.get('access_token')).toBe('rotated-token');
 
     await backend.stop();
   });
@@ -1859,7 +1873,231 @@ describe('JmapBackend startup catch-up resilience', () => {
   });
 });
 
+describe('JmapBackend.stop with a stalled request', () => {
+  it('resolves instead of waiting out the request deadline', async () => {
+    // OutboxRunner.stop() awaits the in-flight drain, and the drain is
+    // awaiting a POST the server never answers. Without cancelling the
+    // transport first, stop() blocks for the whole request deadline —
+    // 30s in production. Everything that waits on teardown waits with
+    // it, including the sign-out path.
+    let stallReached: () => void;
+    const stalled = new Promise<void>((resolve) => { stallReached = resolve; });
+    const scenario = {
+      'Mailbox/get': () => ({
+        list: [{ id: 'mb-inbox', name: 'Inbox', role: 'inbox' }],
+        state: 'mb-1',
+      }),
+      'Identity/get': () => ({ list: [], state: 'id' }),
+      'AddressBook/get': () => ({ list: [], state: 'ab' }),
+      'ContactCard/query': () => ({ ids: [], total: 0, state: 'cc' }),
+      'ContactCard/get': () => ({ list: [], state: 'cc' }),
+    };
+    const respond = makeJmapHandlers(scenario);
+    const fetchMock = vi.fn(async (url, init) => {
+      if (init?.method === 'POST' && String(init.body).includes('Email/set')) {
+        stallReached();
+        // Hang exactly the way a stalled server does: connection
+        // accepted, no response, and only an abort ends it.
+        return new Promise((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => {
+            const err: any = new Error('The operation was aborted.');
+            err.name = 'AbortError';
+            reject(err);
+          });
+        });
+      }
+      return respond(url, init);
+    });
+    const transport = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: async () => 'Bearer test',
+      fetch: fetchMock,
+      WebSocketImpl: FakeWebSocket,
+      // Deliberately far longer than the test is willing to wait, so a
+      // pass can only come from the abort and never from the deadline.
+      httpRequestTimeoutMs: 60_000,
+    });
+    const backend = new JmapBackend({
+      transport,
+      serverOrigin: 'https://mail.example.com',
+      handlers,
+      options: { useWebSocket: false },
+    });
+    await backend.start();
+    await backend.bootstrapped();
+
+    const ts = Date.now();
+    await engine.run(
+      `INSERT INTO messages(
+         account_id, remote_id, subject, keywords_json,
+         metadata_fetched_at, updated_at
+       ) VALUES (?, ?, 'subj', '{}', ?, ?)`,
+      [backend.account.id, 'e-1', ts, ts],
+    );
+    const message = await engine.get(
+      'SELECT id FROM messages WHERE account_id = ? AND remote_id = ?',
+      [backend.account.id, 'e-1'],
+    );
+    await handlers[DB_RPC.PENDING_MUTATION_INSERT]({
+      accountId: backend.account.id,
+      mutationType: 'setKeywords',
+      targetMessageId: message.id,
+      requestJson: JSON.stringify({ add: ['$seen'], remove: [] }),
+    });
+    backend.outboxRunner.notify({ immediate: true });
+    await stalled;
+
+    const started = Date.now();
+    await backend.stop();
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  it('opens no WebSocket for a backend that has already stopped', async () => {
+    // The bootstrap continuation runs detached from start() and swallows
+    // each step's failure, so teardown cannot end it by making a call
+    // fail. If it reached openWebSocket anyway, a signed-out account
+    // would be left holding an authenticated socket.
+    let releaseIdentities: () => void;
+    const identitiesHang = new Promise<void>((resolve) => { releaseIdentities = resolve; });
+    let identitiesReached: () => void;
+    const identitiesCalled = new Promise<void>((resolve) => { identitiesReached = resolve; });
+    const scenario = {
+      'Mailbox/get': () => ({
+        list: [{ id: 'mb-inbox', name: 'Inbox', role: 'inbox' }],
+        state: 'mb-1',
+      }),
+      'Identity/get': async () => {
+        identitiesReached();
+        await identitiesHang;
+        return { list: [], state: 'id' };
+      },
+      'AddressBook/get': () => ({ list: [], state: 'ab' }),
+      'ContactCard/query': () => ({ ids: [], total: 0, state: 'cc' }),
+      'ContactCard/get': () => ({ list: [], state: 'cc' }),
+    };
+    const respond = makeJmapHandlers(scenario);
+    FakeWebSocket._reset();
+    const transport = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: async () => 'Bearer test',
+      fetch: vi.fn(async (url, init) => respond(url, init)),
+      WebSocketImpl: FakeWebSocket,
+    });
+    const backend = new JmapBackend({
+      transport,
+      serverOrigin: 'https://mail.example.com',
+      handlers,
+      options: { useWebSocket: true },
+    });
+
+    await backend.start();
+    // Bootstrap is now parked inside syncIdentities, before the socket.
+    await identitiesCalled;
+    await backend.stop();
+    releaseIdentities();
+    await backend.bootstrapped().catch(() => {});
+
+    expect(FakeWebSocket.instances, 'teardown must leave no socket behind').toHaveLength(0);
+    expect((backend as any)._unsubStateChange).toBeNull();
+    expect((backend as any)._unsubClose).toBeNull();
+  });
+});
+
 describe('JmapBackend shared-account reconciliation', () => {
+  it('does not strand trash mutations when reconnect push-state loading fails', async () => {
+    const backend = new JmapBackend({
+      transport: new MockTransport(),
+      serverOrigin: 'https://mail.example.com',
+      handlers,
+      options: { useWebSocket: false },
+    });
+    backend.account = { id: 1, remote_account_id: 'acct-1' };
+    backend._started = true;
+    backend._loadPushState = vi.fn(async () => {
+      throw new Error('push state unavailable');
+    });
+    backend._onTransportClose = vi.fn();
+    backend.ensureContactsTrash = vi.fn(async () => {
+      throw Object.assign(new Error('trash marker collision'), {
+        type: 'invalidDocument',
+        terminal: true,
+      });
+    });
+
+    await expect(backend._reconnect()).resolves.toBeUndefined();
+    expect(backend._onTransportClose).toHaveBeenCalledTimes(1);
+    await expect(backend._processMutationRow({
+      mutation_type: MUTATION_TYPE.DELETE_CONTACT,
+    })).resolves.toMatchObject({
+      ok: false,
+      error: {
+        type: 'invalidDocument',
+        message: 'trash marker collision',
+        terminal: true,
+      },
+    });
+    expect(backend.ensureContactsTrash).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispatches owned FileNode changes only for the primary account', async () => {
+    const primary = { id: 1, remote_account_id: 'acct-1' };
+    const shared = { id: 2, remote_account_id: 'acct-shared' };
+    const backend = new JmapBackend({
+      transport: new MockTransport(),
+      serverOrigin: 'https://mail.example.com',
+      handlers,
+      options: { useWebSocket: false },
+    });
+    backend.account = primary;
+    backend.sharedAccounts = [shared];
+    backend.ensureSettings = vi.fn(async () => ({ ok: true as const, pulled: true }));
+    backend.ensureContactsTrash = vi.fn(async () => ({ ok: true as const, pulled: true }));
+
+    await backend._syncAccountStateChange(primary, { FileNode: 'files-2' });
+    await backend._syncAccountStateChange(shared, { FileNode: 'shared-files-2' });
+
+    expect(backend.ensureSettings).toHaveBeenCalledTimes(1);
+    expect(backend.ensureContactsTrash).toHaveBeenCalledTimes(1);
+  });
+
+  it('still syncs contacts trash when settings FileNode sync fails', async () => {
+    const primary = { id: 1, remote_account_id: 'acct-1' };
+    const backend = new JmapBackend({
+      transport: new MockTransport(),
+      serverOrigin: 'https://mail.example.com',
+      handlers,
+      options: { useWebSocket: false },
+    });
+    backend.account = primary;
+    backend.sharedAccounts = [];
+    backend.ensureSettings = vi.fn(async () => {
+      throw new Error('invalid settings document');
+    });
+    backend.ensureContactsTrash = vi.fn(async () => ({ ok: true as const, pulled: true }));
+
+    await backend._syncAccountStateChange(primary, { FileNode: 'files-2' });
+
+    expect(backend.ensureContactsTrash).toHaveBeenCalledTimes(1);
+  });
+
+  it('subscribes to FileNode only with primary account capability', () => {
+    const primary = { id: 1, remote_account_id: 'acct-1' };
+    const transport = new MockTransport({
+      capabilities: { [JMAP_CAPS.FILENODE]: {} },
+      accounts: { 'acct-1': { accountCapabilities: {} } },
+    });
+    const backend = new JmapBackend({
+      transport,
+      serverOrigin: 'https://mail.example.com',
+      handlers,
+    });
+    backend.account = primary;
+    expect(backend._subscribedTypes()).not.toContain('FileNode');
+
+    transport.session.accounts['acct-1'].accountCapabilities[JMAP_CAPS.FILENODE] = {};
+    expect(backend._subscribedTypes()).toContain('FileNode');
+  });
+
   it('acknowledges push state only after all account work succeeds', async () => {
     const primary = { id: 1, remote_account_id: 'acct-1' };
     const shared = { id: 2, remote_account_id: 'acct-shared' };
@@ -1950,6 +2188,52 @@ describe('JmapBackend shared-account reconciliation', () => {
     );
     expect(backend._refreshActiveQueryViews).toHaveBeenNthCalledWith(1, primary);
     expect(backend._refreshActiveQueryViews).toHaveBeenNthCalledWith(2, shared);
+  });
+
+  it('re-reads the identities after reconnect', async () => {
+    // Identities have no delta call, and a push sent while the socket was
+    // down is not replayed — so an alias that changed during the outage is
+    // invisible until something asks again (CS-4.6).
+    const transport = new MockTransport() as any;
+    transport.openWebSocket = vi.fn(async () => {});
+    const backend = new JmapBackend({
+      transport,
+      serverOrigin: 'https://mail.example.com',
+      handlers,
+      options: { useWebSocket: true },
+    });
+    backend.account = { id: 1, remote_account_id: 'acct-1' };
+    backend._started = true;
+    backend._refreshActiveQueryViews = vi.fn(async () => {});
+    backend.ensureIdentities = vi.fn(async () => ({ count: 0, state: null, removed: 0 }));
+    backend.ensureSettings = vi.fn(async () => ({ ok: true as const, skipped: true }));
+
+    await backend._reconnect();
+
+    expect(backend.ensureIdentities).toHaveBeenCalled();
+    expect(backend.ensureSettings).toHaveBeenCalled();
+  });
+
+  it('still refreshes the views when the identity re-read fails', async () => {
+    const transport = new MockTransport() as any;
+    transport.openWebSocket = vi.fn(async () => {});
+    const backend = new JmapBackend({
+      transport,
+      serverOrigin: 'https://mail.example.com',
+      handlers,
+      options: { useWebSocket: true },
+    });
+    const primary = { id: 1, remote_account_id: 'acct-1' };
+    backend.account = primary;
+    backend._started = true;
+    backend._refreshActiveQueryViews = vi.fn(async () => {});
+    backend.ensureIdentities = vi.fn(async () => {
+      throw new Error('identity fetch failed');
+    });
+
+    await backend._reconnect();
+
+    expect(backend._refreshActiveQueryViews).toHaveBeenCalledWith(primary);
   });
 
   it('rejects folders whose shared account is no longer in the Session', async () => {
@@ -2084,5 +2368,450 @@ describe('JmapBackend shared-account reconciliation', () => {
       objectType: 'Email',
       scope: '',
     })).toBeNull();
+  });
+});
+
+describe('JmapBackend attachment transfers', () => {
+  function makeAttachmentBackend() {
+    const primary = { id: 1, remote_account_id: 'acct-primary' };
+    const shared = { id: 2, remote_account_id: 'acct-shared' };
+    const uploadResult = {
+      accountId: 'acct-shared',
+      blobId: 'uploaded-1',
+      type: 'text/plain',
+      size: 4,
+      serverMetadata: 'preserved',
+    };
+    const transport = {
+      session: {
+        capabilities: {
+          [JMAP_CAPS.CORE]: {
+            maxObjectsInGet: 500,
+            maxObjectsInSet: 500,
+            maxSizeUpload: 10,
+            maxConcurrentUpload: 3,
+          },
+        },
+        accounts: {
+          'acct-primary': {
+            accountCapabilities: {
+              [JMAP_CAPS.MAIL]: { maxSizeAttachmentsPerEmail: 20 },
+            },
+          },
+          'acct-shared': {
+            accountCapabilities: {
+              [JMAP_CAPS.MAIL]: { maxSizeAttachmentsPerEmail: 15 },
+            },
+          },
+        },
+      },
+      upload: vi.fn(async () => uploadResult),
+      download: vi.fn(async () => new Uint8Array([1, 2, 3])),
+      downloadBlob: vi.fn(async ({ type }) =>
+        new Blob([new Uint8Array([1, 2, 3])], { type })),
+    };
+    const backend = new JmapBackend({
+      transport,
+      serverOrigin: 'https://mail.example.com',
+      handlers,
+      options: { useWebSocket: false },
+    });
+    backend.account = primary;
+    backend.sharedAccounts = [shared];
+    backend._accountsByLocalId = new Map([
+      [primary.id, primary],
+      [shared.id, shared],
+    ]);
+    return {
+      backend,
+      primary,
+      shared,
+      transport,
+      uploadResult,
+    };
+  }
+
+  it('exposes live limits and routes upload/download through the supplied local account', async () => {
+    const {
+      backend,
+      shared,
+      transport,
+      uploadResult,
+    } = makeAttachmentBackend();
+
+    expect(backend.attachmentLimits(shared.id)).toEqual({
+      maxSizeUpload: 10,
+      maxSizeAttachmentsPerEmail: 15,
+      maxConcurrentUpload: 3,
+    });
+    const upload = await backend.uploadComposeAttachment({
+      accountId: shared.id,
+      blob: new Blob(['data'], { type: 'text/plain' }),
+      totalAttachmentBytes: 12,
+    });
+    expect(upload).toBe(uploadResult);
+    expect(transport.upload).toHaveBeenCalledWith(expect.objectContaining({
+      accountId: 'acct-shared',
+      type: 'text/plain',
+      body: expect.any(Blob),
+    }));
+
+    const downloaded = await backend.downloadAttachment({
+      accountId: shared.id,
+      blobId: 'part-1',
+      type: 'application/octet-stream',
+      maxBytes: 5,
+    });
+    expect(await downloaded.arrayBuffer()).toEqual(
+      new Uint8Array([1, 2, 3]).buffer,
+    );
+    expect(transport.downloadBlob).toHaveBeenCalledWith(expect.objectContaining({
+      accountId: 'acct-shared',
+      blobId: 'part-1',
+      maxBytes: 5,
+      truncateAtMaxBytes: false,
+    }));
+
+    await backend.downloadAttachment({
+      accountId: shared.id,
+      blobId: 'part-prefix',
+      type: 'text/plain',
+      maxBytes: 6,
+      truncateAtMaxBytes: true,
+    });
+    expect(transport.downloadBlob).toHaveBeenLastCalledWith(expect.objectContaining({
+      accountId: 'acct-shared',
+      blobId: 'part-prefix',
+      maxBytes: 6,
+      truncateAtMaxBytes: true,
+    }));
+
+    const legacy = await backend.downloadBlob({
+      accountId: shared.id,
+      blobId: 'cid-1',
+      type: 'image/png',
+      name: 'inline.png',
+    });
+    expect(legacy).toEqual({ base64: 'AQID', type: 'image/png' });
+    expect(transport.download).toHaveBeenLastCalledWith(expect.objectContaining({
+      accountId: 'acct-shared',
+      blobId: 'cid-1',
+    }));
+  });
+
+  it('rejects per-file and aggregate limits before upload', async () => {
+    const { backend, primary, transport } = makeAttachmentBackend();
+
+    await expect(backend.uploadComposeAttachment({
+      accountId: primary.id,
+      blob: new Blob(['01234567890']),
+    })).rejects.toMatchObject({
+      type: 'tooLarge',
+      maxBytes: 10,
+      actualBytes: 11,
+    });
+    await expect(backend.uploadComposeAttachment({
+      accountId: primary.id,
+      blob: new Blob(['small']),
+      totalAttachmentBytes: 21,
+    })).rejects.toMatchObject({
+      type: 'tooLarge',
+      maxBytes: 20,
+      actualBytes: 21,
+    });
+    expect(transport.upload).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when an account attachment capability is missing', () => {
+    const { backend, shared, transport } = makeAttachmentBackend();
+    delete transport.session.accounts['acct-shared'].accountCapabilities[JMAP_CAPS.MAIL];
+
+    expect(() => backend.attachmentLimits(shared.id)).toThrow(
+      /maxSizeAttachmentsPerEmail/,
+    );
+  });
+});
+
+describe('JmapBackend recent recipient import', () => {
+  async function makeImportBootstrap(sentMessages = [{
+    id: 'sent-1',
+    name: 'Recent',
+    email: 'recent@example.com',
+  }]) {
+    const account = (await handlers[DB_RPC.ACCOUNT_UPSERT]({
+      displayName: 'Tester',
+      primaryEmail: 'tester@example.com',
+      serverOrigin: 'https://mail.example.com',
+      remoteAccountId: 'acct-1',
+      isPrimary: true,
+    })).row;
+    await handlers[DB_RPC.FOLDER_UPSERT_MANY]({
+      accountId: account.id,
+      folders: [{ remoteId: 'mb-sent', name: 'Sent', role: 'sent' }],
+    });
+
+    let currentMessages = sentMessages;
+    let revision = 1;
+    const transport = new MockTransport();
+    transport.handle('Identity/get', () => ({
+      list: [{ id: 'identity', email: 'tester@example.com' }],
+      state: `identity-${revision}`,
+    }));
+    transport.handle('AddressBook/get', () => ({
+      list: [{ id: 'ab-default', name: 'Default', isDefault: true }],
+      state: `addressbook-${revision}`,
+    }));
+    transport.handle('ContactCard/query', () => ({
+      ids: [],
+      total: 0,
+      position: 0,
+      queryState: `contacts-${revision}`,
+    }));
+    transport.handle('ContactCard/get', () => ({
+      list: [],
+      state: null,
+    }));
+    transport.handle('Email/query', (params) => ({
+      ids: currentMessages
+        .map((message) => message.id)
+        .slice(params.position, params.position + params.limit),
+      total: currentMessages.length,
+      position: params.position,
+      queryState: `query-${revision}`,
+    }));
+    transport.handle('Email/get', (params) => ({
+      list: params.ids.map((id) => {
+        const message = currentMessages.find((candidate) => candidate.id === id);
+        return {
+          id,
+          threadId: `thread-${id}`,
+          mailboxIds: { 'mb-sent': true },
+          keywords: {},
+          sentAt: '2026-08-07T12:00:00Z',
+          receivedAt: '2026-08-07T12:00:00Z',
+          from: [{ email: 'tester@example.com' }],
+          to: [{ name: message?.name, email: message?.email }],
+          cc: [],
+          bcc: [],
+        };
+      }),
+      state: `email-${revision}`,
+    }));
+    transport.handle('Email/changes', (params) => ({
+      oldState: params.sinceState,
+      newState: `email-${revision}`,
+      hasMoreChanges: false,
+      created: [],
+      updated: [],
+      destroyed: [],
+    }));
+    const backend = new JmapBackend({
+      transport,
+      serverOrigin: 'https://mail.example.com',
+      handlers,
+      options: { useWebSocket: false },
+    });
+    backend.account = account;
+    backend.services = [{ serviceKind: SERVICE_KIND.JMAP_CONTACTS }];
+    const runMutation = vi.fn(async () => ({
+      attempted: 1,
+      succeeded: 1,
+      failed: 0,
+    }));
+    backend.runMutation = runMutation;
+
+    return {
+      account,
+      backend,
+      runMutation,
+      transport,
+      setSentMessages(next) {
+        currentMessages = next;
+        revision += 1;
+      },
+    };
+  }
+
+  it('pages the bounded Sent snapshot when maxObjectsInGet is below 300', async () => {
+    const account = (await handlers[DB_RPC.ACCOUNT_UPSERT]({
+      displayName: 'Tester',
+      primaryEmail: 'tester@example.com',
+      serverOrigin: 'https://mail.example.com',
+      remoteAccountId: 'acct-1',
+      isPrimary: true,
+    })).row;
+    await handlers[DB_RPC.FOLDER_UPSERT_MANY]({
+      accountId: account.id,
+      folders: [{ remoteId: 'mb-sent', name: 'Sent', role: 'sent' }],
+    });
+    const ids = ['sent-1', 'sent-2', 'sent-3'];
+    const transport = new MockTransport({
+      capabilities: {
+        [JMAP_CAPS.CORE]: { maxObjectsInGet: 2, maxObjectsInSet: 2 },
+      },
+    });
+    transport.handle('Email/query', (params) => ({
+      ids: ids.slice(params.position, params.position + params.limit),
+      total: ids.length,
+      position: params.position,
+      queryState: 'q-stable',
+    }));
+    transport.handle('Email/get', (params) => ({
+      list: params.ids.map((id) => ({
+        id,
+        threadId: `thread-${id}`,
+        mailboxIds: { 'mb-sent': true },
+        keywords: {},
+        sentAt: '2026-08-07T12:00:00Z',
+        receivedAt: '2026-08-07T12:00:00Z',
+        from: [{ email: 'tester@example.com' }],
+        to: [{ email: `${id}@example.com` }],
+      })),
+      state: 'e3',
+    }));
+    transport.handle('Email/changes', () => ({
+      oldState: 'e3',
+      newState: 'e3',
+      hasMoreChanges: false,
+      created: [],
+      updated: [],
+      destroyed: [],
+    }));
+    const backend = new JmapBackend({
+      transport,
+      serverOrigin: 'https://mail.example.com',
+      handlers,
+      options: { useWebSocket: false },
+    });
+    backend.account = account;
+
+    expect(await backend._refreshRecipientUsage()).toEqual({ scanned: 3, ranked: 0 });
+    const queryCalls = transport.requests.flatMap((request) => request.methodCalls)
+      .filter(([name]) => name === 'Email/query');
+    expect(queryCalls).toHaveLength(2);
+    expect(await handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: account.id,
+      objectType: 'Email',
+    })).toMatchObject({ state: 'e3' });
+  });
+
+  it('imports cached Sent recipients automatically during bootstrap and latches completion', async () => {
+    const { account, backend, runMutation } = await makeImportBootstrap();
+
+    await backend._continueBootstrap();
+
+    expect(runMutation).toHaveBeenCalledTimes(1);
+    const mutation = await engine.get(
+      `SELECT request_json FROM pending_mutations
+        WHERE mutation_type = 'whitelistSender'`,
+    );
+    expect(JSON.parse(mutation.request_json).senders).toEqual([
+      {
+        email: 'recent@example.com',
+        name: 'Recent',
+        sourceSentAt: Date.UTC(2026, 7, 7, 12),
+        uid: expect.stringMatching(/^urn:uuid:/),
+      },
+    ]);
+    expect(await handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: account.id,
+      objectType: 'RecentRecipientContactImport',
+    })).toMatchObject({ state: expect.any(String) });
+  });
+
+  it('does not repeat a completed import, preserving deleted auto-collected contacts', async () => {
+    const { account, backend, runMutation } = await makeImportBootstrap();
+    await backend._continueBootstrap();
+
+    // Later bootstraps cannot recreate a deliberately deleted historical card (CS-3.13).
+    await backend._continueBootstrap();
+
+    expect(runMutation).toHaveBeenCalledTimes(1);
+    expect(await engine.get(
+      `SELECT COUNT(*) AS count FROM pending_mutations
+        WHERE mutation_type = 'whitelistSender'`,
+    )).toEqual({ count: 1 });
+    expect(await handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: account.id,
+      objectType: 'RecentRecipientContactImport',
+    })).not.toBeNull();
+  });
+
+  it('defers an empty Sent cache and imports after a later bootstrap populates it', async () => {
+    const {
+      account, backend, runMutation, setSentMessages,
+    } = await makeImportBootstrap([]);
+
+    // An empty first-bootstrap cache stays retryable so account history is not lost (CS-3.13).
+    await backend._continueBootstrap();
+
+    expect(runMutation).not.toHaveBeenCalled();
+    expect(await handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: account.id,
+      objectType: 'RecentRecipientContactImport',
+    })).toBeNull();
+
+    setSentMessages([{
+      id: 'sent-later',
+      name: 'Available Later',
+      email: 'later@example.com',
+    }]);
+    await backend._continueBootstrap();
+
+    expect(runMutation).toHaveBeenCalledTimes(1);
+    expect(await handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: account.id,
+      objectType: 'RecentRecipientContactImport',
+    })).not.toBeNull();
+  });
+
+  it('leaves a failed import retryable and continues the remaining bootstrap', async () => {
+    const {
+      account, backend, runMutation, transport,
+    } = await makeImportBootstrap();
+    runMutation.mockResolvedValue({ attempted: 1, succeeded: 0, failed: 1 });
+    backend._started = true;
+    (transport as any).onStateChange = vi.fn(() => () => {});
+    (transport as any).onClose = vi.fn(() => () => {});
+    const refreshViews = vi.spyOn(backend, '_refreshActiveQueryViews')
+      .mockResolvedValue(undefined);
+    vi.spyOn(backend, '_scheduleMetadataIndexer').mockImplementation(() => {});
+
+    await expect(backend._continueBootstrap()).resolves.toBeUndefined();
+
+    expect(refreshViews).toHaveBeenCalledWith(account);
+    expect(await handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: account.id,
+      objectType: 'RecentRecipientContactImport',
+    })).toBeNull();
+    await backend.stop();
+  });
+
+  it('deduplicates concurrent bootstrap import attempts across backend instances', async () => {
+    const {
+      account, backend, runMutation, transport,
+    } = await makeImportBootstrap();
+    await backend._refreshRecipientUsage();
+    const overlappingBackend = new JmapBackend({
+      transport,
+      serverOrigin: 'https://mail.example.com',
+      handlers,
+      options: { useWebSocket: false },
+    });
+    overlappingBackend.account = account;
+    const overlappingMutation = vi.fn(async () => ({
+      attempted: 1,
+      succeeded: 1,
+      failed: 0,
+    }));
+    overlappingBackend.runMutation = overlappingMutation;
+
+    const firstImport = backend.importRecentRecipients(1);
+    const overlappingImport = overlappingBackend.importRecentRecipients(1);
+
+    expect(overlappingImport).toBe(firstImport);
+    await firstImport;
+    expect(runMutation).toHaveBeenCalledTimes(1);
+    expect(overlappingMutation).not.toHaveBeenCalled();
   });
 });

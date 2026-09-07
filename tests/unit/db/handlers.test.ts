@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 import { bootTestEngine } from '../../../src/db/bootstrap-memory';
+import { CONTACT_ADDRESS_PREFIX_SQL } from '../../../src/db/autocomplete';
 import { makeHandlers, noopBroadcaster } from '../../../src/db/handlers';
 import { DB_RPC, TABLE_FAMILIES } from '../../../src/db/protocol';
 import { SERVICE_KIND } from '../../../src/constants/states';
@@ -13,6 +14,52 @@ beforeEach(async () => {
   engine = await bootTestEngine();
   broadcaster = noopBroadcaster();
   h = makeHandlers(engine, broadcaster);
+});
+
+describe('accepted send trusted-recipient effect', () => {
+  it('checkpoints acceptance and queues trust atomically', async () => {
+    const account = await seedAccount();
+    const inserted = await h[DB_RPC.PENDING_MUTATION_INSERT]({
+      accountId: account.id,
+      mutationType: 'send',
+      requestJson: '{}',
+    });
+    const checkpoint = {
+      operationId: 'op',
+      messageId: '<op@example.com>',
+      emailRemoteId: 'email',
+      submissionRemoteId: 'submission',
+      cacheAttempts: 0,
+      trustedRecipientsQueued: false,
+    };
+    const saved = await h[DB_RPC.SEND_ACCEPT_AND_QUEUE_TRUST]({
+      accountId: account.id,
+      rowId: inserted.id,
+      checkpoint,
+      senders: [{ email: 'recipient@example.com', sourceSentAt: 10 }],
+    });
+
+    expect(saved.trustedRecipientsQueued).toBe(true);
+    expect(await engine.get(
+      `SELECT phase, server_response_json FROM pending_mutations WHERE id = ?`,
+      [inserted.id],
+    )).toMatchObject({ phase: 'submitted' });
+    expect(await engine.get(
+      `SELECT COUNT(*) AS count FROM pending_mutations
+        WHERE mutation_type = 'whitelistSender'`,
+    )).toEqual({ count: 1 });
+
+    await expect(h[DB_RPC.SEND_ACCEPT_AND_QUEUE_TRUST]({
+      accountId: account.id,
+      rowId: 999_999,
+      checkpoint,
+      senders: [{ email: 'must-rollback@example.com' }],
+    })).rejects.toThrow(/not found/);
+    expect(await engine.get(
+      `SELECT COUNT(*) AS count FROM pending_mutations
+        WHERE mutation_type = 'whitelistSender'`,
+    )).toEqual({ count: 1 });
+  });
 });
 
 afterEach(async () => {
@@ -436,9 +483,11 @@ describe('thread + message + membership handlers', () => {
     });
 
     const body = await h[DB_RPC.MESSAGE_BODY_READ]({ messageId });
-    expect(body).toEqual({
+    expect(body).toMatchObject({
       text: 'plain body',
       html: '<p>html body</p>',
+      isComplete: true,
+      truncatedParts: [],
       attachments: [{
         part_id: 'att-1',
         blob_id: null,
@@ -447,8 +496,13 @@ describe('thread + message + membership handlers', () => {
         size: 42,
         disposition: 'attachment',
         cid: null,
+        charset: null,
       }],
     });
+    expect(body.bodyParts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'text', value: 'plain body', isTruncated: false }),
+      expect.objectContaining({ kind: 'html', value: '<p>html body</p>', isTruncated: false }),
+    ]));
     expect(await h[DB_RPC.MESSAGE_BODY_READ]({ messageId: messageId + 999 })).toBeNull();
   });
 
@@ -588,6 +642,44 @@ describe('thread + message + membership handlers', () => {
     expect(row.subject).toBe('updated');
     expect(Number(row.is_seen)).toBe(0);
     expect(Number(row.is_flagged)).toBe(1);
+  });
+
+  it('returns a message addresses in header order for the reply path', async () => {
+    // Cc and Reply-To live nowhere else in the cache: there is no column
+    // for either, so Reply All can only be computed from these rows.
+    const account = await seedAccount();
+    const inbox = await seedFolder(account.id, { remoteId: 'inbox', role: 'inbox' });
+    const { messageId } = await seedMessage(account.id, inbox.id, {
+      remoteId: 'with-cc',
+      addresses: [
+        { kind: 'from', position: 0, name: 'Alice', email: 'alice@example.com' },
+        { kind: 'to', position: 1, name: null, email: 'second@example.com' },
+        { kind: 'to', position: 0, name: 'First', email: 'first@example.com' },
+        { kind: 'cc', position: 0, name: 'Carol', email: 'carol@example.com' },
+        { kind: 'replyTo', position: 0, name: null, email: 'replies@example.com' },
+      ],
+    });
+
+    const rows = await h[DB_RPC.MESSAGE_LIST_ADDRESSES]({ messageId });
+
+    expect(rows).toEqual([
+      { kind: 'cc', position: 0, name: 'Carol', email: 'carol@example.com' },
+      { kind: 'from', position: 0, name: 'Alice', email: 'alice@example.com' },
+      { kind: 'replyTo', position: 0, name: null, email: 'replies@example.com' },
+      { kind: 'to', position: 0, name: 'First', email: 'first@example.com' },
+      { kind: 'to', position: 1, name: null, email: 'second@example.com' },
+    ]);
+  });
+
+  it('returns no addresses for a message that has none', async () => {
+    const account = await seedAccount();
+    const inbox = await seedFolder(account.id, { remoteId: 'inbox', role: 'inbox' });
+    const { messageId } = await seedMessage(account.id, inbox.id, {
+      remoteId: 'bare',
+      addresses: [],
+    });
+
+    expect(await h[DB_RPC.MESSAGE_LIST_ADDRESSES]({ messageId })).toEqual([]);
   });
 
   it('supports many-to-many folder membership for one message', async () => {
@@ -917,7 +1009,7 @@ describe('contacts and autocomplete', () => {
       accountId: account.id,
       contacts: [
         {
-          addressbookId: ab.id,
+          addressbookIds: [ab.id],
           remoteId: 'c-1',
           fullName: 'Jane Doe',
           displayName: 'Jane Doe',
@@ -931,16 +1023,22 @@ describe('contacts and autocomplete', () => {
       ],
     });
     let rows = await engine.all(
-      'SELECT email_lower FROM contact_emails WHERE contact_id = (SELECT id FROM contacts WHERE remote_id = ?) ORDER BY position',
+      `SELECT account_id, email_key
+         FROM contact_emails
+        WHERE contact_id = (SELECT id FROM contacts WHERE remote_id = ?)
+        ORDER BY position`,
       ['c-1'],
     );
-    expect(rows.map((r) => r.email_lower)).toEqual(['jane@example.com', 'jane.doe@work.example.com']);
+    expect(rows).toEqual([
+      { account_id: account.id, email_key: 'jane@example.com' },
+      { account_id: account.id, email_key: 'jane.doe@work.example.com' },
+    ]);
 
     await h[DB_RPC.CONTACT_UPSERT_MANY]({
       accountId: account.id,
       contacts: [
         {
-          addressbookId: ab.id,
+          addressbookIds: [ab.id],
           remoteId: 'c-1',
           fullName: 'Jane Doe',
           displayName: 'Jane Doe',
@@ -949,13 +1047,198 @@ describe('contacts and autocomplete', () => {
       ],
     });
     rows = await engine.all(
-      'SELECT email_lower FROM contact_emails WHERE contact_id = (SELECT id FROM contacts WHERE remote_id = ?)',
+      `SELECT account_id, email_key
+         FROM contact_emails
+        WHERE contact_id = (SELECT id FROM contacts WHERE remote_id = ?)`,
       ['c-1'],
     );
-    expect(rows.map((r) => r.email_lower)).toEqual(['jane@new.example.com']);
+    expect(rows).toEqual([
+      { account_id: account.id, email_key: 'jane@new.example.com' },
+    ]);
   });
 
-  it('autocompletes from contacts and message-history with case-insensitive prefix', async () => {
+  it('files one card in every book it belongs to', async () => {
+    // RFC 9610 lets a card belong to several books, and which books it is
+    // in is something a user arranged. The old shape kept the first and
+    // dropped the rest.
+    const account = await seedAccount();
+    await h[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [
+        { remoteId: 'ab-personal', name: 'Personal', isDefault: true },
+        { remoteId: 'ab-work', name: 'Work' },
+      ],
+    });
+    const books = await engine.all(
+      'SELECT id, remote_id FROM addressbooks WHERE account_id = ? ORDER BY remote_id',
+      [account.id],
+    );
+    const [personal, work] = books.map((book) => book.id);
+
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({
+      accountId: account.id,
+      contacts: [{
+        addressbookIds: [personal, work],
+        remoteId: 'c-1',
+        displayName: 'Ada',
+        emails: [{ email: 'ada@example.com' }],
+      }],
+    });
+
+    const rows = await engine.all('SELECT id FROM contacts WHERE account_id = ?', [account.id]);
+    expect(rows, 'one card is one contact').toHaveLength(1);
+    const listed = await h[DB_RPC.CONTACT_LIST]({ accountId: account.id });
+    expect(listed[0].addressbook_ids.sort()).toEqual([personal, work].sort());
+    const fetched = await h[DB_RPC.CONTACT_GET]({
+      accountId: account.id,
+      contactId: rows[0].id,
+    });
+    expect(fetched.addressbook_ids.sort()).toEqual([personal, work].sort());
+  });
+
+  it('lists the whole address book when no limit is asked for', async () => {
+    // The compose browse path calls CONTACT_LIST with no limit and relies
+    // on getting every card back (CS-3.12); a default page size here would
+    // silently hide the contacts sorted after it.
+    const account = await seedAccount();
+    await h[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', name: 'Default', isDefault: true }],
+    });
+    const books = await engine.all(
+      'SELECT id FROM addressbooks WHERE account_id = ?', [account.id],
+    );
+
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({
+      accountId: account.id,
+      contacts: Array.from({ length: 250 }, (_, i) => ({
+        addressbookIds: [books[0].id],
+        remoteId: `c-${i}`,
+        displayName: `Contact ${String(i).padStart(3, '0')}`,
+        emails: [{ email: `contact${i}@example.com` }],
+      })),
+    });
+
+    const listed = await h[DB_RPC.CONTACT_LIST]({ accountId: account.id });
+    expect(listed).toHaveLength(250);
+  });
+
+  it('takes a contact out of a book it has been removed from', async () => {
+    const account = await seedAccount();
+    await h[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [
+        { remoteId: 'ab-personal', name: 'Personal', isDefault: true },
+        { remoteId: 'ab-work', name: 'Work' },
+      ],
+    });
+    const books = await engine.all(
+      'SELECT id FROM addressbooks WHERE account_id = ? ORDER BY remote_id',
+      [account.id],
+    );
+    const [personal, work] = books.map((book) => book.id);
+    const card = {
+      remoteId: 'c-1',
+      displayName: 'Ada',
+      emails: [{ email: 'ada@example.com' }],
+    };
+
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({
+      accountId: account.id,
+      contacts: [{ ...card, addressbookIds: [personal, work] }],
+    });
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({
+      accountId: account.id,
+      contacts: [{ ...card, addressbookIds: [personal] }],
+    });
+
+    const listed = await h[DB_RPC.CONTACT_LIST]({ accountId: account.id });
+    expect(listed[0].addressbook_ids).toEqual([personal]);
+  });
+
+  it('sweeps the contacts a completed sync did not see, and only those', async () => {
+    const account = await seedAccount();
+    await h[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', name: 'Default', isDefault: true }],
+    });
+    const ab = await engine.get('SELECT id FROM addressbooks WHERE remote_id = ?', ['ab-default']);
+    const contact = (remoteId: string) => ({
+      addressbookIds: [ab.id],
+      remoteId,
+      displayName: remoteId,
+      emails: [{ email: `${remoteId}@example.com` }],
+    });
+
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({
+      accountId: account.id,
+      contacts: [contact('stays'), contact('goes')],
+      generation: 100,
+    });
+    // The next sync sees only one of them, as it would if the other card
+    // had been deleted on the server.
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({
+      accountId: account.id,
+      contacts: [contact('stays')],
+      generation: 200,
+    });
+
+    const { swept } = await h[DB_RPC.CONTACT_SWEEP_STALE]({
+      accountId: account.id,
+      generation: 200,
+    });
+
+    expect(swept).toBe(1);
+    const live = await h[DB_RPC.CONTACT_LIST]({ accountId: account.id });
+    expect(live.map((row: any) => row.remote_id)).toEqual(['stays']);
+  });
+
+  it('refuses to sweep without the generation the sync stamped', async () => {
+    // A sweep with no generation, or a zero one, would match every row: the
+    // failure mode is deleting the address book, so it must not be reachable
+    // by a caller that forgot an argument.
+    const account = await seedAccount();
+
+    await expect(h[DB_RPC.CONTACT_SWEEP_STALE]({ accountId: account.id }))
+      .rejects.toThrow(/generation/);
+    await expect(h[DB_RPC.CONTACT_SWEEP_STALE]({ accountId: account.id, generation: 0 }))
+      .rejects.toThrow(/generation/);
+  });
+
+  it('does not let a targeted reconcile backdate a row into a sweep', async () => {
+    // A reconcile after a single-card edit passes no generation. If that
+    // reset the stamp, the card the user just saved would be swept by a
+    // full sync that had already passed it.
+    const account = await seedAccount();
+    await h[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', name: 'Default', isDefault: true }],
+    });
+    const ab = await engine.get('SELECT id FROM addressbooks WHERE remote_id = ?', ['ab-default']);
+    const card = {
+      addressbookIds: [ab.id],
+      remoteId: 'c-1',
+      displayName: 'Ada',
+      emails: [{ email: 'ada@example.com' }],
+    };
+
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({
+      accountId: account.id,
+      contacts: [card],
+      generation: 300,
+    });
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({ accountId: account.id, contacts: [card] });
+
+    const row = await engine.get('SELECT sync_generation FROM contacts WHERE remote_id = ?', ['c-1']);
+    expect(row.sync_generation).toBe(300);
+  });
+
+  it('autocompletes only from contacts, never from received mail', async () => {
     const account = await seedAccount();
     await h[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
       accountId: account.id,
@@ -967,33 +1250,42 @@ describe('contacts and autocomplete', () => {
       accountId: account.id,
       contacts: [
         {
-          addressbookId: ab.id,
+          addressbookIds: [ab.id],
           remoteId: 'c-jane',
           displayName: 'Jane Doe',
           emails: [{ email: 'Jane@Example.com', isPreferred: true }],
         },
         {
-          addressbookId: ab.id,
+          addressbookIds: [ab.id],
           remoteId: 'c-jay',
           displayName: 'Jay',
           emails: [{ email: 'jay@example.com' }],
         },
+        {
+          addressbookIds: [ab.id],
+          remoteId: 'c-jasmine',
+          displayName: 'Jasmine',
+          emails: [{ email: 'jasmine@contacts.example' }],
+        },
       ],
     });
 
-    const inbox = await seedFolder(account.id);
+    // Someone who wrote to the user and was never written back to. This is
+    // the address the old implementation would offer and CS-3.3 forbids:
+    // being mailed by a stranger is not evidence you want to mail them.
+    await seedFolder(account.id);
     await h[DB_RPC.MESSAGE_UPSERT_MANY]({
       accountId: account.id,
       messages: [{
-        remoteId: 'm-from-history',
+        remoteId: 'm-from-stranger',
         threadId: null,
         rfc822MessageId: '<x@example.com>',
-        subject: 'history',
+        subject: 'unsolicited',
         receivedAt: Date.now(),
         keywordsJson: '{}',
         keywords: [],
         addresses: [
-          { kind: 'from', position: 0, name: 'Jasmine', email: 'jasmine@history.example' },
+          { kind: 'from', position: 0, name: 'Jarvis', email: 'jarvis@stranger.example' },
         ],
         metadataFetchedAt: Date.now(),
       }],
@@ -1004,12 +1296,172 @@ describe('contacts and autocomplete', () => {
       prefix: 'ja',
       limit: 10,
     });
-    expect(matches.length).toBeGreaterThanOrEqual(2);
     const emails = matches.map((m) => m.email);
     expect(emails).toContain('Jane@Example.com');
-    const sources = new Set(matches.map((m) => m.source));
-    expect(sources.has('contact')).toBe(true);
-    expect(sources.has('history')).toBe(true);
+    expect(emails).toContain('jasmine@contacts.example');
+    expect(emails).not.toContain('jarvis@stranger.example');
+    expect(new Set(matches.map((m) => m.source))).toEqual(new Set(['contact']));
+  });
+
+  it('finds a contact by a word of its name, not just by address (CS-3.1, CS-3.2)', async () => {
+    const account = await seedAccount();
+    await h[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', isDefault: true, name: 'Default' }],
+    });
+    const ab = await engine.get('SELECT id FROM addressbooks WHERE remote_id = ?', ['ab-default']);
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({
+      accountId: account.id,
+      contacts: [{
+        addressbookIds: [ab.id],
+        remoteId: 'c-jane',
+        displayName: 'Smith, Jane',
+        givenName: 'Jane',
+        familyName: 'Smith',
+        // Nothing about this address begins with "jane", which is why an
+        // address-prefix-only implementation could never find her.
+        emails: [{ email: 'jqs@example.com', isPreferred: true }],
+      }],
+    });
+
+    const byGivenName = await h[DB_RPC.CONTACT_AUTOCOMPLETE]({
+      accountId: account.id, prefix: 'jane', limit: 10,
+    });
+    expect(byGivenName.map((m) => m.email)).toEqual(['jqs@example.com']);
+
+    // Two words, in the order the name is not stored in.
+    const unordered = await h[DB_RPC.CONTACT_AUTOCOMPLETE]({
+      accountId: account.id, prefix: 'jane smi', limit: 10,
+    });
+    expect(unordered.map((m) => m.email)).toEqual(['jqs@example.com']);
+
+    // A second word narrows rather than widens: nobody is called "jane
+    // nokia", so nothing matches.
+    const narrowed = await h[DB_RPC.CONTACT_AUTOCOMPLETE]({
+      accountId: account.id, prefix: 'jane nokia', limit: 10,
+    });
+    expect(narrowed).toEqual([]);
+  });
+
+  it('stops matching a name the contact no longer has', async () => {
+    const account = await seedAccount();
+    await h[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', isDefault: true, name: 'Default' }],
+    });
+    const ab = await engine.get('SELECT id FROM addressbooks WHERE remote_id = ?', ['ab-default']);
+    const card = {
+      addressbookIds: [ab.id],
+      remoteId: 'c-1',
+      displayName: 'Jane Maidenname',
+      emails: [{ email: 'jane@example.com' }],
+    };
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({ accountId: account.id, contacts: [card] });
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({
+      accountId: account.id,
+      contacts: [{ ...card, displayName: 'Jane Marriedname' }],
+    });
+
+    const byNewName = await h[DB_RPC.CONTACT_AUTOCOMPLETE]({
+      accountId: account.id, prefix: 'marriedname', limit: 10,
+    });
+    expect(byNewName.map((m) => m.email)).toEqual(['jane@example.com']);
+    // Tokens are replaced rather than added to, so the old name stops
+    // matching. Otherwise a rename would leave a suggestion nobody could
+    // account for.
+    const byOldName = await h[DB_RPC.CONTACT_AUTOCOMPLETE]({
+      accountId: account.id, prefix: 'maidenname', limit: 10,
+    });
+    expect(byOldName).toEqual([]);
+  });
+
+  // The two tests below were written to characterise the defects the
+  // autocomplete rewrite (CS-3.4, CS-3.6) is specified to remove. They now
+  // assert the fixed behaviour: the old expectations are recorded in each
+  // one so the change of contract stays legible.
+
+  it('offers one row per address however many names it was stored under (CS-3.4)', async () => {
+    const account = await seedAccount();
+    await h[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', isDefault: true, name: 'Default' }],
+    });
+    const ab = await engine.get('SELECT id FROM addressbooks WHERE remote_id = ?', ['ab-default']);
+    // One correspondent known through two duplicate cards.
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({
+      accountId: account.id,
+      contacts: [
+        {
+          addressbookIds: [ab.id],
+          remoteId: 'c-dana-work',
+          displayName: 'Dana Smith',
+          emails: [{ email: 'dana@example.com', isPreferred: true }],
+        },
+        {
+          addressbookIds: [ab.id],
+          remoteId: 'c-dana-old',
+          displayName: 'dana',
+          emails: [{ email: 'Dana@Example.com' }],
+        },
+      ],
+    });
+    const matches = await h[DB_RPC.CONTACT_AUTOCOMPLETE]({
+      accountId: account.id,
+      prefix: 'dana',
+      limit: 10,
+    });
+    // Previously: two rows, one per stored display name — issue #58. The
+    // addresses differ only by case, which CS-3.5 folds for comparison.
+    expect(matches.map((m) => m.email)).toEqual(['dana@example.com']);
+    // The preferred card's metadata wins deterministically.
+    expect(matches[0].name).toBe('Dana Smith');
+    expect(matches[0].source).toBe('contact');
+
+    // Deterministic means the same answer twice, not merely one answer.
+    const again = await h[DB_RPC.CONTACT_AUTOCOMPLETE]({
+      accountId: account.id,
+      prefix: 'dana',
+      limit: 10,
+    });
+    expect(again).toEqual(matches);
+  });
+
+  it('offers the exact address typed even when contacts could fill the limit (CS-3.6)', async () => {
+    const account = await seedAccount();
+    await h[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', isDefault: true, name: 'Default' }],
+    });
+    const ab = await engine.get('SELECT id FROM addressbooks WHERE remote_id = ?', ['ab-default']);
+    const contacts = [];
+    for (let i = 0; i < 8; i += 1) {
+      contacts.push({
+        addressbookIds: [ab.id],
+        remoteId: `c-team-${i}`,
+        displayName: `Team ${i}`,
+        emails: [{ email: `team-${i}@example.com` }],
+      });
+    }
+    contacts.push({
+      addressbookIds: [ab.id],
+      remoteId: 'c-team-exact',
+      displayName: 'Team Exact',
+      emails: [{ email: 'team@example.com' }],
+    });
+    await h[DB_RPC.CONTACT_UPSERT_MANY]({ accountId: account.id, contacts });
+
+    // There are enough contacts sharing the prefix to fill the limit.
+    const matches = await h[DB_RPC.CONTACT_AUTOCOMPLETE]({
+      accountId: account.id,
+      prefix: 'team@example.com',
+      limit: 8,
+    });
+    expect(matches[0].email).toBe('team@example.com');
+
   });
 });
 
@@ -1182,7 +1634,7 @@ describe('index usage on the canonical query patterns', () => {
     expect(detail).toMatch(/folder_messages_by_folder_received/);
   });
 
-  it('uses contact_emails_lookup for autocomplete prefix scans', async () => {
+  it('serves the autocomplete prefix scan by index, on the query production runs', async () => {
     const account = await seedAccount();
     await h[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
       accountId: account.id,
@@ -1193,7 +1645,7 @@ describe('index usage on the canonical query patterns', () => {
     const seed = [];
     for (let i = 0; i < 50; i += 1) {
       seed.push({
-        addressbookId: ab.id,
+        addressbookIds: [ab.id],
         remoteId: `c-${i}`,
         displayName: `Person ${i}`,
         emails: [{ email: `person${i}@example.com` }],
@@ -1202,34 +1654,17 @@ describe('index usage on the canonical query patterns', () => {
     await h[DB_RPC.CONTACT_UPSERT_MANY]({ accountId: account.id, contacts: seed });
     await engine.exec('ANALYZE');
 
-    // The handler uses a half-open range scan against email_lower so the
-    // planner can use contact_emails_lookup unconditionally. The exact
-    // entry point (account-led vs email-led) is up to the optimiser, but
-    // there must not be a full SCAN of either table.
-    const planAccountScoped = await engine.all(
-      `EXPLAIN QUERY PLAN
-        SELECT c.display_name, ce.email FROM contact_emails ce
-          JOIN contacts c ON c.id = ce.contact_id
-         WHERE c.account_id = ?
-           AND c.is_deleted = 0
-           AND ce.email_lower >= ?
-           AND ce.email_lower < ?`,
-      [account.id, 'pers', 'pert'],
+    // EXPLAIN the exported SQL the handler actually issues, not a copy that
+    // can drift from it. The half-open range over email_key must be what an
+    // index answers: no full SCAN of either table.
+    const plan = await engine.all(
+      `EXPLAIN QUERY PLAN ${CONTACT_ADDRESS_PREFIX_SQL}`,
+      [account.id, 'pers', 'pert', 40],
     );
-    const accountDetail = planAccountScoped.map((row) => row.detail).join(' | ');
-    expect(accountDetail).not.toMatch(/SCAN contact_emails\b(?! USING)/i);
-    expect(accountDetail).not.toMatch(/SCAN contacts\b(?! USING)/i);
-
-    // The email-only path used by autocomplete fall-throughs MUST hit
-    // contact_emails_lookup - there is no other reasonable plan.
-    const planEmailOnly = await engine.all(
-      `EXPLAIN QUERY PLAN
-        SELECT contact_id FROM contact_emails
-         WHERE email_lower >= ? AND email_lower < ?`,
-      ['pers', 'pert'],
-    );
-    const emailDetail = planEmailOnly.map((row) => row.detail).join(' | ');
-    expect(emailDetail).toMatch(/contact_emails_lookup/);
+    const detail = plan.map((row) => row.detail).join(' | ');
+    expect(detail).not.toMatch(/SCAN contact_emails\b(?! USING)/i);
+    expect(detail).not.toMatch(/SCAN contacts\b(?! USING)/i);
+    expect(detail).toMatch(/contact_emails_key_lookup/);
   });
 
 });

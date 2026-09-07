@@ -64,6 +64,98 @@ export const MUTATION_STATUS = {
 } as const;
 export type MutationStatus = (typeof MUTATION_STATUS)[keyof typeof MUTATION_STATUS];
 
+/**
+ * pending_mutations.phase for SEND rows. Records the furthest point known
+ * to have succeeded, written before the next protocol call is issued, so
+ * a resume can skip work that already happened. Only CREATED and
+ * SUBMITTED describe irreversible server state; the rest are local
+ * bookkeeping. Contact and Identity writes reuse CACHE_PENDING for their own
+ * server-applied-cache-behind windows; contact creates also record a phase
+ * while their idempotency key is being reconciled.
+ *
+ * UNKNOWN is terminal for automation on purpose: it means a response was
+ * lost and reconciliation could not decide, so the choice belongs to the
+ * user rather than to a retry loop.
+ */
+export const SEND_PHASE = {
+  QUEUED: 'queued',
+  CREATED: 'created',
+  /**
+   * The submission request is about to go out, or is out and unanswered.
+   * Written before the call rather than after it, because the window
+   * being guarded is the call itself: a worker that dies here may already
+   * have had its submission accepted, so this phase must never be
+   * replayed. Without it, `created` would have to cover both "not yet
+   * submitted" and "submission outcome unknown", and treating that as
+   * resumable delivers the message twice.
+   */
+  SUBMITTING: 'submitting',
+  SUBMITTED: 'submitted',
+  CACHE_PENDING: 'cache_pending',
+  UNKNOWN: 'unknown',
+} as const;
+export type SendPhase = (typeof SEND_PHASE)[keyof typeof SEND_PHASE];
+
+export const IDENTITY_PHASE = {
+  CREATE_SUBMITTING: 'identity_create_submitting',
+} as const;
+export type IdentityPhase = (typeof IDENTITY_PHASE)[keyof typeof IDENTITY_PHASE];
+
+export const CONTACT_PHASE = {
+  CREATE_PENDING: 'contact_create_pending',
+} as const;
+export type ContactPhase = (typeof CONTACT_PHASE)[keyof typeof CONTACT_PHASE];
+
+export const ADDRESSBOOK_PHASE = {
+  CREATE_SUBMITTING: 'addressbook_create_submitting',
+  DESTROY_SUBMITTING: 'addressbook_destroy_submitting',
+  CACHE_PENDING: 'addressbook_cache_pending',
+} as const;
+export type AddressBookPhase =
+  (typeof ADDRESSBOOK_PHASE)[keyof typeof ADDRESSBOOK_PHASE];
+
+/**
+ * Phases of a createEmails row. SUBMITTING is written before Email/set
+ * goes out and is in neither recovery list: a worker that dies inside the
+ * call may already have had the creates committed, and Email/set creates
+ * carry no idempotency key, so the row must park rather than replay.
+ * CACHE_PENDING means every create was acknowledged and only the local
+ * mirror is still owed.
+ */
+export const CREATE_EMAILS_PHASE = {
+  SUBMITTING: 'emails_create_submitting',
+  CACHE_PENDING: 'emails_cache_pending',
+} as const;
+export type CreateEmailsPhase = (typeof CREATE_EMAILS_PHASE)[keyof typeof CREATE_EMAILS_PHASE];
+
+export const CONTACT_TRASH_PHASE = {
+  SNAPSHOT_SAVED: 'contact_trash_snapshot_saved',
+  DOCUMENT_CONFIRMED: 'contact_trash_document_confirmed',
+  SERVER_WRITE_PENDING: 'contact_trash_server_write_pending',
+  CACHE_PENDING: 'contact_trash_cache_pending',
+  RESTORE_PENDING: 'contact_trash_restore_pending',
+  TOMBSTONE_PENDING: 'contact_trash_tombstone_pending',
+} as const;
+export type ContactTrashPhase =
+  (typeof CONTACT_TRASH_PHASE)[keyof typeof CONTACT_TRASH_PHASE];
+
+export const DRAFT_PHASE = {
+  QUEUED: 'draft_queued',
+  CREATED: 'draft_created',
+  CACHE_PENDING: 'draft_cache_pending',
+  CLEANUP_PENDING: 'draft_cleanup_pending',
+  CONFLICT: 'draft_conflict',
+} as const;
+export type DraftPhase = (typeof DRAFT_PHASE)[keyof typeof DRAFT_PHASE];
+export type MutationPhase =
+  | SendPhase
+  | DraftPhase
+  | IdentityPhase
+  | ContactPhase
+  | AddressBookPhase
+  | ContactTrashPhase
+  | CreateEmailsPhase;
+
 export const SYNC_JOB_STATUS = {
   PENDING: 'pending',
   IN_FLIGHT: 'in_flight',
@@ -91,23 +183,72 @@ export type ServiceKind = (typeof SERVICE_KIND)[keyof typeof SERVICE_KIND];
  * a JMAP wire value — the outbox dispatcher maps each one to the right
  * Email/set / EmailSubmission/set call shape.
  */
-export const MUTATION_TYPE = {
+export const MUTATION_TYPE = Object.freeze({
   SET_KEYWORDS: 'setKeywords',
   MOVE_TO_FOLDERS: 'moveToFolders',
   COPY_TO_FOLDERS: 'copyToFolders',
   DESTROY: 'destroy',
   SEND: 'send',
+  CANCEL_SCHEDULED_SEND: 'cancelScheduledSend',
+  SAVE_DRAFT: 'saveDraft',
+  DISCARD_DRAFT: 'discardDraft',
   WHITELIST_SENDER: 'whitelistSender',
   CREATE_CONTACT: 'createContact',
   UPDATE_CONTACT: 'updateContact',
   DELETE_CONTACT: 'deleteContact',
+  CONTACT_BATCH: 'contactBatch',
+  CONTACT_TRASH: 'contactTrash',
+  CREATE_IDENTITY: 'createIdentity',
+  UPDATE_IDENTITY: 'updateIdentity',
+  DELETE_IDENTITY: 'deleteIdentity',
+  CREATE_ADDRESSBOOK: 'createAddressbook',
+  UPDATE_ADDRESSBOOK: 'updateAddressbook',
+  DESTROY_ADDRESSBOOK: 'destroyAddressbook',
   SET_MAILBOX_SUBSCRIPTION: 'setMailboxSubscription',
   CREATE_MAILBOX: 'createMailbox',
   UPDATE_MAILBOX: 'updateMailbox',
   DESTROY_MAILBOX: 'destroyMailbox',
+  /** Email/set create into one mailbox; used by the kanban seed only. */
+  CREATE_EMAILS: 'createEmails',
+  PUSH_SETTINGS: 'pushSettings',
+  PUSH_CONTACTS_TRASH: 'pushContactsTrash',
   SET_SIEVE_RULES: 'setSieveRules',
-} as const;
+} as const);
 export type MutationType = (typeof MUTATION_TYPE)[keyof typeof MUTATION_TYPE];
+
+export interface MutationRecoveryPolicy {
+  mutationType: MutationType;
+  replayablePhases: readonly MutationPhase[];
+  completedPhases: readonly MutationPhase[];
+}
+
+export const MUTATION_RECOVERY_POLICIES = [
+  {
+    mutationType: MUTATION_TYPE.SEND,
+    replayablePhases: [SEND_PHASE.QUEUED, SEND_PHASE.CREATED],
+    completedPhases: [SEND_PHASE.SUBMITTED, SEND_PHASE.CACHE_PENDING],
+  },
+  {
+    mutationType: MUTATION_TYPE.CREATE_IDENTITY,
+    replayablePhases: [IDENTITY_PHASE.CREATE_SUBMITTING],
+    completedPhases: [SEND_PHASE.CACHE_PENDING],
+  },
+  {
+    mutationType: MUTATION_TYPE.CREATE_ADDRESSBOOK,
+    replayablePhases: [ADDRESSBOOK_PHASE.CREATE_SUBMITTING],
+    completedPhases: [ADDRESSBOOK_PHASE.CACHE_PENDING],
+  },
+  {
+    mutationType: MUTATION_TYPE.DESTROY_ADDRESSBOOK,
+    replayablePhases: [ADDRESSBOOK_PHASE.DESTROY_SUBMITTING],
+    completedPhases: [ADDRESSBOOK_PHASE.CACHE_PENDING],
+  },
+  {
+    mutationType: MUTATION_TYPE.CREATE_EMAILS,
+    replayablePhases: [],
+    completedPhases: [CREATE_EMAILS_PHASE.CACHE_PENDING],
+  },
+] as const satisfies readonly MutationRecoveryPolicy[];
 
 /**
  * query_views.view_type. Stormbox-internal label for the cached
@@ -170,11 +311,13 @@ export type JmapType =
   | 'EmailSubmission'
   | 'EmailDelivery'
   | 'AddressBook'
-  | 'ContactCard';
+  | 'ContactCard'
+  | 'FileNode';
 
 /**
  * `sort: [{ property }]` value for an Email/query mailbox-window view.
  * Maps to the `sort_received_at` / `sort_sent_at` columns on
- * folder_messages.
+ * folder_messages. `scheduled` is sentAt ascending — the Scheduled
+ * mailbox lists the soonest send first.
  */
-export type JmapViewSort = 'received' | 'sent';
+export type JmapViewSort = 'received' | 'sent' | 'scheduled';

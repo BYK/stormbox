@@ -2,6 +2,8 @@
 import fs from 'node:fs';
 
 import {
+  INTEGRATION_TEST_OIDC_EMAIL,
+  INTEGRATION_TEST_OIDC_PASSWORD,
   OIDC_CLIENT_ID,
   SHARED_TEST_OIDC_EMAIL,
   SHARED_TEST_OIDC_PASSWORD,
@@ -18,7 +20,11 @@ function stackHost() {
 const host = stackHost();
 const KEYCLOAK_BASE = process.env.KEYCLOAK_BASE_URL ?? `http://${host}:8999`;
 const REALM = process.env.KEYCLOAK_REALM ?? 'tbpro';
-const PUBLIC_ORIGIN = process.env.VITE_LOCAL_PUBLIC_ORIGIN ?? 'https://localhost:3000';
+// Pin the shared realm to the developer origin. Vite rewrites this per
+// worktree via KEYCLOAK_FRONTEND_ORIGIN / VITE_LOCAL_PUBLIC_ORIGIN.
+// Playwright must not pass a lane port here.
+const PUBLIC_ORIGIN = process.env.KEYCLOAK_FRONTEND_ORIGIN
+  ?? 'http://localhost:3000';
 const ADMIN_USER = process.env.KEYCLOAK_ADMIN_USER ?? 'admin';
 const ADMIN_PASSWORD = process.env.KEYCLOAK_ADMIN_PASSWORD ?? 'admin';
 const DEV_OIDC_USERNAME = process.env.DEV_OIDC_USERNAME ?? 'admin@example.org';
@@ -118,6 +124,43 @@ async function configureClient(token) {
   }
 }
 
+async function configureRecoveryEmailMapper(token) {
+  const clients = await request(
+    `${KEYCLOAK_BASE}/admin/realms/${REALM}/clients?clientId=${encodeURIComponent(OIDC_CLIENT_ID)}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  const clientId = clients?.[0]?.id;
+  if (!clientId) throw new Error(`OIDC client ${OIDC_CLIENT_ID} was not created`);
+
+  const endpoint = `${KEYCLOAK_BASE}/admin/realms/${REALM}/clients/${clientId}/protocol-mappers/models`;
+  const mappers = await request(endpoint, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const mapper = {
+    name: 'recovery_email',
+    protocol: 'openid-connect',
+    protocolMapper: 'oidc-usermodel-property-mapper',
+    consentRequired: false,
+    config: {
+      'user.attribute': 'email',
+      'claim.name': 'recovery_email',
+      'jsonType.label': 'String',
+      'id.token.claim': 'true',
+      'access.token.claim': 'true',
+      'userinfo.token.claim': 'true',
+      'introspection.token.claim': 'true',
+      multivalued: 'false',
+    },
+  };
+  const existing = mappers.find((item) =>
+    item.name === mapper.name || item.config?.['claim.name'] === 'recovery_email');
+  await request(existing?.id ? `${endpoint}/${existing.id}` : endpoint, {
+    method: existing?.id ? 'PUT' : 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ ...mapper, ...(existing?.id ? { id: existing.id } : {}) }),
+  });
+}
+
 async function findUser(token, username) {
   const users = await request(
     `${KEYCLOAK_BASE}/admin/realms/${REALM}/users?username=${encodeURIComponent(username)}&exact=true`,
@@ -191,6 +234,7 @@ export async function configureKeycloak() {
   const token = await adminToken();
   await configureRealm(token);
   await configureClient(token);
+  await configureRecoveryEmailMapper(token);
   // Ensure the dedicated e2e account exists. It stays separate from
   // the developer account so Playwright sweeps and fixtures never
   // mutate a human's local mailbox.
@@ -207,6 +251,13 @@ export async function configureKeycloak() {
     firstName: 'Stormbox',
     lastName: 'Shared E2E',
     password: SHARED_TEST_OIDC_PASSWORD,
+  });
+  await ensureUser(token, {
+    username: INTEGRATION_TEST_OIDC_EMAIL,
+    email: INTEGRATION_TEST_OIDC_EMAIL,
+    firstName: 'Stormbox',
+    lastName: 'Integration',
+    password: INTEGRATION_TEST_OIDC_PASSWORD,
   });
   // Keep the local developer login deterministic too. Existing
   // Keycloak volumes can otherwise preserve an unknown imported

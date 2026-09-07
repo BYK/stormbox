@@ -1,27 +1,9 @@
 import type { IdentityRow } from '../types';
-
-export interface RememberedComposeIdentity {
-  remoteId?: string | null;
-  email?: string | null;
-}
+import { addressKey } from './address-key';
 
 export interface ResolveComposeIdentityOptions {
-  remembered?: RememberedComposeIdentity | null;
-  primaryEmail?: string | null;
-}
-
-function normalizeEmail(email: string | null | undefined): string {
-  return (email ?? '').trim().toLowerCase();
-}
-
-function rawJsonMayDelete(rawJson: string | null): boolean | null {
-  if (!rawJson) return null;
-  try {
-    const parsed = JSON.parse(rawJson);
-    return typeof parsed?.mayDelete === 'boolean' ? parsed.mayDelete : null;
-  } catch {
-    return null;
-  }
+  accountPrimaryEmail?: string | null;
+  primaryIdentityRemoteId?: string | null;
 }
 
 function indexByRemoteId(identities: IdentityRow[], remoteId: string | null | undefined): number {
@@ -30,9 +12,9 @@ function indexByRemoteId(identities: IdentityRow[], remoteId: string | null | un
 }
 
 function indexByEmail(identities: IdentityRow[], email: string | null | undefined): number {
-  const normalized = normalizeEmail(email);
+  const normalized = addressKey(email);
   if (!normalized) return -1;
-  return identities.findIndex((identity) => normalizeEmail(identity.email) === normalized);
+  return identities.findIndex((identity) => addressKey(identity.email) === normalized);
 }
 
 export function findMatchingIdentityIndex(
@@ -47,26 +29,42 @@ export function findMatchingIdentityIndex(
 
 export function resolveComposeIdentityIndex(
   identities: IdentityRow[],
-  { remembered = null, primaryEmail = null }: ResolveComposeIdentityOptions = {},
+  {
+    accountPrimaryEmail = null,
+    primaryIdentityRemoteId = null,
+  }: ResolveComposeIdentityOptions = {},
 ): number {
   if (identities.length === 0) return 0;
 
-  const rememberedRemoteMatch = indexByRemoteId(identities, remembered?.remoteId);
-  if (rememberedRemoteMatch >= 0) return rememberedRemoteMatch;
+  const selectedPrimary = indexByRemoteId(identities, primaryIdentityRemoteId);
+  if (selectedPrimary >= 0) return selectedPrimary;
 
-  const rememberedEmailMatch = indexByEmail(identities, remembered?.email);
-  if (rememberedEmailMatch >= 0) return rememberedEmailMatch;
-
-  const primaryEmailMatch = indexByEmail(identities, primaryEmail);
-  if (primaryEmailMatch >= 0) return primaryEmailMatch;
-
-  const nonDeletableMatch = identities.findIndex((identity) => rawJsonMayDelete(identity.raw_json) === false);
+  const nonDeletableMatch = identities.findIndex((identity) => identity.may_delete === 0);
   if (nonDeletableMatch >= 0) return nonDeletableMatch;
 
-  const thundermailMatch = identities.findIndex((identity) =>
-    normalizeEmail(identity.email).endsWith('@thundermail.com'),
-  );
-  if (thundermailMatch >= 0) return thundermailMatch;
+  const accountPrimaryMatch = indexByEmail(identities, accountPrimaryEmail);
+  if (accountPrimaryMatch >= 0) return accountPrimaryMatch;
 
   return 0;
+}
+
+export function resolveReplyIdentityIndex(
+  identities: IdentityRow[],
+  originalTo: readonly (string | null | undefined)[],
+  options: ResolveComposeIdentityOptions = {},
+): number {
+  const match = findReplyIdentityIndex(identities, originalTo);
+  if (match >= 0) return match;
+  return resolveComposeIdentityIndex(identities, options);
+}
+
+export function findReplyIdentityIndex(
+  identities: IdentityRow[],
+  originalTo: readonly (string | null | undefined)[],
+): number {
+  for (const email of originalTo) {
+    const match = indexByEmail(identities, email);
+    if (match >= 0) return match;
+  }
+  return -1;
 }

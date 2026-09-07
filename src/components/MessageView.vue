@@ -2,38 +2,49 @@
 import {
   computed,
   nextTick,
-  watch,
-  ref,
   onMounted,
   onUnmounted,
+  ref,
+  watch,
 } from 'vue';
 import DOMPurify from 'dompurify';
 import {
-  Trash2, Paperclip,
-  ArrowLeft, Sun, Moon,
+  ArrowLeft,
+  Clock,
+  Moon,
+  Sun,
+  Trash2,
 } from '@lucide/vue';
 
-import { useMailStore } from '../stores/mail-store';
-import { useComposeStore } from '../stores/compose-store';
+import { useMessageAttachments } from '../composables/useMessageAttachments';
 import { invokeThunderbirdShortcut } from '../composables/useThunderbirdShortcuts';
+import { useComposeStore } from '../stores/compose-store';
+import { useMailStore } from '../stores/mail-store';
+import { useSettingsStore } from '../stores/settings-store';
 import {
   ALLOWED_URI_REGEXP,
   BODY_THEME_COLORS,
+  BOLT_BODY_BACKGROUND,
   IFRAME_SANDBOX,
   buildMessageSrcDoc,
   isInlineImageType,
   normalizeContentId,
-  referencedContentIds,
+  referencedInlineImageContentIds,
   sanitizeMessageDocument,
   sanitizeMessageHtml,
 } from '../utils/message-html';
 import { adaptHtmlForDarkMode } from '../utils/dark-email';
+import { formatAddressList } from '../utils/address-parse';
+import { titleWithShortcut, type ShortcutAction } from '../constants/shortcuts';
 import { plaintextToHtml } from '../utils/plaintext-html';
 import archiveIcon from '../assets/icons/tb-folder-archive.svg?raw';
 import junkIcon from '../assets/icons/tb-folder-spam.svg?raw';
 import forwardIcon from '../assets/icons/tb-forward.svg?raw';
 import replyIcon from '../assets/icons/tb-reply.svg?raw';
 import replyAllIcon from '../assets/icons/tb-reply-all.svg?raw';
+import AppIconButton from './AppIconButton.vue';
+import MessageAttachmentBar from './MessageAttachmentBar.vue';
+import MessageAttachmentPreviews from './MessageAttachmentPreviews.vue';
 
 // Minimum logical width we lay HTML email out at before scaling down.
 // Reflowing typical marketing HTML below this gets visually messy
@@ -49,12 +60,19 @@ defineProps<{
 
 const mailStore = useMailStore();
 const composeStore = useComposeStore();
+const settingsStore = useSettingsStore();
+const shortcutScheme = computed(() => settingsStore.get('shortcutScheme'));
+/** Toolbar title with the key the active scheme binds, e.g. `Reply (R)`. */
+function actionTitle(label: string, action: ShortcutAction): string {
+  return titleWithShortcut(label, action, shortcutScheme.value);
+}
 
-const bodyRef = ref(null);
 const htmlShellRef = ref(null);
 const iframeRef = ref(null);
 const iframeSrcDoc = ref('');
 const iframeHeight = ref(120);
+const resolvedCidPartIds = ref<ReadonlySet<string>>(new Set());
+const cidResolutionSettled = ref(false);
 const effectiveColorScheme = ref(getEffectiveColorScheme());
 // Allow the user to disable dark mode in the message view only,
 // independently of the global theme toggle. Resets when the open message
@@ -66,15 +84,18 @@ const bodyColorScheme = computed(() =>
   (effectiveColorScheme.value === 'dark' && forceLightBody.value)
     ? 'light'
     : effectiveColorScheme.value);
-const iframeBackground = computed(() =>
-  BODY_THEME_COLORS[bodyColorScheme.value === 'dark' ? 'dark' : 'light'].background);
+const iframeBackground = computed(() => {
+  const scheme = bodyColorScheme.value === 'dark' ? 'dark' : 'light';
+  return settingsStore.get('palette') === 'bolt'
+    ? BOLT_BODY_BACKGROUND[scheme]
+    : BODY_THEME_COLORS[scheme].background;
+});
 
 const body = computed(() => mailStore.messageBody);
 // null while the body is still loading; a (possibly empty) object once the
 // load completes. Used to show the loading placeholder only while loading,
 // not for a message that has genuinely no body content.
 const bodyLoaded = computed(() => body.value != null);
-const referencedInlineContentIds = computed(() => referencedContentIds(body.value?.html ?? ''));
 
 // Render plaintext bodies the way Thunderbird Desktop does: keep the
 // original line breaks/whitespace (white-space: pre-wrap), linkify URLs
@@ -95,6 +116,36 @@ const message = computed(() =>
   // access so find() doesn't throw on a hole.
   mailStore.messages.find((m) => m?.id === mailStore.selectedMessageId) ?? null,
 );
+const selectedMessageId = computed(() => mailStore.selectedMessageId);
+const messageAccountId = computed(() => message.value?.account_id ?? null);
+const attachmentParts = computed(() => (
+  Array.isArray(body.value?.attachments) ? body.value.attachments : []
+));
+const {
+  rows: attachmentRows,
+  preview: previewAttachment,
+  download: downloadAttachment,
+  retry: retryAttachment,
+} = useMessageAttachments({
+  messageId: selectedMessageId,
+  accountId: messageAccountId,
+  attachments: attachmentParts,
+  resolvedCidPartIds,
+  cidResolutionSettled,
+});
+
+/**
+ * The message's Cc recipients, so the audience is visible before replying
+ * (CS-2.7). There is no `cc_text` column, and there should not be: the
+ * addresses are already cached one per row, which is the form Reply All
+ * needs anyway.
+ */
+const ccText = computed(() => formatAddressList(
+  mailStore.selectedMessageAddresses
+    .filter((row) => row.kind === 'cc' && row.email)
+    .sort((a, b) => a.position - b.position)
+    .map((row) => ({ ...(row.name ? { name: row.name } : {}), email: row.email })),
+));
 
 let resizeObserver = null;
 let iframeMeasurementCleanup = null;
@@ -103,17 +154,6 @@ let themeMutationObserver = null;
 // Monotonic guard so an async inline-image render can detect that a newer
 // body/scheme render has superseded it.
 let renderToken = 0;
-
-function isReferencedInlinePart(part) {
-  const cid = normalizeContentId(part?.cid);
-  return !!cid && referencedInlineContentIds.value.has(cid);
-}
-
-const visibleAttachments = computed(() => {
-  const attachments = body.value?.attachments;
-  if (!Array.isArray(attachments)) return [];
-  return attachments.filter((part) => !isReferencedInlinePart(part));
-});
 
 function applyHtmlSrcDoc(html, colorScheme) {
   const nextSrcDoc = buildMessageSrcDoc(html, { colorScheme });
@@ -131,10 +171,10 @@ function applyHtmlSrcDoc(html, colorScheme) {
   if (nextSrcDoc === iframeSrcDoc.value) return;
   teardownResizeObserver();
   iframeSrcDoc.value = nextSrcDoc;
-  iframeHeight.value = initialIframeHeight();
+  iframeHeight.value = 120;
   nextTick(() => {
     if (iframeSrcDoc.value === nextSrcDoc) {
-      iframeHeight.value = Math.max(iframeHeight.value, initialIframeHeight());
+      iframeHeight.value = Math.max(iframeHeight.value, 120);
     }
   });
 }
@@ -143,40 +183,67 @@ function applyHtmlSrcDoc(html, colorScheme) {
 // parts that (a) belong to this message, (b) are an allowed raster image
 // type, and (c) are actually referenced by the body. Any other cid is
 // left untouched — it renders broken and never triggers a request.
-async function resolveCidImageUrls(next) {
-  const map = new Map<string, string>();
+function resolveCidImageUrls(next) {
+  const urls = new Map<string, string>();
+  const partIds = new Set<string>();
   const html = next?.html;
   const parts = next?.attachments;
-  if (!html || !Array.isArray(parts)) return map;
-  const referenced = referencedContentIds(html);
-  for (const part of parts) {
+  if (!html || !Array.isArray(parts)) return { urls, partIds };
+  const referenced = referencedInlineImageContentIds(html);
+  const candidates = parts.filter((part) => {
     const cid = normalizeContentId(part?.cid);
     const blobId = part?.blob_id;
-    if (!cid || !blobId || !isInlineImageType(part?.mime_type)) continue;
-    if (!referenced.has(cid)) continue;
-    const url = await mailStore.loadInlineImageUrl(blobId, part.mime_type, part.name);
-    if (url) map.set(cid, url);
-  }
-  return map;
+    return !!cid
+      && !!blobId
+      && isInlineImageType(part?.mime_type)
+      && referenced.has(cid);
+  });
+  if (candidates.length === 0) return { urls, partIds };
+
+  const accountId = message.value?.account_id ?? null;
+  return (async () => {
+    for (const part of candidates) {
+      const cid = normalizeContentId(part.cid);
+      const url = await mailStore.loadInlineImageUrl(
+        part.blob_id,
+        part.mime_type,
+        part.name,
+        accountId,
+      );
+      if (url) {
+        urls.set(cid, url);
+        partIds.add(part.part_id);
+      }
+    }
+    return { urls, partIds };
+  })();
 }
 
 async function renderHtmlBody(next, colorScheme) {
+  const myToken = (renderToken += 1);
+  resolvedCidPartIds.value = new Set();
+  cidResolutionSettled.value = false;
   if (!next?.html) {
     teardownResizeObserver();
     iframeSrcDoc.value = '';
     iframeHeight.value = 120;
+    cidResolutionSettled.value = true;
     return;
   }
   // Guard against a newer body/scheme starting to render while we await
   // inline-image blob downloads, so a fast selection change can't paint
   // a stale message.
-  const myToken = (renderToken += 1);
-  const cidUrls = await resolveCidImageUrls(next);
+  const resolution = resolveCidImageUrls(next);
+  const { urls: cidUrls, partIds } = resolution instanceof Promise
+    ? await resolution
+    : resolution;
   if (myToken !== renderToken) return;
   // Adapt for dark before building the srcdoc, so the first paint is already
   // dark-correct and never flashes the un-themed email (see dark-email.ts).
   const safeHtml = sanitizeMessageDocument(next.html, cidUrls);
   const themedHtml = colorScheme === 'dark' ? adaptHtmlForDarkMode(safeHtml) : safeHtml;
+  resolvedCidPartIds.value = partIds;
+  cidResolutionSettled.value = true;
   applyHtmlSrcDoc(themedHtml, colorScheme);
 }
 
@@ -187,6 +254,21 @@ watch([body, bodyColorScheme], ([next, colorScheme]) => {
 watch(() => mailStore.selectedMessageId, () => {
   forceLightBody.value = false;
 });
+
+let openingDraftId: number | null = null;
+watch([message, body], ([selected, selectedBody]) => {
+  if (!selected || Number(selected.is_draft) !== 1 || !selectedBody) return;
+  if (openingDraftId === selected.id) return;
+  openingDraftId = selected.id;
+  void composeStore.prepareDraftFromMessage(selected, selectedBody).then((sessionId) => {
+    if (sessionId && mailStore.selectedMessageId === selected.id) {
+      mailStore.selectMessage(null);
+      mailStore.clearSelection();
+    }
+  }).finally(() => {
+    if (openingDraftId === selected.id) openingDraftId = null;
+  });
+}, { immediate: true });
 
 // Only offered in dark mode for HTML bodies; plain text already follows the
 // readable app theme.
@@ -242,7 +324,7 @@ function teardownThemeObservers() {
 }
 
 function initialIframeHeight() {
-  return Math.max(120, bodyRef.value?.clientHeight ?? 0);
+  return 120;
 }
 
 onMounted(() => {
@@ -267,6 +349,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  renderToken += 1;
   teardownResizeObserver();
   teardownThemeObservers();
   iframeSrcDoc.value = '';
@@ -418,19 +501,19 @@ function fmtDate(ms) {
 async function quoteBody() {
   const b = body.value;
   if (!b?.html) return b ?? {};
-  const cidUrls = await resolveCidImageUrls(b);
+  const { urls: cidUrls } = await resolveCidImageUrls(b);
   if (cidUrls.size === 0) return b;
   return { ...b, html: sanitizeMessageHtml(b.html, cidUrls) };
 }
 
 async function reply() {
   if (!message.value) return;
-  composeStore.prepareReplyFromMessage(message.value, await quoteBody());
+  await composeStore.prepareReplyFromMessage(message.value, await quoteBody());
 }
 
 async function replyAll() {
   if (!message.value) return;
-  composeStore.prepareReplyAll(message.value, await quoteBody());
+  await composeStore.prepareReplyAll(message.value, await quoteBody());
 }
 
 async function forward() {
@@ -478,6 +561,64 @@ async function junk() {
   }
 }
 
+// Send Later: a scheduled message renders through the normal detail
+// view; the scheduling columns on its row only add this banner, swap
+// the toolbar to read-only + Cancel Send, and label the Date row with
+// the send time.
+const scheduledStatus = computed(() => {
+  const value = message.value?.scheduled_undo_status;
+  return value === 'pending' || value === 'unknown' || value === 'final' || value === 'canceled'
+    ? value
+    : null;
+});
+const isScheduledMessage = computed(() => scheduledStatus.value != null);
+const canCancelScheduled = computed(
+  () => scheduledStatus.value === 'pending' || scheduledStatus.value === 'unknown',
+);
+const cancelingScheduled = ref(false);
+
+function describeTimeUntil(ms) {
+  const target = Number(ms);
+  if (!Number.isFinite(target)) return '';
+  const diffMs = target - Date.now();
+  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
+  const minutes = Math.round(diffMs / 60_000);
+  if (Math.abs(minutes) < 60) return rtf.format(minutes, 'minute');
+  const hours = Math.round(diffMs / 3_600_000);
+  if (Math.abs(hours) < 48) return rtf.format(hours, 'hour');
+  return rtf.format(Math.round(diffMs / 86_400_000), 'day');
+}
+
+const scheduledBannerText = computed(() => {
+  const sendAt = message.value?.sent_at;
+  switch (scheduledStatus.value) {
+    case 'pending': {
+      const relative = describeTimeUntil(sendAt);
+      return `Scheduled to send ${fmtDate(sendAt)}${relative ? ` (${relative})` : ''}.`;
+    }
+    case 'unknown':
+      return 'The scheduled time has passed, but the server has not confirmed sending yet.';
+    case 'final':
+      return 'This message was sent and is moving to your Sent folder.';
+    case 'canceled':
+      return 'Sending was canceled; this message is moving back to Drafts.';
+    default:
+      return '';
+  }
+});
+
+async function cancelScheduledSend() {
+  if (!message.value || cancelingScheduled.value) return;
+  cancelingScheduled.value = true;
+  try {
+    await mailStore.cancelScheduledSend(message.value.id);
+  } catch (err) {
+    console.warn('[message-view] cancel scheduled send failed', err?.message ?? err);
+  } finally {
+    cancelingScheduled.value = false;
+  }
+}
+
 async function destroy() {
   if (!message.value) return;
   try {
@@ -505,25 +646,30 @@ function closeMessageView() {
     aria-label="Message detail"
   >
     <article v-if="spotlightActions" class="message-view__article">
-      <header class="message-view__header">
-        <button class="message-view__action message-view__action--ghost message-view__action--back" type="button" title="Back" aria-label="Back">
+      <!-- Decorative stand-in so the onboarding spotlight has a toolbar
+           to highlight while no message is open. These buttons carry no
+           handlers, so they are hidden from assistive technology and
+           removed from the tab order rather than announced as six
+           working actions that do nothing. -->
+      <header class="message-view__header" aria-hidden="true">
+        <AppIconButton class="message-view__action message-view__action--back" tabindex="-1" title="Back">
           <ArrowLeft class="message-view__toolbar-icon" :size="18" :stroke-width="1.65" />
-        </button>
-        <button class="message-view__action" type="button" title="Archive (A)" aria-label="Archive">
+        </AppIconButton>
+        <AppIconButton class="message-view__action" tabindex="-1" :title="actionTitle('Archive', 'archive')">
           <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="archiveIcon" />
-        </button>
-        <button class="message-view__action message-view__action--danger" type="button" title="Delete (Del)" aria-label="Delete">
+        </AppIconButton>
+        <AppIconButton class="message-view__action" danger tabindex="-1" :title="actionTitle('Delete', 'delete')">
           <Trash2 class="message-view__toolbar-icon" :size="18" :stroke-width="1.65" />
-        </button>
-        <button class="message-view__action message-view__action--compose-spotlight" type="button" title="Reply (Ctrl+R)" aria-label="Reply">
+        </AppIconButton>
+        <AppIconButton class="message-view__action message-view__action--compose-spotlight" tabindex="-1" :title="actionTitle('Reply', 'reply')">
           <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="replyIcon" />
-        </button>
-        <button class="message-view__action message-view__action--compose-spotlight" type="button" title="Reply All (Ctrl+Shift+R)" aria-label="Reply All">
+        </AppIconButton>
+        <AppIconButton class="message-view__action message-view__action--compose-spotlight" tabindex="-1" :title="actionTitle('Reply All', 'replyAll')">
           <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="replyAllIcon" />
-        </button>
-        <button class="message-view__action message-view__action--compose-spotlight" type="button" title="Forward (Ctrl+L)" aria-label="Forward">
+        </AppIconButton>
+        <AppIconButton class="message-view__action message-view__action--compose-spotlight" tabindex="-1" :title="actionTitle('Forward', 'forward')">
           <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="forwardIcon" />
-        </button>
+        </AppIconButton>
       </header>
       <div class="message-view__empty">
         <p>Select a message to read it.</p>
@@ -534,9 +680,9 @@ function closeMessageView() {
     </div>
     <article v-else class="message-view__article">
       <header class="message-view__header">
-        <button class="message-view__action message-view__action--ghost message-view__action--back" type="button" @click="closeMessageView" title="Back" aria-label="Back">
+        <AppIconButton class="message-view__action message-view__action--back" @click="closeMessageView" title="Back" aria-label="Back">
           <ArrowLeft class="message-view__toolbar-icon" :size="18" :stroke-width="1.65" />
-        </button>
+        </AppIconButton>
         <!-- Contextual: only in the Junk folder. Labeled and set apart at
              the leading edge so it reads as a folder-specific action,
              not one of the always-present icon buttons. -->
@@ -551,28 +697,32 @@ function closeMessageView() {
         >
           <span class="message-view__whitelist-label">Not junk</span>
         </button>
-        <button class="message-view__action" type="button" @click="archive" title="Archive (A)" aria-label="Archive">
-          <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="archiveIcon" />
-        </button>
-        <button v-if="!isInJunkFolder" class="message-view__action" type="button" @click="junk" title="Junk" aria-label="Mark as junk">
-          <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="junkIcon" />
-        </button>
-        <button class="message-view__action message-view__action--danger" type="button" @click="destroy" title="Delete (Del)" aria-label="Delete">
-          <Trash2 class="message-view__toolbar-icon" :size="18" :stroke-width="1.65" />
-        </button>
-        <button class="message-view__action message-view__action--compose-spotlight" type="button" @click="reply" title="Reply (Ctrl+R)" aria-label="Reply">
-          <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="replyIcon" />
-        </button>
-        <button class="message-view__action message-view__action--compose-spotlight" type="button" @click="replyAll" title="Reply All (Ctrl+Shift+R)" aria-label="Reply All">
-          <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="replyAllIcon" />
-        </button>
-        <button class="message-view__action message-view__action--compose-spotlight" type="button" @click="forward" title="Forward (Ctrl+L)" aria-label="Forward">
-          <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="forwardIcon" />
-        </button>
-        <button
+        <!-- A scheduled message is read-only: the toolbar keeps only
+             Back and the view-mode toggle, and the banner below owns
+             Cancel Send. -->
+        <template v-if="!isScheduledMessage">
+          <AppIconButton class="message-view__action" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
+            <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="archiveIcon" />
+          </AppIconButton>
+          <AppIconButton v-if="!isInJunkFolder" class="message-view__action" @click="junk" title="Junk" aria-label="Mark as junk">
+            <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="junkIcon" />
+          </AppIconButton>
+          <AppIconButton class="message-view__action" danger @click="destroy" :title="actionTitle('Delete', 'delete')" aria-label="Delete">
+            <Trash2 class="message-view__toolbar-icon" :size="18" :stroke-width="1.65" />
+          </AppIconButton>
+          <AppIconButton class="message-view__action message-view__action--compose-spotlight" @click="reply" :title="actionTitle('Reply', 'reply')" aria-label="Reply">
+            <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="replyIcon" />
+          </AppIconButton>
+          <AppIconButton class="message-view__action message-view__action--compose-spotlight" @click="replyAll" :title="actionTitle('Reply All', 'replyAll')" aria-label="Reply All">
+            <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="replyAllIcon" />
+          </AppIconButton>
+          <AppIconButton class="message-view__action message-view__action--compose-spotlight" @click="forward" :title="actionTitle('Forward', 'forward')" aria-label="Forward">
+            <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="forwardIcon" />
+          </AppIconButton>
+        </template>
+        <AppIconButton
           v-if="canForceLightBody"
           class="message-view__action message-view__action--view-mode"
-          type="button"
           :aria-pressed="forceLightBody"
           :title="forceLightBody ? 'View this message in dark mode' : 'View this message in light mode'"
           :aria-label="forceLightBody ? 'View this message in dark mode' : 'View this message in light mode'"
@@ -580,8 +730,21 @@ function closeMessageView() {
         >
           <Moon v-if="forceLightBody" :size="16" :stroke-width="1.75" />
           <Sun v-else :size="16" :stroke-width="1.75" />
-        </button>
+        </AppIconButton>
       </header>
+      <div v-if="isScheduledMessage" class="message-view__scheduled" role="status">
+        <Clock :size="16" :stroke-width="1.75" aria-hidden="true" />
+        <span class="message-view__scheduled-text">{{ scheduledBannerText }}</span>
+        <button
+          v-if="canCancelScheduled"
+          class="message-view__scheduled-cancel"
+          type="button"
+          :disabled="cancelingScheduled"
+          @click="cancelScheduledSend"
+        >
+          {{ cancelingScheduled ? 'Canceling…' : 'Cancel send' }}
+        </button>
+      </div>
       <section class="message-view__details" aria-label="Message header">
         <dl class="message-view__metadata">
           <div class="message-view__metadata-row">
@@ -592,17 +755,23 @@ function closeMessageView() {
             <dt>To</dt>
             <dd>{{ message.to_text }}</dd>
           </div>
+          <div v-if="ccText" class="message-view__metadata-row">
+            <dt>Cc</dt>
+            <dd>{{ ccText }}</dd>
+          </div>
           <div class="message-view__metadata-row message-view__title">
             <dt>Subject</dt>
             <dd><h2>{{ message.subject || '(no subject)' }}</h2></dd>
           </div>
           <div class="message-view__metadata-row">
-            <dt>Date</dt>
-            <dd class="message-view__date">{{ fmtDate(message.received_at) }}</dd>
+            <dt>{{ isScheduledMessage ? 'Send at' : 'Date' }}</dt>
+            <dd class="message-view__date">
+              {{ fmtDate(isScheduledMessage ? (message.sent_at ?? message.received_at) : message.received_at) }}
+            </dd>
           </div>
         </dl>
       </section>
-      <div ref="bodyRef" class="message-view__body">
+      <div class="message-view__body">
         <div
           v-if="iframeSrcDoc"
           ref="htmlShellRef"
@@ -623,14 +792,17 @@ function closeMessageView() {
         </div>
         <div v-else-if="textHtml" class="message-view__text" v-html="textHtml" />
         <p v-else-if="!bodyLoaded" class="message-view__placeholder">Loading message…</p>
-        <ul v-if="visibleAttachments.length" class="message-view__attachments">
-          <li v-for="a in visibleAttachments" :key="a.part_id">
-            <Paperclip :size="14" :stroke-width="1.75" class="message-view__att-icon" />
-            <span class="att-name">{{ a.name || '(unnamed)' }}</span>
-            <span class="att-meta">{{ a.mime_type || '?' }}{{ a.size ? ` · ${Math.ceil(a.size / 1024)} KB` : '' }}</span>
-          </li>
-        </ul>
+        <MessageAttachmentPreviews
+          :rows="attachmentRows"
+          @preview="previewAttachment"
+        />
       </div>
+      <MessageAttachmentBar
+        :rows="attachmentRows"
+        @preview="previewAttachment"
+        @download="downloadAttachment"
+        @retry="retryAttachment"
+      />
     </article>
   </section>
 </template>
@@ -648,16 +820,12 @@ function closeMessageView() {
   height: 100%;
 }
 .message-view__article {
-  /* This is where the actual auto-header + 1fr-body split happens.
-   * Without this, the body wrapper has unconstrained height (its
-   * height = its content's height) and the overflow-y: auto rule
-   * below has no overflow to act on — which is what made tall
-   * marketing emails (e.g. PledgeBox) impossible to scroll. */
-  display: grid;
-  grid-template-rows: auto auto 1fr;
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   min-height: 0;
   width: 100%;
+  overflow: hidden;
   --message-content-inset: 20px;
   --message-content-trailing-inset: 16px;
   --message-html-edge-inset: 8px;
@@ -666,12 +834,15 @@ function closeMessageView() {
 }
 .message-view__empty {
   display: grid;
+  flex: 1 1 auto;
+  min-height: 0;
   place-items: center;
   height: 100%;
   color: var(--muted);
 }
 .message-view__header {
   display: flex;
+  flex: 0 0 auto;
   gap: 6px;
   align-items: center;
   justify-content: flex-start;
@@ -682,10 +853,48 @@ function closeMessageView() {
   border-bottom: 1px solid var(--border);
 }
 .message-view__details {
+  flex: 0 0 auto;
   min-width: 0;
   padding: 12px var(--message-content-trailing-inset) 12px var(--message-content-inset);
   border-bottom: 1px solid var(--border-soft);
   background: color-mix(in srgb, var(--panel) 92%, var(--panel2));
+}
+/* Send Later status strip, rendered above the normal metadata header. */
+.message-view__scheduled {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px var(--message-content-trailing-inset) 10px var(--message-content-inset);
+  border-bottom: 1px solid var(--border-soft);
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+  color: var(--text);
+  font-size: 13px;
+}
+.message-view__scheduled-text {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.message-view__scheduled-cancel {
+  flex: 0 0 auto;
+  padding: 5px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border));
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.message-view__scheduled-cancel:hover {
+  background: var(--rowHover);
+}
+.message-view__scheduled-cancel:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 .message-view__metadata {
   display: grid;
@@ -719,22 +928,6 @@ function closeMessageView() {
   white-space: normal;
 }
 .message-view__date { font-variant-numeric: tabular-nums; }
-.message-view__action {
-  display: inline-grid;
-  place-items: center;
-  border: 0;
-  background: transparent;
-  color: var(--muted);
-  width: 34px;
-  height: 34px;
-  padding: 0;
-  border-radius: 8px;
-  cursor: pointer;
-  font: inherit;
-  flex-shrink: 0;
-}
-.message-view__action:hover { background: var(--rowHover); color: var(--text); }
-.message-view__action--danger:hover { background: rgba(255, 107, 107, 0.12); color: #ff6b6b; }
 /* Whitelist ("Not junk") is a contextual, Junk-only action. It leads
    the action group at the toolbar's leading edge, set apart from the
    always-present icon buttons by a trailing margin. Styled as a filled
@@ -771,14 +964,6 @@ function closeMessageView() {
   background: var(--accent);
   color: #fff;
 }
-.message-view__action:disabled,
-.message-view__action:disabled:hover {
-  background: transparent;
-  color: var(--muted);
-  opacity: 0.35;
-  cursor: default;
-}
-.message-view__action--ghost { color: var(--muted); }
 .message-view__action--back { margin-right: 12px; }
 /* View option, not a mail action — sits at the trailing edge. */
 .message-view__action--view-mode { margin-left: auto; }
@@ -843,6 +1028,7 @@ function closeMessageView() {
    * document owns the canvas color so simple HTML can follow the app
    * theme while styled emails keep their own design. */
   padding: 0;
+  flex: 0 1 auto;
   overflow-y: auto;
   overflow-x: hidden;
   min-width: 0;
@@ -903,27 +1089,6 @@ function closeMessageView() {
 .message-view__text :deep(blockquote.pt-quote--l5) {
   border-inline-start-color: rgb(233, 185, 110); /* Chocolate 1 */
 }
-.message-view__attachments {
-  list-style: none;
-  margin: 0;
-  padding: 12px 22px 18px;
-  border-top: 1px solid var(--border-soft);
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.message-view__attachments li {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  font-size: 13px;
-  padding: 6px 8px;
-  border-radius: 6px;
-}
-.message-view__attachments li:hover { background: var(--rowHover); }
-.message-view__att-icon { color: var(--muted); }
-.att-name { font-weight: 500; color: var(--text); }
-.att-meta { color: var(--muted); font-size: 12px; }
 .message-view__placeholder { margin: 0; padding: 18px 22px; color: var(--muted); }
 
 @media (max-width: 639px) {

@@ -14,6 +14,16 @@ const tlsAgent = new https.Agent({ rejectUnauthorized: false });
 // (see thunderbird-accounts/mail/etc/config.toml `[http.rate-limit]`),
 // so a 429 here means a real regression.
 const RETRYABLE_HTTP_STATUSES = new Set([502, 503, 504]);
+const CORE_CAPABILITY = 'urn:ietf:params:jmap:core';
+const DEFAULT_USING = [
+  CORE_CAPABILITY,
+  'urn:ietf:params:jmap:mail',
+  'urn:ietf:params:jmap:submission',
+];
+/** `using` for AddressBook/* and ContactCard/* calls. */
+export const CONTACTS_USING = [CORE_CAPABILITY, 'urn:ietf:params:jmap:contacts'];
+/** `using` for FileNode/* calls. */
+export const FILE_NODE_USING = [CORE_CAPABILITY, 'urn:ietf:params:jmap:filenode'];
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -45,12 +55,27 @@ async function fetchWithTls(url, options = {}) {
 
 const cachedTokens = new Map();
 
+/**
+ * A token for one account.
+ *
+ * `email` is accepted as an alias for `username` because that is what the
+ * account is called everywhere else in these tests, and getting it wrong
+ * used to be silent: the username fell back to the default account while
+ * the password did not, and the cache — then keyed by username alone —
+ * handed back the default account's token. The caller believed it held a
+ * connection to the second account and was reading the first one's mail.
+ *
+ * @param {{ username?: string, email?: string, password?: string }} [credentials]
+ */
 export async function getAccessToken({
-  username = TEST_OIDC_EMAIL,
+  username,
+  email,
   password = TEST_OIDC_PASSWORD,
 } = {}) {
+  const user = username ?? email ?? TEST_OIDC_EMAIL;
   const now = Date.now();
-  const cached = cachedTokens.get(username);
+  const cacheKey = `${user}\u0000${password}`;
+  const cached = cachedTokens.get(cacheKey);
   if (cached?.token && cached.expiresAt > now + 30_000) {
     return cached.token;
   }
@@ -59,7 +84,7 @@ export async function getAccessToken({
   const body = new URLSearchParams({
     grant_type: 'password',
     client_id: OIDC_CLIENT_ID,
-    username,
+    username: user,
     password,
   });
 
@@ -76,7 +101,7 @@ export async function getAccessToken({
   if (!payload.access_token) {
     throw new Error(`Token response missing access_token: ${JSON.stringify(payload)}`);
   }
-  cachedTokens.set(username, {
+  cachedTokens.set(cacheKey, {
     token: payload.access_token,
     expiresAt: now + (payload.expires_in ?? 300) * 1000,
   });
@@ -143,11 +168,13 @@ export async function downloadBlob(jmap, { blobId, type = 'application/octet-str
   return Buffer.from(await response.arrayBuffer());
 }
 
-export async function jmapRequest(jmap, methodCalls, using = [
-  'urn:ietf:params:jmap:core',
-  'urn:ietf:params:jmap:mail',
-  'urn:ietf:params:jmap:submission',
-]) {
+/**
+ * One JMAP API call. `using` defaults to core + mail + submission; pass
+ * `CONTACTS_USING` / `FILE_NODE_USING` (or use the wrappers below) for
+ * the other capabilities. Throws on non-2xx HTTP and on any method-level
+ * `error` response.
+ */
+export async function jmapRequest(jmap, methodCalls, using = DEFAULT_USING) {
   const response = await fetchWithTls(jmap.apiUrl, {
     method: 'POST',
     headers: {
@@ -179,6 +206,14 @@ export async function jmapRequest(jmap, methodCalls, using = [
     throw new Error(`JMAP method error: ${JSON.stringify(errorResponse[1])}`);
   }
   return payload;
+}
+
+export function contactsRequest(jmap, methodCalls) {
+  return jmapRequest(jmap, methodCalls, CONTACTS_USING);
+}
+
+export function fileNodeRequest(jmap, methodCalls) {
+  return jmapRequest(jmap, methodCalls, FILE_NODE_USING);
 }
 
 export function pickResponse(payload, name) {

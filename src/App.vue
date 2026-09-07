@@ -1,44 +1,103 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { onClickOutside, useTitle } from '@vueuse/core';
-import { Bug, ChevronDown, Lightbulb, Moon, Plus, Sun, X } from '@lucide/vue';
+import {
+  computed,
+  defineAsyncComponent,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+} from 'vue';
+import { useTitle } from '@vueuse/core';
+import { Bug, Lightbulb, Moon, Plus, Sun, X } from '@lucide/vue';
 import AppButton from './components/AppButton.vue';
+import mailGlyph from './assets/icons/tb-mail-glyph.svg?raw';
 
+import { useColumnResize } from './composables/useColumnResize';
+import {
+  DIRECTORY_COLUMN_MIN_WIDTHS,
+  DIRECTORY_RESIZER_WIDTH,
+} from './composables/useDirectoryColumnResize';
 import { useThunderbirdShortcuts } from './composables/useThunderbirdShortcuts';
 import { APP_TITLE } from './app-config';
-import { APPOINTMENT_URL, BUG_REPORT_URL, FEEDBACK_URL, SEND_URL } from './defines';
+import { BUG_REPORT_URL, FEEDBACK_URL } from './defines';
 
 import { useAuthStore } from './stores/auth-store';
 import { useMailStore } from './stores/mail-store';
 import { useContactsStore } from './stores/contacts-store';
 import { useComposeStore } from './stores/compose-store';
+import { useSettingsStore } from './stores/settings-store';
 import { AUTH_STATE } from './constants/states';
+import type { Palette, Theme } from './constants/settings';
+import { shortcutAria, shortcutHint } from './constants/shortcuts';
 
 import AppSpaces from './components/AppSpaces.vue';
 import LoginGate from './components/LoginGate.vue';
 import FolderTree from './components/FolderTree.vue';
 import MessageList from './components/MessageList.vue';
 import MessageView from './components/MessageView.vue';
-import ComposeDialog from './components/ComposeDialog.vue';
+import ComposeManager from './components/ComposeManager.vue';
 import ContactsView from './components/ContactsView.vue';
 import StorageUsageBar from './components/StorageUsageBar.vue';
 import StoreErrorToast from './components/StoreErrorToast.vue';
 import BulkOperationOverlay from './components/BulkOperationOverlay.vue';
-import ThundermailLogo from './components/ThundermailLogo.vue';
+import AppDrawer from './components/AppDrawer.vue';
+import TopNavMenu from './components/TopNavMenu.vue';
 import AccountAvatarMenu from './components/AccountAvatarMenu.vue';
 import WelcomeModal from './components/WelcomeModal.vue';
 import MailRulesDialog from './components/MailRulesDialog.vue';
+import SettingsDialog from './components/settings/SettingsDialog.vue';
+import SettingsGearButton from './components/settings/SettingsGearButton.vue';
+// Staff-only Kanban feature (src/features/kanban): the settings dialog's
+// staff section gates the flag; the board replaces MessageList only while
+// the flag is on. Both staff pieces are async so a non-staff session never
+// downloads the feature (the celebration chunk carries fireworks and the
+// audio clip).
+import { useKanbanStore } from './features/kanban/kanban-store';
+
+const KanbanBoard = defineAsyncComponent(() => import('./features/kanban/KanbanBoard.vue'));
+const KanbanCelebration = defineAsyncComponent(() => import('./features/kanban/KanbanCelebration.vue'));
 
 const authStore = useAuthStore();
 const mailStore = useMailStore();
 const contactsStore = useContactsStore();
 const composeStore = useComposeStore();
+const settingsStore = useSettingsStore();
+const kanbanStore = useKanbanStore();
 
-const space = ref('mail');
+type AppSpace = 'contacts' | 'mail';
+
+interface ContactsViewHandle {
+  requestFilterChange: (next: string) => Promise<boolean>;
+  requestLeave: () => Promise<boolean>;
+}
+
+const space = ref<AppSpace>('mail');
+const contactsViewEl = ref<ContactsViewHandle | null>(null);
+// ContactsView teleports its address-book rail into this shell element so the
+// rail shares the folder list's slot, width, toggle, and drawer (CT-1.3).
+const CONTACTS_SIDEBAR_ID = 'contacts-sidebar';
+const contactsDetailVisible = ref(false);
+const sidebarLabel = computed(() =>
+  space.value === 'contacts' ? 'address book list' : 'folder list');
 const quickFilterQuery = ref('');
 const quickFilterSpotlight = ref(false);
 const resizeLayoutSpotlight = ref(false);
 const composeActionSpotlight = ref(false);
+const quickFilterPlaceholder = computed(() =>
+  space.value === 'contacts' ? 'Filter contacts or identities' : 'Filter messages',
+);
+const quickFilterAriaLabel = computed(() =>
+  space.value === 'contacts'
+    ? 'Filter contacts or identities by name or email address'
+    : 'Quick Filter messages by from, to, or subject',
+);
+const shortcutScheme = computed(() => settingsStore.get('shortcutScheme'));
+// The badge shows the scheme's first key; aria lists every binding.
+const quickFilterShortcutLabel = computed(() =>
+  shortcutHint('quickFilter', shortcutScheme.value)?.split(' or ')[0] ?? '');
+const quickFilterAriaShortcut = computed(() =>
+  shortcutAria('quickFilter', shortcutScheme.value) ?? undefined);
 
 const showLogin = computed(() => authStore.status !== AUTH_STATE.CONNECTED);
 
@@ -59,7 +118,6 @@ useTitle(documentTitle, { restoreOnUnmount: false });
 type ResizePane = 'folderList' | 'messageList';
 
 const RESIZE_STORAGE_KEY = 'stormbox.mailColumnWidths.v1';
-const THEME_STORAGE_KEY = 'stormbox.theme.v1';
 const WELCOME_MODAL_STORAGE_KEY = 'stormbox.welcomeModalDismissed.v1';
 const SPACE_RAIL_WIDTH = 56;
 const RESIZER_WIDTH = 6;
@@ -67,7 +125,6 @@ const COMPACT_READING_WIDTH = 1024;
 const SINGLE_COLUMN_WIDTH = 640;
 const FOLDER_LIST_TRANSITION_MS = 360;
 const MESSAGE_VIEW_PRELOAD_MS = 50;
-type Theme = 'dark' | 'light';
 const DEFAULT_COLUMN_WIDTHS = {
   folderList: 240,
   messageList: 360,
@@ -83,20 +140,29 @@ const MAX_COLUMN_WIDTHS = {
 };
 const shellEl = ref<HTMLElement | null>(null);
 const quickFilterInputEl = ref<HTMLInputElement | null>(null);
-const appMenuEl = ref<HTMLDetailsElement | null>(null);
-const theme = ref<Theme>(getInitialTheme());
+const theme = computed<Theme>(() => settingsStore.get('theme'));
+const appliedTheme = ref<'dark' | 'light'>(resolveTheme(theme.value));
 applyTheme(theme.value);
+watch(theme, (value) => applyTheme(value));
+const palette = computed<Palette>(() => settingsStore.get('palette'));
+applyPalette(palette.value);
+watch(palette, (value) => applyPalette(value));
 const themeToggleLabel = computed(() =>
-  theme.value === 'dark' ? 'Switch to light mode' : 'Switch to dark mode',
-);
+  appliedTheme.value === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
 const folderListWidth = ref(DEFAULT_COLUMN_WIDTHS.folderList);
 const messageListWidth = ref(DEFAULT_COLUMN_WIDTHS.messageList);
 const folderListHidden = ref(false);
 const showWelcomeModal = ref(false);
+const showSettingsDialog = ref(false);
 const showMailRules = ref(false);
+// With 'system' the OS decides, so a manual light/dark button would fight it.
+const showThemeToggle = computed(() => theme.value !== 'system');
+// Modal dialogs own the keyboard: a single-letter mail shortcut must not
+// archive or delete the selection behind them, or move focus out of them.
 const shortcutsEnabled = computed(() =>
   authStore.status === AUTH_STATE.CONNECTED
   && !showWelcomeModal.value
+  && !showSettingsDialog.value
   && !showMailRules.value,
 );
 const windowWidth = ref(typeof window === 'undefined' ? COMPACT_READING_WIDTH : window.innerWidth);
@@ -107,9 +173,12 @@ const wantsMessageDetailView = computed(() =>
 );
 // Multi-select never opens the message view: the bulk actions live in
 // the message list header, so a checkbox selection hides the reading
-// pane entirely (and works the same in single-column layouts).
+// pane entirely (and works the same in single-column layouts). The
+// kanban board's column selection follows the same rule.
 const showMessageView = computed(() =>
-  wantsMessageDetailView.value && mailStore.selectedIds.size === 0,
+  wantsMessageDetailView.value
+  && mailStore.selectedIds.size === 0
+  && !(kanbanStore.enabled && kanbanStore.hasSelection),
 );
 const displayedMessageView = ref(
   showMessageView.value && !(space.value === 'mail' && windowWidth.value < COMPACT_READING_WIDTH),
@@ -122,7 +191,13 @@ const shouldUseSingleMailColumn = computed(() =>
 const displayedMessageList = computed(() =>
   !(space.value === 'mail' && shouldUseSingleMailColumn.value),
 );
-const activeResizePane = ref<ResizePane | null>(null);
+// The board beside an open message sizes its own track and carries its
+// own handle, so the shell's list width and list resizer step aside.
+const kanbanCompact = computed(() =>
+  space.value === 'mail'
+  && kanbanStore.enabled
+  && displayedMessageList.value
+  && displayedMessageView.value);
 let messageViewTimer: number | null = null;
 let quickFilterSpotlightTimer: number | null = null;
 let resizeLayoutSpotlightTimer: number | null = null;
@@ -130,13 +205,6 @@ let composeActionSpotlightTimer: number | null = null;
 let resizeLayoutDemoStart: { folderList: number; messageList: number } | null = null;
 let resizeLayoutDemoTimers: number[] = [];
 let responsiveFolderListHidden = false;
-
-let resizeState: {
-  pane: ResizePane;
-  startX: number;
-  startFolderListWidth: number;
-  startMessageListWidth: number;
-} | null = null;
 
 const shellStyle = computed(() => ({
   '--folder-list-width': `${folderListWidth.value}px`,
@@ -147,36 +215,73 @@ const shellStyle = computed(() => ({
   '--folder-list-transition-ms': `${FOLDER_LIST_TRANSITION_MS}ms`,
 }));
 
+const {
+  activeResizePane,
+  clampPane,
+  onResizeHandleKeydown,
+  startColumnResize,
+} = useColumnResize<ResizePane>({
+  panes: {
+    folderList: {
+      get: () => folderListWidth.value,
+      max: (widths) => maxFolderListWidth(widths.messageList),
+      min: () => MIN_COLUMN_WIDTHS.folderList,
+      set: (width) => {
+        folderListWidth.value = width;
+      },
+      storageKey: 'folderList',
+    },
+    messageList: {
+      get: () => messageListWidth.value,
+      max: (widths) => maxMessageListWidth(widths.folderList),
+      min: () => MIN_COLUMN_WIDTHS.messageList,
+      set: (width) => {
+        messageListWidth.value = width;
+      },
+      storageKey: 'messageList',
+    },
+  },
+  storageKey: RESIZE_STORAGE_KEY,
+});
+
 useThunderbirdShortcuts({
   space,
   enabled: shortcutsEnabled,
   focusQuickFilter: focusQuickFilterInput,
 });
 
-onClickOutside(appMenuEl, () => {
-  if (appMenuEl.value?.open) appMenuEl.value.open = false;
-});
+let appMounted = false;
 
 onMounted(async () => {
+  appMounted = true;
   applyTheme(theme.value);
-  loadColumnWidths();
+  applyPalette(palette.value);
+  watchSystemTheme();
   applyResponsiveLayout();
   clampColumnWidths();
   window.addEventListener('resize', onWindowResize);
 
+  void settingsStore.attach().catch((error) => {
+    console.warn('[app] settings attach failed', error);
+  });
   await authStore.initialize();
+  if (!appMounted) return;
   await mailStore.attach();
+  if (!appMounted) return;
   await contactsStore.attach();
+  if (!appMounted) return;
   await composeStore.attach();
 });
 
 onBeforeUnmount(() => {
-  stopColumnResize();
+  appMounted = false;
   clearMessageViewTimer();
   clearQuickFilterSpotlightTimer();
   clearResizeLayoutSpotlightTimer();
   clearComposeActionSpotlightTimer();
   window.removeEventListener('resize', onWindowResize);
+  unwatchSystemTheme();
+  settingsStore.detach();
 });
 
 watch(showMessageView, () => {
@@ -184,7 +289,18 @@ watch(showMessageView, () => {
   clampColumnWidths();
 });
 
+let contactFilterGeneration = 0;
+let contactFilterTransition: Promise<boolean> | null = null;
+
 watch(space, () => {
+  contactFilterGeneration += 1;
+  quickFilterQuery.value = '';
+  if (space.value !== 'contacts') contactsDetailVisible.value = false;
+  applyResponsiveLayout();
+  clampColumnWidths();
+});
+
+watch(contactsDetailVisible, () => {
   applyResponsiveLayout();
   clampColumnWidths();
 });
@@ -199,7 +315,6 @@ watch(() => authStore.status, (status) => {
     return;
   }
   showWelcomeModal.value = false;
-  showMailRules.value = false;
 }, { immediate: true });
 
 function startCompose() {
@@ -208,11 +323,11 @@ function startCompose() {
 
 function setQuickFilterQuery(event: Event) {
   const next = (event.target as HTMLInputElement | null)?.value ?? '';
-  updateQuickFilterQuery(next);
+  void updateQuickFilterQuery(next);
 }
 
 function clearQuickFilterQuery() {
-  updateQuickFilterQuery('');
+  void updateQuickFilterQuery('');
 }
 
 function focusQuickFilterInput() {
@@ -220,12 +335,50 @@ function focusQuickFilterInput() {
   quickFilterInputEl.value?.select();
 }
 
-function updateQuickFilterQuery(next: string) {
+async function updateQuickFilterQuery(next: string) {
+  if (space.value === 'contacts' && contactsViewEl.value) {
+    if (next === quickFilterQuery.value && !contactFilterTransition) return;
+    const generation = ++contactFilterGeneration;
+    const transition = contactFilterTransition
+      ?? contactsViewEl.value.requestFilterChange(next);
+    contactFilterTransition = transition;
+    let allowed: boolean;
+    try {
+      allowed = await transition;
+    } finally {
+      if (contactFilterTransition === transition) {
+        contactFilterTransition = null;
+      }
+    }
+    if (generation !== contactFilterGeneration || space.value !== 'contacts') {
+      return;
+    }
+    if (!allowed) {
+      await nextTick();
+      if (quickFilterInputEl.value) {
+        quickFilterInputEl.value.value = quickFilterQuery.value;
+      }
+      return;
+    }
+    quickFilterQuery.value = next;
+    return;
+  }
   if (next === quickFilterQuery.value) return;
-  if (mailStore.selectedMessageId != null) {
+  if (space.value === 'mail' && mailStore.selectedMessageId != null) {
     mailStore.selectMessage(null);
   }
   quickFilterQuery.value = next;
+}
+
+async function requestSpaceChange(next: string) {
+  if (next !== 'mail' && next !== 'contacts') return;
+  if (next === space.value) return;
+  if (
+    space.value === 'contacts'
+    && contactsViewEl.value
+    && !await contactsViewEl.value.requestLeave()
+  ) return;
+  space.value = next;
 }
 
 function toggleFolderList() {
@@ -234,9 +387,10 @@ function toggleFolderList() {
 }
 
 function toggleTheme() {
-  theme.value = theme.value === 'dark' ? 'light' : 'dark';
-  applyTheme(theme.value);
-  saveTheme(theme.value);
+  const nextTheme = appliedTheme.value === 'dark' ? 'light' : 'dark';
+  void settingsStore.update({ theme: nextTheme }).catch((error) => {
+    console.warn('[app] theme update failed', error);
+  });
 }
 
 function maybeShowWelcomeModal() {
@@ -361,66 +515,23 @@ function restoreResizeLayoutDemo() {
   }
 }
 
-function startColumnResize(pane: ResizePane, event: PointerEvent) {
-  if (event.button !== 0) return;
-
-  event.preventDefault();
-  resizeState = {
-    pane,
-    startX: event.clientX,
-    startFolderListWidth: folderListWidth.value,
-    startMessageListWidth: messageListWidth.value,
-  };
-  activeResizePane.value = pane;
-  document.body.classList.add('is-column-resizing');
-  window.addEventListener('pointermove', onColumnResizeMove);
-  window.addEventListener('pointerup', stopColumnResize, { once: true });
-  window.addEventListener('pointercancel', stopColumnResize, { once: true });
-}
-
-function onColumnResizeMove(event: PointerEvent) {
-  if (!resizeState) return;
-
-  const delta = event.clientX - resizeState.startX;
-  if (resizeState.pane === 'folderList') {
-    const nextWidth = resizeState.startFolderListWidth + delta;
-    folderListWidth.value = clamp(
-      nextWidth,
-      MIN_COLUMN_WIDTHS.folderList,
-      maxFolderListWidth(resizeState.startMessageListWidth),
-    );
-  } else {
-    const nextWidth = resizeState.startMessageListWidth + delta;
-    messageListWidth.value = clamp(
-      nextWidth,
-      MIN_COLUMN_WIDTHS.messageList,
-      maxMessageListWidth(folderListWidth.value),
-    );
-  }
-}
-
-function stopColumnResize() {
-  if (!resizeState && activeResizePane.value == null) return;
-
-  resizeState = null;
-  activeResizePane.value = null;
-  document.body.classList.remove('is-column-resizing');
-  window.removeEventListener('pointermove', onColumnResizeMove);
-  window.removeEventListener('pointerup', stopColumnResize);
-  window.removeEventListener('pointercancel', stopColumnResize);
-  saveColumnWidths();
-}
-
 function onWindowResize() {
   windowWidth.value = window.innerWidth;
   applyResponsiveLayout();
   clampColumnWidths();
 }
 
+// The active space's detail pane: the message view in Mail, the contact,
+// identity, or address-book pane in Contacts. Both collapse the sidebar in
+// the compact layout (R-10.2, CT-1.3).
+function detailPaneVisible() {
+  return space.value === 'contacts' ? contactsDetailVisible.value : showMessageView.value;
+}
+
 function applyResponsiveLayout() {
-  const compactMailLayout = space.value === 'mail' && windowWidth.value < COMPACT_READING_WIDTH;
-  const singleColumnMailLayout = space.value === 'mail' && windowWidth.value < SINGLE_COLUMN_WIDTH;
-  const shouldHideFolderList = singleColumnMailLayout || (compactMailLayout && showMessageView.value);
+  const compactLayout = windowWidth.value < COMPACT_READING_WIDTH;
+  const singleColumnLayout = windowWidth.value < SINGLE_COLUMN_WIDTH;
+  const shouldHideFolderList = singleColumnLayout || (compactLayout && detailPaneVisible());
   const shouldShowSingleColumn = shouldUseSingleMailColumn.value;
   const willHideFolderList = shouldHideFolderList && !folderListHidden.value;
 
@@ -434,7 +545,9 @@ function applyResponsiveLayout() {
     responsiveFolderListHidden = false;
   }
 
-  syncDisplayedMessageView({ delayForFolderSlide: willHideFolderList && !shouldShowSingleColumn });
+  syncDisplayedMessageView({
+    delayForFolderSlide: space.value === 'mail' && willHideFolderList && !shouldShowSingleColumn,
+  });
 }
 
 function syncDisplayedMessageView({ delayForFolderSlide = false } = {}) {
@@ -464,39 +577,35 @@ function clearMessageViewTimer() {
   messageViewTimer = null;
 }
 
-function onResizeHandleKeydown(pane: ResizePane, event: KeyboardEvent) {
-  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
-
-  event.preventDefault();
-  const direction = event.key === 'ArrowRight' ? 1 : -1;
-  const step = event.shiftKey ? 40 : 10;
-  if (pane === 'folderList') {
-    folderListWidth.value = clamp(
-      folderListWidth.value + direction * step,
-      MIN_COLUMN_WIDTHS.folderList,
-      maxFolderListWidth(messageListWidth.value),
-    );
-  } else {
-    messageListWidth.value = clamp(
-      messageListWidth.value + direction * step,
-      MIN_COLUMN_WIDTHS.messageList,
-      maxMessageListWidth(folderListWidth.value),
-    );
-  }
-  saveColumnWidths();
-}
-
 function availablePaneWidth() {
   const shellWidth = shellEl.value?.clientWidth || window.innerWidth || 0;
-  const resizerCount = (folderListHidden.value ? 0 : 1) + (displayedMessageView.value ? 1 : 0);
+  const messageViewResizer = space.value === 'mail' && displayedMessageView.value && !kanbanCompact.value ? 1 : 0;
+  const resizerCount = (folderListHidden.value ? 0 : 1) + messageViewResizer;
   return Math.max(0, shellWidth - SPACE_RAIL_WIDTH - resizerCount * RESIZER_WIDTH);
 }
 
-function maxFolderListWidth(messageList: number) {
-  const reserve = displayedMessageView.value
+// Width the columns beside the sidebar need so it can never push them into
+// horizontal overflow (R-10.1): the Contacts columns at their minimums, and in
+// Mail the message list at its current width plus the message view minimum.
+function sidebarNeighbourReserve(messageList: number) {
+  if (space.value === 'contacts') {
+    return contactsDetailVisible.value
+      ? DIRECTORY_COLUMN_MIN_WIDTHS.list + DIRECTORY_RESIZER_WIDTH + DIRECTORY_COLUMN_MIN_WIDTHS.detail
+      : DIRECTORY_COLUMN_MIN_WIDTHS.list;
+  }
+  if (kanbanCompact.value) {
+    return kanbanStore.compactBoardWidth + MIN_COLUMN_WIDTHS.messageView;
+  }
+  return displayedMessageView.value
     ? messageList + MIN_COLUMN_WIDTHS.messageView
     : MIN_COLUMN_WIDTHS.messageList;
-  return Math.min(MAX_COLUMN_WIDTHS.folderList, availablePaneWidth() - reserve);
+}
+
+function maxFolderListWidth(messageList: number) {
+  return Math.min(
+    MAX_COLUMN_WIDTHS.folderList,
+    availablePaneWidth() - sidebarNeighbourReserve(messageList),
+  );
 }
 
 function maxMessageListWidth(folderList: number) {
@@ -507,83 +616,56 @@ function maxMessageListWidth(folderList: number) {
 
 function clampColumnWidths() {
   if (!folderListHidden.value) {
-    folderListWidth.value = clamp(
-      folderListWidth.value,
-      MIN_COLUMN_WIDTHS.folderList,
-      maxFolderListWidth(messageListWidth.value),
-    );
+    clampPane('folderList');
   }
-  messageListWidth.value = clamp(
-    messageListWidth.value,
-    MIN_COLUMN_WIDTHS.messageList,
-    maxMessageListWidth(folderListWidth.value),
-  );
-}
-
-function loadColumnWidths() {
-  try {
-    const raw = window.localStorage?.getItem(RESIZE_STORAGE_KEY);
-    if (!raw) return;
-
-    const parsed = JSON.parse(raw);
-    if (Number.isFinite(parsed?.folderList)) {
-      folderListWidth.value = parsed.folderList;
-    }
-    if (Number.isFinite(parsed?.messageList)) {
-      messageListWidth.value = parsed.messageList;
-    }
-  } catch {
-    // Layout preferences are best-effort; blocked storage should not affect mail.
+  if (space.value === 'mail') {
+    clampPane('messageList');
   }
 }
 
-function saveColumnWidths() {
-  try {
-    window.localStorage?.setItem(RESIZE_STORAGE_KEY, JSON.stringify({
-      folderList: folderListWidth.value,
-      messageList: messageListWidth.value,
-    }));
-  } catch {
-    // Ignore storage failures; the current drag still applies for this session.
-  }
-}
-
-function getInitialTheme(): Theme {
-  try {
-    const stored = window.localStorage?.getItem(THEME_STORAGE_KEY);
-    if (isTheme(stored)) return stored;
-  } catch {
-    // Theme falls back to the system preference when storage is unavailable.
-  }
-
+function resolveTheme(value: Theme): 'dark' | 'light' {
+  if (value !== 'system') return value;
   if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
     return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
   }
-
   return 'dark';
 }
 
-function applyTheme(nextTheme: Theme) {
+function applyTheme(value: Theme) {
   if (typeof document === 'undefined') return;
+  const resolved = resolveTheme(value);
+  appliedTheme.value = resolved;
   // services-ui drives theming off a `dark` class on <html>; we add an
   // explicit `light` class too so an explicit light choice can override
   // a dark system preference. Our own tokens key off the same classes.
   const root = document.documentElement;
-  root.classList.toggle('dark', nextTheme === 'dark');
-  root.classList.toggle('light', nextTheme === 'light');
-  root.style.colorScheme = nextTheme;
+  root.classList.toggle('dark', resolved === 'dark');
+  root.classList.toggle('light', resolved === 'light');
+  root.style.colorScheme = resolved;
 }
 
-function saveTheme(nextTheme: Theme) {
-  try {
-    window.localStorage?.setItem(THEME_STORAGE_KEY, nextTheme);
-  } catch {
-    // Ignore storage failures; the selected theme still applies this session.
-  }
+// The stylesheets default to the classic palette; `palette-bolt` on <html>
+// activates every Bolt override in assets/bolt-theme.css.
+function applyPalette(value: Palette) {
+  if (typeof document === 'undefined') return;
+  document.documentElement.classList.toggle('palette-bolt', value === 'bolt');
 }
 
-function isTheme(value: string | null): value is Theme {
-  return value === 'dark' || value === 'light';
+let systemThemeMedia: MediaQueryList | null = null;
+
+function onSystemThemeChange() {
+  if (theme.value === 'system') applyTheme('system');
+}
+
+function watchSystemTheme() {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+  systemThemeMedia = window.matchMedia('(prefers-color-scheme: light)');
+  systemThemeMedia.addEventListener?.('change', onSystemThemeChange);
+}
+
+function unwatchSystemTheme() {
+  systemThemeMedia?.removeEventListener?.('change', onSystemThemeChange);
+  systemThemeMedia = null;
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -600,6 +682,7 @@ function clamp(value: number, min: number, max: number) {
     :class="{
       'shell--message-view-hidden': space === 'mail' && !displayedMessageView,
       'shell--message-list-hidden': space === 'mail' && !displayedMessageList,
+      'shell--kanban-compact': kanbanCompact,
       'shell--folder-list-hidden': folderListHidden,
       'shell--contacts': space === 'contacts',
       'shell--column-resizing': activeResizePane !== null,
@@ -608,36 +691,11 @@ function clamp(value: number, min: number, max: number) {
     }"
     :style="shellStyle"
   >
-    <div class="quick-filter">
-      <details ref="appMenuEl" class="app-menu">
-        <summary class="app-menu__button" aria-label="Open Thundermail menu">
-          <ThundermailLogo :size="26" class="app-menu__logo" aria-hidden="true" />
-          <span>Thundermail</span>
-          <ChevronDown class="app-menu__chevron" :size="14" :stroke-width="2" aria-hidden="true" />
-        </summary>
-        <div class="app-menu__popover" role="menu">
-          <a
-            class="app-menu__item"
-            :href="APPOINTMENT_URL"
-            target="_blank"
-            rel="noopener noreferrer"
-            role="menuitem"
-          >
-            <img src="/icons/icon-appointment.svg" class="app-menu__item-icon" alt="" aria-hidden="true" />
-            <span>Appointment</span>
-          </a>
-          <a
-            class="app-menu__item"
-            :href="SEND_URL"
-            target="_blank"
-            rel="noopener noreferrer"
-            role="menuitem"
-          >
-            <img src="/icons/icon-send.svg" class="app-menu__item-icon" alt="" aria-hidden="true" />
-            <span>Send</span>
-          </a>
-        </div>
-      </details>
+    <header class="quick-filter">
+      <div class="quick-filter__brand">
+        <span class="quick-filter__glyph" aria-hidden="true" v-html="mailGlyph" />
+        <span class="quick-filter__wordmark">Mail</span>
+      </div>
 
       <div
         class="quick-filter__search"
@@ -647,14 +705,21 @@ function clamp(value: number, min: number, max: number) {
         <input
           ref="quickFilterInputEl"
           class="quick-filter__input"
+          :class="{ 'quick-filter__input--empty': quickFilterQuery.length === 0 }"
           type="search"
           :value="quickFilterQuery"
-          aria-label="Quick Filter messages by from, to, or subject"
-          :placeholder="quickFilterSpotlight ? '' : 'Quick Filter'"
+          :aria-label="quickFilterAriaLabel"
+          :aria-keyshortcuts="quickFilterAriaShortcut"
+          :placeholder="quickFilterSpotlight ? '' : quickFilterPlaceholder"
           autocomplete="off"
           spellcheck="false"
           @input="setQuickFilterQuery"
         />
+        <kbd
+          v-if="quickFilterQuery.length === 0"
+          class="quick-filter__shortcut"
+          aria-hidden="true"
+        >{{ quickFilterShortcutLabel }}</kbd>
         <button
           v-if="quickFilterQuery.length > 0"
           class="quick-filter__clear"
@@ -688,40 +753,50 @@ function clamp(value: number, min: number, max: number) {
         >
           <Lightbulb :size="18" :stroke-width="1.75" aria-hidden="true" />
         </a>
+        <SettingsGearButton @open="showSettingsDialog = true" />
         <button
+          v-if="showThemeToggle"
           class="quick-filter__action theme-toggle"
           type="button"
           :aria-label="themeToggleLabel"
           :title="themeToggleLabel"
           @click="toggleTheme"
         >
-          <Sun v-if="theme === 'dark'" :size="18" :stroke-width="1.75" aria-hidden="true" />
+          <Sun v-if="appliedTheme === 'dark'" :size="18" :stroke-width="1.75" aria-hidden="true" />
           <Moon v-else :size="18" :stroke-width="1.75" aria-hidden="true" />
         </button>
+        <AppDrawer />
+        <TopNavMenu
+          class="quick-filter__menu"
+          :theme="appliedTheme"
+          :theme-toggle-label="themeToggleLabel"
+          :show-theme-toggle="showThemeToggle"
+          @toggle-theme="toggleTheme"
+          @open-settings="showSettingsDialog = true"
+        />
         <AccountAvatarMenu
           @show-mail-rules="showMailRules = true"
           @show-welcome-modal="showWelcomeModalAgain"
         />
       </div>
-    </div>
+    </header>
 
     <AppSpaces
       :active="space"
       :unread-count="inboxUnread"
       :folder-list-hidden="folderListHidden"
-      :show-folder-list-toggle="space === 'mail'"
-      @change="space = $event"
+      :sidebar-label="sidebarLabel"
+      @change="requestSpaceChange"
       @toggle-folder-list="toggleFolderList"
     />
 
     <div
-      v-if="space === 'mail'"
       class="sidebar-slot"
       :class="{ 'sidebar-slot--hidden': folderListHidden }"
       :aria-hidden="folderListHidden"
       :inert="folderListHidden"
     >
-      <aside class="sidebar">
+      <aside v-if="space === 'mail'" class="sidebar">
         <header class="sidebar__header">
           <AppButton
             class="sidebar__compose"
@@ -739,17 +814,20 @@ function clamp(value: number, min: number, max: number) {
           <span class="sidebar__account-name">{{ accountLabel }}</span>
         </div>
 
-        <FolderTree v-if="space === 'mail'" />
-        <p v-else class="sidebar__hint">Switch to Mail to navigate folders.</p>
+        <FolderTree />
 
         <footer class="sidebar__footer">
           <StorageUsageBar />
         </footer>
       </aside>
+      <div
+        v-else
+        :id="CONTACTS_SIDEBAR_ID"
+        class="sidebar sidebar--contacts"
+      />
     </div>
 
     <div
-      v-if="space === 'mail'"
       class="column-resizer column-resizer--folder-list"
       :class="{
         'is-active': activeResizePane === 'folderList',
@@ -757,7 +835,7 @@ function clamp(value: number, min: number, max: number) {
         'column-resizer--spotlight': resizeLayoutSpotlight,
       }"
       role="separator"
-      aria-label="Resize folder list"
+      :aria-label="`Resize ${sidebarLabel}`"
       aria-orientation="vertical"
       :aria-valuemin="MIN_COLUMN_WIDTHS.folderList"
       :aria-valuemax="maxFolderListWidth(messageListWidth)"
@@ -769,9 +847,14 @@ function clamp(value: number, min: number, max: number) {
     />
 
     <template v-if="space === 'mail'">
-      <MessageList v-if="displayedMessageList" :quick-filter-query="quickFilterQuery" />
+      <KanbanBoard
+        v-if="displayedMessageList && kanbanStore.enabled"
+        :compact="displayedMessageView"
+        :quick-filter-query="quickFilterQuery"
+      />
+      <MessageList v-else-if="displayedMessageList" :quick-filter-query="quickFilterQuery" />
       <div
-        v-if="displayedMessageView && displayedMessageList"
+        v-if="displayedMessageView && displayedMessageList && !kanbanCompact"
         class="column-resizer column-resizer--message-list"
         :class="{
           'is-active': activeResizePane === 'messageList',
@@ -792,11 +875,23 @@ function clamp(value: number, min: number, max: number) {
         :spotlight-actions="composeActionSpotlight"
       />
     </template>
-    <ContactsView v-else-if="space === 'contacts'" />
+    <ContactsView
+      v-else-if="space === 'contacts'"
+      ref="contactsViewEl"
+      :filter-query="quickFilterQuery"
+      :rail-target="`#${CONTACTS_SIDEBAR_ID}`"
+      @detail-visible-change="contactsDetailVisible = $event"
+    />
 
-    <ComposeDialog />
+    <ComposeManager />
     <StoreErrorToast />
-    <BulkOperationOverlay />
+    <BulkOperationOverlay
+      :active="mailStore.bulkOperation.active"
+      item-label="messages"
+      :label="mailStore.bulkOperation.label"
+      singular-item-label="message"
+      :total="mailStore.bulkOperation.total"
+    />
     <MailRulesDialog v-if="showMailRules" @close="showMailRules = false" />
     <WelcomeModal
       v-if="showWelcomeModal"
@@ -805,6 +900,12 @@ function clamp(value: number, min: number, max: number) {
       @spotlight-resize-layout="spotlightResizeLayout"
       @spotlight-compose-actions="spotlightComposeActions"
     />
+    <SettingsDialog
+      v-if="showSettingsDialog"
+      :applied-theme="appliedTheme"
+      @close="showSettingsDialog = false"
+    />
+    <KanbanCelebration v-if="authStore.isStaff" />
   </div>
 </template>
 
@@ -819,14 +920,22 @@ function clamp(value: number, min: number, max: number) {
   --space-rail-bg: color-mix(in srgb, var(--panel) 88%, #fff);
   --space-rail-fg: var(--muted);
   --folder-list-bg: color-mix(in srgb, var(--panel) 96%, #fff);
-  --app-menu-popover-bg: color-mix(in srgb, var(--panel) 92%, #fff);
+  /* Top nav: same 56px band as before, sharing the rail's surface. The
+     Bolt palette (assets/bolt-theme.css) re-points these tokens. */
+  --top-nav-height: 56px;
+  --top-nav-bg: var(--space-rail-bg);
+  --top-nav-shadow: transparent;
+  --top-nav-wordmark: var(--accent);
+  --top-nav-input-bg: var(--surface);
+  --top-nav-popover-bg: color-mix(in srgb, var(--panel) 92%, #fff);
 }
 
 html.light,
 .light {
   --space-rail-bg: color-mix(in srgb, var(--panel2) 96%, #000);
   --folder-list-bg: color-mix(in srgb, var(--panel) 97%, #000);
-  --app-menu-popover-bg: var(--panel2);
+  --top-nav-wordmark: var(--accent);
+  --top-nav-popover-bg: var(--panel2);
 }
 
 .shell {
@@ -867,8 +976,24 @@ html.light,
 .shell--folder-list-hidden {
   --folder-resizer-width: 0px;
 }
+/* Kanban board beside an open message: the board sets its own width
+ * (two columns plus their handles) and its last handle replaces the
+ * shell's list resizer. */
+.shell--kanban-compact {
+  grid-template-columns:
+    56px
+    auto
+    var(--folder-resizer-width)
+    auto
+    0px
+    minmax(var(--message-view-min-width, 320px), 1fr);
+}
 .shell--contacts {
-  grid-template-columns: 56px minmax(0, 1fr);
+  grid-template-columns:
+    56px
+    auto
+    var(--folder-resizer-width)
+    minmax(0, 1fr);
 }
 .shell--resize-spotlight {
   transition: grid-template-columns 0.55s ease;
@@ -887,6 +1012,9 @@ html.light,
   grid-column: 4;
   border-right: 0;
 }
+.shell > .kanban-board {
+  grid-column: 4;
+}
 .shell > .message-view {
   grid-column: 6;
 }
@@ -894,35 +1022,70 @@ html.light,
   grid-column: 4 / -1;
 }
 .shell > .contacts { grid-column: 4 / -1; }
-.shell--contacts > .contacts { grid-column: 2 / -1; }
-.shell--folder-list-hidden > .contacts { grid-column: 2 / -1; }
 
 .quick-filter {
   grid-column: 1 / -1;
   position: relative;
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
+  display: flex;
   align-items: center;
-  column-gap: 12px;
-  min-height: 56px;
-  padding: 10px 16px;
-  background: var(--space-rail-bg);
-  border-bottom: 1px solid var(--border);
+  column-gap: 16px;
+  height: var(--top-nav-height);
+  padding: 0 16px 0 14px;
+  /* No bottom hairline: the bar reads as one surface with the sidebar. */
+  background: var(--top-nav-bg);
 }
-.quick-filter > .app-menu {
-  justify-self: start;
-  position: relative;
-  z-index: 30;
-  margin-left: -7px;
+/* Drop shadow onto the panes below. The bar itself carries no z-index so
+ * the welcome tour can still lift .quick-filter__search above its backdrop. */
+.quick-filter::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  top: 100%;
+  left: 0;
+  right: 0;
+  height: 8px;
+  background: linear-gradient(to bottom, var(--top-nav-shadow), transparent);
+  pointer-events: none;
 }
-.quick-filter > .quick-filter__search {
-  justify-self: center;
-}
-.quick-filter__actions {
-  justify-self: end;
+.quick-filter__brand {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  height: 36px;
+  flex-shrink: 0;
+  user-select: none;
+}
+.quick-filter__glyph {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  color: var(--accent);
+}
+.quick-filter__glyph svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.quick-filter__wordmark {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.01em;
+  color: var(--top-nav-wordmark);
+}
+/* Compact layouts only; see the 639px media query. */
+.quick-filter__menu {
+  display: none;
+}
+.quick-filter__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.quick-filter__actions > .account-menu {
+  margin-left: 2px;
 }
 .quick-filter__action,
 .quick-filter__action.theme-toggle {
@@ -947,89 +1110,11 @@ html.light,
   border-color: var(--border-soft);
   outline: none;
 }
-.app-menu__button {
-  min-height: 36px;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 10px 4px 6px;
-  border: 1px solid transparent;
-  border-radius: 999px;
-  color: var(--text);
-  cursor: pointer;
-  font: inherit;
-  font-weight: 600;
-  list-style: none;
-  user-select: none;
-}
-.app-menu__button::-webkit-details-marker {
-  display: none;
-}
-.app-menu__button:hover,
-.app-menu__button:focus-visible,
-.app-menu[open] .app-menu__button {
-  background: var(--rowHover);
-  border-color: var(--border-soft);
-  outline: none;
-}
-.app-menu[open] .app-menu__button {
-  position: relative;
-  z-index: 31;
-  background: var(--app-menu-popover-bg);
-  border-color: var(--border);
-}
-.app-menu__logo,
-.app-menu__item-icon {
-  display: block;
-  width: 26px;
-  height: 26px;
-  border-radius: 6px;
-  flex-shrink: 0;
-}
-.app-menu__chevron {
-  color: var(--muted);
-  transition: transform 0.12s ease;
-}
-.app-menu[open] .app-menu__chevron {
-  transform: rotate(180deg);
-}
-.app-menu__popover {
-  position: absolute;
-  z-index: 30;
-  top: calc(100% - 1px);
-  left: 0;
-  min-width: 240px;
-  padding: 6px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--app-menu-popover-bg);
-  box-shadow: 0 16px 32px color-mix(in srgb, #000 32%, transparent);
-}
-.app-menu[open] .app-menu__popover {
-  margin-top: 4px;
-}
-.app-menu__item-icon {
-  filter: drop-shadow(0 2px 3px color-mix(in srgb, #000 20%, transparent));
-}
-.app-menu__item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 42px;
-  padding: 8px 10px 8px 0;
-  border-radius: 8px;
-  color: var(--text);
-  font-weight: 600;
-  text-decoration: none;
-}
-.app-menu__item:hover,
-.app-menu__item:focus-visible {
-  background: var(--rowHover);
-  outline: none;
-}
 .quick-filter__search {
   position: relative;
-  width: clamp(160px, 40vw, 520px);
+  flex: 0 1 360px;
+  min-width: 160px;
+  margin: 0 auto;
 }
 .quick-filter__search--spotlight {
   z-index: 130;
@@ -1039,7 +1124,7 @@ html.light,
   position: absolute;
   inset: -7px;
   border: 1px solid color-mix(in srgb, var(--accent) 78%, #fff);
-  border-radius: 999px;
+  border-radius: 15px;
   box-shadow:
     0 0 0 7px color-mix(in srgb, var(--accent) 18%, transparent),
     0 18px 46px color-mix(in srgb, #000 32%, transparent);
@@ -1048,20 +1133,29 @@ html.light,
 }
 .quick-filter__input {
   width: 100%;
-  min-height: 36px;
+  height: 36px;
   border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--surface);
+  border-radius: 8px;
+  background: var(--top-nav-input-bg);
   color: var(--text);
   font: inherit;
   font-size: 14px;
-  padding: 0 40px 0 16px;
+  padding: 0 40px 0 14px;
   outline: none;
-  box-shadow: 0 1px 2px color-mix(in srgb, #000 8%, transparent);
+}
+.quick-filter__input--empty {
+  padding-right: 70px;
 }
 .quick-filter__search--spotlight .quick-filter__input {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+/* .quick-filter__clear occupies the padding gutter, so the WebKit search
+   affordances would sit beside it as a second clear button. */
+.quick-filter__input::-webkit-search-cancel-button,
+.quick-filter__input::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
 }
 .quick-filter__input::placeholder {
   color: var(--muted);
@@ -1069,6 +1163,21 @@ html.light,
 .quick-filter__input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.quick-filter__shortcut {
+  position: absolute;
+  top: 50%;
+  right: 12px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--surface) 88%, var(--rowHover));
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.2;
+  pointer-events: none;
+  transform: translateY(-50%);
 }
 .quick-filter__clear {
   position: absolute;
@@ -1125,8 +1234,14 @@ html.light,
   }
   .shell .sidebar-slot {
     position: absolute;
-    z-index: 70;
-    top: 56px;
+    /* Under `.compose-dialog` (50), which is a modal and has to be reachable
+       from the one control that opens it here — the New Message button inside
+       this drawer. At 70 the drawer covered the dialog it had just opened, and
+       took its taps with it, which is what made compose unusable on a phone
+       (CS-2.9). Nothing else occupies the band between the mail columns and
+       the dialog, so this only reorders those two. */
+    z-index: 40;
+    top: var(--top-nav-height);
     bottom: 0;
     left: 56px;
     width: min(var(--folder-list-width, 240px), calc(100vw - 56px));
@@ -1151,24 +1266,32 @@ html.light,
     display: none;
   }
   .shell--message-view-hidden > .msg-list,
-  .shell--message-list-hidden > .message-view,
-  .shell > .contacts {
+  .shell--message-list-hidden > .message-view {
     grid-column: 2 / -1;
   }
+  /* Same 56px band: glyph, full-width filter, menu and avatar in one row.
+     The wordmark and the desktop-only actions give the filter their room;
+     the menu takes their place beside the avatar. */
   .quick-filter {
-    grid-template-columns: auto 1fr auto;
     column-gap: 8px;
-    padding-left: 8px;
-    padding-right: 8px;
+    padding: 0 8px;
   }
-  .app-menu__button span {
+  .quick-filter__wordmark {
     display: none;
   }
-  .quick-filter > .quick-filter__search {
-    justify-self: stretch;
-  }
   .quick-filter__search {
-    width: 100%;
+    flex: 1 1 auto;
+    min-width: 0;
+    margin: 0;
+  }
+  .quick-filter__menu {
+    display: block;
+  }
+  .quick-filter__actions > :not(.account-menu, .quick-filter__menu) {
+    display: none;
+  }
+  .quick-filter__actions > .account-menu {
+    margin-left: 0;
   }
 }
 
@@ -1188,7 +1311,7 @@ html.light,
     grid-row: 3;
   }
   .shell .sidebar-slot {
-    top: 56px;
+    top: var(--top-nav-height);
     bottom: var(--spaces-bar-height);
     left: 0;
     width: min(var(--folder-list-width, 240px), 100vw);
@@ -1201,8 +1324,7 @@ html.light,
   .shell > .message-view,
   .shell > .contacts,
   .shell--message-view-hidden > .msg-list,
-  .shell--message-list-hidden > .message-view,
-  .shell--folder-list-hidden > .contacts {
+  .shell--message-list-hidden > .message-view {
     grid-column: 1;
     grid-row: 2;
   }
@@ -1238,6 +1360,9 @@ html.light,
 .sidebar-slot--hidden .sidebar {
   transform: translateX(-100%);
 }
+.sidebar--contacts {
+  grid-template-rows: minmax(0, 1fr);
+}
 .sidebar > * {
   min-width: 0;
 }
@@ -1245,7 +1370,6 @@ html.light,
 .sidebar__header {
   min-width: 0;
   padding: 12px 12px 10px;
-  border-bottom: 1px solid var(--border-soft);
 }
 /* New Message is our AppButton (services-ui PrimaryButton wrapper, which
    owns the 34px height and bold label). Here we only stretch it to the
@@ -1284,12 +1408,6 @@ html.light,
   font-size: 13px;
   font-weight: 500;
   color: var(--text);
-}
-
-.sidebar__hint {
-  padding: 16px;
-  color: var(--muted);
-  font-size: 13px;
 }
 
 .sidebar__footer {

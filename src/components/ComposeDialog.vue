@@ -1,1106 +1,1049 @@
 <script setup lang="ts">
-import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
 import {
-  Bold,
-  Code,
-  Highlighter,
-  Image as ImageIcon,
-  Italic,
-  Link as LinkIcon,
-  List,
-  ListIndentDecrease,
-  ListIndentIncrease,
-  ListOrdered,
-  Redo2,
-  RemoveFormatting,
-  Strikethrough,
-  Subscript,
-  Superscript,
-  TextAlignCenter,
-  TextAlignEnd,
-  TextAlignJustify,
-  TextAlignStart,
-  Underline,
-  Undo2,
+  Check,
+  ChevronDown,
+  Paperclip,
+  RotateCw,
+  Save,
+  Send as SendIcon,
+  Trash2,
+  X,
 } from '@lucide/vue';
-import DOMPurify from 'dompurify';
-import Squire from 'squire-rte';
 
-import { useComposeStore } from '../stores/compose-store';
+import {
+  COMPOSE_PRESENTATION,
+  RECIPIENT_FIELDS,
+  useComposeStore,
+  type ComposeSession,
+  type RecipientEntry,
+  type RecipientField,
+} from '../stores/compose-store';
+import { useModalFocus } from '../composables/useModalFocus';
 import { useContactsStore } from '../stores/contacts-store';
+import { useSettingsStore } from '../stores/settings-store';
 import { COMPOSE_STATE } from '../constants/states';
+import type { IdentityRow } from '../types/db';
+import { sanitizeAttachmentFilename } from '../utils/attachment-presentation';
+import { closeContainingDropdown } from '../utils/dropdown';
+import { isComposingKeyEvent, matchesShortcut } from '../utils/keyboard';
+import { senderAvatarStyle, senderInitials } from '../utils/sender-avatar';
+import { formatBytes } from '../utils/format-bytes';
+import {
+  SCHEDULE_PRESETS,
+  formatScheduleTarget,
+  resolveSchedulePreset,
+  resolveSchedulePresets,
+  type SchedulePresetId,
+  type SchedulePresetResolution,
+} from '../utils/schedule-time';
+import {
+  IDENTITY_SIGNATURE_ORIGIN,
+  type TrackedOriginState,
+} from '../utils/compose-provenance';
 import AppButton from './AppButton.vue';
+import AppDropdown from './AppDropdown.vue';
+import AppIconButton from './AppIconButton.vue';
+import RecipientInput from './RecipientInput.vue';
+import RichTextEditor from './RichTextEditor.vue';
+import ScheduleSendDialog from './ScheduleSendDialog.vue';
+
+const props = defineProps<{
+  sessionId?: string;
+}>();
 
 const composeStore = useComposeStore();
 const contactsStore = useContactsStore();
+const settingsStore = useSettingsStore();
+const session = computed<ComposeSession | null>(() =>
+  props.sessionId
+    ? composeStore.sessionById(props.sessionId)
+    : composeStore.activeSession);
+const draft = computed(() => session.value?.draft ?? composeStore.draft);
+const sessionStatus = computed(() => session.value?.status ?? COMPOSE_STATE.IDLE);
+const sessionError = computed(() => session.value?.error ?? null);
+const isSending = computed(() => sessionStatus.value === COMPOSE_STATE.SENDING);
+const attachments = computed(() => session.value?.attachments ?? []);
+const uncheckpointedAttachmentCount = computed(() =>
+  session.value ? composeStore.uncheckpointedAttachmentCount(session.value.id) : 0);
+const attachmentBusy = computed(() =>
+  session.value ? composeStore.isAttachmentBusy(session.value.id) : false);
+const fromIdentity = computed(() => composeStore.identityForSession(session.value));
+const isExpanded = computed(() =>
+  session.value?.presentation === COMPOSE_PRESENTATION.EXPANDED);
 
-const editorEl = ref(null);
-const toolbarEl = ref(null);
-const toolbarState = ref({
-  bold: false,
-  italic: false,
-  underline: false,
-  strikethrough: false,
-  subscript: false,
-  superscript: false,
-  code: false,
-  link: false,
-  unorderedList: false,
-  orderedList: false,
-  quote: false,
-  canUndo: false,
-  canRedo: false,
-  fontFamily: '',
-  fontSize: '',
-  textColor: '#e5e7eb',
-  highlightColor: '#fef3c7',
-  direction: 'ltr',
+function fieldId(field: RecipientField): string {
+  return isExpanded.value ? `compose-${field}` : `compose-${session.value?.id}-${field}`;
+}
+
+const fromLabelId = computed(() =>
+  isExpanded.value ? 'compose-from-label' : `compose-${session.value?.id}-from-label`);
+const subjectInputId = computed(() =>
+  isExpanded.value ? 'compose-subject' : `compose-${session.value?.id}-subject`);
+const dialogTitleId = computed(() =>
+  isExpanded.value ? 'compose-title' : `compose-${session.value?.id}-title`);
+const closeTriggerLabel = computed(() =>
+  session.value && composeStore.isSessionMeaningfullyNonEmpty(session.value.id)
+    ? 'Close options'
+    : 'Close');
+
+const dialogEl = ref<HTMLElement | null>(null);
+const closePromptEl = ref<HTMLElement | null>(null);
+const attachmentInputEl = ref<HTMLInputElement | null>(null);
+const scheduleMenuTriggerEl = ref<HTMLElement | null>(null);
+const customScheduleOpen = ref(false);
+const isScheduling = ref(false);
+const scheduleUiError = ref<string | null>(null);
+const customScheduleError = ref<string | null>(null);
+interface StagedSchedule {
+  targetAt: string;
+  timeZone: string;
+  resolvedLabel: string;
+  optionLabel: string;
+}
+const stagedSchedule = ref<StagedSchedule | null>(null);
+const schedulePresets = ref<SchedulePresetResolution[]>(
+  SCHEDULE_PRESETS.map((preset) => ({
+    ...preset,
+    available: false,
+    targetAt: null,
+    resolvedLabel: null,
+    reason: 'capabilityUnavailable',
+    message: 'Checking whether scheduled sending is available.',
+  })),
+);
+let scheduleActionGeneration = 0;
+const closePromptOpen = computed(() => Boolean(session.value?.closePromptOpen));
+useModalFocus(dialogEl, {
+  containTab: true,
+  focusOnActivate: false,
+  resolveContainer: () => (
+    closePromptOpen.value ? closePromptEl.value : dialogEl.value
+  ),
 });
-const visibleToolbarGroups = ref(['style', 'font', 'insert', 'lists', 'alignment']);
-
-let squire = null;
-let lastSelection = null;
-let toolbarResizeObserver = null;
-let isResizingImage = false;
-const toolbarGroupWidths = new Map();
-
-const defaultTextColor = '#e5e7eb';
-const defaultHighlightColor = '#fef3c7';
-const toolbarGroupOrder = ['style', 'font', 'insert', 'lists', 'alignment'];
-const blockElementNames = new Set([
-  'ADDRESS',
-  'ARTICLE',
-  'ASIDE',
-  'BLOCKQUOTE',
-  'DD',
-  'DIV',
-  'DL',
-  'DT',
-  'FIGURE',
-  'FIGCAPTION',
-  'FOOTER',
-  'H1',
-  'H2',
-  'H3',
-  'H4',
-  'H5',
-  'H6',
-  'HEADER',
-  'LI',
-  'OL',
-  'P',
-  'PRE',
-  'SECTION',
-  'TABLE',
-  'TBODY',
-  'TD',
-  'TFOOT',
-  'TH',
-  'THEAD',
-  'TR',
-  'UL',
-]);
-const fontOptions = [
-  { label: 'Sans', value: 'Arial, sans-serif' },
-  { label: 'Serif', value: 'Georgia, serif' },
-  { label: 'Mono', value: '"Courier New", monospace' },
-  { label: 'Verdana', value: 'Verdana, sans-serif' },
-  { label: 'Times', value: '"Times New Roman", serif' },
-];
-const fontSizeOptions = [
-  { label: 'Small', value: '12px' },
-  { label: 'Normal', value: '14px' },
-  { label: 'Large', value: '18px' },
-  { label: 'Huge', value: '24px' },
-];
-const alignmentOptions = [
-  { label: 'Align left', value: 'left', icon: TextAlignStart },
-  { label: 'Align center', value: 'center', icon: TextAlignCenter },
-  { label: 'Align right', value: 'right', icon: TextAlignEnd },
-  { label: 'Align justify', value: 'justify', icon: TextAlignJustify },
-];
-
-function isToolbarGroupVisible(group) {
-  return visibleToolbarGroups.value.includes(group);
-}
-
-function syncDraftFromEditor() {
-  if (!squire || !editorEl.value) return;
-  composeStore.draft.htmlBody = squire.getHTML();
-  composeStore.draft.textBody = editorEl.value.innerText;
-}
-
-function rememberSelection() {
-  if (!squire) return;
-  try {
-    lastSelection = squire.getSelection().cloneRange();
-  } catch {
-    lastSelection = null;
+useModalFocus(closePromptEl, {
+  active: closePromptOpen,
+  onDefault: saveClosePrompt,
+});
+const closeMenuTriggerEl = ref<HTMLElement | null>(null);
+const selectedTimeZone = computed(() => settingsStore.get('timeZone'));
+const scheduleBusy = computed(() => isSending.value || isScheduling.value);
+const scheduleChoiceDisabled = computed(() =>
+  scheduleBusy.value
+  || !composeStore.scheduleCapabilityKnown
+  || !composeStore.canScheduleSend);
+const scheduleSegmentDisabled = computed(() =>
+  scheduleBusy.value
+  || (!stagedSchedule.value && scheduleChoiceDisabled.value));
+// One condition for the Send button and the Ctrl/⌘+Enter shortcut. The
+// close prompt sits inside this dialog, so its keystrokes reach the
+// shortcut; nothing sends while the user is deciding whether to keep it.
+const sendDisabled = computed(() =>
+  scheduleBusy.value
+  || closePromptOpen.value
+  || Boolean(session.value?.isDiscarding)
+  || attachmentBusy.value
+  || Boolean(stagedSchedule.value && scheduleChoiceDisabled.value));
+const sendButtonText = computed(() => {
+  if (isScheduling.value) return 'Scheduling…';
+  if (isSending.value) return 'Sending…';
+  return 'Send';
+});
+const scheduleTriggerLabel = computed(() => stagedSchedule.value
+  ? `Schedule send: ${stagedSchedule.value.optionLabel}`
+  : 'Schedule send');
+const scheduleTriggerTitle = computed(() => stagedSchedule.value
+  ? `${stagedSchedule.value.optionLabel} — ${stagedSchedule.value.resolvedLabel}`
+  : 'Schedule send');
+const scheduleDescriptionId = computed(() =>
+  `compose-${session.value?.id ?? 'inactive'}-schedule-description`);
+const scheduleAvailabilityMessage = computed(() => {
+  if (isScheduling.value) return 'Scheduling this message.';
+  if (stagedSchedule.value) {
+    return `Selected ${stagedSchedule.value.resolvedLabel}. `
+      + 'Click Send to schedule this message.';
   }
-}
-
-function restoreSelection() {
-  if (!squire || !lastSelection) return;
-  try {
-    squire.setSelection(lastSelection);
-  } catch {
-    lastSelection = null;
+  if (!composeStore.scheduleCapabilityKnown) {
+    return 'Checking whether scheduled sending is available.';
   }
-}
-
-function normalizeColor(value, fallback) {
-  if (/^#[0-9a-f]{6}$/i.test(value || '')) return value;
-
-  const rgb = (value || '').match(/^rgb\(\s*(\d+),\s*(\d+),\s*(\d+)\s*\)$/i);
-  if (!rgb) return fallback;
-
-  return rgb
-    .slice(1)
-    .map((channel) => Number(channel).toString(16).padStart(2, '0'))
-    .join('')
-    .replace(/^/, '#');
-}
-
-function normalizeFontFamily(value) {
-  const firstFamily = (value || '').split(',')[0].replace(/["']/g, '').trim().toLowerCase();
-  return fontOptions.find((option) => {
-    const optionFamily = option.value.split(',')[0].replace(/["']/g, '').trim().toLowerCase();
-    return optionFamily === firstFamily;
-  })?.value || '';
-}
-
-function pathHasFormat(path, tag) {
-  return new RegExp(`(?:^|>)${tag}(?:$|[.#\\[])`).test(path) || new RegExp(`(?:^|>)${tag}(?:>|$)`).test(path);
-}
-
-function stateForFormat(tag, path, range) {
-  if (path && path !== '(selection)') {
-    return pathHasFormat(path, tag);
+  if (!composeStore.canScheduleSend) {
+    return 'Scheduled sending is not supported by this account. Immediate Send is still available.';
   }
-  return !!range && squire.hasFormat(tag, null, range);
+  return `Scheduled sending uses ${selectedTimeZone.value}.`;
+});
+const richTextEditorEl = ref<{
+  focus: () => void;
+  setContent: (
+    content: string,
+    options?: { preserveFocus?: boolean },
+  ) => { html: string; text: string };
+  updateTrackedContent: (
+    originId: string,
+    content: string,
+    options?: { preserveFocus?: boolean },
+  ) => { html: string; text: string };
+} | null>(null);
+
+function saveClosePrompt(): void {
+  const current = session.value;
+  if (!current || current.isSaving) return;
+  void composeStore.saveAndClose(current.id);
 }
 
-function updateToolbarState(pathOverride = null) {
-  if (!squire) return;
+function updateDraftBody(content: { html: string; text: string }) {
+  const currentSession = session.value;
+  if (!currentSession) return;
+  composeStore.setBodyContent(content, currentSession.id, { touch: false });
+  composeStore.touchSession(currentSession.id);
+}
 
-  let range = null;
-  try {
-    range = squire.getSelection();
-  } catch {
-    // Selection may be unavailable mid-update; fall through with range=null.
-  }
+function updateTrackedOrigins(states: TrackedOriginState[]) {
+  composeStore.updateTrackedOrigins(states, session.value?.id ?? null);
+}
 
-  const path = pathOverride ?? squire.getPath();
-  const fontInfo = range ? squire.getFontInfo(range) : {};
-  toolbarState.value = {
-    ...toolbarState.value,
-    bold: stateForFormat('B', path, range),
-    italic: stateForFormat('I', path, range),
-    underline: stateForFormat('U', path, range),
-    strikethrough: stateForFormat('S', path, range),
-    subscript: stateForFormat('SUB', path, range),
-    superscript: stateForFormat('SUP', path, range),
-    code: stateForFormat('CODE', path, range) || stateForFormat('PRE', path, range),
-    link: stateForFormat('A', path, range),
-    unorderedList: /(?:^|>)UL/.test(path),
-    orderedList: /(?:^|>)OL/.test(path),
-    quote: /(?:^|>)BLOCKQUOTE/.test(path),
-    fontFamily: normalizeFontFamily(fontInfo.fontFamily),
-    fontSize: fontInfo.fontSize || '',
-    textColor: normalizeColor(fontInfo.color, toolbarState.value.textColor || defaultTextColor),
-    highlightColor: normalizeColor(
-      fontInfo.backgroundColor,
-      toolbarState.value.highlightColor || defaultHighlightColor,
-    ),
-    direction: /\[dir=rtl\]/.test(path) ? 'rtl' : 'ltr',
+interface PastedEditorFile {
+  file: File;
+  kind: 'inline' | 'attachment';
+}
+
+function openAttachmentPicker(): void {
+  attachmentInputEl.value?.click();
+}
+
+async function pickAttachments(event: Event): Promise<void> {
+  const input = event.currentTarget as HTMLInputElement;
+  const files = input.files ? Array.from(input.files) : [];
+  input.value = '';
+  if (files.length === 0 || !session.value) return;
+  await composeStore.addAttachments(files, 'picker', session.value.id);
+}
+
+async function attachPastedFiles(files: PastedEditorFile[]): Promise<void> {
+  const regular = files
+    .filter((entry) => entry.kind === 'attachment')
+    .map((entry) => entry.file);
+  if (regular.length === 0 || !session.value) return;
+  await composeStore.addAttachments(regular, 'paste', session.value.id);
+}
+
+function attachmentSize(size: number): string {
+  return formatBytes(size) ?? `${size} B`;
+}
+
+function attachmentDisplayName(name: string): string {
+  return sanitizeAttachmentFilename(name);
+}
+
+function closeScheduleMenu(): void {
+  closeContainingDropdown(scheduleMenuTriggerEl.value);
+}
+
+// Preset targets are relative to now, so they are recomputed whenever the
+// menu opens or the inputs they derive from change; the capability itself
+// is read once per signed-in account (SL-1.6).
+function refreshResolvedPresets(): void {
+  schedulePresets.value = resolveSchedulePresets({
+    now: Date.now(),
+    timeZone: selectedTimeZone.value,
+    maxDelayedSend: composeStore.scheduleMaxDelayedSend,
+    serverClockReference: composeStore.scheduleCapability.serverClockReference,
+  });
+}
+
+watch(
+  [() => composeStore.scheduleCapability, () => composeStore.canScheduleSend, selectedTimeZone],
+  refreshResolvedPresets,
+);
+
+function onScheduleMenuToggle(event: Event): void {
+  const details = event.target;
+  if (!(details instanceof HTMLDetailsElement) || !details.open) return;
+  scheduleUiError.value = null;
+  refreshResolvedPresets();
+}
+
+function stageScheduleTarget(
+  targetAt: string,
+  timeZone: string,
+  optionLabel: string,
+): void {
+  const current = session.value;
+  if (!current || scheduleChoiceDisabled.value) return;
+  scheduleUiError.value = null;
+  customScheduleError.value = null;
+  stagedSchedule.value = {
+    targetAt,
+    timeZone,
+    resolvedLabel: formatScheduleTarget(targetAt, timeZone),
+    optionLabel,
   };
+  closeScheduleMenu();
+  customScheduleOpen.value = false;
+  void nextTick(() =>
+    dialogEl.value?.querySelector<HTMLButtonElement>('.compose-send')?.focus());
 }
 
-function syncEditorState() {
-  syncDraftFromEditor();
-  rememberSelection();
-  updateToolbarState();
+function clearStagedSchedule(event: Event): void {
+  closeContainingDropdown(event);
+  stagedSchedule.value = null;
+  scheduleUiError.value = null;
 }
 
-function handleEditorInput() {
-  // Squire's image resizer mutates the <img> on every pointermove, which
-  // fires 'input'. syncDraftFromEditor() reads squire.getHTML(), and
-  // getHTML() momentarily removes and re-adds Squire's resize-handle
-  // container — which releases the in-flight pointer capture and freezes
-  // the drag after a single step. Skip the per-mutation sync while a
-  // resize handle is being dragged; we sync once when the drag ends.
-  if (isResizingImage) return;
-  syncEditorState();
-}
-
-function handleResizeHandlePointerDown(event: PointerEvent) {
-  const target = event.target as Element | null;
-  if (target?.closest?.('.squire-resize-handle')) {
-    isResizingImage = true;
-  }
-}
-
-function handleResizeHandlePointerUp() {
-  if (!isResizingImage) return;
-  isResizingImage = false;
-  syncEditorState();
-}
-
-function handlePathChange() {
-  rememberSelection();
-  updateToolbarState();
-}
-
-function handleSquirePathChange(event) {
-  rememberSelection();
-  updateToolbarState(event.detail?.path ?? null);
-}
-
-function handleUndoStateChange(event) {
-  toolbarState.value = {
-    ...toolbarState.value,
-    canUndo: !!event.detail?.canUndo,
-    canRedo: !!event.detail?.canRedo,
-  };
-}
-
-function runEditorCommand(command: (editor: any) => void, { restore = true } = {}) {
-  if (!squire) return;
-  if (restore) {
-    squire.focus();
-    restoreSelection();
-  }
-  ensureEditorBlocks();
-  command(squire);
-  syncDraftFromEditor();
-  rememberSelection();
-  updateToolbarState();
-  if (restore) {
-    squire.focus();
-  }
-}
-
-function toggleFormat(tag: string, remove: any = null, options?: any) {
-  runEditorCommand((editor: any) => {
-    const range = editor.getSelection();
-    toggleFormatInRange(editor, tag, remove, range);
-  }, options);
-}
-
-function toggleFormatInRange(editor: any, tag: string, remove: any = null, range: any = editor.getSelection()) {
-  ensureEditorBlocks();
-  if (editor.hasFormat(tag, null, range)) {
-    editor.changeFormat(null, { tag }, range);
-  } else {
-    editor.changeFormat({ tag }, remove, range);
-  }
-}
-
-function isBlockNode(node) {
-  return node.nodeType === Node.ELEMENT_NODE && blockElementNames.has(node.nodeName);
-}
-
-function shouldWrapRootChild(node) {
-  if (isBlockNode(node)) return false;
-  if (node.nodeType === Node.TEXT_NODE) return node.data.length > 0;
-  return node.nodeType === Node.ELEMENT_NODE;
-}
-
-function ensureEditorBlocks() {
-  if (!squire) return;
-
-  const root = squire.getRoot();
-  let wrapper = null;
-  Array.from(root.childNodes).forEach((child) => {
-    if (!shouldWrapRootChild(child)) {
-      wrapper = null;
-      return;
-    }
-
-    if (!wrapper) {
-      wrapper = document.createElement('div');
-      root.insertBefore(wrapper, child);
-    }
-    wrapper.appendChild(child);
+function pickSchedulePreset(id: SchedulePresetId): void {
+  if (scheduleChoiceDisabled.value) return;
+  const current = resolveSchedulePreset(id, {
+    now: Date.now(),
+    timeZone: selectedTimeZone.value,
+    maxDelayedSend: composeStore.scheduleMaxDelayedSend,
+    serverClockReference: composeStore.scheduleCapability.serverClockReference,
   });
-}
-
-function toggleList(type: 'UL' | 'OL') {
-  runEditorCommand((editor: any) => {
-    const path = editor.getPath();
-    const tag = type === 'UL' ? 'UL' : 'OL';
-    const inList = new RegExp(`(?:^|>)${tag}`).test(path);
-    if (inList) {
-      editor.removeList();
-    } else if (type === 'UL') {
-      editor.makeUnorderedList();
-    } else {
-      editor.makeOrderedList();
-    }
-  });
-}
-
-function adjustIndent(delta: number) {
-  runEditorCommand((editor: any) => {
-    const path = editor.getPath();
-    const inList = /(?:^|>)[OU]L/.test(path);
-    const inQuote = /(?:^|>)BLOCKQUOTE/.test(path);
-    const useListLevel = inList && !inQuote;
-
-    if (delta > 0) {
-      if (useListLevel) editor.increaseListLevel();
-      else editor.increaseQuoteLevel();
-    } else if (useListLevel) {
-      editor.decreaseListLevel();
-    } else {
-      editor.decreaseQuoteLevel();
-    }
-  });
-}
-
-function applyFontFace(value: string) {
-  runEditorCommand((editor: any) => editor.setFontFace(value || null));
-}
-
-function applyFontSize(value: string) {
-  runEditorCommand((editor: any) => editor.setFontSize(value || null));
-}
-
-function applyTextColor(value: string) {
-  runEditorCommand((editor: any) => editor.setTextColor(value || null));
-}
-
-function applyHighlightColor(value: string) {
-  runEditorCommand((editor: any) => editor.setHighlightColor(value || null));
-}
-
-function promptForLink() {
-  if (!squire) return;
-  restoreSelection();
-  const selectedText = squire.getSelectedText().trim();
-  const initialValue = /^https?:\/\//i.test(selectedText) || /^mailto:/i.test(selectedText) ? selectedText : '';
-  const url = window.prompt('Enter link URL', initialValue);
-  if (url === null) return;
-
-  const trimmed = url.trim();
-  runEditorCommand((editor) => {
-    if (trimmed) {
-      editor.makeLink(trimmed);
-    } else {
-      editor.removeLink();
-    }
-  });
-}
-
-function promptForImage() {
-  const src = window.prompt('Enter image URL');
-  if (src === null || !src.trim()) return;
-
-  const alt = window.prompt('Image alt text', '') ?? '';
-  runEditorCommand((editor) => editor.insertImage(src.trim(), { alt }));
-}
-
-// Pasted images are inlined as data: URLs for an instant, offline-safe
-// draft. The send pipeline (runSend) later uploads them as JMAP blobs
-// and rewrites them to cid: inline attachments so recipients see them.
-const MAX_PASTED_IMAGE_BYTES = 10 * 1024 * 1024;
-
-function insertPastedImageFile(file: File | null) {
-  if (!file || !file.type.startsWith('image/')) return;
-  if (file.size > MAX_PASTED_IMAGE_BYTES) {
-    console.warn('[compose] pasted image exceeds size limit; skipping', file.size);
+  if (!current.available || !current.targetAt) {
+    scheduleUiError.value = current.message ?? 'Choose another scheduled time.';
+    refreshResolvedPresets();
     return;
   }
-  // Capture the caret before the async read so the image lands where the
-  // user pasted rather than wherever the selection drifts to.
-  rememberSelection();
-  const reader = new FileReader();
-  reader.onload = () => {
-    const dataUrl = typeof reader.result === 'string' ? reader.result : '';
-    if (!dataUrl.startsWith('data:image/')) return;
-    runEditorCommand((editor: any) => {
-      editor.insertImage(dataUrl, { style: 'max-width:100%;height:auto;' });
-      // Centre by default via the containing block's text-align rather
-      // than the image's own margin, so the toolbar alignment buttons
-      // (which set block text-align) can re-align the image afterwards.
-      // text-align centering also survives Outlook, unlike margin:auto.
-      editor.setTextAlignment('center');
-    });
-  };
-  reader.readAsDataURL(file);
+  stageScheduleTarget(current.targetAt, selectedTimeZone.value, current.label);
 }
 
-// Squire fires 'pasteImage' for image-only clipboard payloads (it has
-// already called preventDefault), handing us the ClipboardData so we can
-// inline the bitmap ourselves.
-function handlePasteImage(event: any) {
-  const clipboardData = event?.detail?.clipboardData;
-  const items = clipboardData?.items ? Array.from(clipboardData.items) : [];
-  const imageItem = items.find(
-    (item: any) => item?.kind === 'file' && typeof item?.type === 'string' && item.type.startsWith('image/'),
-  ) as any;
-  insertPastedImageFile(imageItem?.getAsFile?.() ?? null);
+function stageCustomScheduleTarget(targetAt: string, timeZone: string): void {
+  stageScheduleTarget(targetAt, timeZone, 'Custom');
 }
 
-function syncAfterKeyboardCommand(editor, range = null) {
-  ensureEditorBlocks();
-  syncDraftFromEditor();
-  if (range) {
-    lastSelection = range.cloneRange();
+function openCustomSchedule(event: Event): void {
+  if (scheduleChoiceDisabled.value) return;
+  closeContainingDropdown(event);
+  scheduleUiError.value = null;
+  customScheduleError.value = null;
+  customScheduleOpen.value = true;
+}
+
+function closeCustomSchedule(): void {
+  if (!isScheduling.value) {
+    customScheduleOpen.value = false;
+    void nextTick(() => scheduleMenuTriggerEl.value?.focus());
+  }
+}
+
+function activateCloseTrigger(event: MouseEvent) {
+  const sessionId = session.value?.id;
+  if (!sessionId || composeStore.isSessionMeaningfullyNonEmpty(sessionId)) return;
+  event.preventDefault();
+  composeStore.close(sessionId);
+}
+
+async function discardFromCloseMenu(event: Event) {
+  const sessionId = session.value?.id;
+  if (!sessionId) return;
+  closeContainingDropdown(event);
+  if (!await composeStore.discardDraft(sessionId)) {
+    await nextTick();
+    closeMenuTriggerEl.value?.focus();
+  }
+}
+
+async function saveFromCloseMenu(event: Event) {
+  const sessionId = session.value?.id;
+  if (!sessionId) return;
+  closeContainingDropdown(event);
+  if (!await composeStore.saveAndClose(sessionId)) {
+    await nextTick();
+    closeMenuTriggerEl.value?.focus();
+  }
+}
+
+/**
+ * Where writing starts for this draft: the To field when it is empty (a
+ * fresh message begins with addressing), the body when recipients came
+ * prefilled (a reply or forward — addressing is done, prose is next).
+ * Called after the open/remount tick, so the target exists.
+ */
+function focusFreshDraft() {
+  if (!session.value || !isExpanded.value) return;
+  if (draft.value.to.length === 0) {
+    document.getElementById(fieldId('to'))?.focus();
   } else {
-    rememberSelection();
+    richTextEditorEl.value?.focus();
   }
-  updateToolbarState();
-}
-
-function registerKeyboardShortcut(key: string, command: (editor: any, range?: any) => void) {
-  squire.setKeyHandler(key, (editor: any, event: KeyboardEvent, range: any) => {
-    event.preventDefault();
-    command(editor, range);
-    syncAfterKeyboardCommand(editor, range);
-  });
-}
-
-function registerKeyboardShortcuts() {
-  ['Ctrl-b', 'Ctrl-B', 'Meta-b', 'Meta-B'].forEach((key) => registerKeyboardShortcut(
-    key,
-    (editor, range) => toggleFormatInRange(editor, 'B', null, range),
-  ));
-  ['Ctrl-i', 'Ctrl-I', 'Meta-i', 'Meta-I'].forEach((key) => registerKeyboardShortcut(
-    key,
-    (editor, range) => toggleFormatInRange(editor, 'I', null, range),
-  ));
-  ['Ctrl-u', 'Ctrl-U', 'Meta-u', 'Meta-U'].forEach((key) => registerKeyboardShortcut(
-    key,
-    (editor, range) => toggleFormatInRange(editor, 'U', null, range),
-  ));
-  ['Ctrl-z', 'Meta-z'].forEach((key) => registerKeyboardShortcut(key, (editor) => editor.undo()));
-  ['Ctrl-y', 'Meta-y', 'Ctrl-Shift-z', 'Ctrl-Shift-Z', 'Meta-Shift-z', 'Meta-Shift-Z']
-    .forEach((key) => registerKeyboardShortcut(key, (editor) => editor.redo()));
-  ['Ctrl-k', 'Meta-k'].forEach((key) => {
-    squire.setKeyHandler(key, (editor, event, range) => {
-      event.preventDefault();
-      lastSelection = range.cloneRange();
-      promptForLink();
-    });
-  });
-}
-
-function elementOuterWidth(element) {
-  const styles = window.getComputedStyle(element);
-  const rectWidth = element.getBoundingClientRect().width || element.offsetWidth || 0;
-  return rectWidth + Number.parseFloat(styles.marginLeft || '0') + Number.parseFloat(styles.marginRight || '0');
-}
-
-function updateToolbarOverflow() {
-  if (!toolbarEl.value) return;
-
-  toolbarEl.value.querySelectorAll('[data-toolbar-group]').forEach((groupEl) => {
-    const group = groupEl.dataset.toolbarGroup;
-    const width = elementOuterWidth(groupEl);
-    if (group && width > 0) {
-      toolbarGroupWidths.set(group, width);
-    }
-  });
-
-  const toolbarWidth = toolbarEl.value.clientWidth || toolbarEl.value.getBoundingClientRect().width;
-  if (!toolbarWidth) return;
-
-  const moreWidth = elementOuterWidth(toolbarEl.value.querySelector('.toolbar-more')) || 70;
-  const toolbarGap = 4;
-  const nextVisible = [...toolbarGroupOrder];
-  const widthFor = (group) => toolbarGroupWidths.get(group) ?? 0;
-  const totalWidth = () =>
-    moreWidth + (nextVisible.length * toolbarGap) + nextVisible.reduce((sum, group) => sum + widthFor(group), 0);
-
-  while (nextVisible.length > 1 && totalWidth() > toolbarWidth) {
-    nextVisible.pop();
-  }
-
-  if (nextVisible.join('|') !== visibleToolbarGroups.value.join('|')) {
-    visibleToolbarGroups.value = nextVisible;
-  }
-}
-
-function scheduleToolbarOverflowUpdate() {
-  void nextTick().then(updateToolbarOverflow);
-}
-
-function ensureSquireSanitizer() {
-  (window as any).DOMPurify ??= DOMPurify;
-  (globalThis as any).DOMPurify ??= DOMPurify;
-}
-
-function observeToolbarSize() {
-  toolbarResizeObserver?.disconnect();
-  toolbarResizeObserver = null;
-  if ('ResizeObserver' in window && toolbarEl.value) {
-    toolbarResizeObserver = new window.ResizeObserver(scheduleToolbarOverflowUpdate);
-    toolbarResizeObserver.observe(toolbarEl.value);
-  }
-}
-
-function destroyEditor() {
-  toolbarResizeObserver?.disconnect();
-  toolbarResizeObserver = null;
-  document.removeEventListener('pointerdown', handleResizeHandlePointerDown, true);
-  document.removeEventListener('pointerup', handleResizeHandlePointerUp);
-  document.removeEventListener('pointercancel', handleResizeHandlePointerUp);
-  isResizingImage = false;
-  squire?.destroy?.();
-  squire = null;
-  lastSelection = null;
-}
-
-function initEditor() {
-  if (!editorEl.value) return;
-  destroyEditor();
-  ensureSquireSanitizer();
-  squire = new Squire(editorEl.value);
-  squire.setHTML(composeStore.draft.htmlBody || '<p><br></p>');
-  registerKeyboardShortcuts();
-  squire.addEventListener('input', handleEditorInput);
-  squire.addEventListener('pasteImage', handlePasteImage);
-  squire.addEventListener('pathChange', handleSquirePathChange);
-  squire.addEventListener('select', handlePathChange);
-  squire.addEventListener('cursor', handlePathChange);
-  squire.addEventListener('undoStateChange', handleUndoStateChange);
-  // Squire's resize handles capture the pointer; track drag start/end so
-  // handleEditorInput can suppress the getHTML sync that would break it.
-  // pointerdown is captured because Squire stops propagation on the handle.
-  document.addEventListener('pointerdown', handleResizeHandlePointerDown, true);
-  document.addEventListener('pointerup', handleResizeHandlePointerUp);
-  document.addEventListener('pointercancel', handleResizeHandlePointerUp);
-  updateToolbarState();
-  scheduleToolbarOverflowUpdate();
-  observeToolbarSize();
 }
 
 onMounted(() => {
-  window.addEventListener('resize', scheduleToolbarOverflowUpdate);
-  if (composeStore.isOpen) {
-    void nextTick().then(initEditor);
+  refreshResolvedPresets();
+  if (session.value && isExpanded.value) {
+    void nextTick().then(() => {
+      if (isExpanded.value) focusFreshDraft();
+    });
   }
 });
 
-watch(() => composeStore.isOpen, (open) => {
-  if (open) {
-    void nextTick().then(initEditor);
+watch(() => session.value?.id, (nextId, previousId) => {
+  if (nextId && nextId !== previousId) {
+    scheduleActionGeneration += 1;
+    customScheduleOpen.value = false;
+    isScheduling.value = false;
+    scheduleUiError.value = null;
+    customScheduleError.value = null;
+    stagedSchedule.value = null;
+    refreshResolvedPresets();
+    void nextTick().then(() => {
+      if (isExpanded.value) focusFreshDraft();
+    });
+  }
+});
+
+watch(() => session.value?.draftEpoch, (nextEpoch, previousEpoch) => {
+  if (nextEpoch !== previousEpoch) void nextTick().then(focusFreshDraft);
+});
+
+watch(isExpanded, (expanded) => {
+  if (expanded) {
+    refreshResolvedPresets();
+    void nextTick().then(focusFreshDraft);
   } else {
-    destroyEditor();
+    customScheduleOpen.value = false;
+    closeScheduleMenu();
   }
 });
 
-onUnmounted(() => {
-  window.removeEventListener('resize', scheduleToolbarOverflowUpdate);
-  destroyEditor();
+watch(
+  () => [session.value?.id, session.value?.bodyVersion] as const,
+  ([nextId, nextVersion], [previousId, previousVersion]) => {
+    if (!nextId || nextId !== previousId || nextVersion === previousVersion) return;
+    void nextTick().then(() => {
+      const current = session.value;
+      if (!current || current.id !== nextId || current.bodyVersion !== nextVersion) return;
+      richTextEditorEl.value?.updateTrackedContent(
+        IDENTITY_SIGNATURE_ORIGIN,
+        current.editorHtmlBody,
+        { preserveFocus: true },
+      );
+    });
+  },
+);
+
+/**
+ * The committed recipients of each field, as the control shows them.
+ *
+ * Held here rather than read from the store on render because the order the
+ * two kinds appear in is the control's: a fragment stays between the
+ * addresses it was typed between, which the draft does not record. The
+ * store keeps what the message carries and what refuses the send.
+ */
+const recipientEntries = reactive<Record<RecipientField, RecipientEntry[]>>({
+  to: [],
+  cc: [],
+  bcc: [],
 });
 
-const autocompleteSuggestions = ref([]);
-const autocompleteFor = ref(null);
+// Cc and Bcc stay out of the way until they hold something or are asked
+// for: three empty fields on every new message is the reason they were
+// left out in the first place.
+const showCc = ref(false);
+const showBcc = ref(false);
 
-async function onRecipientInput(field) {
-  autocompleteFor.value = field;
-  const value = composeStore.draft[field];
-  const lastTokenMatch = value.match(/(?:^|,)\s*([^,]+)$/);
-  const prefix = (lastTokenMatch?.[1] ?? '').trim();
-  if (prefix.length < 2) {
-    autocompleteSuggestions.value = [];
-    return;
-  }
-  autocompleteSuggestions.value = await contactsStore.autocomplete(prefix, 8);
+const RECIPIENT_LABELS: Record<RecipientField, string> = { to: 'To', cc: 'Cc', bcc: 'Bcc' };
+
+const visibleRecipientFields = computed<RecipientField[]>(() => [
+  'to',
+  ...(showCc.value ? (['cc'] as const) : []),
+  ...(showBcc.value ? (['bcc'] as const) : []),
+]);
+
+watch(
+  () => [
+    session.value?.id,
+    session.value?.draftEpoch,
+    session.value?.recipientVersion,
+  ] as const,
+  () => {
+    const sessionId = session.value?.id;
+    if (!sessionId) return;
+    for (const field of RECIPIENT_FIELDS) {
+      recipientEntries[field] = composeStore.recipientEntries(field, sessionId);
+    }
+    showCc.value = draft.value.cc.length > 0;
+    showBcc.value = draft.value.bcc.length > 0;
+  },
+  { immediate: true },
+);
+
+function setEntries(field: RecipientField, entries: RecipientEntry[]) {
+  recipientEntries[field] = entries;
+  composeStore.setRecipientEntries(field, entries, session.value?.id ?? null);
 }
 
-function applySuggestion(field: 'to' | 'cc' | 'bcc', candidate: any) {
-  const value = composeStore.draft[field];
-  const lastTokenIdx = value.lastIndexOf(',');
-  const prefix = lastTokenIdx >= 0 ? value.slice(0, lastTokenIdx + 1) + ' ' : '';
-  const formatted = candidate.name
-    ? `${candidate.name} <${candidate.email}>`
-    : candidate.email;
-  composeStore.draft[field] = `${prefix}${formatted}, `;
-  autocompleteSuggestions.value = [];
+/** Reveal Cc or Bcc and put the cursor in it. */
+function revealField(field: 'cc' | 'bcc') {
+  if (field === 'cc') showCc.value = true;
+  else showBcc.value = true;
+  void nextTick().then(() => document.getElementById(fieldId(field))?.focus());
+}
+
+/**
+ * A Cc or Bcc left empty collapses when focus leaves the row, so an
+ * unused field is not left open. focusout bubbles from the control's
+ * input to this row; relatedTarget still inside the row means focus only
+ * moved between the field and its own pills, which is not leaving.
+ *
+ * The empty check is deferred a tick because leaving the field also
+ * commits any pending text, and a committed recipient must keep the
+ * field open. To never hides.
+ */
+function onRecipientFocusOut(field: RecipientField, event: FocusEvent) {
+  if (field === 'to') return;
+  const row = event.currentTarget as HTMLElement | null;
+  const next = event.relatedTarget as Node | null;
+  if (row && next && row.contains(next)) return;
+  void nextTick().then(() => {
+    if (recipientEntries[field].length > 0) return;
+    if (field === 'cc') showCc.value = false;
+    else showBcc.value = false;
+  });
+}
+
+/**
+ * Addresses this message already carries in its other fields. Offering one
+ * of them again spends a row of the list on a recipient who is already on
+ * the message.
+ */
+function takenElsewhere(field: RecipientField): string[] {
+  return RECIPIENT_FIELDS
+    .filter((other) => other !== field)
+    .flatMap((other) => draft.value[other].map((address) => address.email));
+}
+
+function queryContacts(prefix: string, limit: number, exclude: string[]) {
+  return contactsStore.autocomplete(prefix, limit, exclude);
+}
+
+/**
+ * The whole address book, for the browse path. The Contacts space is the
+ * other place this list lives, and it is behind this dialog rather than
+ * beside it, so the browse path stays in the field. No limit is passed:
+ * CS-3.12 requires every contact to be selectable from the browse list.
+ */
+async function browseAllContacts() {
+  return contactsStore.browseAutocompleteCandidates();
+}
+
+/** Ctrl/⌘+Enter sends from anywhere in the dialog, under the Send button's own guard. */
+function onDialogKeydown(event: KeyboardEvent) {
+  if (event.defaultPrevented || isComposingKeyEvent(event)) return;
+  if (!matchesShortcut(event, { key: 'Enter', mod: true })) return;
+  event.preventDefault();
+  if (sendDisabled.value) return;
+  void send();
 }
 
 async function send() {
-  await composeStore.send();
+  if (isScheduling.value) return;
+  const current = session.value;
+  const schedule = stagedSchedule.value;
+  if (!current || !schedule) {
+    await composeStore.send(current?.id ?? null);
+    return;
+  }
+  const actionGeneration = ++scheduleActionGeneration;
+  isScheduling.value = true;
+  scheduleUiError.value = null;
+  try {
+    const scheduled = await composeStore.scheduleSend(
+      current.id,
+      schedule.targetAt,
+      schedule.timeZone,
+    );
+    if (
+      actionGeneration === scheduleActionGeneration
+      && session.value?.id === current.id
+      && !scheduled
+    ) {
+      scheduleUiError.value = sessionError.value
+        ?? 'Could not schedule this message. Try another time.';
+    }
+  } finally {
+    if (actionGeneration === scheduleActionGeneration) {
+      isScheduling.value = false;
+    }
+  }
 }
 
-function selectFromIdentity(event: Event) {
-  const select = event.target as HTMLSelectElement | null;
-  composeStore.selectFromIndex(select?.value ?? 0);
+function pickFromIdentity(idx: number, event: Event) {
+  closeContainingDropdown(event);
+  composeStore.selectFromIndex(idx, session.value?.id ?? null);
+}
+
+function identityLabel(id: IdentityRow | null): string {
+  if (!id) return '';
+  return id.name ? `${id.name} <${id.email}>` : id.email;
+}
+
+/** The message list's sender circle, so one address is one color everywhere. */
+function identityAvatarStyle(id: IdentityRow): Record<string, string> {
+  return senderAvatarStyle(id.email);
+}
+
+function identityInitials(id: IdentityRow): string {
+  return senderInitials(id.name?.trim() || id.email);
 }
 </script>
 
 <template>
-  <div v-if="composeStore.isOpen" class="compose-dialog" role="dialog" aria-label="Compose">
+    <div
+      v-if="session"
+      v-show="isExpanded"
+      ref="dialogEl"
+      class="compose-dialog"
+      :class="{ 'compose-dialog--expanded': isExpanded }"
+      role="dialog"
+      aria-modal="true"
+      :aria-labelledby="dialogTitleId"
+      :aria-hidden="customScheduleOpen ? 'true' : undefined"
+      tabindex="-1"
+      @keydown="onDialogKeydown"
+    >
     <div class="compose-dialog__card">
       <header>
-        <h2>{{ composeStore.draft.subject || 'New Message' }}</h2>
-        <button type="button" class="icon" @click="composeStore.close()" aria-label="Close" title="Close">×</button>
+        <h2 :id="dialogTitleId">{{ draft.subject || 'New Message' }}</h2>
+        <div class="compose-dialog__window-actions">
+          <button
+            type="button"
+            class="icon icon--minimize"
+            :disabled="scheduleBusy || session.isSaving || session.isDiscarding"
+            :title="isScheduling
+              ? 'Scheduling — please wait'
+              : (isSending ? 'Sending — please wait' : 'Minimize')"
+            aria-label="Minimize"
+            @click="composeStore.minimize(session.id)"
+          >−</button>
+          <AppDropdown
+            class="compose-close-menu"
+            :disabled="scheduleBusy || session.isDiscarding"
+          >
+            <summary
+              ref="closeMenuTriggerEl"
+              class="icon compose-close-menu__trigger"
+              role="button"
+              aria-haspopup="menu"
+              :title="isScheduling
+                ? 'Scheduling — please wait'
+                : (isSending ? 'Sending — please wait' : closeTriggerLabel)"
+              :aria-label="closeTriggerLabel"
+              :aria-disabled="scheduleBusy || session.isDiscarding
+                ? 'true'
+                : undefined"
+              :tabindex="scheduleBusy || session.isDiscarding ? -1 : undefined"
+              @click="activateCloseTrigger"
+            >×</summary>
+            <div
+              class="app-dropdown__menu compose-close-menu__menu"
+              role="menu"
+              aria-label="Close options"
+            >
+              <button
+                type="button"
+                class="app-dropdown__item compose-close-menu__discard"
+                role="menuitem"
+                :disabled="scheduleBusy || session.isDiscarding"
+                @click="discardFromCloseMenu"
+              >
+                <Trash2 :size="15" aria-hidden="true" />
+                <span>Discard</span>
+              </button>
+              <button
+                type="button"
+                class="app-dropdown__item"
+                role="menuitem"
+                :disabled="scheduleBusy || session.isSaving || session.isDiscarding"
+                @click="saveFromCloseMenu"
+              >
+                <Save :size="15" aria-hidden="true" />
+                <span>Save Draft</span>
+              </button>
+            </div>
+          </AppDropdown>
+        </div>
       </header>
 
       <div class="row">
-        <label>From</label>
-        <select :value="composeStore.draft.fromIdx" @change="selectFromIdentity">
-          <option v-for="(id, idx) in composeStore.identities" :key="id.id" :value="idx">
-            {{ id.name ? `${id.name} <${id.email}>` : id.email }}
-          </option>
-        </select>
+        <label :id="fromLabelId">From</label>
+        <!-- An identity is a person with an address, so its rows wear the
+             same avatar-and-two-lines dress the suggestion list and the
+             message list use: one look for one kind of thing. -->
+        <AppDropdown class="from-picker" data-compose-from>
+          <summary
+            class="app-dropdown__summary from-picker__summary"
+            :aria-labelledby="fromLabelId"
+          >
+            <span
+              v-if="fromIdentity"
+              class="from-picker__avatar"
+              aria-hidden="true"
+              :style="identityAvatarStyle(fromIdentity)"
+            >{{ identityInitials(fromIdentity) }}</span>
+            <span class="from-picker__summary-text">
+              {{ session.unresolvedFrom
+                ? `Unavailable identity: ${session.unresolvedFrom.email}`
+                : identityLabel(fromIdentity) }}
+            </span>
+          </summary>
+          <div class="app-dropdown__menu from-picker__menu" role="menu" aria-label="From identity">
+            <button
+              v-for="(id, idx) in composeStore.identities"
+              :key="id.id"
+              type="button"
+              class="app-dropdown__item from-picker__option"
+              role="menuitemradio"
+              :aria-checked="idx === draft.fromIdx"
+              @click="pickFromIdentity(idx, $event)"
+            >
+              <span
+                class="from-picker__avatar"
+                aria-hidden="true"
+                :style="identityAvatarStyle(id)"
+              >{{ identityInitials(id) }}</span>
+              <span class="from-picker__lines">
+                <span v-if="id.name" class="from-picker__name">{{ id.name }}</span>
+                <span class="from-picker__email" :class="{ 'from-picker__email--primary': !id.name }">
+                  {{ id.email }}
+                </span>
+              </span>
+              <Check v-if="idx === draft.fromIdx" :size="15" class="from-picker__check" />
+            </button>
+          </div>
+        </AppDropdown>
+      </div>
+
+      <!-- Remounted per draft: the control owns the text being typed, and a
+           reply that replaces the draft has to replace that too. -->
+      <div
+        v-for="field in visibleRecipientFields"
+        :key="field"
+        class="row row--recipient"
+        :class="{ 'row--to': field === 'to' }"
+        @focusout="onRecipientFocusOut(field, $event)"
+      >
+        <label :for="fieldId(field)">{{ RECIPIENT_LABELS[field] }}</label>
+        <RecipientInput
+          :key="`${session.id}-${field}-${session.draftEpoch}`"
+          :input-id="fieldId(field)"
+          :label="RECIPIENT_LABELS[field]"
+          :entries="recipientEntries[field]"
+          :taken="takenElsewhere(field)"
+          :query="queryContacts"
+          :browse-all="browseAllContacts"
+          @update:entries="(entries: RecipientEntry[]) => setEntries(field, entries)"
+          @update:pending-text="(value: string) =>
+            composeStore.setPendingRecipientText(field, value, session.id)"
+        />
+        <!-- Cc/Bcc live at the right of To, both offered at once. Each
+             reveals its field; an empty field hides again on blur, so the
+             toggle returns. -->
+        <div v-if="field === 'to'" class="recipient-cc-toggles">
+          <button
+            v-if="!showCc"
+            type="button"
+            class="recipient-toggle"
+            @click="revealField('cc')"
+          >Cc</button>
+          <button
+            v-if="!showBcc"
+            type="button"
+            class="recipient-toggle"
+            @click="revealField('bcc')"
+          >Bcc</button>
+        </div>
       </div>
 
       <div class="row">
-        <label>To</label>
+        <label :for="subjectInputId">Subject</label>
         <input
+          :id="subjectInputId"
           type="text"
-          v-model="composeStore.draft.to"
-          @input="onRecipientInput('to')"
-          autocomplete="off"
+          v-model="draft.subject"
+          @input="composeStore.touchSession(session.id)"
         />
       </div>
-      <ul v-if="autocompleteFor === 'to' && autocompleteSuggestions.length > 0" class="autocomplete">
-        <li v-for="s in autocompleteSuggestions" :key="`${s.email}-${s.source}`">
-          <button type="button" @click="applySuggestion('to', s)">
-            <span class="ac-name">{{ s.name || s.email }}</span>
-            <span class="ac-email">{{ s.email }}</span>
-            <span class="ac-source">{{ s.source }}</span>
-          </button>
-        </li>
-      </ul>
 
-      <div class="row">
-        <label>Subject</label>
-        <input type="text" v-model="composeStore.draft.subject" />
-      </div>
+      <RichTextEditor
+        ref="richTextEditorEl"
+        :content-key="session.id"
+        :initial-html="session.editorHtmlBody"
+        accessible-label="Message body"
+        @tracked-origin-state="updateTrackedOrigins"
+        @update="updateDraftBody"
+        @paste-files="attachPastedFiles"
+      />
 
-      <div ref="toolbarEl" class="compose-toolbar" role="toolbar" aria-label="Rich text formatting" @pointerdown.capture="rememberSelection">
-        <div v-if="isToolbarGroupVisible('style')" class="toolbar-group" data-toolbar-group="style">
-          <button
-            type="button"
-            class="toolbar-button"
-            :class="{ active: toolbarState.bold }"
-            aria-label="Bold"
-            title="Bold"
-            @mousedown.prevent
-            @click="toggleFormat('B')"
-          >
-            <Bold :size="15" />
-          </button>
-          <button
-            type="button"
-            class="toolbar-button"
-            :class="{ active: toolbarState.italic }"
-            aria-label="Italic"
-            title="Italic"
-            @mousedown.prevent
-            @click="toggleFormat('I')"
-          >
-            <Italic :size="15" />
-          </button>
-          <button
-            type="button"
-            class="toolbar-button"
-            :class="{ active: toolbarState.underline }"
-            aria-label="Underline"
-            title="Underline"
-            @mousedown.prevent
-            @click="toggleFormat('U')"
-          >
-            <Underline :size="15" />
-          </button>
-          <button
-            type="button"
-            class="toolbar-button"
-            :class="{ active: toolbarState.strikethrough }"
-            aria-label="Strikethrough"
-            title="Strikethrough"
-            @mousedown.prevent
-            @click="toggleFormat('S')"
-          >
-            <Strikethrough :size="15" />
-          </button>
-        </div>
-
-        <div v-if="isToolbarGroupVisible('font')" class="toolbar-group" data-toolbar-group="font">
-          <select
-            class="toolbar-select"
-            :value="toolbarState.fontFamily"
-            aria-label="Font family"
-            title="Font family"
-            @mousedown="rememberSelection"
-            @change="applyFontFace(($event.target as HTMLInputElement | HTMLSelectElement).value)"
-          >
-            <option value="">Font</option>
-            <option v-for="font in fontOptions" :key="font.value" :value="font.value">
-              {{ font.label }}
-            </option>
-          </select>
-          <select
-            class="toolbar-select toolbar-select--size"
-            :value="toolbarState.fontSize"
-            aria-label="Font size"
-            title="Font size"
-            @mousedown="rememberSelection"
-            @change="applyFontSize(($event.target as HTMLInputElement | HTMLSelectElement).value)"
-          >
-            <option value="">Size</option>
-            <option v-for="size in fontSizeOptions" :key="size.value" :value="size.value">
-              {{ size.label }}
-            </option>
-          </select>
-          <label class="toolbar-color" title="Text color">
-            <span>A</span>
-            <input
-              type="color"
-              :value="toolbarState.textColor"
-              aria-label="Text color"
-              @mousedown="rememberSelection"
-              @input="applyTextColor(($event.target as HTMLInputElement | HTMLSelectElement).value)"
-            />
-          </label>
-          <label class="toolbar-color" title="Highlight color">
-            <Highlighter :size="15" />
-            <input
-              type="color"
-              :value="toolbarState.highlightColor"
-              aria-label="Highlight color"
-              @mousedown="rememberSelection"
-              @input="applyHighlightColor(($event.target as HTMLInputElement | HTMLSelectElement).value)"
-            />
-          </label>
-        </div>
-
-        <div v-if="isToolbarGroupVisible('insert')" class="toolbar-group" data-toolbar-group="insert">
-          <button
-            type="button"
-            class="toolbar-button"
-            aria-label="Insert image"
-            title="Insert image"
-            @mousedown.prevent
-            @click="promptForImage"
-          >
-            <ImageIcon :size="15" />
-          </button>
-          <button
-            type="button"
-            class="toolbar-button"
-            :class="{ active: toolbarState.link }"
-            aria-label="Insert or remove link"
-            title="Insert or remove link"
-            @mousedown.prevent
-            @click="promptForLink"
-          >
-            <LinkIcon :size="15" />
-          </button>
-        </div>
-
-        <div v-if="isToolbarGroupVisible('lists')" class="toolbar-group" data-toolbar-group="lists">
-          <button
-            type="button"
-            class="toolbar-button"
-            :class="{ active: toolbarState.unorderedList }"
-            aria-label="Bulleted list"
-            title="Bulleted list"
-            @mousedown.prevent
-            @click="toggleList('UL')"
-          >
-            <List :size="15" />
-          </button>
-          <button
-            type="button"
-            class="toolbar-button"
-            :class="{ active: toolbarState.orderedList }"
-            aria-label="Numbered list"
-            title="Numbered list"
-            @mousedown.prevent
-            @click="toggleList('OL')"
-          >
-            <ListOrdered :size="15" />
-          </button>
-          <button
-            type="button"
-            class="toolbar-button"
-            aria-label="Decrease quote or list indent"
-            title="Decrease quote or list indent"
-            @mousedown.prevent
-            @click="adjustIndent(-1)"
-          >
-            <ListIndentDecrease :size="15" />
-          </button>
-          <button
-            type="button"
-            class="toolbar-button"
-            :class="{ active: toolbarState.quote }"
-            aria-label="Increase quote or list indent"
-            title="Increase quote or list indent"
-            @mousedown.prevent
-            @click="adjustIndent(1)"
-          >
-            <ListIndentIncrease :size="15" />
-          </button>
-        </div>
-
-        <div v-if="isToolbarGroupVisible('alignment')" class="toolbar-group" data-toolbar-group="alignment">
-          <button
-            v-for="alignment in alignmentOptions"
-            :key="alignment.value"
-            type="button"
-            class="toolbar-button"
-            :aria-label="alignment.label"
-            :title="alignment.label"
-            @mousedown.prevent
-            @click="runEditorCommand((editor) => editor.setTextAlignment(alignment.value))"
-          >
-            <component :is="alignment.icon" :size="15" />
-          </button>
-        </div>
-
-        <details class="toolbar-more">
-          <summary class="toolbar-button toolbar-more__summary" @mousedown.prevent>
-            More
-          </summary>
-          <div class="toolbar-more__menu" role="menu" aria-label="More formatting options">
-            <div v-if="!isToolbarGroupVisible('font')" class="toolbar-menu-section" role="group" aria-label="Font formatting">
-              <label class="toolbar-menu-field">
-                <span>Font</span>
-                <select
-                  :value="toolbarState.fontFamily"
-                  aria-label="Font family"
-                  @mousedown="rememberSelection"
-                  @change="applyFontFace(($event.target as HTMLInputElement | HTMLSelectElement).value)"
-                >
-                  <option value="">Default</option>
-                  <option v-for="font in fontOptions" :key="font.value" :value="font.value">
-                    {{ font.label }}
-                  </option>
-                </select>
-              </label>
-              <label class="toolbar-menu-field">
-                <span>Size</span>
-                <select
-                  :value="toolbarState.fontSize"
-                  aria-label="Font size"
-                  @mousedown="rememberSelection"
-                  @change="applyFontSize(($event.target as HTMLInputElement | HTMLSelectElement).value)"
-                >
-                  <option value="">Default</option>
-                  <option v-for="size in fontSizeOptions" :key="size.value" :value="size.value">
-                    {{ size.label }}
-                  </option>
-                </select>
-              </label>
-              <label class="toolbar-menu-field">
-                <span>Text color</span>
-                <input
-                  type="color"
-                  :value="toolbarState.textColor"
-                  aria-label="Text color"
-                  @mousedown="rememberSelection"
-                  @input="applyTextColor(($event.target as HTMLInputElement | HTMLSelectElement).value)"
-                />
-              </label>
-              <label class="toolbar-menu-field">
-                <span>Highlight</span>
-                <input
-                  type="color"
-                  :value="toolbarState.highlightColor"
-                  aria-label="Highlight color"
-                  @mousedown="rememberSelection"
-                  @input="applyHighlightColor(($event.target as HTMLInputElement | HTMLSelectElement).value)"
-                />
-              </label>
+      <section
+        v-if="attachments.length > 0"
+        class="compose-attachments"
+        aria-label="Attachments"
+      >
+        <article
+          v-for="attachment in attachments"
+          :key="attachment.clientId"
+          class="compose-attachment"
+        >
+          <div class="compose-attachment__details">
+            <strong class="compose-attachment__name">
+              {{ attachmentDisplayName(attachment.name) }}
+            </strong>
+            <span class="compose-attachment__meta">
+              {{ attachmentSize(attachment.size) }}
+              <template v-if="attachment.status === 'ready'"> · Ready</template>
+              <template v-else-if="attachment.status === 'failed'"> · Upload failed</template>
+            </span>
+            <div
+              v-if="attachment.status === 'uploading'"
+              class="compose-attachment__progress"
+            >
+              <progress
+                :value="attachment.progress"
+                max="100"
+                :aria-label="`Uploading ${attachmentDisplayName(attachment.name)}: ${attachment.progress}%`"
+              />
+              <span>{{ attachment.progress }}%</span>
             </div>
-
-            <div v-if="!isToolbarGroupVisible('insert')" class="toolbar-menu-section" role="group" aria-label="Insert">
-              <button
-                type="button"
-                class="toolbar-menu-button"
-                role="menuitem"
-                @mousedown.prevent
-                @click="promptForImage"
-              >
-                <ImageIcon :size="15" />
-                <span>Insert image</span>
-              </button>
-              <button
-                type="button"
-                class="toolbar-menu-button"
-                :class="{ active: toolbarState.link }"
-                role="menuitem"
-                @mousedown.prevent
-                @click="promptForLink"
-              >
-                <LinkIcon :size="15" />
-                <span>Link</span>
-              </button>
-            </div>
-
-            <div v-if="!isToolbarGroupVisible('lists')" class="toolbar-menu-section" role="group" aria-label="Lists and indentation">
-              <button
-                type="button"
-                class="toolbar-menu-button"
-                :class="{ active: toolbarState.unorderedList }"
-                role="menuitem"
-                @mousedown.prevent
-                @click="toggleList('UL')"
-              >
-                <List :size="15" />
-                <span>Bulleted list</span>
-              </button>
-              <button
-                type="button"
-                class="toolbar-menu-button"
-                :class="{ active: toolbarState.orderedList }"
-                role="menuitem"
-                @mousedown.prevent
-                @click="toggleList('OL')"
-              >
-                <ListOrdered :size="15" />
-                <span>Numbered list</span>
-              </button>
-              <button
-                type="button"
-                class="toolbar-menu-button"
-                role="menuitem"
-                @mousedown.prevent
-                @click="adjustIndent(-1)"
-              >
-                <ListIndentDecrease :size="15" />
-                <span>Decrease indent</span>
-              </button>
-              <button
-                type="button"
-                class="toolbar-menu-button"
-                :class="{ active: toolbarState.quote }"
-                role="menuitem"
-                @mousedown.prevent
-                @click="adjustIndent(1)"
-              >
-                <ListIndentIncrease :size="15" />
-                <span>Increase indent</span>
-              </button>
-            </div>
-
-            <div v-if="!isToolbarGroupVisible('alignment')" class="toolbar-menu-section" role="group" aria-label="Alignment">
-              <button
-                v-for="alignment in alignmentOptions"
-                :key="alignment.value"
-                type="button"
-                class="toolbar-menu-button"
-                role="menuitem"
-                @mousedown.prevent
-                @click="runEditorCommand((editor) => editor.setTextAlignment(alignment.value))"
-              >
-                <component :is="alignment.icon" :size="15" />
-                <span>{{ alignment.label }}</span>
-              </button>
-            </div>
-
-            <div class="toolbar-menu-section" role="group" aria-label="More formatting">
-            <button
-              type="button"
-              class="toolbar-menu-button"
-              :class="{ active: toolbarState.direction === 'ltr' }"
-              role="menuitem"
-              @mousedown.prevent
-              @click="runEditorCommand((editor) => editor.setTextDirection('ltr'))"
-            >
-              <span>LTR</span>
-              <span>Left-to-right</span>
-            </button>
-            <button
-              type="button"
-              class="toolbar-menu-button"
-              :class="{ active: toolbarState.direction === 'rtl' }"
-              role="menuitem"
-              @mousedown.prevent
-              @click="runEditorCommand((editor) => editor.setTextDirection('rtl'))"
-            >
-              <span>RTL</span>
-              <span>Right-to-left</span>
-            </button>
-            <button
-              type="button"
-              class="toolbar-menu-button"
-              :class="{ active: toolbarState.subscript }"
-              role="menuitem"
-              @mousedown.prevent
-              @click="toggleFormat('SUB', { tag: 'SUP' })"
-            >
-              <Subscript :size="15" />
-              <span>Subscript</span>
-            </button>
-            <button
-              type="button"
-              class="toolbar-menu-button"
-              :class="{ active: toolbarState.superscript }"
-              role="menuitem"
-              @mousedown.prevent
-              @click="toggleFormat('SUP', { tag: 'SUB' })"
-            >
-              <Superscript :size="15" />
-              <span>Superscript</span>
-            </button>
-            <button
-              type="button"
-              class="toolbar-menu-button"
-              :class="{ active: toolbarState.code }"
-              role="menuitem"
-              @mousedown.prevent
-              @click="runEditorCommand((editor) => editor.toggleCode())"
-            >
-              <Code :size="15" />
-              <span>Code</span>
-            </button>
-            <button
-              type="button"
-              class="toolbar-menu-button"
-              role="menuitem"
-              @mousedown.prevent
-              @click="runEditorCommand((editor) => editor.removeAllFormatting())"
-            >
-              <RemoveFormatting :size="15" />
-              <span>Clear formatting</span>
-            </button>
-            <button
-              type="button"
-              class="toolbar-menu-button"
-              :disabled="!toolbarState.canUndo"
-              role="menuitem"
-              @mousedown.prevent
-              @click="runEditorCommand((editor) => editor.undo())"
-            >
-              <Undo2 :size="15" />
-              <span>Undo</span>
-            </button>
-            <button
-              type="button"
-              class="toolbar-menu-button"
-              :disabled="!toolbarState.canRedo"
-              role="menuitem"
-              @mousedown.prevent
-              @click="runEditorCommand((editor) => editor.redo())"
-            >
-              <Redo2 :size="15" />
-              <span>Redo</span>
-            </button>
-            </div>
+            <span
+              v-if="attachment.error"
+              class="compose-attachment__error"
+              role="status"
+            >{{ attachment.error }}</span>
           </div>
-        </details>
-      </div>
+          <div class="compose-attachment__actions">
+            <AppIconButton
+              v-if="attachment.status === 'failed'"
+              class="compose-attachment__action"
+              :aria-label="`Retry ${attachmentDisplayName(attachment.name)}`"
+              :title="`Retry ${attachmentDisplayName(attachment.name)}`"
+              @click="composeStore.retryAttachment(attachment.clientId, session.id)"
+            >
+              <RotateCw :size="15" aria-hidden="true" />
+            </AppIconButton>
+            <AppIconButton
+              v-if="attachment.status === 'uploading'"
+              class="compose-attachment__action"
+              :aria-label="`Cancel upload of ${attachmentDisplayName(attachment.name)}`"
+              :title="`Cancel upload of ${attachmentDisplayName(attachment.name)}`"
+              @click="composeStore.cancelAttachment(attachment.clientId, session.id)"
+            >
+              <X :size="15" aria-hidden="true" />
+            </AppIconButton>
+            <AppIconButton
+              class="compose-attachment__action"
+              :aria-label="`Remove ${attachmentDisplayName(attachment.name)}`"
+              :title="`Remove ${attachmentDisplayName(attachment.name)}`"
+              @click="composeStore.removeAttachment(attachment.clientId, session.id)"
+            >
+              <Trash2 :size="15" aria-hidden="true" />
+            </AppIconButton>
+          </div>
+        </article>
+      </section>
 
-      <div class="editor-wrap">
-        <div ref="editorEl" class="editor" contenteditable="true" />
-      </div>
+      <p
+        v-if="uncheckpointedAttachmentCount > 0"
+        class="compose-attachment-warning"
+        role="status"
+      >
+        {{ uncheckpointedAttachmentCount === 1
+          ? '1 attachment has not reached the draft yet.'
+          : `${uncheckpointedAttachmentCount} attachments have not reached the draft yet.` }}
+      </p>
 
       <footer>
-        <AppButton variant="outline" @click="composeStore.close()">Discard</AppButton>
-        <AppButton :disabled="composeStore.status === COMPOSE_STATE.SENDING" @click="send">
-          {{ composeStore.status === COMPOSE_STATE.SENDING ? 'Sending…' : 'Send' }}
+        <input
+          ref="attachmentInputEl"
+          type="file"
+          multiple
+          hidden
+          @change="pickAttachments"
+        />
+        <AppButton
+          variant="outline"
+          :disabled="scheduleBusy || session.isDiscarding"
+          aria-label="Attach files"
+          title="Attach files"
+          @click="openAttachmentPicker"
+        >
+          <template #iconLeft>
+            <Paperclip :size="17" aria-hidden="true" />
+          </template>
+          Attach
         </AppButton>
+        <div class="compose-send-split">
+          <AppButton
+            class="compose-send"
+            :disabled="sendDisabled"
+            @click="send"
+          >
+            <template #iconLeft>
+              <SendIcon
+                :size="16"
+                :stroke-width="2"
+                aria-hidden="true"
+              />
+            </template>
+            {{ sendButtonText }}
+          </AppButton>
+          <AppDropdown
+            class="compose-schedule-menu"
+            :disabled="scheduleSegmentDisabled"
+            @toggle="onScheduleMenuToggle"
+          >
+            <summary
+              ref="scheduleMenuTriggerEl"
+              class="compose-schedule-menu__trigger"
+              :class="{ 'compose-schedule-menu__trigger--selected': stagedSchedule }"
+              role="button"
+              aria-haspopup="menu"
+              :aria-label="scheduleTriggerLabel"
+              :title="scheduleTriggerTitle"
+              :aria-describedby="scheduleDescriptionId"
+              :aria-busy="isScheduling ? 'true' : undefined"
+              :aria-disabled="scheduleSegmentDisabled ? 'true' : undefined"
+              :tabindex="scheduleSegmentDisabled ? -1 : undefined"
+            >
+              <span
+                v-if="stagedSchedule"
+                class="compose-schedule-menu__selection"
+              >{{ stagedSchedule.optionLabel }}</span>
+              <ChevronDown :size="16" :stroke-width="2" aria-hidden="true" />
+            </summary>
+            <div
+              class="app-dropdown__menu compose-schedule-menu__menu"
+              role="menu"
+              aria-label="Schedule send"
+            >
+              <button
+                v-if="stagedSchedule"
+                type="button"
+                class="app-dropdown__item compose-schedule-menu__item"
+                role="menuitem"
+                :disabled="scheduleBusy"
+                @click="clearStagedSchedule"
+              >
+                <span class="compose-schedule-menu__label">Send now</span>
+                <span class="compose-schedule-menu__secondary">Immediately</span>
+              </button>
+              <div
+                v-if="stagedSchedule"
+                class="compose-schedule-menu__separator"
+                role="separator"
+              />
+              <button
+                v-for="preset in schedulePresets"
+                :key="preset.id"
+                type="button"
+                class="app-dropdown__item compose-schedule-menu__item"
+                role="menuitem"
+                :disabled="scheduleChoiceDisabled || !preset.available"
+                :title="preset.available
+                  ? (preset.resolvedLabel ?? undefined)
+                  : (preset.message ?? undefined)"
+                @click="pickSchedulePreset(preset.id)"
+              >
+                <span class="compose-schedule-menu__label">{{ preset.label }}</span>
+                <span class="compose-schedule-menu__secondary">
+                  {{ preset.available ? preset.resolvedLabel : preset.message }}
+                </span>
+              </button>
+              <div class="compose-schedule-menu__separator" role="separator" />
+              <button
+                type="button"
+                class="app-dropdown__item compose-schedule-menu__item"
+                role="menuitem"
+                :disabled="scheduleChoiceDisabled"
+                @click="openCustomSchedule"
+              >
+                <span class="compose-schedule-menu__label">Choose a date and time</span>
+              </button>
+            </div>
+          </AppDropdown>
+          <span :id="scheduleDescriptionId" class="compose-schedule-menu__description">
+            {{ scheduleAvailabilityMessage }}
+          </span>
+        </div>
       </footer>
 
-      <p v-if="composeStore.error" class="compose-error">{{ composeStore.error }}</p>
+      <ScheduleSendDialog
+        v-if="customScheduleOpen"
+        :busy="isScheduling"
+        :error="customScheduleError"
+        :max-delayed-send="composeStore.scheduleMaxDelayedSend"
+        :server-clock-reference="composeStore.scheduleCapability.serverClockReference"
+        :session-id="session.id"
+        :time-zone="selectedTimeZone"
+        @clear-error="customScheduleError = null"
+        @close="closeCustomSchedule"
+        @select="stageCustomScheduleTarget"
+      />
+
+      <p
+        v-if="session.saveError && session.saveError !== sessionError"
+        class="compose-save-error"
+        role="status"
+        aria-live="polite"
+      >{{ session.saveError }}</p>
+
+      <!-- role="alert" carries an implicit assertive live region, which is
+           announced on insertion. The element is conditional because the
+           card is a flex column with a gap, and a permanently rendered
+           container would hold that gap open under the footer whenever
+           there is no error. -->
+      <p
+        v-if="scheduleUiError"
+        class="compose-error"
+        role="alert"
+        aria-live="assertive"
+        aria-atomic="true"
+      >{{ scheduleUiError }}</p>
+
+      <p
+        v-if="sessionError"
+        class="compose-error"
+        role="alert"
+        aria-live="assertive"
+        aria-atomic="true"
+      >{{ sessionError }}</p>
+
+      <div
+        v-if="session.closePromptOpen"
+        class="compose-confirm-backdrop"
+      >
+        <section
+          ref="closePromptEl"
+          class="compose-confirm"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="compose-close-title"
+          aria-describedby="compose-close-description"
+          tabindex="-1"
+        >
+          <h3
+            id="compose-close-title"
+          >Save this draft?</h3>
+          <p id="compose-close-description">
+            {{ uncheckpointedAttachmentCount > 0
+              ? 'Some attachments have not reached the draft. Keep this window open to finish '
+                + 'or retry them, or close without saving those attachments.'
+              : 'Save your latest changes before closing this compose window.' }}
+          </p>
+          <div class="compose-confirm__actions">
+            <AppButton
+              variant="outline"
+              @click="composeStore.cancelClose(session.id)"
+            >Cancel</AppButton>
+            <AppButton
+              variant="outline"
+              @click="composeStore.closeWithoutSaving(session.id)"
+            >Don't Save</AppButton>
+            <AppButton
+              :disabled="session.isSaving"
+              @click="composeStore.saveAndClose(session.id)"
+            >Save draft</AppButton>
+          </div>
+        </section>
+      </div>
     </div>
   </div>
 </template>
@@ -1115,6 +1058,7 @@ function selectFromIdentity(event: Event) {
   z-index: 50;
 }
 .compose-dialog__card {
+  position: relative;
   width: min(960px, 96vw);
   height: min(640px, 90vh);
   background: var(--surface, #fff);
@@ -1130,6 +1074,11 @@ function selectFromIdentity(event: Event) {
   align-items: baseline;
 }
 .compose-dialog__card header h2 { margin: 0; font-size: 16px; }
+.compose-dialog__window-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
 .icon {
   background: transparent;
   border: 0;
@@ -1137,236 +1086,374 @@ function selectFromIdentity(event: Event) {
   cursor: pointer;
   color: inherit;
 }
+.icon--minimize {
+  font-size: 20px;
+}
+.compose-close-menu__trigger {
+  display: grid;
+  place-items: center;
+  list-style: none;
+}
+.compose-close-menu__trigger::-webkit-details-marker {
+  display: none;
+}
+.compose-close-menu__menu {
+  top: calc(100% + 1px);
+  right: 0;
+  left: auto;
+  min-width: 160px;
+  line-height: normal;
+}
+.compose-close-menu__menu .app-dropdown__item:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.compose-close-menu__discard:hover:not(:disabled),
+.compose-close-menu__discard:focus-visible {
+  color: #ff6b6b;
+}
 .row {
   display: grid;
   grid-template-columns: 70px 1fr;
   gap: 8px;
   align-items: center;
+  font-size: var(--txt-default, 0.875rem);
 }
 .row label {
-  font-size: 12px;
-  color: var(--muted, #6b7388);
+  color: var(--colour-ti-secondary, var(--text, #111827));
+  font-size: inherit;
 }
-.row input, .row select {
+.row input {
+  min-width: 0;
   padding: 7px 10px;
   border: 1px solid var(--border, #d6d9e2);
   border-radius: 8px;
-  font-size: 14px;
-}
-.compose-toolbar {
-  display: flex;
-  flex-wrap: nowrap;
-  align-items: center;
-  gap: 4px;
-  padding: 6px;
-  border: 1px solid var(--border, #d6d9e2);
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.04);
-  overflow: visible;
-}
-.toolbar-group {
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding-right: 6px;
-  margin-right: 4px;
-  border-right: 1px solid var(--border, #d6d9e2);
-}
-.toolbar-group:last-child {
-  padding-right: 0;
-  margin-right: 0;
-  border-right: 0;
-}
-.toolbar-button,
-.toolbar-select,
-.toolbar-color {
-  height: 28px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: inherit;
   font: inherit;
 }
-.toolbar-button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 28px;
-  padding: 0 7px;
-  cursor: pointer;
-  font-size: 12px;
-}
-.toolbar-button svg,
-.toolbar-color svg {
-  pointer-events: none;
-}
-.toolbar-button:hover,
-.toolbar-button.active,
-.toolbar-select:hover,
-.toolbar-color:hover {
-  background: rgba(127, 127, 127, 0.18);
-}
-.toolbar-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.45;
-}
-.toolbar-select {
-  max-width: 76px;
-  padding: 0 4px;
-  cursor: pointer;
-  font-size: 12px;
-}
-.toolbar-select--size {
-  max-width: 70px;
-}
-.toolbar-color {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 28px;
-  padding: 0 5px;
-  cursor: pointer;
-  font-size: 12px;
-}
-.toolbar-color input {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  opacity: 0;
-  cursor: pointer;
-}
-.toolbar-more {
-  position: relative;
-  flex: 0 0 auto;
-}
-.toolbar-more__summary {
-  list-style: none;
-}
-.toolbar-more__summary::-webkit-details-marker {
-  display: none;
-}
-.toolbar-more__summary::after {
-  content: '▾';
-  margin-left: 5px;
-  font-size: 10px;
-  opacity: 0.7;
-}
-.toolbar-more[open] .toolbar-more__summary {
-  background: rgba(127, 127, 127, 0.18);
-}
-.toolbar-more__menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
-  z-index: 3;
-  display: grid;
-  min-width: 190px;
-  padding: 6px;
-  border: 1px solid var(--border, #d6d9e2);
-  border-radius: 8px;
-  background: var(--surface, #fff);
-  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.22);
-}
-.toolbar-menu-section {
-  display: grid;
-  gap: 2px;
-  padding: 4px 0;
-}
-.toolbar-menu-section + .toolbar-menu-section {
-  border-top: 1px solid var(--border, #d6d9e2);
-}
-.toolbar-menu-button {
-  display: grid;
-  grid-template-columns: 24px 1fr;
-  align-items: center;
-  gap: 8px;
-  min-height: 32px;
-  padding: 6px 8px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
-}
-.toolbar-menu-button:hover,
-.toolbar-menu-button.active {
-  background: rgba(127, 127, 127, 0.18);
-}
-.toolbar-menu-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.45;
-}
-.toolbar-menu-field {
-  display: grid;
-  grid-template-columns: 72px 1fr;
-  align-items: center;
-  gap: 8px;
-  min-height: 32px;
-  padding: 4px 8px;
-  font-size: 12px;
-}
-.toolbar-menu-field select,
-.toolbar-menu-field input {
+.from-picker {
   min-width: 0;
 }
-.editor-wrap {
-  flex: 1;
+/* The field look of .row input, on a summary; the chevron rides the
+   right edge. */
+.from-picker__summary {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  padding: 5px 10px;
   border: 1px solid var(--border, #d6d9e2);
   border-radius: 8px;
-  padding: 8px;
+  background: var(--panel, transparent);
+}
+.from-picker__summary::after {
+  margin-left: auto;
+}
+.from-picker__summary-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Full row width: an identity line is long, a 190px panel is not. */
+.from-picker__menu {
+  right: 0;
+}
+/* Person rows: avatar, the two lines, and the check on the selected
+   one — the suggestion list's shape. */
+.from-picker__option {
+  grid-template-columns: 24px 1fr auto;
+}
+.from-picker__avatar {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  flex: none;
+}
+.from-picker__summary .from-picker__avatar {
+  width: 20px;
+  height: 20px;
+  font-size: 9px;
+}
+.from-picker__lines {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.from-picker__name {
+  font-weight: 600;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.from-picker__email {
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--muted, #6b7280);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.from-picker__email--primary {
+  font-size: inherit;
+  color: inherit;
+  font-weight: 600;
+}
+.from-picker__check {
+  flex: none;
+  color: var(--accent, #0060df);
+}
+/* The To row carries the Cc/Bcc toggles in a third, content-width column
+   at its right edge; the label column stays 70px so every row aligns. */
+.row--to {
+  grid-template-columns: 70px 1fr auto;
+}
+.recipient-cc-toggles {
+  display: flex;
+  gap: 4px;
+}
+.recipient-toggle {
+  padding: 4px 8px;
+  border: 1px solid var(--border, #d6d9e2);
+  border-radius: 6px;
+  background: none;
+  color: var(--colour-ti-secondary, var(--text, #111827));
+  font: inherit;
+  cursor: pointer;
+}
+.recipient-toggle:hover {
+  color: var(--text, inherit);
+  border-color: var(--accent, #0060df);
+}
+.compose-attachments {
+  display: grid;
+  max-height: 150px;
   overflow-y: auto;
-  min-height: 0;
+  border: 1px solid var(--border, #d6d9e2);
+  border-radius: 8px;
 }
-.editor {
-  /* Positioned so Squire's built-in image resize handles, which it
-     appends to the editor root and positions absolutely relative to it,
-     anchor over the image instead of the fixed dialog overlay. */
-  position: relative;
-  min-height: 100%;
-  outline: none;
-  font-size: 14px;
+.compose-attachment {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 8px 10px;
 }
-/* Inserted images are added dynamically, so they never carry the scoped
-   data-attribute; :deep keeps pasted screenshots from overflowing. */
-.editor :deep(img) {
-  max-width: 100%;
-  height: auto;
+.compose-attachment + .compose-attachment {
+  border-top: 1px solid var(--border, #d6d9e2);
+}
+.compose-attachment__details {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+.compose-attachment__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--txt-default, 0.875rem);
+}
+.compose-attachment__meta,
+.compose-attachment__error,
+.compose-attachment__progress,
+.compose-attachment-warning {
+  font-size: var(--txt-small, 0.75rem);
+}
+.compose-attachment__meta {
+  color: var(--colour-ti-secondary, var(--muted, #6b7280));
+}
+.compose-attachment__error,
+.compose-attachment-warning {
+  color: var(--colour-ti-warning, #8a4b00);
+}
+.compose-attachment__progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.compose-attachment__progress progress {
+  width: min(220px, 40vw);
+}
+.compose-attachment__actions {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+.compose-attachment__action {
+  width: 32px;
+  height: 32px;
+  flex-basis: 32px;
+  border: 1px solid var(--border, #d6d9e2);
+  border-radius: 7px;
+  color: inherit;
+}
+.compose-attachment__action:hover {
+  border-color: var(--accent, #0060df);
+}
+.compose-attachment-warning {
+  margin: 0;
 }
 footer {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: 8px;
 }
-.autocomplete {
-  margin: 0 0 0 78px;
+.compose-send-split {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
+}
+.compose-send-split .compose-schedule-menu {
+  position: static;
+}
+.compose-schedule-menu__trigger {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
   padding: 0;
-  list-style: none;
-  border: 1px solid var(--border, #d6d9e2);
-  border-radius: 8px;
-  max-height: 200px;
-  overflow-y: auto;
-}
-.autocomplete button {
-  width: 100%;
-  text-align: left;
   border: 0;
-  background: transparent;
-  padding: 8px 10px;
+  border-left: 1px solid color-mix(in srgb, #fff 42%, transparent);
+  border-radius: 0 4px 4px 0;
+  background: var(--colour-primary-default, var(--accent, #0060df));
+  color: var(--colour-ti-on-primary, #fff);
   cursor: pointer;
-  display: grid;
-  grid-template-columns: 1fr auto auto;
-  gap: 8px;
-  align-items: baseline;
+  list-style: none;
 }
-.autocomplete button:hover { background: rgba(0, 0, 0, 0.04); }
-.ac-name { font-size: 13px; }
-.ac-email { font-size: 12px; color: var(--muted, #6b7388); }
-.ac-source { font-size: 11px; color: var(--muted, #6b7388); text-transform: uppercase; }
+.compose-schedule-menu__trigger--selected {
+  width: auto;
+  min-width: 34px;
+  gap: 4px;
+  padding: 0 8px 0 10px;
+}
+.compose-schedule-menu__selection {
+  max-width: 112px;
+  overflow: hidden;
+  font-size: var(--txt-small, 0.75rem);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compose-schedule-menu__trigger::-webkit-details-marker {
+  display: none;
+}
+.compose-schedule-menu__trigger:hover:not([aria-disabled='true']) {
+  background: var(--colour-primary-hover, #0250bb);
+}
+.compose-schedule-menu__trigger:active:not([aria-disabled='true']) {
+  background: var(--colour-primary-pressed, #054096);
+}
+.compose-schedule-menu__trigger:focus:not(:focus-visible) {
+  outline: none;
+}
+.compose-schedule-menu__trigger:focus-visible {
+  z-index: 2;
+  outline: 2px solid var(--accent, #0060df);
+  outline-offset: 2px;
+}
+.compose-schedule-menu__trigger[aria-disabled='true'] {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.compose-send-split .base.app-button.compose-send {
+  border-radius: 4px 0 0 4px;
+}
+.compose-schedule-menu__menu {
+  top: auto;
+  right: 0;
+  bottom: calc(100% + 6px);
+  left: auto;
+  width: min(340px, calc(100vw - 32px));
+  min-width: 290px;
+}
+.compose-schedule-menu__item {
+  grid-template-columns: 1fr;
+  gap: 1px;
+}
+.compose-schedule-menu__item:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+.compose-schedule-menu__label {
+  font-weight: 600;
+}
+.compose-schedule-menu__secondary {
+  overflow: hidden;
+  color: var(--muted, #6b7280);
+  font-size: 11px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compose-schedule-menu__separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border, #d6d9e2);
+}
+.compose-schedule-menu__description {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.base.app-button.compose-send:disabled {
+  background: var(--colour-neutral-border, var(--border, #d6d9e2));
+  color: var(--colour-ti-secondary, var(--muted, #6b7280));
+  cursor: not-allowed;
+  opacity: 1;
+}
 .compose-error { color: #b3261e; font-size: 13px; }
+.compose-save-error {
+  margin: 0;
+  color: var(--colour-ti-warning, #8a4b00);
+  font-size: var(--txt-small, 0.8125rem);
+}
+.compose-confirm-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  border-radius: inherit;
+  background: rgba(13, 22, 42, 0.48);
+}
+.compose-confirm {
+  width: min(420px, 100%);
+  padding: 20px;
+  border: 1px solid var(--border, #d6d9e2);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+}
+.compose-confirm h3 {
+  margin: 0 0 8px;
+  font-size: var(--txt-large, 1rem);
+}
+.compose-confirm h3:focus {
+  outline: none;
+}
+.compose-confirm p {
+  margin: 0 0 20px;
+  color: var(--colour-ti-secondary, var(--text, #111827));
+}
+.compose-confirm__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
 </style>

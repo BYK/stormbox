@@ -24,6 +24,13 @@ import {
   readViewCacheForFolderRole,
   waitForPendingMutations,
 } from './helpers/ui.js';
+import {
+  composeSendButton,
+  composeSubject,
+  fillRecipient,
+  recipientAddresses,
+  waitForIdentities,
+} from './helpers/compose.js';
 
 /**
  * Compose + send (R-4.4, SC-2) — Verified Consistency triple.
@@ -47,13 +54,6 @@ import {
  */
 
 test.skip(!localStackEnabled, skipLocalStackMessage);
-
-function composeInput(page, label) {
-  return page.locator('.compose-dialog .row')
-    .filter({ hasText: new RegExp(`^${label}$`) })
-    .locator('input')
-    .first();
-}
 
 async function findSentMessageBySubject(jmap, sentMailbox, subject) {
   const payload = await jmapRequest(jmap, [
@@ -122,29 +122,18 @@ test.describe('Compose + send e2e', () => {
       await clickFolder(page, sent.name);
       await clickFolder(page, 'Inbox');
 
-      // Open compose. Ctrl+N is the documented compose shortcut and is
-      // already exercised in keyboard-shortcuts.spec.js; we use the UI
-      // path here so this spec stands alone.
-      await page.keyboard.press('ControlOrMeta+n');
+      await page.keyboard.press('c');
       await expect(page.locator('.compose-dialog')).toBeVisible({ timeout: 10_000 });
 
       // Identities sync runs in the background after connect; under
       // firefox we sometimes open compose before it lands. Without an
       // identity, send() fails with "No identities are configured."
       // and the dialog stays open. Wait until the From <select> in
-      // particular has at least one option. The From select is the
-      // first <select> in the dialog (toolbar font/size selects come
-      // later); scoping by position avoids the `<label>` regex trick,
-      // which breaks the moment options populate and push their text
-      // into the row's text content.
-      const fromSelect = page.locator('.compose-dialog select').first();
-      await expect.poll(
-        async () => fromSelect.locator('option').count(),
-        { timeout: 30_000, message: 'identity sync should populate the From dropdown' },
-      ).toBeGreaterThan(0);
+      // particular has at least one identity to send as.
+      await waitForIdentities(page);
 
-      await composeInput(page, 'To').fill(recipient);
-      await composeInput(page, 'Subject').fill(subject);
+      await fillRecipient(page, 'To', recipient);
+      await composeSubject(page).fill(subject);
 
       // Squire contenteditable body — click and type so the compose
       // store picks up htmlBody and textBody.
@@ -152,7 +141,7 @@ test.describe('Compose + send e2e', () => {
       await editor.click();
       await page.keyboard.type('Hello from the compose+send e2e.');
 
-      await page.locator('.compose-dialog button.primary', { hasText: /^Send$/ }).click();
+      await composeSendButton(page).click();
 
       await expect(page.locator('.compose-dialog')).toBeHidden({ timeout: 30_000 });
       await waitForPendingMutations(page);

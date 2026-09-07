@@ -4,12 +4,11 @@ This directory is the human entry point for project documentation.
 
 ## Architecture
 
+[Architecture overview and index](architecture/README.md) summarizes the
+system and links to the focused design documents.
+
 - [BYK Cloudflare deployment](byk-cloudflare-deployment.md): personal Pages
   and JMAP bridge configuration.
-- [Performance and architecture notes](architecture/performance.md): current
-  runtime shape, cache behavior, and performance work.
-- [SQLite storage design](architecture/sqlite-storage.md): local cache schema,
-  sync state, and storage rationale.
 
 ## Spec-Driven Development
 

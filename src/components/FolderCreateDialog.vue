@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
-import { X } from '@lucide/vue';
+import { Check, X } from '@lucide/vue';
 
+import { useModalFocus } from '../composables/useModalFocus';
 import { useAuthStore } from '../stores/auth-store';
 import { useMailStore } from '../stores/mail-store';
-import type { FolderRow } from '../types';
+import { closeContainingDropdown } from '../utils/dropdown';
 import { folderCapabilities } from '../utils/folder-capabilities';
-import { folderSortKey } from '../utils/folder-presentation';
+import { isComposingKeyEvent } from '../utils/keyboard';
+import { flattenFolderTree } from '../utils/folder-presentation';
+import AppDropdown from './AppDropdown.vue';
 
 const props = withDefaults(
   defineProps<{
@@ -19,7 +22,13 @@ const emit = defineEmits<{ close: [] }>();
 
 const authStore = useAuthStore();
 const mailStore = useMailStore();
+const dialogEl = ref<HTMLElement | null>(null);
 const nameEl = ref<HTMLInputElement | null>(null);
+useModalFocus(dialogEl, {
+  containTab: true,
+  initialFocus: nameEl,
+  onDefault: submit,
+});
 const name = ref('');
 const parentFolderId = ref<number | null>(props.initialParentId);
 const failure = ref<string | null>(null);
@@ -43,7 +52,7 @@ const parentOptions = computed<ParentOption[]>(() => {
     const group = isOwn
       ? account.display_name ?? account.primary_email ?? 'My account'
       : `${account.display_name ?? account.primary_email ?? 'Shared account'} (shared)`;
-    const rows = flatten(
+    const rows = flattenFolderTree(
       mailStore.folders.filter((f) => f.account_id === account.id),
     ).filter((entry) =>
       folderCapabilities(entry.folder, authStore.accountId).mayCreateChild);
@@ -70,28 +79,15 @@ const groups = computed(() => {
   return [...byGroup.entries()].map(([label, options]) => ({ label, options }));
 });
 
-function flatten(accountFolders: FolderRow[]): Array<{ folder: FolderRow; depth: number }> {
-  const byParent = new Map<number | 'ROOT', FolderRow[]>();
-  for (const folder of accountFolders) {
-    if (Number(folder.is_deleted) === 1) continue;
-    const key = folder.parent_id ?? 'ROOT';
-    if (!byParent.has(key)) byParent.set(key, []);
-    byParent.get(key)!.push(folder);
-  }
-  for (const list of byParent.values()) {
-    // Structural order (role, then name): the parent picker mirrors
-    // the manager dialog's tree, not the sidebar's starred grouping.
-    list.sort((a, b) => folderSortKey(a) - folderSortKey(b) || a.name.localeCompare(b.name));
-  }
-  const out: Array<{ folder: FolderRow; depth: number }> = [];
-  function walk(parentKey: number | 'ROOT', depth: number) {
-    for (const folder of byParent.get(parentKey) ?? []) {
-      out.push({ folder, depth });
-      walk(folder.id, depth + 1);
-    }
-  }
-  walk('ROOT', 0);
-  return out;
+/** The closed control shows the choice without its tree indentation. */
+const selectedParentLabel = computed(() => {
+  const chosen = parentOptions.value.find((option) => option.id === parentFolderId.value);
+  return (chosen?.label ?? 'Top Level').replace(/^\u00a0+/, '');
+});
+
+function pickParent(id: number | null, event: Event) {
+  parentFolderId.value = id;
+  closeContainingDropdown(event);
 }
 
 const canSubmit = computed(() => name.value.trim().length > 0 && !mailStore.folderCreatePending);
@@ -126,11 +122,13 @@ async function submit() {
 }
 
 function onWindowKeydown(event: KeyboardEvent) {
+  // Escape cancels an input-method conversion in the name field, so it
+  // belongs to the composition rather than to this dialog.
+  if (isComposingKeyEvent(event)) return;
   if (event.key === 'Escape') emit('close');
 }
 
 onMounted(() => {
-  nameEl.value?.focus();
   window.addEventListener('keydown', onWindowKeydown);
 });
 
@@ -145,10 +143,12 @@ onBeforeUnmount(() => {
   <Teleport to="body">
   <div class="folder-create" role="presentation" @click.self="emit('close')">
     <section
+      ref="dialogEl"
       class="folder-create__panel"
       role="dialog"
       aria-modal="true"
       aria-labelledby="folder-create-title"
+      tabindex="-1"
     >
       <header class="folder-create__header">
         <h2 id="folder-create-title">New folder</h2>
@@ -173,22 +173,34 @@ onBeforeUnmount(() => {
             data-folder-create-name
           />
         </label>
-        <label class="folder-create__field">
-          <span>Parent</span>
-          <select
-            v-model="parentFolderId"
-            class="folder-create__input"
-            data-folder-create-parent
-          >
-            <optgroup v-for="group in groups" :key="group.label" :label="group.label">
-              <option
-                v-for="option in group.options"
-                :key="option.id ?? 'root'"
-                :value="option.id"
-              >{{ option.label }}</option>
-            </optgroup>
-          </select>
-        </label>
+        <div class="folder-create__field">
+          <span id="folder-create-parent-label">Parent</span>
+          <AppDropdown class="folder-create__parent" data-folder-create-parent>
+            <summary
+              class="app-dropdown__summary folder-create__parent-summary"
+              aria-labelledby="folder-create-parent-label"
+            >{{ selectedParentLabel }}</summary>
+            <div class="app-dropdown__menu folder-create__parent-menu" role="menu" aria-label="Parent folder">
+              <template v-for="group in groups" :key="group.label">
+                <span class="app-dropdown__heading" aria-hidden="true">{{ group.label }}</span>
+                <button
+                  v-for="option in group.options"
+                  :key="option.id ?? 'root'"
+                  type="button"
+                  class="app-dropdown__item"
+                  role="menuitemradio"
+                  :aria-checked="parentFolderId === option.id"
+                  :data-folder-parent-option="option.id ?? 'root'"
+                  @click="pickParent(option.id, $event)"
+                >
+                  <Check v-if="parentFolderId === option.id" :size="14" />
+                  <span v-else aria-hidden="true" />
+                  <span>{{ option.label }}</span>
+                </button>
+              </template>
+            </div>
+          </AppDropdown>
+        </div>
         <p v-if="failure" class="folder-create__error">{{ failure }}</p>
         <div class="folder-create__actions">
           <button
@@ -301,6 +313,29 @@ onBeforeUnmount(() => {
 .folder-create__input:focus-visible {
   outline: none;
   border-color: var(--accent);
+}
+.folder-create__parent {
+  flex: 1;
+  min-width: 0;
+}
+/* The field look of .folder-create__input, on a summary. */
+.folder-create__parent-summary {
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+.folder-create__parent-summary::after {
+  margin-left: auto;
+}
+.folder-create__parent-menu {
+  right: 0;
 }
 .folder-create__error {
   margin: 0;

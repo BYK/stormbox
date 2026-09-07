@@ -1,10 +1,11 @@
 /**
- * Thunderbird-standard keyboard shortcuts for the mail UI.
+ * Global keyboard shortcuts for the mail UI.
  *
- * Bound at the App shell so shortcuts work regardless of which pane
- * has focus. Compose editor formatting keys are handled by Squire.
- *
- * Reference: https://support.mozilla.org/kb/keyboard-shortcuts-thunderbird
+ * Bound at the App shell so shortcuts work regardless of which pane has
+ * focus. Key bindings come from the scheme table selected by the
+ * `shortcutScheme` setting (`constants/shortcuts.ts`); this file only
+ * maps the resolved action onto store calls. Compose editor formatting
+ * keys are handled by Squire.
  */
 
 import {
@@ -13,22 +14,53 @@ import {
   type Ref,
 } from 'vue';
 
+import {
+  prefixForEvent,
+  resolveShortcut,
+  type ShortcutAction,
+} from '../constants/shortcuts';
 import { useMailStore } from '../stores/mail-store';
 import { useComposeStore } from '../stores/compose-store';
+import { useSettingsStore } from '../stores/settings-store';
 import {
-  isDeleteKey,
+  isComposingKeyEvent,
   isEditableTarget,
-  isModKey,
-  matchesShortcut,
 } from '../utils/keyboard';
 
+/** How long a sequence prefix such as `*` waits for its second key. */
+export const SHORTCUT_PREFIX_TIMEOUT_MS = 1500;
+
 export interface UseThunderbirdShortcutsOptions {
-  /** Current app space ('mail' | 'contacts'). Shortcuts only run in mail. */
+  /** Current app space ('mail' | 'contacts'). */
   space: Ref<string>;
   /** When false, no shortcuts are handled (e.g. login gate). */
   enabled: Ref<boolean>;
   /** Focuses the app-level Quick Filter field. */
   focusQuickFilter?: () => void;
+}
+
+export type MessageListNavigationCommand =
+  | 'first'
+  | 'last'
+  | 'next'
+  | 'nextUnread'
+  | 'previous'
+  | 'previousUnread';
+
+export interface MessageListCommands {
+  navigate: (command: MessageListNavigationCommand) => void;
+  selectAll: () => void;
+}
+
+let activeMessageListCommands: MessageListCommands | null = null;
+
+export function registerMessageListCommands(commands: MessageListCommands): () => void {
+  activeMessageListCommands = commands;
+  return () => {
+    if (activeMessageListCommands === commands) {
+      activeMessageListCommands = null;
+    }
+  };
 }
 
 function getTargetIds(mailStore: ReturnType<typeof useMailStore>): number[] {
@@ -47,59 +79,15 @@ function getSingleMessage(mailStore: ReturnType<typeof useMailStore>) {
   return mailStore.messages.find((m) => m?.id === ids[0]) ?? null;
 }
 
-function findMessageIndex(mailStore: ReturnType<typeof useMailStore>, messageId: number | null) {
-  if (messageId == null) return -1;
-  return mailStore.messages.findIndex((m) => m?.id === messageId);
-}
-
-function firstLoadedIndex(mailStore: ReturnType<typeof useMailStore>) {
-  return mailStore.messages.findIndex((m) => m?.id != null);
-}
-
-function lastLoadedIndex(mailStore: ReturnType<typeof useMailStore>) {
-  for (let i = mailStore.messages.length - 1; i >= 0; i -= 1) {
-    if (mailStore.messages[i]?.id != null) return i;
-  }
-  return -1;
-}
-
-function navigateToIndex(mailStore: ReturnType<typeof useMailStore>, index: number) {
-  const row = mailStore.messages[index];
-  if (row?.id == null) return;
-  mailStore.selectMessage(row.id);
-}
-
-function navigateRelative(
+function hasScheduledTarget(
   mailStore: ReturnType<typeof useMailStore>,
-  direction: 1 | -1,
-  { unreadOnly = false } = {},
-) {
-  const len = mailStore.messages.length;
-  if (!len) return;
-  let index = findMessageIndex(mailStore, mailStore.selectedMessageId);
-  if (index < 0) {
-    index = direction > 0 ? -1 : len;
-  }
-  for (let i = index + direction; direction > 0 ? i < len : i >= 0; i += direction) {
-    const row = mailStore.messages[i];
-    if (row?.id == null) continue;
-    if (unreadOnly && Number(row.is_seen) === 1) continue;
-    navigateToIndex(mailStore, i);
-    return;
-  }
-}
-
-function selectAllLoaded(mailStore: ReturnType<typeof useMailStore>) {
-  const upper = Math.min(
-    mailStore.messages.length,
-    mailStore.totalForFolder ?? mailStore.messages.length,
-  );
-  const next = new Set(mailStore.selectedIds);
-  for (let i = 0; i < upper; i += 1) {
-    const id = mailStore.messages[i]?.id;
-    if (id != null) next.add(id);
-  }
-  mailStore.selectedIds = next;
+  ids: number[],
+): boolean {
+  const targets = new Set(ids);
+  return mailStore.messages.some((message) =>
+    message?.id != null
+    && targets.has(Number(message.id))
+    && message.scheduled_undo_status != null);
 }
 
 type ShortcutHandler = (event: KeyboardEvent) => void | Promise<void>;
@@ -117,130 +105,195 @@ export function useThunderbirdShortcuts({
 }: UseThunderbirdShortcutsOptions) {
   const mailStore = useMailStore();
   const composeStore = useComposeStore();
+  const settingsStore = useSettingsStore();
+
+  let pendingPrefix: string | null = null;
+  let pendingPrefixTimer: number | null = null;
+
+  function clearPendingPrefix() {
+    pendingPrefix = null;
+    if (pendingPrefixTimer != null) {
+      window.clearTimeout(pendingPrefixTimer);
+      pendingPrefixTimer = null;
+    }
+  }
+
+  function startPendingPrefix(prefix: string) {
+    clearPendingPrefix();
+    pendingPrefix = prefix;
+    pendingPrefixTimer = window.setTimeout(() => {
+      pendingPrefixTimer = null;
+      pendingPrefix = null;
+    }, SHORTCUT_PREFIX_TIMEOUT_MS);
+  }
+
+  function targetsForMessageAction(action: ShortcutAction): number[] | null {
+    const targetIds = getTargetIds(mailStore);
+    if (targetIds.length === 0) return null;
+    // Scheduled (Send Later) mail is read-only outgoing mail: archive and
+    // delete stand down for it exactly as the hidden toolbar buttons do.
+    const mutatesScheduled = action === 'archive' || action === 'delete' || action === 'deleteForever';
+    if (mutatesScheduled && hasScheduledTarget(mailStore, targetIds)) return [];
+    return targetIds;
+  }
 
   async function onKeyDown(event: KeyboardEvent) {
+    if (event.defaultPrevented) return;
+    if (isComposingKeyEvent(event)) return;
     if (!enabled.value) return;
-    if (composeStore.isOpen) {
+    if (composeStore.isExpanded) {
       if (event.key === 'Escape') {
+        if (composeStore.activeSession?.closePromptOpen) {
+          event.preventDefault();
+          composeStore.cancelClose(composeStore.activeSessionId);
+          return;
+        }
+        // The nested scheduling dialog owns Escape one layer at a time.
+        // This listener runs first in the document capture phase.
+        if (document.querySelector('.schedule-dialog[aria-modal="true"]')) {
+          return;
+        }
+        // A combobox showing its list owns Escape: dismissing the list is
+        // what the user meant, and closing the whole message instead throws
+        // away a draft over a keypress. This handler runs in the capture
+        // phase, so the control cannot stop the event on its way past —
+        // hence reading the state it already publishes for a screen reader
+        // rather than a flag kept in parallel with it.
+        //
+        // Only where it has focus, because only there will it receive the
+        // key. Standing down for a list somewhere else in the dialog leaves
+        // Escape doing nothing at all, and a message that cannot be closed.
+        const focused = document.activeElement;
+        if (focused?.matches?.('.compose-dialog [role="combobox"][aria-expanded="true"]')) {
+          return;
+        }
+        // An open dropdown owns Escape the same way, but is checked
+        // document-wide rather than by focus: its summary keeps focus in
+        // the editor on purpose, so the menu is open while focus sits
+        // elsewhere. The widget's own capture listener registers after
+        // this one, so standing down is what lets it act.
+        if (document.querySelector(
+          '.compose-dialog--expanded details[data-dropdown-group][open]',
+        )) {
+          return;
+        }
         event.preventDefault();
-        composeStore.close();
+        composeStore.requestClose(composeStore.activeSessionId);
       }
       return;
     }
-    if (space.value !== 'mail') return;
 
-    if (matchesShortcut(event, { key: 'k', mod: true })) {
+    const scheme = settingsStore.get('shortcutScheme');
+    const editable = isEditableTarget(event.target);
+    const resolved = resolveShortcut(event, scheme, pendingPrefix);
+
+    // Quick Filter is shared by every space and its chord form works
+    // from inside a text field; `/` does not, so typing it still works.
+    if (resolved?.action === 'quickFilter') {
+      if (editable && !resolved.binding.inEditable) return;
       event.preventDefault();
       focusQuickFilter?.();
       return;
     }
 
-    if (isEditableTarget(event.target)) return;
+    if (space.value !== 'mail') return;
+    if (editable) return;
 
-    const mod = isModKey(event);
+    const prefix = prefixForEvent(event, scheme);
+    if (prefix) {
+      event.preventDefault();
+      startPendingPrefix(prefix);
+      return;
+    }
+    clearPendingPrefix();
 
-    // --- Compose / reply / forward ---
-    if (matchesShortcut(event, { key: 'n', mod: true }) || matchesShortcut(event, { key: 'm', mod: true })) {
-      event.preventDefault();
-      composeStore.open();
-      return;
-    }
+    if (!resolved) return;
+    const { action } = resolved;
 
-    const single = getSingleMessage(mailStore);
-    if (single && matchesShortcut(event, { key: 'r', mod: true }) && !event.shiftKey) {
-      event.preventDefault();
-      composeStore.prepareReplyFromMessage(single, mailStore.messageBody ?? {});
-      return;
-    }
-    if (single && matchesShortcut(event, { key: 'r', mod: true, shift: true })) {
-      event.preventDefault();
-      composeStore.prepareReplyAll(single, mailStore.messageBody ?? {});
-      return;
-    }
-    if (single && matchesShortcut(event, { key: 'l', mod: true })) {
-      event.preventDefault();
-      composeStore.prepareForward(single, mailStore.messageBody ?? {});
-      return;
-    }
-
-    // --- Selection ---
-    if (matchesShortcut(event, { key: 'a', mod: true })) {
-      event.preventDefault();
-      selectAllLoaded(mailStore);
-      return;
-    }
-    if (event.key === 'Escape' && mailStore.selectedIds.size > 0) {
-      event.preventDefault();
-      mailStore.clearSelection();
-      return;
-    }
-
-    // --- Message actions (need at least one target) ---
-    const targetIds = getTargetIds(mailStore);
-    if (targetIds.length > 0) {
-      if (isDeleteKey(event) && event.shiftKey) {
+    switch (action) {
+      case 'compose':
         event.preventDefault();
-        try {
-          await mailStore.permanentlyDestroyMessages(targetIds);
-        } catch (err) {
-          console.warn('[shortcuts] permanent delete failed', err);
+        composeStore.open();
+        return;
+
+      // The reply prefills read the parent's addresses from the cache, so
+      // they settle a tick later. The handler stays synchronous — it has a
+      // keystroke to preventDefault — and the composer opens when the read
+      // returns, which is the same latency the toolbar buttons have.
+      // Scheduled (Send Later) mail is read-only outgoing mail, so these
+      // stand down for it just like the hidden toolbar buttons.
+      case 'reply':
+      case 'replyAll':
+      case 'forward': {
+        const singleTarget = getSingleMessage(mailStore);
+        const single = singleTarget?.scheduled_undo_status == null ? singleTarget : null;
+        if (!single) return;
+        event.preventDefault();
+        const body = mailStore.messageBody ?? {};
+        if (action === 'reply') void composeStore.prepareReplyFromMessage(single, body);
+        else if (action === 'replyAll') void composeStore.prepareReplyAll(single, body);
+        else composeStore.prepareForward(single, body);
+        return;
+      }
+
+      case 'selectAll':
+        if (!activeMessageListCommands) return;
+        event.preventDefault();
+        activeMessageListCommands.selectAll();
+        return;
+
+      case 'clearSelection':
+        if (mailStore.selectedIds.size === 0) return;
+        event.preventDefault();
+        mailStore.clearSelection();
+        return;
+
+      case 'archive':
+      case 'delete':
+      case 'deleteForever':
+      case 'markRead':
+      case 'markUnread':
+      case 'toggleRead': {
+        const targetIds = targetsForMessageAction(action);
+        if (targetIds == null) return;
+        event.preventDefault();
+        if (targetIds.length === 0) return;
+        if (action === 'archive') {
+          void mailStore.archiveMessages(targetIds);
+        } else if (action === 'markRead') {
+          void mailStore.markManySeen(targetIds, true);
+        } else if (action === 'markUnread') {
+          void mailStore.markManySeen(targetIds, false);
+        } else if (action === 'toggleRead') {
+          void mailStore.toggleManySeen(targetIds);
+        } else {
+          try {
+            if (action === 'deleteForever') {
+              await mailStore.permanentlyDestroyMessages(targetIds);
+            } else {
+              await mailStore.destroyMessages(targetIds);
+            }
+          } catch (err) {
+            console.warn(`[shortcuts] ${action} failed`, err);
+          }
         }
         return;
       }
-      if (isDeleteKey(event)) {
-        event.preventDefault();
-        try {
-          await mailStore.destroyMessages(targetIds);
-        } catch (err) {
-          console.warn('[shortcuts] delete failed', err);
-        }
-        return;
-      }
-      if (event.key === 'a' || event.key === 'A') {
-        event.preventDefault();
-        void mailStore.archiveMessages(targetIds);
-        return;
-      }
-      if (event.key === 'm' || event.key === 'M') {
-        event.preventDefault();
-        void mailStore.toggleManySeen(targetIds);
-        return;
-      }
-    }
 
-    // --- Navigation (single-key, no modifiers) ---
-    if (!mod && !event.altKey && !event.shiftKey) {
-      if (event.key === 'f' || event.key === 'F') {
+      case 'next':
+      case 'previous':
+      case 'nextUnread':
+      case 'previousUnread':
+      case 'first':
+      case 'last':
+        if (!activeMessageListCommands) return;
         event.preventDefault();
-        navigateRelative(mailStore, 1);
+        activeMessageListCommands.navigate(action);
         return;
-      }
-      if (event.key === 'b' || event.key === 'B') {
-        event.preventDefault();
-        navigateRelative(mailStore, -1);
-        return;
-      }
-      if (event.key === 'n' || event.key === 'N') {
-        event.preventDefault();
-        navigateRelative(mailStore, 1, { unreadOnly: true });
-        return;
-      }
-      if (event.key === 'p' || event.key === 'P') {
-        event.preventDefault();
-        navigateRelative(mailStore, -1, { unreadOnly: true });
-        return;
-      }
-      if (event.key === 'Home') {
-        event.preventDefault();
-        const index = firstLoadedIndex(mailStore);
-        if (index >= 0) navigateToIndex(mailStore, index);
-        return;
-      }
-      if (event.key === 'End') {
-        event.preventDefault();
-        const index = lastLoadedIndex(mailStore);
-        if (index >= 0) navigateToIndex(mailStore, index);
-        return;
+
+      default: {
+        const unhandled: never = action;
+        return unhandled;
       }
     }
   }
@@ -252,6 +305,7 @@ export function useThunderbirdShortcuts({
   });
 
   onUnmounted(() => {
+    clearPendingPrefix();
     if (activeShortcutHandler === onKeyDown) {
       activeShortcutHandler = null;
     }

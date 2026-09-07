@@ -36,21 +36,126 @@ function makeFetch(handlers) {
   });
 }
 
-function jsonResponse(body: any, init: { status?: number; statusText?: string } = {}) {
+function jsonResponse(
+  body: any,
+  init: {
+    status?: number;
+    statusText?: string;
+    headers?: Record<string, string>;
+  } = {},
+) {
   return {
     ok: init.status == null || (init.status >= 200 && init.status < 300),
     status: init.status ?? 200,
     statusText: init.statusText ?? 'OK',
+    headers: {
+      get: (name: string) => Object.entries(init.headers ?? {})
+        .find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1] ?? null,
+    },
     text: async () => JSON.stringify(body),
     json: async () => body,
   };
+}
+
+class FakeEventTarget {
+  _listeners = new Map<string, Set<(event?: any) => void>>();
+
+  addEventListener(type: string, listener: (event?: any) => void) {
+    const listeners = this._listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this._listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: (event?: any) => void) {
+    this._listeners.get(type)?.delete(listener);
+  }
+
+  dispatch(type: string, event: any = {}) {
+    for (const listener of [...(this._listeners.get(type) ?? [])]) {
+      listener({ type, ...event });
+    }
+  }
+}
+
+class FakeXMLHttpRequest extends FakeEventTarget {
+  static instances: FakeXMLHttpRequest[] = [];
+
+  upload = new FakeEventTarget();
+  method = '';
+  url = '';
+  async = true;
+  headers: Record<string, string> = {};
+  body: any = null;
+  status = 0;
+  statusText = '';
+  responseText = '';
+  aborted = false;
+
+  constructor() {
+    super();
+    FakeXMLHttpRequest.instances.push(this);
+  }
+
+  static reset() {
+    FakeXMLHttpRequest.instances = [];
+  }
+
+  open(method: string, url: string, async = true) {
+    this.method = method;
+    this.url = url;
+    this.async = async;
+  }
+
+  setRequestHeader(name: string, value: string) {
+    this.headers[name] = value;
+  }
+
+  send(body: any) {
+    this.body = body;
+  }
+
+  abort() {
+    if (this.aborted) return;
+    this.aborted = true;
+    this.dispatch('abort');
+  }
+
+  uploadProgress(loaded: number, total: number) {
+    this.upload.dispatch('progress', {
+      loaded,
+      total,
+      lengthComputable: true,
+    });
+  }
+
+  finishUpload() {
+    this.upload.dispatch('load');
+  }
+
+  respond(body: any, status = 200, statusText = 'OK') {
+    this.status = status;
+    this.statusText = statusText;
+    this.responseText = JSON.stringify(body);
+    this.dispatch('load');
+  }
 }
 
 describe('JmapTransport HTTP', () => {
   let auth;
 
   beforeEach(() => {
+    FakeXMLHttpRequest.reset();
     auth = vi.fn(async () => FAKE_BASIC_AUTH);
+  });
+
+  it('reports a WebSocket as closed before one exists', () => {
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: vi.fn(),
+    });
+
+    expect(t.isWebSocketOpen()).toBe(false);
   });
 
   it('fetches and caches the session document', async () => {
@@ -82,6 +187,84 @@ describe('JmapTransport HTTP', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it('captures a bounded server clock reference from HTTP Date headers', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime('2026-08-31T12:00:00.500Z');
+      const fetchMock = makeFetch({
+        'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION, {
+          headers: { Date: 'Mon, 31 Aug 2026 12:00:01 GMT' },
+        }),
+      });
+      const t = new JmapTransport({
+        sessionUrl: 'https://mail.example.com/.well-known/jmap',
+        getAuthHeader: auth,
+        fetch: fetchMock,
+      });
+
+      await t.fetchSession();
+
+      expect(t.serverClockReference).toEqual({
+        capturedAtMs: Date.parse('2026-08-31T12:00:00.500Z'),
+        lowerOffsetMs: 500,
+        uncertaintyMs: 999,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refreshes the server clock reference from JMAP responses', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime('2026-08-31T12:00:00.000Z');
+      const fetchMock = makeFetch({
+        'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+        'https://mail.example.com/jmap': () => jsonResponse(
+          { methodResponses: [] },
+          { headers: { Date: 'Mon, 31 Aug 2026 12:00:01 GMT' } },
+        ),
+      });
+      const t = new JmapTransport({
+        sessionUrl: 'https://mail.example.com/.well-known/jmap',
+        getAuthHeader: auth,
+        fetch: fetchMock,
+      });
+
+      await t.request([JMAP_CAPS.CORE], []);
+
+      expect(t.serverClockReference).toMatchObject({
+        capturedAtMs: Date.parse('2026-08-31T12:00:00.000Z'),
+        lowerOffsetMs: 1_000,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores invalid or unbounded HTTP Date headers', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime('2026-08-31T12:00:00Z');
+      const fetchMock = makeFetch({
+        'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION, {
+          headers: { Date: 'Wed, 02 Sep 2026 12:00:00 GMT' },
+        }),
+      });
+      const t = new JmapTransport({
+        sessionUrl: 'https://mail.example.com/.well-known/jmap',
+        getAuthHeader: auth,
+        fetch: fetchMock,
+      });
+
+      await t.fetchSession();
+
+      expect(t.serverClockReference).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('throws a descriptive error on session fetch failure', async () => {
     const fetchMock = makeFetch({
       'https://mail.example.com/.well-known/jmap': () =>
@@ -92,7 +275,11 @@ describe('JmapTransport HTTP', () => {
       getAuthHeader: auth,
       fetch: fetchMock,
     });
-    await expect(t.fetchSession()).rejects.toThrow(/401/);
+    await expect(t.fetchSession()).rejects.toMatchObject({
+      type: 'httpError',
+      status: 401,
+      message: expect.stringMatching(/401/),
+    });
   });
 
   it('issues a method-call request with the provided using/methodCalls', async () => {
@@ -120,6 +307,238 @@ describe('JmapTransport HTTP', () => {
     expect(result.methodResponses[0][0]).toBe('Mailbox/get');
   });
 
+  it('rejects a request with a typed timeout error when the server never responds', async () => {
+    // Failure mode: fetch() has no timeout. A server that accepts the
+    // POST and then stalls leaves the awaiting caller hung until the OS
+    // gives up on the socket. For a send that means compose-store never
+    // leaves status SENDING, and Close and Discard — which are gated on
+    // exactly that — stay disabled with no way out but a reload.
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap': (init) => new Promise((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => {
+          const err: any = new Error('The operation was aborted.');
+          err.name = 'AbortError';
+          reject(err);
+        });
+      }),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+      httpRequestTimeoutMs: 80,
+    });
+
+    const started = Date.now();
+    await expect(t.request([JMAP_CAPS.CORE], [['Mailbox/get', {}, 'm1']]))
+      .rejects.toMatchObject({
+        type: 'httpRequestTimeout',
+        message: expect.stringMatching(/timed out/i),
+      });
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(50);
+    expect(elapsed).toBeLessThan(2_000);
+    expect((t as any)._inFlightHttp.size).toBe(0);
+  });
+
+  it('applies the deadline to the response body, not just the headers', async () => {
+    // fetch() resolves as soon as the headers arrive, so a deadline
+    // that stops there leaves a server which sends 200 and then stalls
+    // the body hanging in response.json() with the timer cleared.
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap': (init) => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => new Promise((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => {
+            const err: any = new Error('The operation was aborted.');
+            err.name = 'AbortError';
+            reject(err);
+          });
+        }),
+      }),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+      httpRequestTimeoutMs: 80,
+    });
+
+    await expect(t.request([JMAP_CAPS.CORE], [['Mailbox/get', {}, 'm1']]))
+      .rejects.toMatchObject({ type: 'httpRequestTimeout' });
+    expect((t as any)._inFlightHttp.size).toBe(0);
+  });
+
+  it('abort() cancels an in-flight request with a distinguishable error', async () => {
+    // Teardown needs the pending call to settle now, not at the
+    // deadline, and the resulting error must not read as a stalled
+    // server: recovery treats the two differently.
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap': (init) => new Promise((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => {
+          const err: any = new Error('The operation was aborted.');
+          err.name = 'AbortError';
+          reject(err);
+        });
+      }),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+      httpRequestTimeoutMs: 60_000,
+    });
+
+    // Warm the session first. Otherwise request() issues the session
+    // fetch as well, and waiting on a size of 1 could be satisfied by
+    // that fetch's controller rather than by the parked POST this test
+    // means to abort.
+    await t.fetchSession();
+    const pending = t.request([JMAP_CAPS.CORE], [['Mailbox/get', {}, 'm1']]);
+    await vi.waitFor(() => expect((t as any)._inFlightHttp.size).toBe(1));
+    t.abort();
+    await expect(pending).rejects.toMatchObject({ type: 'transportAborted' });
+    expect((t as any)._inFlightHttp.size).toBe(0);
+  });
+
+  it('refuses a request issued after abort() instead of sending it', async () => {
+    // The abort has to latch, not just cancel what is in flight. A
+    // mutation part-way through a multi-call operation reacts to its
+    // cancelled call by moving on, and the next call would otherwise be
+    // sent after teardown began and hold stop() open for its own
+    // deadline.
+    let posts = 0;
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap': () => {
+        posts += 1;
+        return jsonResponse({ methodResponses: [['Mailbox/get', { list: [] }, 'm1']] });
+      },
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+    });
+
+    t.abort();
+
+    await expect(t.request([JMAP_CAPS.CORE], [['Mailbox/get', {}, 'm1']]))
+      .rejects.toMatchObject({ type: 'transportAborted' });
+    expect(posts, 'no request should reach the server after abort()').toBe(0);
+    expect((t as any)._inFlightHttp.size).toBe(0);
+  });
+
+  it('refuses a WebSocket request issued after abort() too', async () => {
+    // The WebSocket leg has the same exposure: abort() rejects what is
+    // pending, and a frame sent afterwards would sit until the 30s
+    // WebSocket deadline because stop() closes the socket only after
+    // the runner has quiesced.
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: makeFetch({}),
+    });
+    const sent: string[] = [];
+    (t as any)._ws = {
+      OPEN: 1,
+      readyState: 1,
+      send: (frame: string) => sent.push(frame),
+    };
+
+    t.abort();
+
+    await expect(t.wsRequest([JMAP_CAPS.CORE], [['Mailbox/get', {}, 'm1']]))
+      .rejects.toMatchObject({ type: 'transportAborted' });
+    expect(sent, 'no frame should be sent after abort()').toEqual([]);
+  });
+
+  it('leaves a request that completes in time untouched and unregisters it', async () => {
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap': () =>
+        jsonResponse({ methodResponses: [['Mailbox/get', { list: [] }, 'm1']] }),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+      httpRequestTimeoutMs: 60,
+    });
+    // Fake timers so the deadline timer's disposal can be observed
+    // directly. Waiting past the deadline instead would prove nothing:
+    // an armed timer would fire abort() on a controller already removed
+    // from _inFlightHttp, leaving every assertion here unchanged.
+    vi.useFakeTimers();
+    try {
+      const result = await t.request([JMAP_CAPS.CORE], [['Mailbox/get', {}, 'm1']]);
+      expect(result.methodResponses[0][0]).toBe('Mailbox/get');
+      expect((t as any)._inFlightHttp.size).toBe(0);
+      expect(
+        vi.getTimerCount(),
+        'the deadline timer must be cleared once the request settles',
+      ).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still honours a caller-supplied AbortSignal', async () => {
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap': (init) => new Promise((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => {
+          const err: any = new Error('The operation was aborted.');
+          err.name = 'AbortError';
+          reject(err);
+        });
+      }),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+    });
+    const controller = new AbortController();
+    const pending = t.request(
+      [JMAP_CAPS.CORE],
+      [['Mailbox/get', {}, 'm1']],
+      { signal: controller.signal },
+    );
+    await vi.waitFor(() => expect((t as any)._inFlightHttp.size).toBe(1));
+    controller.abort();
+    // A caller-driven abort keeps its own AbortError rather than being
+    // relabelled as a transport teardown.
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('gives the session fetch a deadline too', async () => {
+    // request() awaits fetchSession() when no session is cached, so a
+    // stalled session document hangs a send just as surely as a stalled
+    // method call.
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': (init) => new Promise((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => {
+          const err: any = new Error('The operation was aborted.');
+          err.name = 'AbortError';
+          reject(err);
+        });
+      }),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+      httpRequestTimeoutMs: 80,
+    });
+    await expect(t.fetchSession()).rejects.toMatchObject({ type: 'httpRequestTimeout' });
+  });
+
   it('attaches the auth header on every request', async () => {
     const fetchMock = makeFetch({
       'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
@@ -137,6 +556,570 @@ describe('JmapTransport HTTP', () => {
       expect(init.headers.Authorization).toBe(FAKE_BASIC_AUTH);
     }
   });
+
+  it('rejects an oversized declared download before reading the body', async () => {
+    const arrayBuffer = vi.fn();
+    const cancel = vi.fn(async () => {});
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap/download/acct-1/blob-1/photo': () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: { get: () => '9' },
+        body: { cancel },
+        arrayBuffer,
+      }),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+    });
+
+    await expect(t.download({
+      accountId: 'acct-1',
+      blobId: 'blob-1',
+      name: 'photo',
+      maxBytes: 8,
+    })).rejects.toMatchObject({
+      type: 'tooLarge',
+      status: 413,
+      maxBytes: 8,
+    });
+    expect(arrayBuffer).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels a streamed download when cumulative bytes exceed the cap', async () => {
+    const chunks = [
+      new Uint8Array([1, 2, 3, 4]),
+      new Uint8Array([5, 6, 7, 8]),
+    ];
+    const read = vi.fn(async () => (
+      chunks.length > 0
+        ? { done: false, value: chunks.shift() }
+        : { done: true, value: undefined }
+    ));
+    const cancel = vi.fn(async () => {});
+    const releaseLock = vi.fn();
+    const arrayBuffer = vi.fn();
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap/download/acct-1/blob-1/photo': () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: { get: () => null },
+        body: {
+          getReader: () => ({ read, cancel, releaseLock }),
+        },
+        arrayBuffer,
+      }),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+    });
+
+    await expect(t.download({
+      accountId: 'acct-1',
+      blobId: 'blob-1',
+      name: 'photo',
+      maxBytes: 6,
+    })).rejects.toMatchObject({
+      type: 'tooLarge',
+      status: 413,
+      actualBytes: 8,
+    });
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(releaseLock).toHaveBeenCalledTimes(1);
+    expect(arrayBuffer).not.toHaveBeenCalled();
+  });
+
+  it('returns a streamed prefix when the caller requests truncation at the cap', async () => {
+    const chunks = [
+      new Uint8Array([1, 2, 3, 4]),
+      new Uint8Array([5, 6, 7, 8]),
+    ];
+    const read = vi.fn(async () => (
+      chunks.length > 0
+        ? { done: false, value: chunks.shift() }
+        : { done: true, value: undefined }
+    ));
+    const cancel = vi.fn(async () => {});
+    const releaseLock = vi.fn();
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap/download/acct-1/blob-1/photo': () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: { get: () => '8' },
+        body: {
+          getReader: () => ({ read, cancel, releaseLock }),
+        },
+      }),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+    });
+
+    await expect(t.download({
+      accountId: 'acct-1',
+      blobId: 'blob-1',
+      name: 'photo',
+      maxBytes: 6,
+      truncateAtMaxBytes: true,
+    })).resolves.toEqual(new Uint8Array([1, 2, 3, 4, 5, 6]));
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(releaseLock).toHaveBeenCalledTimes(1);
+  });
+
+  it('truncates an unknown-length stream without reading its remaining chunks', async () => {
+    const chunks = [
+      new Uint8Array([1, 2, 3, 4]),
+      new Uint8Array([5, 6, 7, 8]),
+      new Uint8Array([9, 10]),
+    ];
+    const read = vi.fn(async () => (
+      chunks.length > 0
+        ? { done: false, value: chunks.shift() }
+        : { done: true, value: undefined }
+    ));
+    const cancel = vi.fn(async () => {});
+    const releaseLock = vi.fn();
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap/download/acct-1/blob-1/photo': () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: { get: () => null },
+        body: {
+          getReader: () => ({ read, cancel, releaseLock }),
+        },
+      }),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+    });
+
+    await expect(t.download({
+      accountId: 'acct-1',
+      blobId: 'blob-1',
+      name: 'photo',
+      maxBytes: 6,
+      truncateAtMaxBytes: true,
+    })).resolves.toEqual(new Uint8Array([1, 2, 3, 4, 5, 6]));
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(releaseLock).toHaveBeenCalledTimes(1);
+  });
+
+  it('never buffers a full non-streaming response in truncating mode', async () => {
+    const arrayBuffer = vi.fn(async () => new Uint8Array(20).buffer);
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap/download/acct-1/blob-1/photo': () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: { get: () => '20' },
+        arrayBuffer,
+      }),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+    });
+
+    await expect(t.download({
+      accountId: 'acct-1',
+      blobId: 'blob-1',
+      name: 'photo',
+      maxBytes: 6,
+      truncateAtMaxBytes: true,
+    })).rejects.toMatchObject({
+      type: 'streamingUnavailable',
+    });
+    expect(arrayBuffer).not.toHaveBeenCalled();
+  });
+
+  it('builds attachment Blobs directly from streamed chunks', async () => {
+    const chunks = [
+      new Uint8Array([0x64, 0x6f, 0x77, 0x6e]),
+      new Uint8Array([0x6c, 0x6f, 0x61, 0x64]),
+    ];
+    const arrayBuffer = vi.fn();
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap/download/acct-1/blob-direct/file': () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: { get: () => '8' },
+        body: {
+          getReader: () => ({
+            read: vi.fn(async () => (
+              chunks.length > 0
+                ? { done: false, value: chunks.shift() }
+                : { done: true, value: undefined }
+            )),
+            cancel: vi.fn(async () => {}),
+            releaseLock: vi.fn(),
+          }),
+        },
+        arrayBuffer,
+      }),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+    });
+
+    const blob = await t.downloadBlob({
+      accountId: 'acct-1',
+      blobId: 'blob-direct',
+      name: 'file',
+      type: 'text/plain',
+    });
+
+    expect(blob).toBeInstanceOf(Blob);
+    expect(blob.type).toBe('text/plain');
+    expect(await blob.text()).toBe('download');
+    expect(arrayBuffer).not.toHaveBeenCalled();
+  });
+
+  it('streams correlated download progress and resets the idle timeout per chunk', async () => {
+    vi.useFakeTimers();
+    try {
+      const chunks = [
+        new Uint8Array([1, 2]),
+        new Uint8Array([3, 4]),
+      ];
+      const fetchMock = makeFetch({
+        'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+        'https://mail.example.com/jmap/download/acct-1/blob-progress/file': () => ({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          headers: { get: () => '4' },
+          body: {
+            getReader: () => ({
+              read: () => new Promise((resolve) => {
+                setTimeout(() => {
+                  resolve(chunks.length > 0
+                    ? { done: false, value: chunks.shift() }
+                    : { done: true, value: undefined });
+                }, 20);
+              }),
+              cancel: vi.fn(async () => {}),
+              releaseLock: vi.fn(),
+            }),
+          },
+        }),
+      });
+      const t = new JmapTransport({
+        sessionUrl: 'https://mail.example.com/.well-known/jmap',
+        getAuthHeader: auth,
+        fetch: fetchMock,
+        httpBlobIdleTimeoutMs: 25,
+      });
+      await t.fetchSession();
+      const progress = [];
+      const pending = t.download({
+        accountId: 'acct-1',
+        blobId: 'blob-progress',
+        name: 'file',
+        onProgress: (event) => progress.push(event),
+      });
+
+      await vi.advanceTimersByTimeAsync(60);
+      await expect(pending).resolves.toEqual(new Uint8Array([1, 2, 3, 4]));
+      expect(progress).toEqual([
+        {
+          direction: 'download',
+          phase: 'transferring',
+          loaded: 0,
+          total: 4,
+        },
+        {
+          direction: 'download',
+          phase: 'transferring',
+          loaded: 2,
+          total: 4,
+        },
+        {
+          direction: 'download',
+          phase: 'transferring',
+          loaded: 4,
+          total: 4,
+        },
+        {
+          direction: 'download',
+          phase: 'complete',
+          loaded: 4,
+          total: 4,
+        },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels a stalled blob after its progress idle timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = makeFetch({
+        'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+        'https://mail.example.com/jmap/download/acct-1/blob-stalled/file': (init) => ({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          headers: { get: () => null },
+          body: {
+            getReader: () => ({
+              read: () => new Promise((_resolve, reject) => {
+                init.signal.addEventListener('abort', () => {
+                  const error: any = new Error('aborted');
+                  error.name = 'AbortError';
+                  reject(error);
+                }, { once: true });
+              }),
+              cancel: vi.fn(async () => {}),
+              releaseLock: vi.fn(),
+            }),
+          },
+        }),
+      });
+      const t = new JmapTransport({
+        sessionUrl: 'https://mail.example.com/.well-known/jmap',
+        getAuthHeader: auth,
+        fetch: fetchMock,
+        httpBlobIdleTimeoutMs: 25,
+      });
+      await t.fetchSession();
+      const pending = t.download({
+        accountId: 'acct-1',
+        blobId: 'blob-stalled',
+        name: 'file',
+      });
+      const rejected = expect(pending).rejects.toMatchObject({
+        type: 'httpIdleTimeout',
+      });
+
+      await vi.advanceTimersByTimeAsync(25);
+      await rejected;
+      expect((t as any)._inFlightHttp.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('allows a progressing upload to outlive repeated 15-second windows', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = makeFetch({
+        'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      });
+      const t = new JmapTransport({
+        sessionUrl: 'https://mail.example.com/.well-known/jmap',
+        getAuthHeader: auth,
+        fetch: fetchMock,
+        XMLHttpRequestImpl: FakeXMLHttpRequest as any,
+      });
+      await t.fetchSession();
+      const source = new Blob(['slow upload'], { type: 'text/plain' });
+      const progress: any[] = [];
+      const pending = t.upload({
+        accountId: 'acct-1',
+        type: 'text/plain',
+        body: source,
+        onProgress: (event) => progress.push(event),
+      });
+      await Promise.resolve();
+      const request = FakeXMLHttpRequest.instances[0];
+
+      expect(request.method).toBe('POST');
+      expect(request.url).toBe('https://mail.example.com/jmap/upload/acct-1/');
+      expect(request.headers).toEqual({
+        Authorization: FAKE_BASIC_AUTH,
+        'Content-Type': 'text/plain',
+        Accept: 'application/json',
+      });
+      expect(request.body).toBe(source);
+
+      for (const loaded of [2, 4, 6, 8, source.size]) {
+        await vi.advanceTimersByTimeAsync(10_000);
+        request.uploadProgress(loaded, source.size);
+        expect(request.aborted).toBe(false);
+      }
+      request.finishUpload();
+      request.respond({
+        accountId: 'acct-1',
+        blobId: 'slow-blob',
+        type: 'text/plain',
+        size: source.size,
+      });
+
+      await expect(pending).resolves.toMatchObject({ blobId: 'slow-blob' });
+      expect(progress.at(0)).toEqual({
+        direction: 'upload',
+        phase: 'transferring',
+        loaded: 0,
+        total: source.size,
+      });
+      expect(progress.at(-1)).toEqual({
+        direction: 'upload',
+        phase: 'complete',
+        loaded: source.size,
+        total: source.size,
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels an upload after 15 seconds without byte progress', async () => {
+    vi.useFakeTimers();
+    try {
+      const t = new JmapTransport({
+        sessionUrl: 'https://mail.example.com/.well-known/jmap',
+        getAuthHeader: auth,
+        fetch: makeFetch({
+          'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+        }),
+        XMLHttpRequestImpl: FakeXMLHttpRequest as any,
+      });
+      await t.fetchSession();
+      const pending = t.upload({
+        accountId: 'acct-1',
+        type: 'application/octet-stream',
+        body: new Blob(['stalled']),
+      });
+      await Promise.resolve();
+      const request = FakeXMLHttpRequest.instances[0];
+      const rejected = expect(pending).rejects.toMatchObject({
+        type: 'httpIdleTimeout',
+        elapsedMs: 15_000,
+      });
+
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(request.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await rejected;
+      expect(request.aborted).toBe(true);
+      expect((t as any)._inFlightHttp.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps observable upload progress in the non-XHR fetch fallback', async () => {
+    const uploadedChunks: Uint8Array[] = [];
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+      'https://mail.example.com/jmap/upload/acct-1/': async (init) => {
+        expect(init.duplex).toBe('half');
+        const reader = init.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          uploadedChunks.push(value);
+        }
+        return jsonResponse({
+          accountId: 'acct-1',
+          blobId: 'fallback-blob',
+          type: 'text/plain',
+          size: 8,
+        });
+      },
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+    });
+    await t.fetchSession();
+    const progress: any[] = [];
+
+    await expect(t.upload({
+      accountId: 'acct-1',
+      type: 'text/plain',
+      body: new Blob(['fallback'], { type: 'text/plain' }),
+      onProgress: (event) => progress.push(event),
+    })).resolves.toMatchObject({ blobId: 'fallback-blob' });
+
+    const uploadedBytes = new Uint8Array(
+      uploadedChunks.reduce((total, chunk) => total + chunk.byteLength, 0),
+    );
+    let offset = 0;
+    for (const chunk of uploadedChunks) {
+      uploadedBytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    expect(new TextDecoder().decode(uploadedBytes)).toBe('fallback');
+    expect(progress.some((event) =>
+      event.phase === 'transferring' && event.loaded === 8)).toBe(true);
+    expect(progress.at(-1)).toMatchObject({
+      phase: 'complete',
+      loaded: 8,
+      total: 8,
+    });
+  });
+
+  it('cancels one upload signal without latching global transport teardown', async () => {
+    const fetchMock = makeFetch({
+      'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
+    });
+    const t = new JmapTransport({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap',
+      getAuthHeader: auth,
+      fetch: fetchMock,
+      XMLHttpRequestImpl: FakeXMLHttpRequest as any,
+    });
+    await t.fetchSession();
+    const controller = new AbortController();
+    const cancelled = t.upload({
+      accountId: 'acct-1',
+      type: 'text/plain',
+      body: new Blob(['cancel me']),
+      signal: controller.signal,
+    });
+    const unaffected = t.upload({
+      accountId: 'acct-1',
+      type: 'text/plain',
+      body: new Blob(['keep']),
+    });
+
+    await vi.waitFor(() => expect(FakeXMLHttpRequest.instances).toHaveLength(2));
+    controller.abort();
+    FakeXMLHttpRequest.instances[1].respond({
+      accountId: 'acct-1',
+      blobId: 'kept',
+      type: 'text/plain',
+      size: 4,
+    });
+
+    await expect(cancelled).rejects.toMatchObject({
+      name: 'AbortError',
+      type: 'cancelled',
+    });
+    await expect(unaffected).resolves.toMatchObject({ blobId: 'kept' });
+    expect((t as any)._aborted).toBe(false);
+    expect((t as any)._inFlightHttp.size).toBe(0);
+  });
 });
 
 describe('JmapTransport WebSocket (RFC 8887)', () => {
@@ -147,7 +1130,7 @@ describe('JmapTransport WebSocket (RFC 8887)', () => {
     auth = vi.fn(async () => 'Bearer test-token');
   });
 
-  function makeTransport() {
+  function makeTransport(options: Record<string, any> = {}) {
     const fetchMock = makeFetch({
       'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),
     });
@@ -156,6 +1139,7 @@ describe('JmapTransport WebSocket (RFC 8887)', () => {
       getAuthHeader: auth,
       fetch: fetchMock,
       WebSocketImpl: FakeWebSocket,
+      ...options,
     });
   }
 
@@ -173,6 +1157,69 @@ describe('JmapTransport WebSocket (RFC 8887)', () => {
     expect(enable['@type']).toBe('WebSocketPushEnable');
     expect(enable.dataTypes).toEqual(['Mailbox', 'Email']);
     expect(enable.pushState).toBe('aaa');
+  });
+
+  it('bounds a stalled opening handshake and allows a later retry', async () => {
+    // Every caller shares the opening promise, so its deadline must release
+    // all of them and clear the cache before another connection is attempted.
+    vi.useFakeTimers();
+    try {
+      const t = makeTransport({ wsRequestTimeoutMs: 25 });
+      const first = t.openWebSocket(['Email'], null);
+      const ws = await FakeWebSocket._waitForInstance();
+      const shared = t.openWebSocket(['Email'], null);
+      expect(FakeWebSocket.instances).toHaveLength(1);
+
+      const firstRejection = expect(first).rejects.toMatchObject({
+        type: 'wsRequestTimeout',
+        requestId: 'openWebSocket',
+        elapsedMs: 25,
+      });
+      const sharedRejection = expect(shared).rejects.toMatchObject({
+        type: 'wsRequestTimeout',
+        requestId: 'openWebSocket',
+      });
+      await vi.advanceTimersByTimeAsync(25);
+      await firstRejection;
+      await sharedRejection;
+
+      expect(ws.readyState).toBe(FakeWebSocket.CLOSED);
+      expect(ws._listeners.get('open')?.size ?? 0).toBe(0);
+      expect(ws._listeners.get('error')?.size ?? 0).toBe(0);
+      expect(ws._listeners.get('close')?.size ?? 0).toBe(0);
+      expect((t as any)._wsReadyPromise).toBeNull();
+      expect((t as any)._ws).toBeNull();
+
+      const retry = t.openWebSocket(['Email'], null);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      const retrySocket = FakeWebSocket.instances[1];
+      retrySocket._open();
+      await retry;
+      expect(retrySocket.sent).toHaveLength(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects when the socket closes before the opening handshake completes', async () => {
+    // A close event is the terminal handshake result even when the browser
+    // emits no error event beside it.
+    vi.useFakeTimers();
+    try {
+      const t = makeTransport({ wsRequestTimeoutMs: 60_000 });
+      const pending = t.openWebSocket(['Email'], null);
+      const ws = await FakeWebSocket._waitForInstance();
+
+      ws._close(1001, 'server shutdown');
+
+      await expect(pending).rejects.toThrow(/closed before open: server shutdown/i);
+      expect((t as any)._wsReadyPromise).toBeNull();
+      expect((t as any)._ws).toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('correlates Request/Response by requestId', async () => {
@@ -213,7 +1260,11 @@ describe('JmapTransport WebSocket (RFC 8887)', () => {
       status: 400,
       detail: 'something is wrong',
     });
-    await expect(pending).rejects.toThrow(/something is wrong/);
+    await expect(pending).rejects.toMatchObject({
+      type: 'urn:ietf:params:jmap:error:notRequest',
+      status: 400,
+      message: 'something is wrong',
+    });
   });
 
   it('delivers StateChange to subscribers and updates lastPushState', async () => {
@@ -236,6 +1287,31 @@ describe('JmapTransport WebSocket (RFC 8887)', () => {
     expect(seen[0].changed['acct-1'].Email).toBe('state-1');
     expect(seen[0].pushState).toBe('bbb');
     expect(t.lastPushState).toBe('bbb');
+  });
+
+  it('opens no socket once the transport has been aborted', async () => {
+    const t = makeTransport();
+    t.abort();
+    await expect(t.openWebSocket(['Email'], null))
+      .rejects.toMatchObject({ type: 'transportAborted' });
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it('closes a socket that finished connecting after the abort', async () => {
+    // The abort can land while the handshake is in flight, between the
+    // constructor and the open event. Keeping that socket would leave an
+    // authenticated connection alive for a signed-out account, and the
+    // WebSocketPushEnable would go out after teardown.
+    const t = makeTransport();
+    const open = t.openWebSocket(['Email'], null);
+    const ws = await FakeWebSocket._waitForInstance();
+    t.abort();
+    ws._open();
+
+    await expect(open).rejects.toMatchObject({ type: 'transportAborted' });
+    expect(ws.sent, 'nothing may be sent on a socket opened into teardown').toEqual([]);
+    expect(ws.readyState).toBe(FakeWebSocket.CLOSED);
+    expect((t as any)._ws).toBeNull();
   });
 
   it('rejects pending requests when the WebSocket closes', async () => {

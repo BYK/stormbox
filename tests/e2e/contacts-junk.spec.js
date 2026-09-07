@@ -1,6 +1,7 @@
 import {
   cleanupEmail,
   connectJmap,
+  contactsRequest,
   createEmailInMailbox,
   getEmailKeywords,
   getEmailMailboxIds,
@@ -8,6 +9,7 @@ import {
   listMailboxes,
   mailboxByRole,
   pickResponse,
+  sweepOrphanTestMessages,
 } from './helpers/jmap-client.js';
 import {
   attachConsoleTail,
@@ -18,6 +20,7 @@ import {
 } from './helpers/shared-session.js';
 import {
   localStackEnabled,
+  SHARED_TEST_OIDC_EMAIL,
   skipLocalStackMessage,
 } from './helpers/stack-env.js';
 import {
@@ -29,6 +32,11 @@ import {
   readViewCacheForFolderRole,
   waitForPendingMutations,
 } from './helpers/ui.js';
+import {
+  composeSubject,
+  fillRecipient,
+  waitForIdentities,
+} from './helpers/compose.js';
 
 /**
  * Contacts management + Junk "Not junk" whitelist flows (junk-whitelist
@@ -43,29 +51,15 @@ import {
 test.skip(!localStackEnabled, skipLocalStackMessage);
 
 const JUNK_SUBJECT_PREFIX = 'JunkWhitelist e2e';
+const AUTO_TRUST_SUBJECT_PREFIX = 'AutoTrustRecipient e2e';
 const CONTACT_DOMAIN = 'contacts-e2e.example';
-
-// --- JMAP contacts helpers (jmapRequest omits the contacts capability,
-// so talk to ContactCard/* directly with our own `using`). ------------
-async function contactsRequest(jmap, methodCalls) {
-  const res = await fetch(jmap.apiUrl, {
-    method: 'POST',
-    headers: { Authorization: jmap.authHeader, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:contacts'],
-      methodCalls,
-    }),
-  });
-  if (!res.ok) throw new Error(`contacts JMAP failed: ${res.status} ${await res.text().catch(() => '')}`);
-  return res.json();
-}
 
 async function listCards(jmap) {
   const q = await contactsRequest(jmap, [['ContactCard/query', { accountId: jmap.accountId }, 'q']]);
-  const ids = q.methodResponses?.find((r) => r[0] === 'ContactCard/query')?.[1]?.ids ?? [];
+  const ids = pickResponse(q, 'ContactCard/query')?.ids ?? [];
   if (ids.length === 0) return [];
   const g = await contactsRequest(jmap, [['ContactCard/get', { accountId: jmap.accountId, ids }, 'g']]);
-  return g.methodResponses?.find((r) => r[0] === 'ContactCard/get')?.[1]?.list ?? [];
+  return pickResponse(g, 'ContactCard/get')?.list ?? [];
 }
 
 function cardEmails(card) {
@@ -87,6 +81,21 @@ async function destroyTestCards(jmap) {
     .map((c) => c.id);
   if (ids.length > 0) {
     await contactsRequest(jmap, [['ContactCard/set', { accountId: jmap.accountId, destroy: ids }, 'd']]);
+  }
+}
+
+async function destroyCardsForEmail(jmap, email) {
+  const ids = (await listCards(jmap))
+    .filter((card) => cardEmails(card).some(
+      (address) => address.toLowerCase() === email.toLowerCase(),
+    ))
+    .map((card) => card.id);
+  if (ids.length > 0) {
+    await contactsRequest(jmap, [[
+      'ContactCard/set',
+      { accountId: jmap.accountId, destroy: ids },
+      'd',
+    ]]);
   }
 }
 
@@ -114,9 +123,63 @@ test.describe('Contacts + Junk whitelist e2e', () => {
     // Tests may leave the app in the Contacts space; resetSharedSession
     // re-anchors the Mail folder tree, so switch back to Mail first.
     await page.getByRole('button', { name: 'Mail', exact: true }).click().catch(() => {});
-    await resetSharedSession(page, { extraSubjectPrefixes: [JUNK_SUBJECT_PREFIX] });
+    await resetSharedSession(page, {
+      extraSubjectPrefixes: [JUNK_SUBJECT_PREFIX, AUTO_TRUST_SUBJECT_PREFIX],
+    });
     const jmap = await connectJmap();
     await destroyTestCards(jmap);
+  });
+
+  test('confirmed sends create one synchronized trusted contact per recipient', async ({
+    sharedPage: page,
+  }, testInfo) => {
+    const jmap = await connectJmap();
+    const recipient = SHARED_TEST_OIDC_EMAIL;
+    const subjects = [
+      `${AUTO_TRUST_SUBJECT_PREFIX} ${Date.now()} one`,
+      `${AUTO_TRUST_SUBJECT_PREFIX} ${Date.now()} two`,
+    ];
+    try {
+      await destroyCardsForEmail(jmap, recipient);
+      for (const subject of subjects) {
+        await page.getByRole('button', { name: 'Mail', exact: true }).click().catch(() => {});
+        await page.keyboard.press('c');
+        await expect(page.locator('.compose-dialog')).toBeVisible({ timeout: 10_000 });
+        await waitForIdentities(page);
+        await fillRecipient(page, 'To', recipient);
+        await composeSubject(page).fill(subject);
+        await page.locator('.compose-dialog').getByRole('button', { name: /^send$/i }).click();
+        await expect(page.locator('.compose-dialog')).toBeHidden({ timeout: 30_000 });
+        await waitForPendingMutations(page);
+      }
+
+      await expect.poll(async () => {
+        const cards = await listCards(jmap);
+        return cards.filter((card) =>
+          cardEmails(card).some((email) => email.toLowerCase() === recipient.toLowerCase()))
+          .length;
+      }, {
+        timeout: 30_000,
+        message: 'two sends to one recipient should produce exactly one ContactCard',
+      }).toBe(1);
+
+      await expect.poll(async () => {
+        const cached = await readContactsCache(page);
+        return (cached ?? []).filter(
+          (contact) => (contact.email ?? '').toLowerCase() === recipient.toLowerCase(),
+        ).length;
+      }, {
+        timeout: 30_000,
+        message: 'auto-trusted recipient should be present once in local contacts',
+      }).toBe(1);
+    } finally {
+      await attachConsoleTail(testInfo, consoleLinesFor(page));
+      await destroyCardsForEmail(jmap, recipient);
+      await destroyTestCards(jmap);
+      await sweepOrphanTestMessages(jmap, {
+        subjectPrefix: AUTO_TRUST_SUBJECT_PREFIX,
+      });
+    }
   });
 
   test('Junk "Not junk" whitelists the sender and moves the message to the Inbox', async ({ sharedPage: page }, testInfo) => {
@@ -146,9 +209,14 @@ test.describe('Contacts + Junk whitelist e2e', () => {
       await expect(notJunk).toBeVisible({ timeout: 30_000 });
       await notJunk.click();
 
-      // Success toast confirms the action.
-      await expect(page.locator('.store-error-toast__item--success'))
-        .toContainText(/whitelisted/i, { timeout: 30_000 });
+      // Success toast confirms the action. Filtered rather than matched
+      // whole: an unrelated success notice from earlier in the session can
+      // still be on screen, and either one satisfying a bare locator is
+      // not what this asserts.
+      await expect(
+        page.locator('.store-error-toast__item--success')
+          .filter({ hasText: /whitelisted/i }),
+      ).toBeVisible({ timeout: 30_000 });
 
       // The message leaves the Junk list.
       await expect.poll(
@@ -255,8 +323,10 @@ test.describe('Contacts + Junk whitelist e2e', () => {
       await page.locator('.msg-list__bulk-actions [title="Whitelist senders and move to Inbox"]').click();
 
       // Success toast names the two unique senders.
-      await expect(page.locator('.store-error-toast__item--success'))
-        .toContainText(/whitelisted 2 senders/i, { timeout: 30_000 });
+      await expect(
+        page.locator('.store-error-toast__item--success')
+          .filter({ hasText: /whitelisted 2 senders/i }),
+      ).toBeVisible({ timeout: 30_000 });
 
       // Every selected message leaves the Junk list.
       for (const { subject } of cases) {
@@ -337,12 +407,12 @@ test.describe('Contacts + Junk whitelist e2e', () => {
         .toBeVisible({ timeout: 30_000 });
 
       // --- Add with two emails ---
-      await page.getByRole('button', { name: 'Add contact' }).click();
+      await page.getByRole('button', { name: 'New Contact' }).click();
       const form = page.locator('.contacts__form');
       await expect(form).toBeVisible();
       await form.locator('input[type="text"]').first().fill(name);
       await form.locator('input[type="email"]').first().fill(email1);
-      await form.getByRole('button', { name: /add another email/i }).click();
+      await form.getByRole('button', { name: /^add email$/i }).click();
       await form.locator('input[type="email"]').nth(1).fill(email2);
       await form.getByRole('button', { name: /^save contact$/i }).click();
 
@@ -370,13 +440,16 @@ test.describe('Contacts + Junk whitelist e2e', () => {
       ).toBe(2);
 
       // --- Edit: rename + add a third email ---
-      await row.getByRole('button', { name: /^Edit / }).click();
+      await row.click();
+      await page.locator('.contact-detail')
+        .getByRole('button', { name: 'Edit', exact: true })
+        .click();
       const editForm = page.locator('.contacts__form');
       await expect(editForm).toBeVisible();
       await editForm.locator('input[type="text"]').first().fill(editedName);
-      await editForm.getByRole('button', { name: /add another email/i }).click();
+      await editForm.getByRole('button', { name: /^add email$/i }).click();
       await editForm.locator('input[type="email"]').nth(2).fill(email3);
-      await editForm.getByRole('button', { name: /^save changes$/i }).click();
+      await editForm.getByRole('button', { name: /^save contact$/i }).click();
 
       const editedRow = page.locator('.contacts__row').filter({ hasText: editedName });
       await expect(editedRow).toBeVisible({ timeout: 30_000 });
@@ -404,7 +477,10 @@ test.describe('Contacts + Junk whitelist e2e', () => {
       ).toBe(3);
 
       // --- Remove ---
-      await editedRow.getByRole('button', { name: /^Remove / }).click();
+      await editedRow.click();
+      await page.locator('.contact-detail')
+        .getByRole('button', { name: 'Delete', exact: true })
+        .click();
       await expect(editedRow).toHaveCount(0, { timeout: 30_000 });
 
       await waitForPendingMutations(page);

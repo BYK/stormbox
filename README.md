@@ -18,9 +18,11 @@ docker compose -f .devcontainer/docker-compose.yml exec app bash -c \
   'cd /workspace && npm run dev'
 ```
 
-Open **https://localhost:3000**. The dev server uses a self-signed certificate
-so browser APIs required by Stormbox, including `SharedWorker` and local storage
-APIs, are available.
+Open **http://localhost:3000**. Loopback counts as a secure context, so the
+browser APIs Stormbox requires, including `SharedWorker` and local storage
+APIs, are available without a certificate. Reaching the dev server through a
+non-loopback hostname needs `VITE_DEV_HTTPS=1`, which serves the same port over
+self-signed HTTPS.
 
 ## Local Mail Stack
 
@@ -38,8 +40,9 @@ container, runs `stack:configure`, and starts the local WebSocket auth bridge in
 the dev container. To also start the Thunderbird Accounts UI and its Django
 Postgres/Redis services, run `WITH_ACCOUNTS=1 ./scripts/local-stack-up.sh`.
 
-`stack:configure` is idempotent and configures Keycloak as well as creates the
-(`e2e@example.org`) account for tests and (`admin@example.org`) for dev.
+`stack:configure` is idempotent and configures Keycloak as well as creates
+separate accounts for Playwright (`e2e@example.org`), backend integration tests
+(`integration@example.org`), and development (`admin@example.org`).
 
 Sign into Stormbox manually as `admin@example.org` / `admin`. Optional test account
 overrides live in `tests/e2e/.env.local.example`.
@@ -58,9 +61,9 @@ E2E tests seed their own baseline inbox/archive data as needed.
 ## Configuration
 
 The app defaults to the local stack during development through
-`.env.development`: Vite keeps Stormbox on self-signed HTTPS and reverse-proxies
-Keycloak, Stalwart JMAP HTTP (`/stalwart-jmap`), the local WebSocket auth
-bridge (`/jmap/ws`), and sender avatar lookups through `https://localhost:3000`.
+`.env.development`: Vite reverse-proxies Keycloak, Stalwart JMAP HTTP
+(`/stalwart-jmap`), the local WebSocket auth bridge (`/jmap/ws`), and sender
+avatar lookups through `http://localhost:3000`.
 
 Hosted stage/prod builds use a single Cloudflare Worker at `infra/jmap-bridge/`
 by default. That bridge fronts both halves of JMAP transport on
@@ -89,6 +92,15 @@ Deployments whose origin is not registered with the configured OIDC client can
 set `VITE_APP_PASSWORD_ONLY=1` to show the app-password form directly and skip
 OIDC initialization.
 
+Contacts Trash limits live in `stormbox.config.json`. Before deployment, set
+`contactsTrash.serverFileStorage` to the Stalwart FileStorage `maxSize`,
+`maxFiles`, and `maxFolders` values. These limits are not available to a normal
+client through standard JMAP. The checked-in defaults match the local Stalwart
+server: 25 MiB per file with no configured file or folder count cap.
+Remote application settings are stored below the top-level JMAP FileNode
+folder `thundermail/`; Contacts Trash shards are isolated further under
+`thundermail/contacts_trash/`.
+
 ```bash
 VITE_JMAP_SERVER_URL=https://your-jmap-bridge-or-server.com
 VITE_APP_PASSWORD_ONLY=1
@@ -105,6 +117,10 @@ docker compose -f .devcontainer/docker-compose.yml exec app bash -c \
 # Type checking
 docker compose -f .devcontainer/docker-compose.yml exec app bash -c \
   'cd /workspace && npm run typecheck'
+
+# Live backend integration tests (serial, no browser UI)
+docker compose -f .devcontainer/docker-compose.yml exec app bash -c \
+  'cd /workspace && npm run test:integration'
 
 # Smoke E2E tests
 docker compose -f .devcontainer/docker-compose.yml exec app bash -c \
@@ -160,6 +176,7 @@ stormbox/
 ├── tests/
 │   ├── e2e/                  # Playwright specs and helpers
 │   ├── fixtures/             # Stack configure/seed scripts, local WS auth bridge
+│   ├── integration/          # Serial Vitest coverage against live Stalwart
 │   └── unit/                 # Vitest tests (mirrors src layout)
 ├── infra/
 │   └── jmap-bridge/          # Unified Cloudflare Worker (HTTP JMAP + WS auth)

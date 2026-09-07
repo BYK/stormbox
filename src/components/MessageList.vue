@@ -1,26 +1,34 @@
 <script setup lang="ts">
 import {
-  computed, nextTick, onBeforeUnmount, onMounted, ref, watch, watchPostEffect,
+  computed, nextTick, onBeforeUnmount, onMounted, ref, watch,
 } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useVirtualizer } from '@tanstack/vue-virtual';
-import {
-  Paperclip, Star, RefreshCw, MailOpen, Mail, Trash2, X,
-} from '@lucide/vue';
+import { RefreshCw } from '@lucide/vue';
 
 import { useMailStore } from '../stores/mail-store';
 import { useListSelection } from '../composables/useListSelection';
 import { useMessageDragDrop } from '../composables/useMessageDragDrop';
-import { SENDER_AVATAR_PROXY_URL } from '../defines';
-import { senderAvatarFor, shortFrom } from '../utils/sender-avatar';
-import archiveIcon from '../assets/icons/tb-folder-archive.svg?raw';
-import junkIcon from '../assets/icons/tb-folder-spam.svg?raw';
+import { provideSenderAvatars } from '../composables/useSenderAvatars';
+import {
+  registerMessageListCommands,
+  type MessageListNavigationCommand,
+} from '../composables/useThunderbirdShortcuts';
+import { folderShowsRecipients } from '../utils/message-row-presentation';
+import { messageMatchesQuickFilter, normalizeFilterText } from '../utils/quick-filter';
+import MessageBulkActions from './MessageBulkActions.vue';
+import MessageListRow from './MessageListRow.vue';
+import SelectableListHeader from './SelectableListHeader.vue';
 
 const mailStore = useMailStore();
 
 const props = defineProps({
   quickFilterQuery: { type: String, default: '' },
 });
+
+// Failed avatar domains are remembered for this list's lifetime and
+// shared by its rows; a remount (mail → contacts → mail) retries them.
+provideSenderAvatars();
 
 const folderName = computed(() => mailStore.currentFolder?.name ?? 'Mail');
 
@@ -75,8 +83,8 @@ const {
   total: computed(() => rowCount.value),
   selectedIds,
   // The keyboard cursor is the store's focusedMessageId, so the global
-  // shortcut handler (F/B/N/P via selectMessage) and arrow nav share
-  // one source of truth and the scroll-follow watcher below tracks it.
+  // list commands and arrow navigation share one source of truth, and
+  // the scroll-follow watcher below tracks it.
   focusedId: focusedMessageId,
 });
 
@@ -87,9 +95,17 @@ const {
 } = useMessageDragDrop();
 
 function handleKeyDown(event) {
+  if (event.defaultPrevented) return;
   if ((event.metaKey || event.ctrlKey) && (event.key === 'a' || event.key === 'A')) {
     event.preventDefault();
     selectAllForCurrentFilter();
+    return;
+  }
+  // Widget-scoped so the page keeps Home/End when the list is not focused.
+  if ((event.key === 'Home' || event.key === 'End')
+      && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    event.preventDefault();
+    navigateMessageList(event.key === 'Home' ? 'first' : 'last');
     return;
   }
   const result = rawHandleKeyDown(event);
@@ -101,14 +117,73 @@ function handleKeyDown(event) {
   }
 }
 
+function navigateMessageList(command: MessageListNavigationCommand): void {
+  switch (command) {
+    case 'first':
+      navigateToBoundary(1);
+      return;
+    case 'last':
+      navigateToBoundary(-1);
+      return;
+    case 'next':
+      navigateRelative(1, false);
+      return;
+    case 'nextUnread':
+      navigateRelative(1, true);
+      return;
+    case 'previous':
+      navigateRelative(-1, false);
+      return;
+    case 'previousUnread':
+      navigateRelative(-1, true);
+      return;
+    default: {
+      const exhaustive: never = command;
+      return exhaustive;
+    }
+  }
+}
+
+function navigateToBoundary(direction: 1 | -1): void {
+  const rows = visibleMessages.value;
+  for (
+    let index = direction > 0 ? 0 : rows.length - 1;
+    direction > 0 ? index < rows.length : index >= 0;
+    index += direction
+  ) {
+    const id = rows[index]?.id;
+    if (id == null) continue;
+    mailStore.selectMessage(id);
+    return;
+  }
+}
+
+function navigateRelative(direction: 1 | -1, unreadOnly: boolean): void {
+  const rows = visibleMessages.value;
+  if (rows.length === 0) return;
+  let index = focusedMessageId.value == null
+    ? -1
+    : rows.findIndex((row) => row?.id === focusedMessageId.value);
+  if (index < 0) index = direction > 0 ? -1 : rows.length;
+  for (
+    let next = index + direction;
+    direction > 0 ? next < rows.length : next >= 0;
+    next += direction
+  ) {
+    const row = rows[next];
+    if (row?.id == null) continue;
+    if (unreadOnly && Number(row.is_seen) === 1) continue;
+    mailStore.selectMessage(row.id);
+    return;
+  }
+}
+
 const CARD_LAYOUT_WIDTH = 360;
 const ROW_HEIGHT = 64;
 const CARD_ROW_HEIGHT = 112;
 const msgListEl = ref<HTMLElement | null>(null);
-const selectAllEl = ref<HTMLInputElement | null>(null);
 const scrollEl = ref(null);
 const listWidth = ref(0);
-const failedAvatarDomains = ref<Set<string>>(new Set());
 const cardLayout = computed(() => listWidth.value > 0 && listWidth.value < CARD_LAYOUT_WIDTH);
 let listResizeObserver: ResizeObserver | null = null;
 
@@ -142,6 +217,7 @@ const virtualItems = computed(() => virtualizer.value.getVirtualItems());
 const THROTTLE_MS = 100;
 let lastPrefetch = 0;
 let trailingTimer: ReturnType<typeof setTimeout> | null = null;
+let unregisterMessageListCommands: (() => void) | null = null;
 
 function fireLoad(first: number, last: number) {
   lastPrefetch = performance.now();
@@ -225,8 +301,8 @@ function onScroll() {
 
 // Keep the virtualized viewport following the keyboard cursor. Every
 // path that moves the cursor — Arrow and Shift+Arrow (useListSelection),
-// the global Thunderbird shortcuts (F/B/N/P/Home/End ->
-// selectMessage), a row click, and the neighbour that becomes current
+// the registered list commands (F/B/N/P/Home/End), a row click, and the
+// neighbour that becomes current
 // after a delete/archive — funnels through mailStore.focusedMessageId.
 // Because the list is virtualized, an off-screen cursor row isn't even
 // in the DOM to scroll to, so watching this single source of truth and
@@ -288,6 +364,10 @@ watch(
 );
 
 onMounted(() => {
+  unregisterMessageListCommands = registerMessageListCommands({
+    navigate: navigateMessageList,
+    selectAll: selectAllForCurrentFilter,
+  });
   if (msgListEl.value) {
     listWidth.value = msgListEl.value.clientWidth;
     if (typeof ResizeObserver === 'function') {
@@ -301,6 +381,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  unregisterMessageListCommands?.();
+  unregisterMessageListCommands = null;
   if (trailingTimer != null) {
     clearTimeout(trailingTimer);
     trailingTimer = null;
@@ -361,19 +443,7 @@ function isDraggingMessage(messageId) {
   return Number.isFinite(id) && draggedIds.value.includes(id);
 }
 
-function senderAvatar(fromText) {
-  const avatar = senderAvatarFor(fromText, SENDER_AVATAR_PROXY_URL);
-  if (avatar.domain && failedAvatarDomains.value.has(avatar.domain)) {
-    return { ...avatar, imageUrl: '' };
-  }
-  return avatar;
-}
-
-function onAvatarError(fromText) {
-  const { domain } = senderAvatarFor(fromText, SENDER_AVATAR_PROXY_URL);
-  if (!domain || failedAvatarDomains.value.has(domain)) return;
-  failedAvatarDomains.value = new Set([...failedAvatarDomains.value, domain]);
-}
+const listShowsRecipients = computed(() => folderShowsRecipients(mailStore.currentFolder));
 
 const allLoadedSelected = computed(() => {
   const loadedIds = [];
@@ -385,12 +455,6 @@ const allLoadedSelected = computed(() => {
     if (!selectedIds.value.has(id)) return false;
   }
   return true;
-});
-
-watchPostEffect(() => {
-  if (!selectAllEl.value) return;
-  selectAllEl.value.checked = allLoadedSelected.value;
-  selectAllEl.value.indeterminate = hasSelection.value && !allLoadedSelected.value;
 });
 
 function selectAllForCurrentFilter() {
@@ -418,7 +482,6 @@ function toggleSelectAll() {
 // message view) because multi-selecting hides the reading pane
 // entirely; the list header is the only surface that is always
 // visible, including in single-column layouts.
-const isInJunkFolder = computed(() => mailStore.currentFolder?.role === 'junk');
 const canWhitelistInJunk = computed(() => {
   const current = mailStore.currentFolder;
   return current?.role === 'junk'
@@ -489,21 +552,6 @@ function toggleUnreadFilter() {
   }
 }
 
-function fmtDate(ms) {
-  if (!ms) return '';
-  const d = new Date(Number(ms));
-  if (Number.isNaN(d.valueOf())) return '';
-  const now = new Date();
-  const sameDay = d.toDateString() === now.toDateString();
-  if (sameDay) {
-    return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
-  }
-  const sameYear = d.getFullYear() === now.getFullYear();
-  return d.toLocaleDateString(undefined, sameYear
-    ? { month: 'short', day: 'numeric' }
-    : { year: 'numeric', month: 'short', day: 'numeric' });
-}
-
 function messagePassesActiveFilters(row, { includeSticky = true } = {}) {
   if (row?.id == null) return false;
   if (
@@ -513,19 +561,8 @@ function messagePassesActiveFilters(row, { includeSticky = true } = {}) {
     return true;
   }
   if (unreadOnly.value && Number(row.is_seen) !== 0) return false;
-  if (quickFilterActive.value && !messageMatchesQuickFilter(row)) return false;
+  if (quickFilterActive.value && !messageMatchesQuickFilter(row, quickFilterNeedle.value)) return false;
   return true;
-}
-
-function messageMatchesQuickFilter(row) {
-  const needle = quickFilterNeedle.value;
-  if (!needle) return true;
-  return [row?.from_text, row?.to_text, row?.subject]
-    .some((value) => normalizeFilterText(value).includes(needle));
-}
-
-function normalizeFilterText(value) {
-  return String(value ?? '').trim().toLowerCase();
 }
 </script>
 
@@ -536,87 +573,58 @@ function normalizeFilterText(value) {
     :class="{ 'msg-list--card': cardLayout }"
     aria-label="Messages"
   >
-    <header class="msg-list__header">
-      <label
-        class="msg-list__select-all"
-        :class="{ 'is-disabled': rowCount === 0 }"
-        :title="rowCount === 0 ? 'No messages to select' : (allLoadedSelected ? 'Deselect all' : 'Select all loaded')"
-      >
-        <input
-          ref="selectAllEl"
-          type="checkbox"
-          :checked="allLoadedSelected"
-          :disabled="rowCount === 0"
-          :indeterminate.prop="hasSelection && !allLoadedSelected"
-          @change="toggleSelectAll"
+    <SelectableListHeader
+      class="msg-list__header"
+      :all-selected="allLoadedSelected"
+      clear-class="msg-list__bulk-action msg-list__bulk-action--ghost"
+      count-class="msg-list__count"
+      item-label="messages"
+      select-all-class="msg-list__select-all"
+      selection-actions-class="msg-list__bulk-actions"
+      singular-item-label="message"
+      :selected-count="selectionCount"
+      :total-count="rowCount"
+      @clear-selection="selectNone"
+      @toggle-all="toggleSelectAll"
+    >
+      <template #selection-actions>
+        <MessageBulkActions
+          :folder="mailStore.currentFolder"
+          :can-whitelist="canWhitelistInJunk"
+          :whitelisting="bulkWhitelisting"
+          @archive="bulkArchive"
+          @junk="bulkJunk"
+          @delete="bulkDelete"
+          @mark-read="bulkMarkRead"
+          @mark-unread="bulkMarkUnread"
+          @whitelist="bulkWhitelist"
         />
-      </label>
-      <!-- Multi-select swaps the filter buttons for the bulk actions:
-           the filters make no sense mid-selection and must not be
-           toggled while one is active. -->
-      <div
-        v-if="hasSelection"
-        class="msg-list__bulk-actions"
-        role="group"
-        aria-label="Selection actions"
-      >
+      </template>
+      <template #normal-actions>
+        <div class="msg-list__filters" role="group" aria-label="Message filters">
+          <button
+            class="msg-list__filter"
+            :class="{ 'is-active': unreadOnly }"
+            type="button"
+            :aria-pressed="unreadOnly"
+            @click="toggleUnreadFilter"
+          >
+            Unread
+          </button>
+        </div>
+      </template>
+      <template #trailing>
         <button
-          v-if="canWhitelistInJunk"
-          class="msg-list__bulk-action msg-list__bulk-action--whitelist"
+          class="msg-list__refresh"
           type="button"
-          :disabled="bulkWhitelisting"
-          @click="bulkWhitelist"
-          title="Whitelist senders and move to Inbox"
-          aria-label="Not junk — whitelist senders and move the selected messages to Inbox"
+          :aria-label="mailStore.isLoading ? 'Refreshing' : 'Refresh'"
+          :title="mailStore.isLoading ? 'Refreshing…' : 'Refresh'"
+          @click="mailStore.refresh()"
         >
-          Not junk
+          <RefreshCw :size="16" :stroke-width="1.75" aria-hidden="true" :class="{ 'is-spinning': mailStore.isLoading }" />
         </button>
-        <button class="msg-list__bulk-action" type="button" @click="bulkArchive" title="Archive" aria-label="Archive">
-          <span class="msg-list__bulk-icon msg-list__bulk-icon--folder" aria-hidden="true" v-html="archiveIcon" />
-        </button>
-        <button v-if="!isInJunkFolder" class="msg-list__bulk-action" type="button" @click="bulkJunk" title="Junk" aria-label="Mark as junk">
-          <span class="msg-list__bulk-icon msg-list__bulk-icon--folder" aria-hidden="true" v-html="junkIcon" />
-        </button>
-        <button class="msg-list__bulk-action msg-list__bulk-action--danger" type="button" @click="bulkDelete" title="Delete" aria-label="Delete">
-          <Trash2 :size="18" :stroke-width="1.65" />
-        </button>
-        <button class="msg-list__bulk-action" type="button" @click="bulkMarkRead" title="Mark as read" aria-label="Mark as read">
-          <MailOpen :size="16" :stroke-width="1.75" />
-        </button>
-        <button class="msg-list__bulk-action" type="button" @click="bulkMarkUnread" title="Mark as unread" aria-label="Mark as unread">
-          <Mail :size="16" :stroke-width="1.75" />
-        </button>
-        <button class="msg-list__bulk-action msg-list__bulk-action--ghost" type="button" @click="selectNone" title="Clear selection" aria-label="Clear selection">
-          <X :size="16" :stroke-width="1.75" />
-        </button>
-      </div>
-      <div v-else class="msg-list__filters" role="group" aria-label="Message filters">
-        <button
-          class="msg-list__filter"
-          :class="{ 'is-active': unreadOnly }"
-          type="button"
-          :aria-pressed="unreadOnly"
-          @click="toggleUnreadFilter"
-        >
-          Unread
-        </button>
-      </div>
-      <span v-if="hasSelection" class="msg-list__count">
-        {{ selectionCount }} selected
-      </span>
-      <span v-else-if="rowCount > 0" class="msg-list__count">
-        {{ rowCount }} {{ rowCount === 1 ? 'message' : 'messages' }}
-      </span>
-      <button
-        class="msg-list__refresh"
-        type="button"
-        :aria-label="mailStore.isLoading ? 'Refreshing' : 'Refresh'"
-        :title="mailStore.isLoading ? 'Refreshing…' : 'Refresh'"
-        @click="mailStore.refresh()"
-      >
-        <RefreshCw :size="16" :stroke-width="1.75" aria-hidden="true" :class="{ 'is-spinning': mailStore.isLoading }" />
-      </button>
-    </header>
+      </template>
+    </SelectableListHeader>
 
     <div
       v-if="rowCount > 0"
@@ -638,82 +646,22 @@ function normalizeFilterText(value) {
       </div>
       <ol class="msg-list__items" role="presentation" :style="{ height: totalSize + 'px' }">
         <template v-for="v in virtualItems" :key="v.key">
-          <li
+          <MessageListRow
             v-if="visibleMessages[v.index]"
-            :id="`msg-row-${visibleMessages[v.index].id}`"
-            :data-index="v.index"
-            role="option"
-            :aria-selected="isSelected(visibleMessages[v.index].id)"
-            :class="{
-              'is-focused': mailStore.selectedMessageId === visibleMessages[v.index].id,
-              'is-selected': isSelected(visibleMessages[v.index].id),
-              'is-dragging': isDraggingMessage(visibleMessages[v.index].id),
-              'is-unread': Number(visibleMessages[v.index].is_seen) === 0,
-            }"
-            :style="{
-              position: 'absolute',
-              top: '0px',
-              left: '0px',
-              right: '0px',
-              transform: `translateY(${v.start}px)`,
-              height: v.size + 'px',
-            }"
-          >
-            <div
-              class="msg-list__item"
-              tabindex="-1"
-              draggable="true"
-              @click="onRowClick(v.index, $event)"
-              @dragstart="onRowDragStart(visibleMessages[v.index], $event)"
-              @dragend="endMessageDrag"
-            >
-              <div class="msg-list__state">
-                <label class="msg-list__check" draggable="false" @click.stop>
-                  <input
-                    type="checkbox"
-                    :checked="isSelected(visibleMessages[v.index].id)"
-                    @click="onCheckboxClick(v.index, $event)"
-                  />
-                </label>
-                <span
-                  v-if="Number(visibleMessages[v.index].is_seen) === 0"
-                  class="msg-list__unread-dot"
-                  aria-label="Unread"
-                />
-              </div>
-              <div
-                class="msg-list__avatar"
-                :style="senderAvatar(visibleMessages[v.index].from_text).style"
-                aria-hidden="true"
-              >
-                <img
-                  v-if="senderAvatar(visibleMessages[v.index].from_text).imageUrl"
-                  class="msg-list__avatar-image"
-                  :src="senderAvatar(visibleMessages[v.index].from_text).imageUrl"
-                  alt=""
-                  loading="lazy"
-                  decoding="async"
-                  referrerpolicy="no-referrer"
-                  @error="onAvatarError(visibleMessages[v.index].from_text)"
-                />
-                <span>{{ senderAvatar(visibleMessages[v.index].from_text).initials }}</span>
-              </div>
-              <div class="msg-list__content">
-                <div class="msg-list__summary">
-                  <span class="msg-list__from">{{ shortFrom(visibleMessages[v.index].from_text) }}</span>
-                  <span class="msg-list__subject">{{ visibleMessages[v.index].subject || '(no subject)' }}</span>
-                  <span class="msg-list__icons">
-                    <Star v-if="Number(visibleMessages[v.index].is_flagged) === 1" :size="13" :stroke-width="2" class="msg-list__star" />
-                    <Paperclip v-if="Number(visibleMessages[v.index].has_attachment) === 1" :size="13" :stroke-width="1.75" class="msg-list__attach" />
-                  </span>
-                  <span class="msg-list__date">{{ fmtDate(visibleMessages[v.index].received_at) }}</span>
-                </div>
-                <p v-if="visibleMessages[v.index].preview" class="msg-list__preview">
-                  {{ visibleMessages[v.index].preview }}
-                </p>
-              </div>
-            </div>
-          </li>
+            :message="visibleMessages[v.index]"
+            :index="v.index"
+            :start="v.start"
+            :size="v.size"
+            :focused="mailStore.selectedMessageId === visibleMessages[v.index].id"
+            :selected="isSelected(visibleMessages[v.index].id)"
+            :dragging="isDraggingMessage(visibleMessages[v.index].id)"
+            :shows-recipients="listShowsRecipients"
+            :sort="mailStore.currentSort"
+            @row-click="onRowClick(v.index, $event)"
+            @checkbox-click="onCheckboxClick(v.index, $event)"
+            @dragstart="onRowDragStart(visibleMessages[v.index], $event)"
+            @dragend="endMessageDrag"
+          />
           <li
             v-else
             :data-index="v.index"
@@ -767,35 +715,6 @@ function normalizeFilterText(value) {
   min-height: 0;
   height: 100%;
 }
-.msg-list__header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 57px;
-  padding: 11px 12px;
-  border-bottom: 1px solid var(--border);
-}
-.msg-list__select-all {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  cursor: pointer;
-}
-.msg-list__select-all.is-disabled {
-  cursor: default;
-  opacity: 0.72;
-}
-.msg-list__select-all input {
-  width: 14px;
-  height: 14px;
-  margin: 0;
-  cursor: pointer;
-  accent-color: var(--accent);
-}
-.msg-list__select-all input:disabled {
-  cursor: default;
-}
 .msg-list__filters {
   flex: 1;
   min-width: 0;
@@ -828,97 +747,6 @@ function normalizeFilterText(value) {
   color: #fff;
   border-color: color-mix(in srgb, var(--accent) 80%, #000);
   box-shadow: 0 1px 2px color-mix(in srgb, #000 16%, transparent);
-}
-.msg-list__bulk-actions {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 4px;
-  /* Sit next to the select-all checkbox, with a little breathing
-     room beyond the header's own gap. */
-  margin-inline-start: 8px;
-}
-.msg-list__bulk-action {
-  display: inline-grid;
-  place-items: center;
-  border: 0;
-  background: transparent;
-  color: var(--muted);
-  width: 34px;
-  height: 34px;
-  padding: 0;
-  border-radius: 8px;
-  cursor: pointer;
-  font: inherit;
-  flex-shrink: 0;
-}
-.msg-list__bulk-action:hover {
-  background: var(--rowHover);
-  color: var(--text);
-}
-.msg-list__bulk-action--danger:hover {
-  background: rgba(255, 107, 107, 0.12);
-  color: #ff6b6b;
-}
-.msg-list__bulk-action--ghost { color: var(--muted); }
-/* "Not junk" is the contextual, Junk-only primary action; a filled
-   accent button set apart from the icon buttons, matching the same
-   action in the open-message toolbar. */
-.msg-list__bulk-action--whitelist {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: auto;
-  padding: 0 12px;
-  margin-inline-end: 6px;
-  background: var(--accent);
-  color: #fff;
-  border: 1px solid color-mix(in srgb, var(--accent) 80%, #000);
-  border-radius: 6px;
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 1.25;
-  white-space: nowrap;
-  box-shadow: 0 1px 2px color-mix(in srgb, #000 16%, transparent);
-  transition: filter 0.12s ease, box-shadow 0.12s ease;
-}
-.msg-list__bulk-action--whitelist:hover {
-  background: var(--accent);
-  color: #fff;
-  filter: brightness(1.04);
-  box-shadow: 0 2px 5px color-mix(in srgb, #000 18%, transparent);
-}
-.msg-list__bulk-action--whitelist:disabled,
-.msg-list__bulk-action--whitelist:disabled:hover {
-  opacity: 0.5;
-  filter: none;
-  background: var(--accent);
-  color: #fff;
-}
-.msg-list__bulk-icon--folder {
-  width: 20px;
-  height: 20px;
-  display: block;
-}
-.msg-list__bulk-icon--folder :deep(svg) {
-  width: 100%;
-  height: 100%;
-  display: block;
-}
-.msg-list__bulk-icon--folder :deep([fill="context-fill"]) {
-  fill: color-mix(in srgb, currentColor 20%, transparent);
-}
-.msg-list__bulk-icon--folder :deep([fill="context-stroke"]) {
-  fill: currentColor;
-}
-.msg-list__count {
-  flex-shrink: 0;
-  font-size: 11px;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
 }
 .msg-list__refresh {
   background: transparent;
@@ -972,215 +800,6 @@ function normalizeFilterText(value) {
   position: relative;
   width: 100%;
 }
-/* Fastmail model: the focused row (currently being viewed) gets the
- * solid accent background. Selection state is communicated by the
- * checkbox itself; we tint the row very softly so the user can scan
- * a column of selected rows without it competing with the "what
- * am I reading" highlight. */
-.msg-list__items li.is-focused .msg-list__item { background: var(--rowActive); }
-.msg-list__items li.is-selected .msg-list__item {
-  background: color-mix(in srgb, var(--accent) 6%, var(--panel));
-}
-.msg-list__items li.is-selected.is-focused .msg-list__item {
-  background: var(--rowActive);
-}
-.msg-list__items li.is-dragging .msg-list__item {
-  opacity: 0.55;
-}
-.msg-list__items li.is-unread .msg-list__from,
-.msg-list__items li.is-unread .msg-list__subject {
-  font-weight: 600;
-  color: var(--text);
-}
-
-.msg-list__item {
-  position: relative;
-  display: grid;
-  grid-template-columns: 34px 34px minmax(0, 1fr);
-  align-items: center;
-  column-gap: 10px;
-  width: 100%;
-  height: 100%;
-  text-align: left;
-  padding: 7px 14px 7px 12px;
-  border: 0;
-  background: transparent;
-  cursor: pointer;
-  border-bottom: 1px solid var(--border-soft);
-  font: inherit;
-  color: inherit;
-  transition: background 0.06s ease;
-  /* Stops Shift-click from accidentally selecting subject text as
-   * the user extends a range — the native text-selection range
-   * appears on top of the row highlight and is very ugly. */
-  user-select: none;
-  -webkit-user-select: none;
-}
-.msg-list__item:hover { background: var(--rowHover); }
-.msg-list__content {
-  min-width: 0;
-}
-
-.msg-list__state {
-  position: relative;
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-}
-.msg-list__check {
-  position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  border-radius: 6px;
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.08s ease;
-}
-.msg-list__check input {
-  width: 14px;
-  height: 14px;
-  margin: 0;
-  cursor: pointer;
-  accent-color: var(--accent);
-}
-
-.msg-list__unread-dot {
-  display: block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--accent);
-  transition: opacity 0.08s ease;
-  /* Pure visual indicator: never intercept clicks meant for the
-   * underlying checkbox (which has inset: 0 within .msg-list__state). */
-  pointer-events: none;
-}
-.msg-list__item:hover .msg-list__check,
-.msg-list__items li.is-selected .msg-list__check {
-  opacity: 1;
-}
-.msg-list__item:hover .msg-list__unread-dot,
-.msg-list__items li.is-selected .msg-list__unread-dot {
-  opacity: 0;
-}
-.msg-list__avatar {
-  position: relative;
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 999px;
-  overflow: hidden;
-  color: #fff;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, #fff 22%, transparent);
-}
-.msg-list__avatar-image {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.msg-list__summary {
-  display: grid;
-  grid-template-columns: clamp(86px, 28%, 200px) minmax(0, 1fr) auto auto;
-  grid-template-areas: "from subject icons date";
-  align-items: baseline;
-  column-gap: 8px;
-}
-.msg-list__from {
-  grid-area: from;
-  min-width: 0;
-  font-size: 13px;
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.msg-list__date {
-  grid-area: date;
-  font-size: 11px;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.msg-list__subject {
-  grid-area: subject;
-  min-width: 0;
-  font-size: 13px;
-  color: var(--text);
-  text-align: left;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.msg-list__icons {
-  grid-area: icons;
-  display: inline-flex;
-  gap: 4px;
-  color: var(--muted);
-  min-width: 0;
-}
-.msg-list__star { color: #f5b700; }
-.msg-list__preview {
-  margin: 4px 0 0;
-  font-size: 12px;
-  color: var(--muted);
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 1;
-  -webkit-box-orient: vertical;
-  line-height: 1.35;
-}
-
-.msg-list--card .msg-list__item {
-  grid-template-columns: 24px 34px minmax(0, 1fr);
-  align-items: start;
-  column-gap: 9px;
-  padding: 10px 12px;
-}
-.msg-list--card .msg-list__state {
-  width: 24px;
-}
-.msg-list--card .msg-list__summary {
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  grid-template-areas:
-    "from icons date"
-    "subject subject subject";
-  row-gap: 2px;
-}
-.msg-list--card .msg-list__from,
-.msg-list--card .msg-list__subject {
-  font-size: 13px;
-}
-.msg-list--card .msg-list__subject {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  line-height: 1.3;
-}
-.msg-list--card .msg-list__preview {
-  margin-top: 3px;
-  -webkit-line-clamp: 1;
-}
-
-@media (max-width: 639px) {
-  .msg-list__check {
-    opacity: 1;
-  }
-  .msg-list__unread-dot {
-    opacity: 0;
-  }
-}
-
 .msg-list__item--placeholder {
   border-bottom: 1px solid var(--border-soft);
   padding: 10px 14px 10px 22px;

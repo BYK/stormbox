@@ -38,6 +38,8 @@
 
 import { DB_RPC } from '../../../db/protocol';
 import { wlog } from '../../../db/worker-log';
+import { MUTATION_TYPE } from '../../../constants/states';
+import { classifyAuthenticationOrAuthorizationError } from './transport';
 
 // SetError types that cannot succeed by retrying: no amount of waiting
 // will turn 'forbidden' into 'success'. Anything else (serverFail,
@@ -53,6 +55,7 @@ const TERMINAL_ERROR_TYPES = new Set([
   'unknownFolder',
   'unknownIdentity',
   'invalidName',
+  'duplicateContacts',
   'emptyUpdate',
   'unsupportedMutation',
 ]);
@@ -68,6 +71,7 @@ export class OutboxRunner {
   _handlers: Record<string, (p: any) => Promise<any>>;
   _processRow: (row: any) => Promise<{ ok: boolean; error?: any; result?: any }>;
   _maxAttempts: number;
+  _maxAttemptsByType: Map<string, number>;
   _notifyDelayMs: number;
   _backoffBaseMs: number;
   _backoffCapMs: number;
@@ -79,8 +83,11 @@ export class OutboxRunner {
   _kickPending: boolean;
   _notifyTimer: any;
   _wakeTimer: any;
+  _unsafeToReplayTypes: Set<string>;
+  _replayablePhases: Set<string>;
+  _completedPhases: Set<string>;
   _targetLocks: Map<string, Promise<void>>;
-  _awaiters: Map<number, Array<{ resolve: (v: any) => void }>>;
+  _awaiters: Map<number, Array<{ resolve: (v: any) => void; mutationType: string }>>;
   _tallyListeners: Set<(id: number, outcome: any) => void>;
 
   _onForegroundChange: ((delta: number) => void) | null;
@@ -105,7 +112,22 @@ export class OutboxRunner {
     this._handlers = handlers;
     this._processRow = processRow;
 
+    // Mutation types whose outcome cannot be inferred from a failure,
+    // because the server may already have acted on them irreversibly.
+    // These are never replayed automatically — not after a crash, and
+    // not after a transport error. The runner stays protocol-neutral:
+    // the backend supplies the policy.
+    this._unsafeToReplayTypes = new Set(options.unsafeToReplayTypes ?? []);
+    // Phase names are opaque here: the backend decides which recorded
+    // phases are safe to resume and which mean the server already acted.
+    this._replayablePhases = new Set(options.replayablePhases ?? []);
+    this._completedPhases = new Set(options.completedPhases ?? []);
     this._maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+    this._maxAttemptsByType = new Map(
+      Object.entries(options.maxAttemptsByType ?? {})
+        .map(([type, limit]) => [type, Number(limit)] as const)
+        .filter(([, limit]) => Number.isInteger(limit) && limit > 0),
+    );
     this._notifyDelayMs = options.notifyDelayMs ?? DEFAULT_NOTIFY_DELAY_MS;
     this._backoffBaseMs = options.backoffBaseMs ?? DEFAULT_BACKOFF_BASE_MS;
     this._backoffCapMs = options.backoffCapMs ?? DEFAULT_BACKOFF_CAP_MS;
@@ -169,6 +191,92 @@ export class OutboxRunner {
   }
 
   /**
+   * Reclaim rows left `in_flight` by a worker that died mid-call. No
+   * live runner is tracking their network call, and `_loadReadyRows`
+   * only selects 'pending' and 'retry', so without this they are
+   * stranded forever.
+   *
+   * Migration 002 does the same reset for non-send rows, but migrations
+   * run once per database version (see engine.runMigrations), so it only
+   * ever covered the boot that applied it. Any later crash needs this.
+   *
+   * Rows whose mutation type is listed in `unsafeToReplayTypes` are
+   * treated according to the progress their `phase` records, because for
+   * those types a blind replay can deliver a second copy:
+   *
+   *   - past the point of no return (`completedPhases`): the server
+   *     already acted, so the row must not be reported as a failure. It
+   *     is returned to the queue, where the checkpoint makes it skip
+   *     straight to filing the local copy and the row then retires
+   *     normally. Deleting it here instead would drop the record of the
+   *     reconciliation it still owes.
+   *   - before that point (`replayablePhases`): nothing irreversible
+   *     happened, and the checkpoint says exactly what to skip, so the
+   *     row is replayable.
+   *   - no phase: the worker died before recording the first checkpoint,
+   *     which precedes Email creation and submission, so the row is safe
+   *     to replay from the start.
+   *   - any other recorded phase: the outcome is unknowable, so it becomes
+   *     conflicted for the user to decide — the same choice Thunderbird
+   *     and Roundcube make for an ambiguous send. This covers a crash while
+   *     the submission was in flight, which is indistinguishable from a
+   *     delivered message.
+   *
+   * `attempts` is deliberately preserved so a row that already burned
+   * retries keeps aging toward the cap instead of starting over.
+   */
+  async recoverStranded() {
+    const guarded = [...this._unsafeToReplayTypes];
+    if (guarded.length > 0) {
+      const types = guarded.map(() => '?').join(',');
+      // Resumable in either direction: before the irreversible step, or
+      // after it with only local filing left to do.
+      const resumable = [...this._replayablePhases, ...this._completedPhases];
+      await this._handlers[DB_RPC.QUERY]({
+        sql: `UPDATE pending_mutations
+                 SET local_status = 'conflicted',
+                     error_json = ?,
+                     updated_at = ?
+               WHERE account_id = ?
+                 AND local_status = 'in_flight'
+                 AND mutation_type IN (${types})
+                 ${resumable.length > 0
+                    ? `AND phase NOT IN (${resumable.map(() => '?').join(',')})`
+                    : ''}`,
+        params: [
+          // `outcomeUnknown` is the type every park path records, here and
+          // in the backend's own processing, so a consumer has one string
+          // to recognise. The row keeps the phase it was interrupted at
+          // rather than being overwritten: that column says how far the
+          // send got, which is worth having, and the error already says
+          // the outcome is unknowable.
+          JSON.stringify({
+            type: 'outcomeUnknown',
+            terminal: true,
+            reason: 'interrupted',
+            description: 'Interrupted while sending; the outcome is unknown.',
+          }),
+          this._now(),
+          this._accountId,
+          ...guarded,
+          ...resumable,
+        ],
+      });
+    }
+
+    const result = await this._handlers[DB_RPC.QUERY]({
+      sql: `UPDATE pending_mutations
+               SET local_status = 'pending',
+                   not_before = NULL,
+                   updated_at = ?
+             WHERE account_id = ?
+               AND local_status = 'in_flight'`,
+      params: [this._now(), this._accountId],
+    });
+    return result;
+  }
+
+  /**
    * Run a single mutation now and resolve when it reaches a terminal
    * state (success, conflicted, or attempt cap). Clears the row's
    * backoff so it is immediately eligible; subsequent failures still
@@ -177,7 +285,10 @@ export class OutboxRunner {
    *
    * Returns { attempted, succeeded, failed } so the existing
    * Repository.runMutation contract (used by compose-store and
-   * destroyMessage) keeps working.
+   * destroyMessage) keeps working, plus `errorType` on a failure: for a
+   * send the difference between "did not go out" and "may have gone out"
+   * decides what the composer is allowed to offer, and the row is gone by
+   * the time a caller could read it on the paths that succeed.
    */
   async runMutation(mutationId) {
     if (this._stopped) {
@@ -211,7 +322,9 @@ export class OutboxRunner {
 
     const outcomePromise = new Promise<{ ok: boolean; error?: any; result?: any }>((resolve) => {
       const list = this._awaiters.get(mutationId) ?? [];
-      list.push({ resolve });
+      // The type rides along so stop() can answer without a database
+      // read, which is not available to it during teardown.
+      list.push({ resolve, mutationType: row.mutation_type });
       this._awaiters.set(mutationId, list);
     });
     // PENDING_MUTATION_INSERT also auto-notifies the runner via the
@@ -246,6 +359,7 @@ export class OutboxRunner {
     };
     const detail = outcome.result ?? outcome.error?.result;
     if (detail != null) summary.result = detail;
+    if (!outcome.ok && outcome.error?.type) summary.errorType = outcome.error.type;
     return summary;
   }
 
@@ -304,13 +418,23 @@ export class OutboxRunner {
       await this._drainInflight.catch(() => {});
     }
     for (const list of this._awaiters.values()) {
-      for (const { resolve } of list) {
-        // Resolve with a synthetic "stopped" outcome so awaited
-        // callers (compose-store, destroyMessage) don't hang
-        // forever when the backend tears down. They treat ok=false
-        // as a failure that surfaces an error to the user.
+      for (const { resolve, mutationType } of list) {
+        // Resolve with a synthetic outcome so awaited callers
+        // (compose-store, destroyMessage) don't hang forever when the
+        // backend tears down. They treat ok=false as a failure that
+        // surfaces an error to the user.
+        //
+        // For a type that must never be replayed, that failure has to say
+        // the outcome is unknown rather than that nothing happened: the
+        // row was checked out to a worker that is going away, and for a
+        // send it could have been anywhere from queued to already
+        // delivered. Telling the user it failed invites the second press
+        // that delivers twice.
+        const error = this._unsafeToReplayTypes.has(mutationType)
+          ? { type: 'outcomeUnknown', terminal: true, reason: 'stopped' }
+          : { type: 'stopped' };
         try {
-          resolve({ ok: false, error: { type: 'stopped' } });
+          resolve({ ok: false, error });
         } catch {
           // ignore
         }
@@ -366,14 +490,57 @@ export class OutboxRunner {
 
   /**
    * Schedule the dispatch of one row behind any previously-queued
-   * dispatches for the same target_message_id. Rows with no target
-   * (currently only the SEND mutation type) get a unique key so they
-   * run concurrently with each other.
+   * dispatches for the same target_message_id. ContactCard writes share an
+   * account lane because their query-before-create de-duplication must not
+   * race. Identity, settings, and mailbox-subscription writes use their own
+   * account lanes so updates to the same server state cannot overtake one
+   * another. Other targetless rows keep a unique key.
    */
   _dispatch(row) {
-    const key = row.target_message_id == null
-      ? `row:${row.id}`
-      : `target:${Number(row.target_message_id)}`;
+    const contactWrite = row.mutation_type === MUTATION_TYPE.WHITELIST_SENDER
+      || row.mutation_type === MUTATION_TYPE.CREATE_CONTACT
+      || row.mutation_type === MUTATION_TYPE.UPDATE_CONTACT
+      || row.mutation_type === MUTATION_TYPE.DELETE_CONTACT
+      || row.mutation_type === MUTATION_TYPE.CONTACT_BATCH
+      || row.mutation_type === MUTATION_TYPE.CONTACT_TRASH
+      || row.mutation_type === MUTATION_TYPE.PUSH_CONTACTS_TRASH
+      || row.mutation_type === MUTATION_TYPE.CREATE_ADDRESSBOOK
+      || row.mutation_type === MUTATION_TYPE.UPDATE_ADDRESSBOOK
+      || row.mutation_type === MUTATION_TYPE.DESTROY_ADDRESSBOOK;
+    const identityWrite = row.mutation_type === MUTATION_TYPE.CREATE_IDENTITY
+      || row.mutation_type === MUTATION_TYPE.UPDATE_IDENTITY
+      || row.mutation_type === MUTATION_TYPE.DELETE_IDENTITY;
+    const settingsWrite = row.mutation_type === MUTATION_TYPE.PUSH_SETTINGS;
+    const subscriptionWrite =
+      row.mutation_type === MUTATION_TYPE.SET_MAILBOX_SUBSCRIPTION;
+    let draftSessionId: string | null = null;
+    if (row.mutation_type === MUTATION_TYPE.SAVE_DRAFT
+        || row.mutation_type === MUTATION_TYPE.DISCARD_DRAFT
+        || row.mutation_type === MUTATION_TYPE.SEND) {
+      try {
+        const request = JSON.parse(row.request_json);
+        draftSessionId = typeof request?.draftSessionId === 'string'
+          ? request.draftSessionId
+          : null;
+      } catch {
+        draftSessionId = null;
+      }
+    }
+    const key = contactWrite
+      ? 'contacts-trash-document'
+      : (identityWrite
+        ? 'identity-writes'
+        : (settingsWrite
+          ? 'settings-document'
+          : (subscriptionWrite
+            ? 'mailbox-subscriptions'
+            : (draftSessionId && row.target_message_id != null
+              ? `draft-target:${Number(row.target_message_id)}`
+              : (draftSessionId
+                ? `draft-session:${draftSessionId}`
+              : (row.target_message_id == null
+                ? `row:${row.id}`
+                : `target:${Number(row.target_message_id)}`))))));
     const prev = this._targetLocks.get(key) ?? Promise.resolve();
     // suppressed-rejection chain: if row N for target T fails, row
     // N+1 for the same target should still get a chance to run.
@@ -405,37 +572,66 @@ export class OutboxRunner {
     // regardless of success or failure.
     this._signalForeground(1);
     let result;
+    let activeRow;
     try {
-      await this._markInFlight(row.id, attemptNumber);
+      activeRow = await this._claimInFlight(row, attemptNumber);
+      if (!activeRow) {
+        await this._settleUnclaimedRow(row.id);
+        return;
+      }
       try {
-        result = await this._processRow(row);
+        result = await this._processRow(activeRow);
       } catch (err) {
+        // A throw means the request never produced a response, so for
+        // most mutations a retry is both safe and desirable. For a send
+        // it is neither: the socket may have died after the server
+        // accepted the submission, and replaying would deliver a second
+        // copy. Fail those to the user with the draft intact instead of
+        // guessing. Positive reconciliation (matching the operation's
+        // Message-ID against the server) is what will let these resume
+        // automatically.
+        const status = (err as any)?.status;
+        const authentication = classifyAuthenticationOrAuthorizationError(err);
         result = {
           ok: false,
-          error: { type: 'transport', message: err?.message ?? String(err) },
+          error: {
+            type: authentication?.type ?? 'transport',
+            message: err?.message ?? String(err),
+            ...(status != null ? { status } : {}),
+            ...((authentication?.terminal === true
+              || this._unsafeToReplayTypes.has(activeRow.mutation_type))
+              ? { terminal: true }
+              : {}),
+          },
         };
       }
     } finally {
       this._signalForeground(-1);
     }
     if (result?.ok) {
-      await this._deleteRow(row.id);
-      this._resolveAwaiters(row.id, { ok: true, result: result.result });
-      this._fireTally(row.id, { ok: true, result: result.result });
+      await this._deleteRow(activeRow.id);
+      this._resolveAwaiters(activeRow.id, { ok: true, result: result.result });
+      this._fireTally(activeRow.id, { ok: true, result: result.result });
       return;
     }
     const errorType = result?.error?.type ?? 'unknown';
+    const maxAttempts = this._maxAttemptsByType.get(activeRow.mutation_type) ?? this._maxAttempts;
+    // The classifier only decides whether the error type itself is
+    // retryable; an explicit terminal flag and the attempt cap apply to
+    // every error so a persistently rejected credential cannot retry
+    // forever and leave awaiters unresolved.
+    const authentication = classifyAuthenticationOrAuthorizationError(result?.error);
     const terminal = result?.error?.terminal === true
-      || TERMINAL_ERROR_TYPES.has(errorType)
-      || attemptNumber >= this._maxAttempts;
+      || (authentication ? authentication.terminal : TERMINAL_ERROR_TYPES.has(errorType))
+      || attemptNumber >= maxAttempts;
     if (terminal) {
-      await this._markConflicted(row.id, result?.error);
-      this._resolveAwaiters(row.id, {
+      await this._markConflicted(activeRow.id, result?.error);
+      this._resolveAwaiters(activeRow.id, {
         ok: false,
         error: result?.error,
         result: result?.result ?? result?.error?.result,
       });
-      this._fireTally(row.id, {
+      this._fireTally(activeRow.id, {
         ok: false,
         error: result?.error,
         result: result?.result ?? result?.error?.result,
@@ -446,7 +642,7 @@ export class OutboxRunner {
       this._backoffBaseMs * 2 ** (attemptNumber - 1),
       this._backoffCapMs,
     );
-    await this._markRetry(row.id, this._now() + delay, result?.error);
+    await this._markRetry(activeRow.id, this._now() + delay, result?.error);
     // Awaiters intentionally not resolved on transient retry — the
     // next drain pass picks this row up after the backoff window
     // and will eventually resolve the awaiter when it terminates.
@@ -496,17 +692,53 @@ export class OutboxRunner {
     return rows[0] ?? null;
   }
 
-  async _markInFlight(mutationId, attempts) {
+  async _claimInFlight(row, attempts) {
     const ts = this._now();
-    await this._handlers[DB_RPC.QUERY]({
-      sql: `UPDATE pending_mutations
+    const [claimed] = await this._handlers[DB_RPC.TRANSACTION]({
+      statements: [{
+        sql: `UPDATE pending_mutations
                SET local_status = 'in_flight',
                    attempts = ?,
                    last_attempt_at = ?,
                    updated_at = ?
-             WHERE id = ?`,
-      params: [attempts, ts, ts, mutationId],
+             WHERE id = ?
+               AND account_id = ?
+               AND mutation_type = ?
+               AND local_status = ?`,
+      params: [
+        attempts,
+        ts,
+        ts,
+        row.id,
+        this._accountId,
+        row.mutation_type,
+        row.local_status,
+      ],
+      }],
     });
+    if ((claimed?.changes ?? 0) !== 1) return null;
+    const current = await this._loadRow(row.id);
+    if (current?.local_status !== 'in_flight'
+        || current.mutation_type !== row.mutation_type) {
+      return null;
+    }
+    return current;
+  }
+
+  async _settleUnclaimedRow(mutationId) {
+    const current = await this._loadRow(mutationId);
+    if (!current) {
+      this._resolveAwaiters(mutationId, { ok: true });
+      return;
+    }
+    if (current.local_status !== 'conflicted') return;
+    let error;
+    try {
+      error = current.error_json ? JSON.parse(current.error_json) : null;
+    } catch {
+      error = { type: 'unknown' };
+    }
+    this._resolveAwaiters(mutationId, { ok: false, error });
   }
 
   async _markRetry(mutationId, notBefore, error) {

@@ -4,6 +4,7 @@ import { bootTestEngine } from '../../../src/db/bootstrap-memory';
 import { makeHandlers } from '../../../src/db/handlers';
 import { DB_RPC } from '../../../src/db/protocol';
 import { SERVICE_KIND } from '../../../src/constants/states';
+import { withContactDetailKeys } from '../../../src/utils/contact-fields';
 import {
   syncAddressBooks,
   syncContacts,
@@ -11,10 +12,15 @@ import {
   createContactCard,
   createTrustedContactCards,
   updateContactCard,
-  deleteContactCard,
 } from '../../../src/sync/backends/jmap/contacts';
 import { processMutationRow } from '../../../src/sync/backends/jmap/outbox';
+import { contactMutationFields as contactFields } from '../_fixtures/rows';
 import { MockTransport } from './_mock-transport';
+
+const PNG_PHOTO_URI =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+const GIF_PHOTO_URI =
+  'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
 
 function jmapCalls(transport, method) {
   const out = [];
@@ -57,8 +63,20 @@ describe('syncAddressBooks', () => {
     const transport = new MockTransport();
     transport.handle('AddressBook/get', () => ({
       list: [
-        { id: 'ab-default', name: 'Default', isDefault: true, isSubscribed: true },
-        { id: 'ab-shared', name: 'Shared', isDefault: false, isSubscribed: true },
+        {
+          id: 'ab-default',
+          name: 'Default',
+          isDefault: true,
+          isSubscribed: true,
+          myRights: { mayWrite: true },
+        },
+        {
+          id: 'ab-shared',
+          name: 'Shared',
+          isDefault: false,
+          isSubscribed: true,
+          myRights: { mayWrite: false },
+        },
       ],
       state: 'ab-1',
     }));
@@ -69,15 +87,118 @@ describe('syncAddressBooks', () => {
     for (const ab of list) {
       expect(ab.service_kind).toBe(SERVICE_KIND.JMAP_CONTACTS);
     }
+    expect(list.map((ab: any) => [ab.remote_id, ab.may_write])).toEqual([
+      ['ab-default', 1],
+      ['ab-shared', 0],
+    ]);
     const stateRow = await handlers[DB_RPC.SYNC_STATE_GET]({
       accountId: account.id,
       objectType: 'AddressBook',
     });
     expect(stateRow.state).toBe('ab-1');
   });
+
+  it('retires a book the server has stopped listing', async () => {
+    // CS-4.8. Upsert-only left a deleted book on offer as a place to file
+    // new contacts, where every save would fail against a book the server
+    // does not have.
+    const transport = new MockTransport();
+    let books = [
+      { id: 'ab-default', name: 'Default', isDefault: true },
+      { id: 'ab-shared', name: 'Shared' },
+    ];
+    transport.handle('AddressBook/get', () => ({ list: books, state: 'ab-1' }));
+    await syncAddressBooks({ transport, account, handlers });
+
+    books = [{ id: 'ab-default', name: 'Default', isDefault: true }];
+    const result = await syncAddressBooks({ transport, account, handlers });
+
+    expect(result.retired).toBe(1);
+    const list = await handlers[DB_RPC.ADDRESSBOOK_LIST]({ accountId: account.id });
+    expect(list.map((ab: any) => ab.remote_id)).toEqual(['ab-default']);
+  });
+
+  it('takes an empty list as an answer', async () => {
+    // The empty case is the one an upsert cannot express, and it is real:
+    // an account whose last address book was deleted.
+    const transport = new MockTransport();
+    let books: any[] = [{ id: 'ab-default', name: 'Default', isDefault: true }];
+    transport.handle('AddressBook/get', () => ({ list: books, state: 'ab-1' }));
+    await syncAddressBooks({ transport, account, handlers });
+
+    books = [];
+    await syncAddressBooks({ transport, account, handlers });
+
+    const list = await handlers[DB_RPC.ADDRESSBOOK_LIST]({ accountId: account.id });
+    expect(list).toEqual([]);
+  });
+
+  it('keeps every book when the response cannot be read', async () => {
+    // A missing response is not an empty account, and treating it as one
+    // would retire the whole address book over a bad reply.
+    const transport = new MockTransport();
+    transport.handle('AddressBook/get', () => ({
+      list: [{ id: 'ab-default', name: 'Default', isDefault: true }],
+      state: 'ab-1',
+    }));
+    await syncAddressBooks({ transport, account, handlers });
+
+    transport.handle('AddressBook/get', () => null);
+    const result = await syncAddressBooks({ transport, account, handlers });
+
+    expect(result.retired).toBe(0);
+    const list = await handlers[DB_RPC.ADDRESSBOOK_LIST]({ accountId: account.id });
+    expect(list).toHaveLength(1);
+  });
+
+  it('leaves another service\'s books alone', async () => {
+    // Snapshots are scoped to the service that answered. A CardDAV book is
+    // not absent from a JMAP response in any meaningful sense.
+    await handlers[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: 'carddav',
+      addressbooks: [{ remoteId: 'dav-1', name: 'From CardDAV' }],
+    });
+    const transport = new MockTransport();
+    transport.handle('AddressBook/get', () => ({
+      list: [{ id: 'ab-default', name: 'Default', isDefault: true }],
+      state: 'ab-1',
+    }));
+
+    await syncAddressBooks({ transport, account, handlers });
+
+    const list = await handlers[DB_RPC.ADDRESSBOOK_LIST]({ accountId: account.id });
+    expect(list.map((ab: any) => ab.remote_id).sort()).toEqual(['ab-default', 'dav-1']);
+  });
 });
 
 describe('syncContacts', () => {
+  /**
+   * A server with nothing to report since the checkpoint. A full sync ends
+   * with a catch-up over the window it spent paging, so every one of these
+   * cases reaches ContactCard/changes whether or not it is what is being
+   * tested.
+   */
+  /** The contacts the account still has, in a stable order. */
+  async function liveRemoteIds(): Promise<string[]> {
+    const rows = await engine.all(
+      'SELECT remote_id FROM contacts WHERE account_id = ? AND is_deleted = 0 ORDER BY remote_id',
+      [account.id],
+    );
+    return rows.map((row: any) => row.remote_id);
+  }
+
+  function nothingChanged(transport: MockTransport) {
+    transport.handle('ContactCard/changes', ({ sinceState }) => ({
+      oldState: sinceState,
+      newState: sinceState,
+      created: [],
+      updated: [],
+      destroyed: [],
+      hasMoreChanges: false,
+    }));
+  }
+
   it('queries ids, fetches cards, and persists contact + emails', async () => {
     // Pre-seed an addressbook so contacts can resolve.
     await handlers[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
@@ -90,7 +211,7 @@ describe('syncContacts', () => {
     transport.handle('ContactCard/query', () => ({
       ids: ['c-1', 'c-2'],
       total: 2,
-      state: 'cc-1',
+      queryState: 'query-state-not-a-checkpoint',
     }));
     transport.handle('ContactCard/get', (params) => ({
       list: params.ids.map((id) => ({
@@ -106,6 +227,7 @@ describe('syncContacts', () => {
       state: 'cc-1',
     }));
 
+    nothingChanged(transport);
     const result = await syncContacts({ transport, account, handlers });
     expect(result.fetched).toBe(2);
 
@@ -138,9 +260,10 @@ describe('syncContacts', () => {
         ids: allIds.slice(params.position, params.position + params.limit),
         position: params.position,
         total,
-        state: 'cc-paged',
+        queryState: 'query-state-not-a-checkpoint',
       };
     });
+    let getPage = 0;
     transport.handle('ContactCard/get', (params) => ({
       list: params.ids.map((id) => ({
         id,
@@ -148,12 +271,18 @@ describe('syncContacts', () => {
         fullName: `Contact ${id}`,
         emails: [{ email: `${id}@example.com` }],
       })),
+      // The state moves on under the paging, as a live server's would.
+      state: `cc-paged-${(getPage += 1)}`,
     }));
 
+    nothingChanged(transport);
     const result = await syncContacts({ transport, account, handlers, pageSize: 3 });
     expect(result.fetched).toBe(total);
     expect(result.total).toBe(total);
-    expect(result.state).toBe('cc-paged');
+    // The checkpoint is the state the *first* page was read from, so a
+    // change made while the later pages were in flight is replayed by a
+    // catch-up rather than lost between them.
+    expect(result.state).toBe('cc-paged-1');
     expect(positions).toEqual([0, 3, 6]);
 
     const row = await engine.get(
@@ -162,11 +291,17 @@ describe('syncContacts', () => {
     );
     expect(row.n).toBe(total);
 
-    // Each page is one chained query+get round trip, not two requests.
-    expect(transport.requests).toHaveLength(3);
-    for (const req of transport.requests) {
+    // Each page is one chained query+get round trip, not two requests,
+    // followed by the single catch-up that closes the paging window.
+    const paging = transport.requests.filter(
+      (req) => req.methodCalls[0][0] === 'ContactCard/query',
+    );
+    expect(paging).toHaveLength(3);
+    for (const req of paging) {
       expect(req.methodCalls.map(([m]) => m)).toEqual(['ContactCard/query', 'ContactCard/get']);
     }
+    expect(transport.requests.at(-1).methodCalls.map(([m]) => m))
+      .toEqual(['ContactCard/changes']);
   });
 
   it('clamps the page size to the session maxObjectsInGet', async () => {
@@ -187,7 +322,7 @@ describe('syncContacts', () => {
         ids: allIds.slice(params.position, params.position + params.limit),
         position: params.position,
         total: allIds.length,
-        state: 'cc-clamped',
+        queryState: 'query-state-not-a-checkpoint',
       };
     });
     transport.handle('ContactCard/get', (params) => ({
@@ -199,6 +334,7 @@ describe('syncContacts', () => {
       })),
     }));
 
+    nothingChanged(transport);
     const result = await syncContacts({ transport, account, handlers, pageSize: 500 });
     expect(result.fetched).toBe(3);
     expect(limits).toEqual([2, 2]);
@@ -206,7 +342,7 @@ describe('syncContacts', () => {
 
   it('skips cards whose addressbook is not yet synced locally', async () => {
     const transport = new MockTransport();
-    transport.handle('ContactCard/query', () => ({ ids: ['c-1'], total: 1, state: 'cc' }));
+    transport.handle('ContactCard/query', () => ({ ids: ['c-1'], total: 1, queryState: 'qs' }));
     transport.handle('ContactCard/get', () => ({
       list: [{
         id: 'c-1',
@@ -217,6 +353,7 @@ describe('syncContacts', () => {
       }],
       state: 'cc',
     }));
+    nothingChanged(transport);
     await syncContacts({ transport, account, handlers });
     const list = await engine.all('SELECT * FROM contacts WHERE account_id = ?', [account.id]);
     expect(list).toHaveLength(0);
@@ -230,7 +367,7 @@ describe('syncContacts', () => {
     });
 
     const transport = new MockTransport();
-    transport.handle('ContactCard/query', () => ({ ids: ['d'], total: 1, state: 'cc-map' }));
+    transport.handle('ContactCard/query', () => ({ ids: ['d'], total: 1, queryState: 'qs' }));
     transport.handle('ContactCard/get', () => ({
       list: [{
         '@type': 'Card',
@@ -245,6 +382,7 @@ describe('syncContacts', () => {
       state: 'cc-map',
     }));
 
+    nothingChanged(transport);
     const result = await syncContacts({ transport, account, handlers });
     expect(result.fetched).toBe(1);
 
@@ -259,6 +397,849 @@ describe('syncContacts', () => {
     expect(row.remote_id).toBe('d');
     expect(row.email).toBe('ada@example.com');
     expect(Number(row.is_preferred)).toBe(1);
+  });
+
+  it('persists complete cards and normalizes keyed surfaced fields independently', async () => {
+    await handlers[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'book-e', name: 'Contacts', isDefault: true }],
+    });
+    const card = {
+      '@type': 'Card',
+      version: '1.0',
+      id: 'details',
+      uid: 'uid-details',
+      kind: 'individual',
+      addressBookIds: { 'book-e': true },
+      name: { full: 'Detail Person' },
+      emails: {
+        email1: {
+          '@type': 'EmailAddress',
+          address: 'detail@example.com',
+          contexts: { work: true, 'x-team': true },
+          pref: 1,
+          label: 'Primary',
+          'x-entry': 'kept',
+        },
+        broken: { '@type': 'Phone', address: 'wrong-type@example.com' },
+      },
+      phones: {
+        phone1: {
+          '@type': 'Phone',
+          number: 'tel:+15551234',
+          contexts: { private: true },
+          features: { voice: true, 'x-satellite': true },
+          label: 'Desk',
+          pref: 2,
+        },
+        broken: { '@type': 'Phone', number: 42 },
+      },
+      links: {
+        site1: {
+          '@type': 'Link',
+          uri: 'https://example.com',
+          label: 'Site',
+          contexts: { work: true },
+          pref: 3,
+        },
+      },
+      anniversaries: {
+        born: {
+          '@type': 'Anniversary',
+          kind: 'birth',
+          date: { '@type': 'PartialDate', year: 2000, month: 2, day: 29 },
+        },
+        died: {
+          kind: 'death',
+          date: { '@type': 'Timestamp', utc: '2050-01-02T03:04:05.6Z' },
+        },
+        monthOnly: {
+          kind: 'wedding',
+          date: { '@type': 'PartialDate', month: 5 },
+        },
+        broken: {
+          kind: 'birth',
+          date: { month: 2, day: 30 },
+        },
+      },
+      notes: {
+        note1: { '@type': 'Note', note: 'One', author: { name: 'Server' } },
+        note2: { note: 'Two' },
+      },
+      organizations: {
+        org1: {
+          '@type': 'Organization',
+          name: 'Example Corp',
+          contexts: { work: true },
+          units: [{ name: 'Engineering' }, { name: 'Platform' }],
+        },
+        org2: { name: 'Community Group' },
+        hiddenOrg: {
+          '@type': 'Organization',
+          contexts: { work: true },
+          sortAs: 'Hidden',
+        },
+      },
+      titles: {
+        title1: {
+          '@type': 'Title',
+          name: 'Engineer',
+          kind: 'title',
+          organizationId: 'org1',
+        },
+        role1: { name: 'Mentor', kind: 'role', organizationId: 'org2' },
+        hiddenTitle: { name: 'Hidden role', kind: 'role', organizationId: 'hiddenOrg' },
+        absentTitle: { name: 'Absent role', kind: 'role', organizationId: 'missingOrg' },
+        invalidTitle: { name: 'Invalid role', kind: 'role', organizationId: 'bad key' },
+      },
+      media: {
+        secondary: {
+          '@type': 'Media',
+          kind: 'photo',
+          uri: 'data:image/png;base64,iVBORw0KGgo=',
+          mediaType: 'image/png',
+        },
+        avatar: {
+          '@type': 'Media',
+          kind: 'photo',
+          uri: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+          mediaType: 'image/png',
+          pref: 1,
+        },
+        sound: {
+          '@type': 'Media',
+          kind: 'sound',
+          uri: 'https://example.com/voice.ogg',
+          mediaType: 'audio/ogg',
+        },
+      },
+      'x-unknown': { nested: ['must', 'survive'] },
+    };
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: ['details'],
+      total: 1,
+      queryState: 'qs-details',
+    }));
+    let getParams: any = null;
+    transport.handle('ContactCard/get', (params) => {
+      getParams = params;
+      return { list: [card], state: 'cc-details' };
+    });
+    nothingChanged(transport);
+
+    await syncContacts({ transport, account, handlers });
+
+    expect(getParams).not.toHaveProperty('properties');
+    const row = await engine.get(
+      'SELECT id, raw_json FROM contacts WHERE account_id = ? AND remote_id = ?',
+      [account.id, 'details'],
+    );
+    expect(JSON.parse(row.raw_json)).toEqual(card);
+    const detail = await handlers[DB_RPC.CONTACT_GET]({
+      accountId: account.id,
+      contactId: row.id,
+    });
+    expect(detail.emails).toEqual([expect.objectContaining({
+      mapKey: 'email1',
+      value: 'detail@example.com',
+      contexts: ['work'],
+      pref: 1,
+      label: 'Primary',
+    })]);
+    expect(detail.photo).toEqual({
+      mapKey: 'avatar',
+      uri: card.media.avatar.uri,
+      blobId: null,
+      mediaType: 'image/png',
+      pref: 1,
+    });
+    expect(await engine.all(
+      `SELECT map_key, kind, uri, media_type, pref
+         FROM contact_media
+        WHERE contact_id = ?
+        ORDER BY position`,
+      [row.id],
+    )).toEqual([
+      {
+        map_key: 'secondary',
+        kind: 'photo',
+        uri: card.media.secondary.uri,
+        media_type: 'image/png',
+        pref: null,
+      },
+      {
+        map_key: 'avatar',
+        kind: 'photo',
+        uri: card.media.avatar.uri,
+        media_type: 'image/png',
+        pref: 1,
+      },
+      {
+        map_key: 'sound',
+        kind: 'sound',
+        uri: 'https://example.com/voice.ogg',
+        media_type: 'audio/ogg',
+        pref: null,
+      },
+    ]);
+    expect(detail.phones).toEqual([expect.objectContaining({
+      mapKey: 'phone1',
+      value: 'tel:+15551234',
+      contexts: ['private'],
+      features: ['voice'],
+      pref: 2,
+    })]);
+    expect(detail.links).toEqual([expect.objectContaining({
+      mapKey: 'site1',
+      value: 'https://example.com',
+    })]);
+    expect(detail.anniversaries).toEqual([
+      expect.objectContaining({
+        mapKey: 'born',
+        kind: 'birth',
+        date: { kind: 'partial', year: 2000, month: 2, day: 29 },
+      }),
+      expect.objectContaining({
+        mapKey: 'died',
+        kind: 'death',
+        date: { kind: 'timestamp', utc: '2050-01-02T03:04:05.6Z' },
+      }),
+      expect.objectContaining({
+        mapKey: 'monthOnly',
+        kind: 'wedding',
+        date: { kind: 'partial', year: null, month: 5, day: null },
+      }),
+    ]);
+    expect(detail.notes.map((note) => [note.mapKey, note.value])).toEqual([
+      ['note1', 'One'],
+      ['note2', 'Two'],
+    ]);
+    expect(detail.organizations).toEqual([
+      expect.objectContaining({
+        mapKey: 'org1',
+        name: 'Example Corp',
+        contexts: ['work'],
+        units: [
+          { position: 0, value: 'Engineering' },
+          { position: 1, value: 'Platform' },
+        ],
+      }),
+      expect.objectContaining({
+        mapKey: 'org2',
+        name: 'Community Group',
+      }),
+      expect.objectContaining({
+        mapKey: 'hiddenOrg',
+        name: null,
+        contexts: ['work'],
+        units: [],
+      }),
+    ]);
+    expect(detail.titles.map((title) => ({
+      mapKey: title.mapKey,
+      value: title.value,
+      kind: title.kind,
+      organizationMapKey: title.organizationMapKey,
+    }))).toEqual([
+      {
+        mapKey: 'title1',
+        value: 'Engineer',
+        kind: 'title',
+        organizationMapKey: 'org1',
+      },
+      {
+        mapKey: 'role1',
+        value: 'Mentor',
+        kind: 'role',
+        organizationMapKey: 'org2',
+      },
+      {
+        mapKey: 'hiddenTitle',
+        value: 'Hidden role',
+        kind: 'role',
+        organizationMapKey: 'hiddenOrg',
+      },
+      {
+        mapKey: 'absentTitle',
+        value: 'Absent role',
+        kind: 'role',
+        organizationMapKey: null,
+      },
+      {
+        mapKey: 'invalidTitle',
+        value: 'Invalid role',
+        kind: 'role',
+        organizationMapKey: null,
+      },
+    ]);
+  });
+
+  it('removes a contact the server no longer has', async () => {
+    // CS-4.2: a full sync is authoritative. Without a sweep a card deleted
+    // on another device stays in the address book and in autocomplete for
+    // as long as the account lives, because `changes` will never name a
+    // card it has already forgotten.
+    await handlers[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', name: 'Default', isDefault: true }],
+    });
+    let serverCards = ['c-1', 'c-2'];
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: serverCards,
+      total: serverCards.length,
+      queryState: 'qs',
+    }));
+    transport.handle('ContactCard/get', (params) => ({
+      list: params.ids.map((id) => ({
+        id,
+        addressBookId: 'ab-default',
+        fullName: `Contact ${id}`,
+        emails: [{ email: `${id}@example.com` }],
+      })),
+      state: `state-${serverCards.length}`,
+    }));
+    nothingChanged(transport);
+
+    await syncContacts({ transport, account, handlers });
+    expect(await liveRemoteIds()).toEqual(['c-1', 'c-2']);
+
+    serverCards = ['c-1'];
+    const result = await syncContacts({ transport, account, handlers });
+
+    expect(result.swept).toBe(1);
+    expect(await liveRemoteIds()).toEqual(['c-1']);
+  });
+
+  it('sweeps nothing when the paging did not finish', async () => {
+    // The dangerous half of an authoritative sync: a run that stopped after
+    // one page knows nothing about the cards it never asked for, and must
+    // not read its own ignorance as a deletion.
+    await handlers[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', name: 'Default', isDefault: true }],
+    });
+    const allIds = ['c-0', 'c-1', 'c-2', 'c-3'];
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', (params) => ({
+      ids: allIds.slice(params.position, params.position + params.limit),
+      position: params.position,
+      total: allIds.length,
+      queryState: 'qs',
+    }));
+    transport.handle('ContactCard/get', (params) => ({
+      list: params.ids.map((id) => ({
+        id,
+        addressBookId: 'ab-default',
+        fullName: `Contact ${id}`,
+        emails: [{ email: `${id}@example.com` }],
+      })),
+      state: 'state-full',
+    }));
+    nothingChanged(transport);
+    await syncContacts({ transport, account, handlers, pageSize: 2 });
+    expect(await liveRemoteIds()).toEqual(allIds);
+
+    // Now the connection drops after the first page of the next sync.
+    let pages = 0;
+    transport.handle('ContactCard/query', (params) => {
+      pages += 1;
+      if (pages > 1) throw new Error('connection lost');
+      return {
+        ids: allIds.slice(params.position, params.position + params.limit),
+        position: params.position,
+        total: allIds.length,
+        queryState: 'qs',
+      };
+    });
+
+    await expect(syncContacts({ transport, account, handlers, pageSize: 2 }))
+      .rejects.toThrow(/connection lost/);
+
+    expect(await liveRemoteIds(), 'an interrupted sync deletes nothing').toEqual(allIds);
+  });
+
+  it('replays what changed while it was paging', async () => {
+    // The checkpoint is the state the first page was read from, so a card
+    // deleted during the sync is caught by the catch-up rather than sitting
+    // in the gap between the pages and the checkpoint.
+    await handlers[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', name: 'Default', isDefault: true }],
+    });
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: ['c-1', 'c-2'],
+      total: 2,
+      queryState: 'qs',
+    }));
+    transport.handle('ContactCard/get', (params) => ({
+      list: params.ids.map((id) => ({
+        id,
+        addressBookId: 'ab-default',
+        fullName: `Contact ${id}`,
+        emails: [{ email: `${id}@example.com` }],
+      })),
+      state: 'state-1',
+    }));
+    transport.handle('ContactCard/changes', ({ sinceState }) => ({
+      oldState: sinceState,
+      newState: 'state-2',
+      created: [],
+      updated: [],
+      destroyed: ['c-2'],
+      hasMoreChanges: false,
+    }));
+
+    const result = await syncContacts({ transport, account, handlers });
+
+    expect(await liveRemoteIds()).toEqual(['c-1']);
+    expect(result.state, 'the checkpoint moves on to where the catch-up ended')
+      .toBe('state-2');
+  });
+
+  it('checkpoints the object state, which is the only one changes accepts', async () => {
+    // The checkpoint used to be read from the query response's `state`, a
+    // field no server sends — a query answers with `queryState` (RFC 8620
+    // §5.5), and only the object state from `get` can be handed to
+    // `changes` (§5.2). Nothing was therefore ever written, and every
+    // contact push fell back to resyncing the whole account.
+    await handlers[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', name: 'Default', isDefault: true }],
+    });
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: ['c-1'],
+      total: 1,
+      queryState: 'query-state-not-a-checkpoint',
+    }));
+    transport.handle('ContactCard/get', (params) => ({
+      list: params.ids.map((id) => ({
+        id,
+        addressBookId: 'ab-default',
+        fullName: 'Ada',
+        emails: [{ email: 'ada@example.com' }],
+      })),
+      state: 'object-state-1',
+    }));
+
+    nothingChanged(transport);
+    const result = await syncContacts({ transport, account, handlers });
+
+    expect(result.state).toBe('object-state-1');
+    const saved = await handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: account.id,
+      objectType: 'ContactCard',
+    });
+    expect(saved?.state, 'a full sync must leave a checkpoint to resume from')
+      .toBe('object-state-1');
+  });
+
+  /** An address book and two cards already synced and settled. */
+  async function seedTwoContacts() {
+    await handlers[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', name: 'Default', isDefault: true }],
+    });
+    const books = await handlers[DB_RPC.ADDRESSBOOK_LIST]({ accountId: account.id });
+    await handlers[DB_RPC.CONTACT_UPSERT_MANY]({
+      accountId: account.id,
+      generation: 1,
+      contacts: ['c-1', 'c-2'].map((remoteId) => ({
+        addressbookIds: [books[0].id],
+        remoteId,
+        displayName: remoteId,
+        emails: [{ email: `${remoteId}@example.com` }],
+      })),
+    });
+  }
+
+  /** A get that answers for whatever ids it is handed. */
+  function answerGets(transport: MockTransport, book = 'ab-default') {
+    transport.handle('ContactCard/get', (params) => ({
+      list: params.ids.map((id) => ({
+        id, addressBookId: book, fullName: id, emails: [{ email: `${id}@example.com` }],
+      })),
+      state: 'object-state-1',
+    }));
+  }
+
+  /** Three cards already synced, so a sweep has something to lose. */
+  async function seedContacts(remoteIds: string[]) {
+    await handlers[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', name: 'Default', isDefault: true }],
+    });
+    const books = await handlers[DB_RPC.ADDRESSBOOK_LIST]({ accountId: account.id });
+    await handlers[DB_RPC.CONTACT_UPSERT_MANY]({
+      accountId: account.id,
+      generation: 1,
+      contacts: remoteIds.map((remoteId) => ({
+        addressbookIds: [books[0].id],
+        remoteId,
+        displayName: remoteId,
+        emails: [{ email: `${remoteId}@example.com` }],
+      })),
+    });
+  }
+
+  it('keeps a card the query named and the get withheld', async () => {
+    // CS-4.2. `notFound` is the documented answer for ids a get did not
+    // return (RFC 8620 §5.1), and it arrives without anything being wrong: a
+    // server capping objects in a get below the ids its own query returned, a
+    // permission change between the two method calls, or a destroy landing
+    // between them. Only the last makes a local deletion correct, and this
+    // code cannot tell them apart, so it must not delete.
+    //
+    // The page reads as complete on every count the loop keeps: the ids were
+    // all named, the cursor advanced by all of them, and `total` is reached.
+    // Only the number of cards actually returned differs.
+    await seedContacts(['c-a', 'c-b']);
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: ['c-a', 'c-b'], total: 2, position: 0, queryState: 'q-1',
+    }));
+    transport.handle('ContactCard/get', (params) => ({
+      list: params.ids.filter((id: string) => id !== 'c-b').map((id: string) => ({
+        id, addressBookId: 'ab-default', fullName: id, emails: [{ email: `${id}@example.com` }],
+      })),
+      notFound: ['c-b'],
+      state: 'object-state-1',
+    }));
+    nothingChanged(transport);
+
+    const result = await syncContacts({ transport, account, handlers });
+
+    expect(await liveRemoteIds(), 'a card the get withheld is not a card the server lost')
+      .toEqual(['c-a', 'c-b']);
+    expect(result.swept, 'nothing may be removed on a reading this incomplete').toBe(0);
+    // And the gap has to stay transient: the card is missing from this pass,
+    // so a checkpoint here would make the next sync incremental, and
+    // `changes` never names a card nothing modified.
+    const checkpoint = await handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: account.id,
+      objectType: 'ContactCard',
+    });
+    expect(checkpoint?.state ?? null, 'no checkpoint past a card this pass never saw')
+      .toBeNull();
+  });
+
+  it('starts over rather than sweeping when the card list moves under the cursor', async () => {
+    // CS-4.2, and the case has to be one where drift actually costs a card,
+    // or the test passes against code with no drift detection at all.
+    //
+    // The server holds [A, B, C] and serves A. A is then deleted elsewhere, so
+    // B slides from index 1 to index 0 and the next page — position 1 — serves
+    // C. B is never fetched, so never stamped, and a sweep would delete a card
+    // the server still has. `changes` cannot save it: nothing modified B.
+    await seedContacts(['c-a', 'c-b', 'c-c']);
+    const transport = new MockTransport();
+    let pass = 1;
+    let served = 0;
+    transport.handle('ContactCard/query', ({ position }) => {
+      if (pass === 1) {
+        served += 1;
+        if (served === 1) {
+          return { ids: ['c-a'], total: 3, position: 0, queryState: 'q-1' };
+        }
+        // A is gone; the list is now [B, C] under a new query state.
+        pass = 2;
+        return { ids: ['c-c'], total: 2, position: 1, queryState: 'q-2' };
+      }
+      const list = ['c-b', 'c-c'];
+      return {
+        ids: list.slice(position, position + 1),
+        total: 2,
+        position,
+        queryState: 'q-2',
+      };
+    });
+    answerGets(transport);
+    nothingChanged(transport);
+
+    const result = await syncContacts({ transport, account, handlers, pageSize: 1 });
+
+    // The exact end state, because it is what separates the two worlds: with
+    // drift detection the restarted pass reads [B, C] and sweeps A, which
+    // really was deleted. Without it, the first pass reads A then C, never
+    // sees B, and sweeps B instead — leaving ['c-a', 'c-c']. A count of
+    // fetched cards is 2 either way and cannot tell them apart.
+    expect(await liveRemoteIds(), 'the card that slid past the cursor must survive')
+      .toEqual(['c-b', 'c-c']);
+    expect(result.swept, 'and the card that really went is the one removed').toBe(1);
+    expect(
+      countMethod(transport, 'ContactCard/query'),
+      'a restart means the list is read again, not carried on from mid-way',
+    ).toBeGreaterThan(2);
+  });
+
+  it('gives up sweeping rather than paging forever against a moving list', async () => {
+    await seedTwoContacts();
+    const transport = new MockTransport();
+    let page = 0;
+    transport.handle('ContactCard/query', () => {
+      page += 1;
+      return { ids: ['c-1'], total: 2, position: 0, queryState: `q-${page}` };
+    });
+    answerGets(transport);
+    nothingChanged(transport);
+
+    const result = await syncContacts({ transport, account, handlers, pageSize: 1 });
+
+    expect(result.unstable, 'the caller should learn the list never settled').toBe(true);
+    expect(result.swept).toBe(0);
+    expect(await liveRemoteIds(), 'an unsettled account keeps what it had')
+      .toEqual(['c-1', 'c-2']);
+  });
+
+  it('refuses to read a failed page as an account with no contacts', async () => {
+    // `pickResponse` answers null for a method-level error as well as an
+    // absent slot, so an unguarded read turns one failed round trip into an
+    // empty result — and the sweep behind it into a deletion of the entire
+    // address book.
+    await seedTwoContacts();
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: ['c-1', 'c-2'], total: 2, queryState: 'q-1',
+    }));
+    transport.handle('ContactCard/get', () => null);
+    nothingChanged(transport);
+
+    await expect(syncContacts({ transport, account, handlers }))
+      .rejects.toThrow(/ContactCard\/get/);
+    expect(await liveRemoteIds(), 'a failed page must leave the contacts alone')
+      .toEqual(['c-1', 'c-2']);
+  });
+
+  it('refuses to read an unanswered query as an account with no contacts', async () => {
+    await seedTwoContacts();
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => null);
+    transport.handle('ContactCard/get', () => ({ list: [], state: 's' }));
+    nothingChanged(transport);
+
+    await expect(syncContacts({ transport, account, handlers }))
+      .rejects.toThrow(/ContactCard\/query/);
+    expect(await liveRemoteIds()).toEqual(['c-1', 'c-2']);
+  });
+
+  it('keeps paging when the server caps the page below what was asked for', async () => {
+    // RFC 8620 §5.5 lets the server clamp `limit` and requires it to return
+    // the limit it enforced. Measuring a short page against what we asked
+    // for rather than what it agreed to give reads a capped server as an
+    // account that ran out of contacts after one page — and the sweep
+    // deletes the remainder. Stalwart's cap is 5000 against a 500 page, so
+    // only a tighter-configured instance reaches this.
+    await seedTwoContacts();
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', ({ position }) => ({
+      // Asked for 500 a page; this server will only ever give one.
+      ids: position === 0 ? ['c-1'] : ['c-2'],
+      total: 2,
+      position,
+      limit: 1,
+      queryState: 'q-1',
+    }));
+    answerGets(transport);
+    nothingChanged(transport);
+
+    const result = await syncContacts({ transport, account, handlers });
+
+    expect(result.fetched, 'both pages should be read').toBe(2);
+    expect(await liveRemoteIds(), 'and nothing swept for being past a short page')
+      .toEqual(['c-1', 'c-2']);
+  });
+
+  it('does not sweep a card it could not file for want of its address book', async () => {
+    // The card is plainly on the server — it came back in this very page —
+    // but no local book matches, so it goes unstamped. Sweeping then reads
+    // it as absent and deletes it, and the `changes` catch-up cannot bring
+    // it back because nothing modified it.
+    await seedTwoContacts();
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: ['c-1', 'c-2'], total: 2, queryState: 'q-1',
+    }));
+    transport.handle('ContactCard/get', (params) => ({
+      list: params.ids.map((id) => ({
+        id,
+        // c-2 has been re-filed into a book this account has not synced.
+        addressBookId: id === 'c-2' ? 'ab-unknown' : 'ab-default',
+        fullName: id,
+        emails: [{ email: `${id}@example.com` }],
+      })),
+      state: 'object-state-1',
+    }));
+    nothingChanged(transport);
+
+    const result = await syncContacts({ transport, account, handlers });
+
+    expect(result.swept).toBe(0);
+    expect(await liveRemoteIds(), 'an unfiled card is not an absent one')
+      .toEqual(['c-1', 'c-2']);
+  });
+
+  it('will not sweep across pages the server gave it no way to tie together', async () => {
+    // A query state is what makes several pages one list. Without one, drift
+    // is undetectable — and initialising the stored state to the same value
+    // that means "the server sent none" is how the whole check quietly stops
+    // running while appearing to pass.
+    // `c-stale` is held locally and absent from the server's list, so a sweep
+    // has something to delete. Asserting `swept === 0` against a list where
+    // every card gets stamped would pass with no check running at all.
+    await seedContacts(['c-a', 'c-b', 'c-stale']);
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', ({ position }) => ({
+      ids: ['c-a', 'c-b'].slice(position, position + 1),
+      total: 2,
+      position,
+    }));
+    answerGets(transport);
+    nothingChanged(transport);
+
+    const result = await syncContacts({ transport, account, handlers, pageSize: 1 });
+
+    expect(result.fetched, 'both pages are still read').toBe(2);
+    expect(result.swept, 'but nothing may be removed on an unverifiable reading').toBe(0);
+    expect(await liveRemoteIds(), 'including a card this pass could not account for')
+      .toContain('c-stale');
+  });
+
+  it('still sweeps a single-page account that reports no query state', async () => {
+    // The other half of the rule, and the common case: one request cannot
+    // drift, because the query and the get are answered together. Refusing to
+    // sweep here would mean a deletion on the server never arrives locally
+    // for any account small enough to fit in one page.
+    await seedContacts(['c-a', 'c-b']);
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: ['c-a'], total: 1, position: 0,
+    }));
+    answerGets(transport);
+    nothingChanged(transport);
+
+    const result = await syncContacts({ transport, account, handlers });
+
+    expect(result.swept, 'the card the server no longer has must go').toBe(1);
+    expect(await liveRemoteIds()).toEqual(['c-a']);
+  });
+
+  it('ignores a limit larger than the one it asked for', async () => {
+    // Clamping only ever reduces. A server reporting its configured ceiling
+    // while serving the page requested would otherwise make every page look
+    // short of it, ending the pass after one page and sweeping the rest.
+    await seedContacts(['c-a', 'c-b']);
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', ({ position }) => ({
+      ids: ['c-a', 'c-b'].slice(position, position + 1),
+      position,
+      limit: 5_000,
+      queryState: 'q-1',
+    }));
+    answerGets(transport);
+    nothingChanged(transport);
+
+    const result = await syncContacts({ transport, account, handlers, pageSize: 1 });
+
+    expect(result.fetched, 'the second page must still be asked for').toBe(2);
+    expect(await liveRemoteIds()).toEqual(['c-a', 'c-b']);
+  });
+
+  it('stops rather than paging forever against a cursor that never moves', async () => {
+    // A server that keeps echoing position 0 while serving full pages makes
+    // every page look like a full page, and a stable query state means no
+    // restart fires either. Nothing else in the loop breaks the tie.
+    await seedContacts(['c-a', 'c-b']);
+    const transport = new MockTransport();
+    let pages = 0;
+    transport.handle('ContactCard/query', () => {
+      pages += 1;
+      if (pages > 50) throw new Error('paged without terminating');
+      return { ids: ['c-a'], position: 0, queryState: 'q-1' };
+    });
+    answerGets(transport);
+    nothingChanged(transport);
+
+    const result = await syncContacts({ transport, account, handlers, pageSize: 1 });
+
+    expect(pages, 'it must give up quickly, not spin').toBeLessThan(50);
+    expect(result.swept, 'and sweep nothing on a reading it could not finish').toBe(0);
+  });
+
+  it('leaves no checkpoint when a card could not be filed', async () => {
+    // Suppressing the sweep keeps the card from being deleted, but a
+    // checkpoint makes the next sync incremental — and `changes` never names
+    // a card nothing modified, so the local gap would be permanent instead of
+    // lasting until the address book arrives.
+    //
+    // The checkpoint seeded here is the point: a full sync runs with one
+    // already on disk — `changes` asking for a rebuild, or the
+    // `SYNC_ENSURE_CONTACTS` RPC — so declining to *write* one is not the same
+    // as leaving none behind. Without the seed this passes either way.
+    await seedContacts(['c-a']);
+    await handlers[DB_RPC.SYNC_STATE_SET]({
+      accountId: account.id,
+      objectType: 'ContactCard',
+      state: 'checkpoint-from-an-earlier-sync',
+    });
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: ['c-a', 'c-b'], total: 2, queryState: 'q-1',
+    }));
+    transport.handle('ContactCard/get', (params) => ({
+      list: params.ids.map((id) => ({
+        id,
+        addressBookId: id === 'c-b' ? 'ab-unknown' : 'ab-default',
+        fullName: id,
+        emails: [{ email: `${id}@example.com` }],
+      })),
+      state: 'object-state-1',
+    }));
+    nothingChanged(transport);
+
+    const result = await syncContacts({ transport, account, handlers });
+
+    expect(result.needsFullSync, 'the caller has to know to read the list again').toBe(true);
+    const saved = await handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: account.id,
+      objectType: 'ContactCard',
+    });
+    expect(saved?.state ?? null, 'a checkpoint here would strand the unfiled card')
+      .toBeNull();
+  });
+
+  it('drops the checkpoint when the catch-up cannot be calculated', async () => {
+    // The baseline is the first page's state, so without a catch-up the
+    // window spent paging is unaccounted for. Keeping a checkpoint that
+    // implies otherwise would let the next delta resume from a state the
+    // cache never reached.
+    await seedTwoContacts();
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: ['c-1'], total: 1, queryState: 'q-1',
+    }));
+    answerGets(transport);
+    // A server that cannot calculate the delta answers with an error, which
+    // reaches the reader as a response it cannot use.
+    transport.handle('ContactCard/changes', () => null);
+
+    const result = await syncContacts({ transport, account, handlers });
+
+    expect(result.needsFullSync, 'the caller has to know to rebuild').toBe(true);
+    const saved = await handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: account.id,
+      objectType: 'ContactCard',
+    });
+    expect(saved?.state ?? null, 'no checkpoint is better than a false one').toBeNull();
   });
 });
 
@@ -283,8 +1264,11 @@ describe('createContactCard', () => {
     });
     expect(result).toEqual({ ok: true, id: 'new-1' });
     expect(created.addressBookIds).toEqual({ 'book-default': true });
-    expect(created.emails.e1.address).toBe('grace@example.com');
+    expect(Object.values(created.emails)[0]).toMatchObject({
+      address: 'grace@example.com',
+    });
     expect(created.name.full).toBe('Grace Hopper');
+    expect(created.uid).toMatch(/^urn:uuid:/);
   });
 
   it('builds a multi-email map from the address list', async () => {
@@ -306,16 +1290,444 @@ describe('createContactCard', () => {
       .toEqual(['a@example.com', 'b@example.com']);
   });
 
-  it('is idempotent: reports alreadyExists without creating a duplicate', async () => {
+  it('promotes an existing card instead of creating a duplicate', async () => {
     const transport = new MockTransport();
-    transport.handle('ContactCard/query', () => ({ ids: ['existing'], total: 1 }));
-    const result = await createContactCard({
-      transport, account, emails: ['dup@example.com'],
+    transport.handle('AddressBook/get', () => ({
+      list: [{ id: 'book-default', name: 'Contacts', isDefault: true }],
+    }));
+    transport.handle('ContactCard/query', (params) => (
+      params.filter?.uid
+        ? { ids: [], total: 0 }
+        : { ids: ['existing'], total: 1 }
+    ));
+    transport.handle('ContactCard/get', () => ({
+      state: 'contacts-state',
+      list: [{
+        id: 'existing',
+        addressBookIds: { 'book-trusted': true },
+        name: { full: 'Promoted', 'x-phonetic': 'Pro-mo-ted' },
+        emails: { e1: { '@type': 'EmailAddress', address: 'dup@example.com' } },
+      }],
+    }));
+    let update: any = null;
+    transport.handle('ContactCard/set', (params) => {
+      update = params.update;
+      return { updated: { existing: null } };
     });
-    expect(result).toEqual({ ok: true, alreadyExists: true });
-    const didSet = transport.requests.some((r) =>
-      r.methodCalls.some(([m]) => m === 'ContactCard/set'));
-    expect(didSet).toBe(false);
+    const result = await createContactCard({
+      transport, account, emails: ['dup@example.com'], name: 'Promoted',
+    });
+    expect(result).toEqual({ ok: true, id: 'existing', alreadyExists: true });
+    expect(update.existing['addressBookIds/book-default']).toBe(true);
+    expect(update.existing.name).toBeUndefined();
+    expect(update.existing['name/full']).toBeUndefined();
+    expect(update.existing.emails).toBeUndefined();
+  });
+
+  it('creates a separate card when duplication is explicit', async () => {
+    const transport = new MockTransport();
+    let created: any = null;
+    transport.handle('ContactCard/set', (params) => {
+      created = params.create?.c1;
+      return { created: { c1: { id: 'copy-1' } } };
+    });
+
+    const result = await createContactCard({
+      transport,
+      account,
+      contact: contactFields({
+        fullName: 'Duplicated (Copy 1)',
+        emails: [{
+          mapKey: 'email',
+          position: 0,
+          value: 'dup@example.com',
+          label: null,
+          contexts: [],
+          pref: 1,
+          isPreferred: true,
+        }],
+        photo: {
+          mapKey: 'avatar',
+          uri: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+          blobId: null,
+          mediaType: 'image/png',
+          pref: 1,
+        },
+      }),
+      addressBookIds: ['book-default'],
+      allowDuplicate: true,
+    });
+
+    expect(result).toEqual({ ok: true, id: 'copy-1' });
+    expect(created.name.full).toBe('Duplicated (Copy 1)');
+    expect(created.media.avatar).toMatchObject({
+      '@type': 'Media',
+      kind: 'photo',
+      mediaType: 'image/png',
+      pref: 1,
+    });
+    expect(jmapCalls(transport, 'ContactCard/query')).toHaveLength(0);
+  });
+
+  it('creates an email-less card with the exact durable keyed detail payload', async () => {
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({ ids: [], total: 0 }));
+    let created: any = null;
+    transport.handle('ContactCard/set', (params) => {
+      created = params.create.c1;
+      return { created: { c1: { id: 'email-less' } } };
+    });
+    const uid = 'urn:uuid:11111111-2222-4333-8444-555555555555';
+    const contact = contactFields({
+      fullName: 'Email Less',
+      phones: [{
+        mapKey: 'phone1',
+        position: 0,
+        value: 'tel:+15551234',
+        label: 'Direct',
+        contexts: ['work'],
+        features: ['voice'],
+        pref: 1,
+      }],
+      links: [{
+        mapKey: 'site1',
+        position: 0,
+        value: 'https://example.com',
+        label: null,
+        contexts: ['private'],
+        pref: null,
+      }],
+      anniversaries: [{
+        mapKey: 'born',
+        position: 0,
+        kind: 'birth',
+        date: { kind: 'partial', year: null, month: 2, day: 29 },
+      }],
+      notes: [{ mapKey: 'note1', position: 0, value: 'A note' }],
+      organizations: [
+        {
+          mapKey: 'org1',
+          position: 0,
+          name: 'Example',
+          contexts: ['work'],
+          units: [{ position: 0, value: 'Engineering' }],
+        },
+        {
+          mapKey: 'org2',
+          position: 1,
+          name: 'Community',
+          contexts: [],
+          units: [],
+        },
+      ],
+      titles: [
+        {
+          mapKey: 'title1',
+          position: 0,
+          value: 'Engineer',
+          kind: 'title',
+          organizationMapKey: 'org1',
+        },
+        {
+          mapKey: 'role1',
+          position: 1,
+          value: 'Mentor',
+          kind: 'role',
+          organizationMapKey: 'org2',
+        },
+      ],
+    });
+
+    const result = await createContactCard({
+      transport,
+      account,
+      uid,
+      contact,
+      addressBookIds: ['book-a', 'book-b'],
+    });
+
+    expect(result).toEqual({ ok: true, id: 'email-less' });
+    expect(created).toEqual({
+      '@type': 'Card',
+      version: '1.0',
+      uid,
+      kind: 'individual',
+      addressBookIds: { 'book-a': true, 'book-b': true },
+      name: { full: 'Email Less' },
+      phones: {
+        phone1: {
+          '@type': 'Phone',
+          number: 'tel:+15551234',
+          contexts: { work: true },
+          features: { voice: true },
+          pref: 1,
+          label: 'Direct',
+        },
+      },
+      links: {
+        site1: {
+          '@type': 'Link',
+          uri: 'https://example.com',
+          contexts: { private: true },
+        },
+      },
+      anniversaries: {
+        born: {
+          '@type': 'Anniversary',
+          kind: 'birth',
+          date: {
+            '@type': 'PartialDate',
+            month: 2,
+            day: 29,
+          },
+        },
+      },
+      notes: { note1: { '@type': 'Note', note: 'A note' } },
+      organizations: {
+        org1: {
+          '@type': 'Organization',
+          name: 'Example',
+          contexts: { work: true },
+          units: [{ '@type': 'OrgUnit', name: 'Engineering' }],
+        },
+        org2: { '@type': 'Organization', name: 'Community' },
+      },
+      titles: {
+        title1: {
+          '@type': 'Title',
+          name: 'Engineer',
+          kind: 'title',
+          organizationId: 'org1',
+        },
+        role1: {
+          '@type': 'Title',
+          name: 'Mentor',
+          kind: 'role',
+          organizationId: 'org2',
+        },
+      },
+    });
+    expect(created).not.toHaveProperty('emails');
+    expect(created.links.site1).not.toHaveProperty('kind');
+    expect(created.anniversaries.born).not.toHaveProperty('label');
+  });
+
+  it('creates a month-only PartialDate without inventing a day or year', async () => {
+    const transport = new MockTransport();
+    let created: any = null;
+    transport.handle('ContactCard/set', ({ create }) => {
+      created = create.c1;
+      return { created: { c1: { id: 'month-only' } } };
+    });
+
+    const result = await createContactCard({
+      transport,
+      account,
+      uid: 'urn:uuid:11111111-2222-4333-8444-555555555555',
+      contact: contactFields({
+        anniversaries: [{
+          mapKey: 'birth-month',
+          position: 0,
+          kind: 'birth',
+          date: { kind: 'partial', year: null, month: 5, day: null },
+        }],
+      }),
+      addressBookIds: ['book-a'],
+    });
+
+    expect(result).toEqual({ ok: true, id: 'month-only' });
+    expect(created.anniversaries['birth-month'].date).toEqual({
+      '@type': 'PartialDate',
+      month: 5,
+    });
+  });
+
+  it('emits a keyed empty organization for a title-only affiliation', async () => {
+    const transport = new MockTransport();
+    let created: any = null;
+    transport.handle('ContactCard/set', ({ create }) => {
+      created = create.c1;
+      return { created: { c1: { id: 'organization-title' } } };
+    });
+    const result = await createContactCard({
+      transport,
+      account,
+      uid: 'urn:uuid:11111111-2222-4333-8444-555555555555',
+      contact: contactFields({
+        organizations: [{
+          mapKey: null,
+          formId: 'new-organization',
+          position: 0,
+          name: null,
+          contexts: ['work'],
+          units: [],
+        }],
+        titles: [{
+          mapKey: null,
+          position: 0,
+          value: 'Engineer',
+          kind: 'title',
+          organizationMapKey: null,
+          organizationFormId: 'new-organization',
+        }],
+      }),
+      addressBookIds: ['book-a'],
+    });
+
+    expect(result).toEqual({ ok: true, id: 'organization-title' });
+    const organizationKey = Object.keys(created.organizations)[0];
+    expect(organizationKey).toMatch(/^organization-/);
+    expect(created.organizations[organizationKey]).toEqual({
+      '@type': 'Organization',
+      contexts: { work: true },
+    });
+    expect(Object.values(created.titles)[0]).toMatchObject({
+      organizationId: organizationKey,
+    });
+    expect(JSON.stringify(created)).not.toContain('organizationFormId');
+  });
+
+  it('rejects an empty card and invalid anniversary without a server request', async () => {
+    const emptyTransport = new MockTransport();
+    const empty = await createContactCard({
+      transport: emptyTransport,
+      account,
+      uid: 'urn:uuid:11111111-2222-4333-8444-555555555555',
+      contact: contactFields(),
+      addressBookIds: ['book-a'],
+    });
+    expect(empty).toMatchObject({ ok: false, error: { type: 'invalidArguments' } });
+    expect(emptyTransport.requests).toHaveLength(0);
+
+    const invalidTransport = new MockTransport();
+    const invalid = await createContactCard({
+      transport: invalidTransport,
+      account,
+      uid: 'urn:uuid:11111111-2222-4333-8444-555555555555',
+      contact: contactFields({
+        anniversaries: [{
+          mapKey: 'bad-date',
+          position: 0,
+          kind: 'birth',
+          date: { kind: 'partial', year: 2023, month: 2, day: 29 },
+        }],
+      }),
+      addressBookIds: ['book-a'],
+    });
+    expect(invalid).toMatchObject({ ok: false, error: { type: 'invalidArguments' } });
+    expect(invalidTransport.requests).toHaveLength(0);
+  });
+
+  it('reconciles an ambiguous create by uid before repeating ContactCard/set', async () => {
+    const transport = new MockTransport();
+    let exists = false;
+    transport.handle('ContactCard/query', ({ filter }) => ({
+      ids: filter?.uid && exists ? ['created-on-lost-response'] : [],
+      total: exists ? 1 : 0,
+    }));
+    transport.handle('ContactCard/get', ({ ids }) => ({
+      list: ids.map((id) => ({ id, uid })),
+    }));
+    let writes = 0;
+    transport.handle('ContactCard/set', () => {
+      writes += 1;
+      exists = true;
+      return null;
+    });
+    const uid = 'urn:uuid:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const args = {
+      transport,
+      account,
+      uid,
+      contact: contactFields({ fullName: 'Recovered' }),
+      addressBookIds: ['book-a'],
+    };
+
+    const first = await createContactCard(args);
+    const retry = await createContactCard({ ...args, recoverCreate: true });
+
+    expect(first.ok).toBe(false);
+    expect(retry).toEqual({
+      ok: true,
+      id: 'created-on-lost-response',
+      alreadyExists: true,
+    });
+    expect(writes).toBe(1);
+    const uidQueries = jmapCalls(transport, 'ContactCard/query');
+    expect(uidQueries.map((query) => query.filter?.uid)).toEqual([uid]);
+  });
+
+  it('does not require uid filtering before the first create attempt', async () => {
+    const transport = new MockTransport();
+    transport.handleError('ContactCard/query', {
+      type: 'unsupportedFilter',
+      description: 'uid is not supported',
+    });
+    let writes = 0;
+    transport.handle('ContactCard/set', () => {
+      writes += 1;
+      return { created: { c1: { id: 'created' } } };
+    });
+
+    const result = await createContactCard({
+      transport,
+      account,
+      uid: 'urn:uuid:11111111-2222-4333-8444-555555555555',
+      contact: contactFields({ fullName: 'First attempt' }),
+      addressBookIds: ['book-a'],
+    });
+
+    expect(result).toEqual({ ok: true, id: 'created' });
+    expect(countMethod(transport, 'ContactCard/query')).toBe(0);
+    expect(writes).toBe(1);
+  });
+
+  it('fails closed when a recovery uid probe is unsupported or ignored', async () => {
+    const uid = 'urn:uuid:11111111-2222-4333-8444-555555555555';
+    const args = {
+      account,
+      uid,
+      contact: contactFields({ fullName: 'Recovery' }),
+      addressBookIds: ['book-a'],
+      recoverCreate: true,
+    };
+    const unsupported = new MockTransport();
+    unsupported.handleError('ContactCard/query', { type: 'unsupportedFilter' });
+    unsupported.handle('ContactCard/set', () => {
+      throw new Error('must not create');
+    });
+
+    const unsupportedResult = await createContactCard({
+      ...args,
+      transport: unsupported,
+    });
+    expect(unsupportedResult).toMatchObject({
+      ok: false,
+      error: { type: 'uidProbeInconclusive' },
+    });
+    expect(countMethod(unsupported, 'ContactCard/set')).toBe(0);
+
+    const ignored = new MockTransport();
+    ignored.handle('ContactCard/query', () => ({
+      ids: ['unrelated-1', 'unrelated-2'],
+      total: 2,
+    }));
+    ignored.handle('ContactCard/get', ({ ids }) => ({
+      list: ids.map((id) => ({ id, uid: `uid-for-${id}` })),
+    }));
+    ignored.handle('ContactCard/set', () => {
+      throw new Error('must not create');
+    });
+
+    const ignoredResult = await createContactCard({ ...args, transport: ignored });
+    expect(ignoredResult).toMatchObject({
+      ok: false,
+      error: {
+        type: 'uidProbeInconclusive',
+        message: 'the server ignored the uid filter',
+      },
+    });
+    expect(countMethod(ignored, 'ContactCard/set')).toBe(0);
   });
 });
 
@@ -352,10 +1764,13 @@ describe('createTrustedContactCards', () => {
     expect(result.created).toBe(2);
 
     const created = getCreated();
-    expect(Object.values(created).map((c: any) => c.emails.e1.address))
+    expect(Object.values(created).map(
+      (c: any) => (Object.values(c.emails)[0] as any).address,
+    ))
       .toEqual(['a@x.com', 'b@y.com']);
     Object.values(created).forEach((c: any) => {
       expect(c.addressBookIds).toEqual({ 'book-trusted': true });
+      expect(c.uid).toMatch(/^urn:uuid:/);
     });
 
     // Proper batch: one book lookup and one create regardless of N.
@@ -376,7 +1791,37 @@ describe('createTrustedContactCards', () => {
     });
     expect(result.ok).toBe(true);
     expect(result.created).toBe(1);
-    expect(Object.values(getCreated()).map((c: any) => c.emails.e1.address)).toEqual(['b@y.com']);
+    expect(Object.values(getCreated()).map(
+      (c: any) => (Object.values(c.emails)[0] as any).address,
+    )).toEqual(['b@y.com']);
+  });
+
+  it('checks every email on every returned card with the canonical NFC/IDNA key', async () => {
+    const { transport } = setup({
+      existingIds: ['ordinary-book-card'],
+      existingCards: [{
+        id: 'ordinary-book-card',
+        addressBookIds: { 'book-default': true },
+        emails: {
+          home: { address: 'other@example.com' },
+          work: { address: 'Usér@bücher.example' },
+        },
+      }],
+    });
+    const result = await createTrustedContactCards({
+      transport,
+      account,
+      senders: [{ email: 'use\u0301r@xn--bcher-kva.example', name: 'Duplicate spelling' }],
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      created: 0,
+      alreadyTrusted: true,
+      ids: ['ordinary-book-card'],
+    });
+    expect(countMethod(transport, 'ContactCard/set')).toBe(0);
+    expect(countMethod(transport, 'AddressBook/get')).toBe(0);
   });
 
   it('reports alreadyTrusted and issues no create when every sender exists', async () => {
@@ -392,9 +1837,31 @@ describe('createTrustedContactCards', () => {
       account,
       senders: [{ email: 'a@x.com' }, { email: 'b@y.com' }],
     });
-    expect(result).toEqual({ ok: true, created: 0, alreadyTrusted: true });
+    expect(result).toEqual({
+      ok: true,
+      created: 0,
+      alreadyTrusted: true,
+      ids: ['e1', 'e2'],
+    });
     expect(countMethod(transport, 'ContactCard/set')).toBe(0);
     expect(countMethod(transport, 'AddressBook/get')).toBe(0);
+  });
+
+  it('fails closed when a duplicate-check card cannot be read', async () => {
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({ ids: ['possible'], total: 1 }));
+    transport.handle('ContactCard/get', () => null);
+    const result = await createTrustedContactCards({
+      transport,
+      account,
+      senders: [{ email: 'possible@example.com' }],
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { type: 'serverFail' },
+    });
+    expect(countMethod(transport, 'ContactCard/set')).toBe(0);
   });
 
   it('fails without touching the server when no valid sender is provided', async () => {
@@ -405,6 +1872,45 @@ describe('createTrustedContactCards', () => {
     expect(result.ok).toBe(false);
     expect(result.error.type).toBe('invalidArguments');
     expect(transport.requests).toHaveLength(0);
+  });
+
+  it('uses trusted-sender uids to recover an uncertain batched create', async () => {
+    const transport = new MockTransport();
+    const uid = 'urn:uuid:11111111-2222-4333-8444-555555555555';
+    let exists = false;
+    let writes = 0;
+    transport.handle('ContactCard/query', ({ filter }) => ({
+      ids: filter?.uid && exists ? ['trusted-recovered'] : [],
+      total: exists ? 1 : 0,
+    }));
+    transport.handle('ContactCard/get', ({ ids }) => ({
+      list: ids.map((id) => ({ id, uid })),
+    }));
+    transport.handle('AddressBook/get', () => ({
+      list: [{ id: 'book-trusted', name: 'Trusted senders', isDefault: false }],
+    }));
+    transport.handle('ContactCard/set', () => {
+      writes += 1;
+      exists = true;
+      return null;
+    });
+    const args = {
+      transport,
+      account,
+      senders: [{ email: 'trusted@example.com', name: 'Trusted', uid }],
+    };
+
+    const first = await createTrustedContactCards(args);
+    const retry = await createTrustedContactCards({ ...args, recoverCreate: true });
+
+    expect(first.ok).toBe(false);
+    expect(retry).toMatchObject({
+      ok: true,
+      created: 0,
+      alreadyTrusted: true,
+      ids: ['trusted-recovered'],
+    });
+    expect(writes).toBe(1);
   });
 });
 
@@ -429,7 +1935,7 @@ describe('updateContactCard', () => {
   function withCard(card: any) {
     const transport = new MockTransport();
     let update: any = null;
-    transport.handle('ContactCard/get', () => ({ list: [card] }));
+    transport.handle('ContactCard/get', () => ({ state: 's1', list: [card] }));
     transport.handle('ContactCard/set', (params) => {
       update = params.update;
       return { updated: { d: null } };
@@ -448,12 +1954,14 @@ describe('updateContactCard', () => {
     });
     expect(result).toEqual({ ok: true });
 
-    const emails = Object.values(getUpdate().d.emails) as any[];
-    const kept = emails.find((e) => e.address === 'keep@example.com');
-    expect(kept.contexts).toEqual({ work: true });
-    expect(kept.pref).toBe(1);
-    expect(emails.some((e) => e.address === 'fresh@example.com')).toBe(true);
-    expect(emails.some((e) => e.address === 'drop@example.com')).toBe(false);
+    const patch = getUpdate().d;
+    expect(patch['emails/e1']).toBeUndefined();
+    expect(patch['emails/e2']).toBeNull();
+    expect(Object.entries(patch).some(
+      ([key, value]: [string, any]) => (
+        key.startsWith('emails/') && value?.address === 'fresh@example.com'
+      ),
+    )).toBe(true);
   });
 
   it('never includes untouched fields in the patch (no silent erasure)', async () => {
@@ -461,10 +1969,121 @@ describe('updateContactCard', () => {
     await updateContactCard({
       transport, account, remoteId: 'd', emails: ['keep@example.com'], name: 'Old Name',
     });
-    // PatchObject only carries `emails`; name is unchanged so it is
-    // omitted, and phones/organizations/addressBookIds are never sent,
-    // so the server leaves them intact.
-    expect(Object.keys(getUpdate().d)).toEqual(['emails']);
+    expect(getUpdate().d).toEqual({ 'emails/e2': null });
+  });
+
+  it('adds, replaces, and removes only the selected photo media entry', async () => {
+    const current = {
+      ...cardWithExtras(),
+      media: {
+        avatar: {
+          '@type': 'Media',
+          kind: 'photo',
+          uri: PNG_PHOTO_URI,
+          mediaType: 'image/png',
+          pref: 1,
+          'x-server': 'preserve',
+        },
+        logo: {
+          '@type': 'Media',
+          kind: 'logo',
+          uri: 'https://example.com/logo.png',
+        },
+      },
+    };
+    const baseline = contactFields({
+      fullName: 'Old Name',
+      emails: [{
+        mapKey: 'e1',
+        position: 0,
+        value: 'keep@example.com',
+        label: null,
+        contexts: ['work'],
+        pref: 1,
+        isPreferred: true,
+      }],
+      photo: {
+        mapKey: 'avatar',
+        uri: PNG_PHOTO_URI,
+        blobId: null,
+        mediaType: 'image/png',
+        pref: 1,
+      },
+    });
+    const replacement = contactFields({
+      ...baseline,
+      photo: {
+        ...baseline.photo!,
+        uri: GIF_PHOTO_URI,
+        mediaType: 'image/gif',
+      },
+    });
+    const replacing = withCard(current);
+
+    await expect(updateContactCard({
+      transport: replacing.transport,
+      account,
+      remoteId: 'd',
+      baseline,
+      contact: replacement,
+    })).resolves.toEqual({ ok: true });
+    expect(replacing.getUpdate().d).toEqual({
+      'media/avatar': {
+        '@type': 'Media',
+        kind: 'photo',
+        uri: GIF_PHOTO_URI,
+        mediaType: 'image/gif',
+        pref: 1,
+        'x-server': 'preserve',
+      },
+    });
+
+    const removing = withCard(current);
+    await expect(updateContactCard({
+      transport: removing.transport,
+      account,
+      remoteId: 'd',
+      baseline,
+      contact: contactFields({ ...baseline, photo: null }),
+    })).resolves.toEqual({ ok: true });
+    expect(removing.getUpdate().d).toEqual({ 'media/avatar': null });
+  });
+
+  it('does not overwrite a photo changed after the editor opened', async () => {
+    const baseline = contactFields({
+      fullName: 'Old Name',
+      photo: {
+        mapKey: 'avatar',
+        uri: PNG_PHOTO_URI,
+        blobId: null,
+        mediaType: 'image/png',
+        pref: 1,
+      },
+    });
+    const current = {
+      ...cardWithExtras(),
+      media: {
+        avatar: {
+          '@type': 'Media',
+          kind: 'photo',
+          uri: GIF_PHOTO_URI,
+          mediaType: 'image/gif',
+          pref: 1,
+        },
+      },
+    };
+    const { transport } = withCard(current);
+
+    const result = await updateContactCard({
+      transport,
+      account,
+      remoteId: 'd',
+      baseline,
+      contact: contactFields({ ...baseline, photo: null }),
+    });
+
+    expect(result).toMatchObject({ ok: false, error: { type: 'stateMismatch' } });
+    expect(jmapCalls(transport, 'ContactCard/set')).toHaveLength(0);
   });
 
   it('changes only name.full and preserves other name components', async () => {
@@ -472,7 +2091,388 @@ describe('updateContactCard', () => {
     await updateContactCard({
       transport, account, remoteId: 'd', emails: ['keep@example.com'], name: 'New Name',
     });
-    expect(getUpdate().d.name).toEqual({ full: 'New Name', given: 'Old', surname: 'Name' });
+    expect(getUpdate().d['name/full']).toBe('New Name');
+    expect(getUpdate().d.name).toBeUndefined();
+  });
+
+  it('sparsely edits stable keys while preserving metadata and concurrent additions', async () => {
+    const baseline = contactFields({
+      fullName: 'Old Name',
+      emails: [
+        {
+          mapKey: 'email1',
+          position: 0,
+          value: 'old@example.com',
+          label: 'Old label',
+          contexts: ['work'],
+          pref: 2,
+          isPreferred: true,
+        },
+        {
+          mapKey: 'email2',
+          position: 1,
+          value: 'remove@example.com',
+          label: null,
+          contexts: [],
+          pref: null,
+          isPreferred: false,
+        },
+      ],
+      phones: [{
+        mapKey: 'phone1',
+        position: 0,
+        value: 'tel:+15550001',
+        label: null,
+        contexts: ['work'],
+        features: ['voice'],
+        pref: null,
+      }],
+      links: [{
+        mapKey: 'link1',
+        position: 0,
+        value: 'https://old.example.com',
+        label: null,
+        contexts: ['work'],
+        pref: null,
+      }],
+      anniversaries: [{
+        mapKey: 'born',
+        position: 0,
+        kind: 'birth',
+        date: { kind: 'partial', year: 2000, month: 2, day: 29 },
+      }],
+      notes: [{ mapKey: 'note1', position: 0, value: 'Old note' }],
+      organizations: [
+        {
+          mapKey: 'org1',
+          position: 0,
+          name: 'Old Corp',
+          contexts: ['work'],
+          units: [{ position: 0, value: 'Old Department' }],
+        },
+        {
+          mapKey: 'org2',
+          position: 1,
+          name: 'Second Corp',
+          contexts: ['work'],
+          units: [],
+        },
+      ],
+      titles: [
+        {
+          mapKey: 'title1',
+          position: 0,
+          value: 'Old Title',
+          kind: 'title',
+          organizationMapKey: 'org1',
+        },
+        {
+          mapKey: 'role2',
+          position: 1,
+          value: 'Existing Role',
+          kind: 'role',
+          organizationMapKey: 'org2',
+        },
+      ],
+    });
+    const desired = contactFields({
+      ...baseline,
+      fullName: 'New Name',
+      emails: [
+        {
+          ...baseline.emails[0],
+          value: 'new@example.com',
+          label: 'Custom',
+          contexts: ['private'],
+          pref: 1,
+        },
+        {
+          mapKey: 'email3',
+          position: 1,
+          value: 'added@example.com',
+          label: null,
+          contexts: ['work'],
+          pref: null,
+          isPreferred: false,
+        },
+      ],
+      phones: [{
+        ...baseline.phones[0],
+        features: ['text'],
+      }],
+      links: [{
+        ...baseline.links[0],
+        value: 'https://new.example.com',
+      }],
+      anniversaries: [{
+        ...baseline.anniversaries[0],
+        date: { kind: 'partial', year: 2004, month: 2, day: 29 },
+      }],
+      notes: [{ ...baseline.notes[0], value: 'New note' }],
+      organizations: [
+        {
+          ...baseline.organizations[0],
+          name: 'New Corp',
+          units: [{ position: 0, value: 'New Department' }],
+        },
+        baseline.organizations[1],
+      ],
+      titles: [
+        { ...baseline.titles[0], value: 'New Title' },
+        baseline.titles[1],
+        {
+          mapKey: 'newRole',
+          position: 2,
+          value: 'New Role',
+          kind: 'role',
+          organizationMapKey: 'org1',
+        },
+      ],
+    });
+    const current = {
+      '@type': 'Card',
+      id: 'd',
+      name: {
+        '@type': 'Name',
+        full: 'Old Name',
+        components: [{ kind: 'given', value: 'Old' }],
+        'x-name': true,
+      },
+      emails: {
+        email1: {
+          '@type': 'EmailAddress',
+          address: 'old@example.com',
+          label: 'Old label',
+          contexts: { work: true, 'x-team': true },
+          pref: 2,
+          'x-entry': 'preserve',
+        },
+        email2: { address: 'remove@example.com' },
+        concurrentEmail: { address: 'concurrent@example.com', 'x-new': true },
+      },
+      phones: {
+        phone1: {
+          '@type': 'Phone',
+          number: 'tel:+15550001',
+          contexts: { work: true },
+          features: { voice: true, 'x-satellite': true },
+          'x-phone': true,
+        },
+        concurrentPhone: { number: 'tel:+15559999' },
+      },
+      links: {
+        link1: {
+          '@type': 'Link',
+          kind: 'website',
+          uri: 'https://old.example.com',
+          contexts: { work: true },
+          'x-link': true,
+        },
+        concurrentLink: { uri: 'https://concurrent.example.com' },
+      },
+      anniversaries: {
+        born: {
+          '@type': 'Anniversary',
+          kind: 'birth',
+          label: 'Birthday',
+          date: {
+            '@type': 'PartialDate',
+            year: 2000,
+            month: 2,
+            day: 29,
+            calendarScale: 'gregory',
+          },
+          place: { full: 'Somewhere' },
+        },
+      },
+      notes: {
+        note1: {
+          '@type': 'Note',
+          note: 'Old note',
+          author: { name: 'Remote' },
+        },
+      },
+      organizations: {
+        org1: {
+          '@type': 'Organization',
+          name: 'Old Corp',
+          contexts: { work: true },
+          units: [{ '@type': 'OrgUnit', name: 'Old Department', sortAs: 'Department' }],
+          sortAs: 'Corp, Old',
+        },
+        org2: { name: 'Second Corp', contexts: { work: true } },
+        concurrentOrg: { name: 'Concurrent Corp', 'x-new': true },
+      },
+      titles: {
+        title1: {
+          '@type': 'Title',
+          name: 'Old Title',
+          kind: 'title',
+          organizationId: 'org1',
+          'x-title': true,
+        },
+        role2: { name: 'Existing Role', kind: 'role', organizationId: 'org2' },
+        concurrentTitle: { name: 'Concurrent Title', kind: 'title' },
+      },
+      'x-top': { preserve: true },
+    };
+    const transport = new MockTransport();
+    transport.handle('ContactCard/get', () => ({ state: 'fresh-state', list: [current] }));
+    let setParams: any = null;
+    transport.handle('ContactCard/set', (params) => {
+      setParams = params;
+      return { updated: { d: null } };
+    });
+
+    const result = await updateContactCard({
+      transport,
+      account,
+      remoteId: 'd',
+      baseline,
+      contact: desired,
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(setParams.ifInState).toBe('fresh-state');
+    const patch = setParams.update.d;
+    expect(patch['name/full']).toBe('New Name');
+    expect(patch).not.toHaveProperty('emails');
+    expect(patch['emails/email2']).toBeNull();
+    expect(patch).not.toHaveProperty('emails/concurrentEmail');
+    expect(patch['emails/email1']).toEqual({
+      ...current.emails.email1,
+      address: 'new@example.com',
+      label: 'Custom',
+      contexts: { 'x-team': true, private: true },
+      pref: 1,
+    });
+    expect(patch['emails/email3']).toMatchObject({
+      '@type': 'EmailAddress',
+      address: 'added@example.com',
+      contexts: { work: true },
+    });
+    expect(patch['phones/phone1']).toEqual({
+      ...current.phones.phone1,
+      features: { 'x-satellite': true, text: true },
+    });
+    expect(patch).not.toHaveProperty('phones/concurrentPhone');
+    expect(patch['links/link1']).toEqual({
+      '@type': 'Link',
+      uri: 'https://new.example.com',
+      contexts: { work: true },
+      kind: 'website',
+      'x-link': true,
+    });
+    expect(patch['anniversaries/born']).toEqual({
+      '@type': 'Anniversary',
+      kind: 'birth',
+      label: 'Birthday',
+      date: {
+        '@type': 'PartialDate',
+        year: 2004,
+        month: 2,
+        day: 29,
+        calendarScale: 'gregory',
+      },
+      place: { full: 'Somewhere' },
+    });
+    expect(patch['notes/note1']).toEqual({
+      ...current.notes.note1,
+      note: 'New note',
+    });
+    expect(patch['organizations/org1']).toEqual({
+      ...current.organizations.org1,
+      name: 'New Corp',
+      units: [{
+        '@type': 'OrgUnit',
+        name: 'New Department',
+        sortAs: 'Department',
+      }],
+    });
+    expect(patch).not.toHaveProperty('organizations/org2');
+    expect(patch).not.toHaveProperty('organizations/concurrentOrg');
+    expect(patch['titles/title1']).toEqual({
+      ...current.titles.title1,
+      name: 'New Title',
+    });
+    expect(patch['titles/newRole']).toEqual({
+      '@type': 'Title',
+      name: 'New Role',
+      kind: 'role',
+      organizationId: 'org1',
+    });
+    expect(patch).not.toHaveProperty('titles/concurrentTitle');
+    expect(patch).not.toHaveProperty('x-top');
+  });
+
+  it('only replaces a detail map when the fresh card has no parent map', async () => {
+    const transport = new MockTransport();
+    transport.handle('ContactCard/get', () => ({
+      state: 'fresh-state',
+      list: [{ id: 'd', name: { full: 'Name' } }],
+    }));
+    let patch: any = null;
+    transport.handle('ContactCard/set', (params) => {
+      patch = params.update.d;
+      return { updated: { d: null } };
+    });
+    const baseline = contactFields({ fullName: 'Name' });
+    const desired = contactFields({
+      fullName: 'Name',
+      phones: [{
+        mapKey: 'phone1',
+        position: 0,
+        value: '+1 555 1234',
+        label: null,
+        contexts: [],
+        features: ['voice'],
+        pref: null,
+      }],
+    });
+
+    await updateContactCard({
+      transport,
+      account,
+      remoteId: 'd',
+      baseline,
+      contact: desired,
+    });
+
+    expect(patch).toEqual({
+      phones: {
+        phone1: {
+          '@type': 'Phone',
+          number: '+1 555 1234',
+          features: { voice: true },
+        },
+      },
+    });
+  });
+
+  it('surfaces stateMismatch so the outbox can refetch and retry', async () => {
+    const transport = new MockTransport();
+    transport.handle('ContactCard/get', () => ({
+      state: 'fresh-state',
+      list: [cardWithExtras()],
+    }));
+    let ifInState: string | null = null;
+    transport.handle('ContactCard/set', (params) => {
+      ifInState = params.ifInState;
+      return { notUpdated: { d: { type: 'stateMismatch' } } };
+    });
+
+    const result = await updateContactCard({
+      transport,
+      account,
+      remoteId: 'd',
+      emails: ['changed@example.com'],
+    });
+
+    expect(ifInState).toBe('fresh-state');
+    expect(result).toMatchObject({
+      ok: false,
+      error: { type: 'stateMismatch' },
+    });
   });
 
   it('reports notFound when the card no longer exists', async () => {
@@ -485,9 +2485,23 @@ describe('updateContactCard', () => {
     expect(result.error.type).toBe('notFound');
   });
 
+  it('does not call a refused read a card that no longer exists', async () => {
+    // `notFound` is terminal in the outbox runner: the row is retired as
+    // conflicted and the user is told the edit cannot be made. A method-level
+    // error deserves the backoff instead, so the two must not collapse into
+    // one answer.
+    const transport = new MockTransport();
+    transport.handle('ContactCard/get', () => null);
+    const result = await updateContactCard({
+      transport, account, remoteId: 'd', emails: ['x@example.com'],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error.type, 'a refused read is worth retrying').toBe('serverFail');
+  });
+
   it('reports an error when the server refuses the update', async () => {
     const transport = new MockTransport();
-    transport.handle('ContactCard/get', () => ({ list: [cardWithExtras()] }));
+    transport.handle('ContactCard/get', () => ({ state: 's1', list: [cardWithExtras()] }));
     transport.handle('ContactCard/set', () => ({
       updated: {},
       notUpdated: { d: { type: 'forbidden' } },
@@ -498,29 +2512,312 @@ describe('updateContactCard', () => {
     expect(result.ok).toBe(false);
     expect(result.error.type).toBe('notUpdated');
   });
-});
 
-describe('deleteContactCard', () => {
-  it('destroys the card by remote id', async () => {
+  it('rejects an update that would leave the contact empty', async () => {
     const transport = new MockTransport();
-    let destroyed: any = null;
-    transport.handle('ContactCard/set', (params) => {
-      destroyed = params.destroy;
-      return { destroyed: params.destroy };
+    const result = await updateContactCard({
+      transport,
+      account,
+      remoteId: 'd',
+      contact: contactFields(),
     });
-    const result = await deleteContactCard({ transport, account, remoteId: 'd' });
-    expect(result).toEqual({ ok: true });
-    expect(destroyed).toEqual(['d']);
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { type: 'invalidArguments', message: 'contact card is empty' },
+    });
+    expect(transport.requests).toHaveLength(0);
   });
 
-  it('treats an already-gone card as success', async () => {
+  it('resolves migrated email keys by canonical value after positions change', async () => {
+    const email = (value: string, position: number) => ({
+      mapKey: null,
+      position,
+      value,
+      label: null,
+      contexts: [],
+      pref: null,
+      isPreferred: position === 0,
+    });
+    const baseline = contactFields({
+      fullName: 'Legacy',
+      emails: [email('First@Example.com', 0), email('second@example.com', 1)],
+    });
+    const desired = contactFields({
+      fullName: 'Legacy',
+      emails: [email('second@example.com', 0)],
+    });
+    const current = {
+      id: 'legacy',
+      name: { full: 'Legacy' },
+      emails: {
+        remoteFirst: {
+          address: 'first@example.com',
+          contexts: { work: true },
+          'x-remote': 'first',
+        },
+        remoteSecond: {
+          address: 'second@example.com',
+          contexts: { private: true },
+          'x-remote': 'second',
+        },
+      },
+    };
     const transport = new MockTransport();
-    transport.handle('ContactCard/set', () => ({
-      destroyed: [],
-      notDestroyed: { d: { type: 'notFound' } },
-    }));
-    const result = await deleteContactCard({ transport, account, remoteId: 'd' });
+    transport.handle('ContactCard/get', () => ({ state: 's1', list: [current] }));
+    let patch: any = null;
+    transport.handle('ContactCard/set', ({ update }) => {
+      patch = update.legacy;
+      return { updated: { legacy: null } };
+    });
+
+    const result = await updateContactCard({
+      transport,
+      account,
+      remoteId: 'legacy',
+      baseline,
+      contact: desired,
+    });
+
     expect(result).toEqual({ ok: true });
+    expect(patch).toEqual({ 'emails/remoteFirst': null });
+    expect(patch).not.toHaveProperty('emails/remoteSecond');
+  });
+
+  it('fails safely when a migrated email has no unique remote key', async () => {
+    const legacyEmail = {
+      mapKey: null,
+      position: 0,
+      value: 'duplicate@example.com',
+      label: null,
+      contexts: [],
+      pref: null,
+      isPreferred: true,
+    };
+    const fields = contactFields({ fullName: 'Legacy', emails: [legacyEmail] });
+    const transport = new MockTransport();
+    transport.handle('ContactCard/get', () => ({
+      state: 's1',
+      list: [{
+        id: 'legacy',
+        name: { full: 'Legacy' },
+        emails: {
+          first: { address: 'duplicate@example.com', 'x-id': 1 },
+          second: { address: 'duplicate@example.com', 'x-id': 2 },
+        },
+      }],
+    }));
+    transport.handle('ContactCard/set', () => {
+      throw new Error('ambiguous legacy keys must not be rebound');
+    });
+
+    const result = await updateContactCard({
+      transport,
+      account,
+      remoteId: 'legacy',
+      baseline: fields,
+      contact: fields,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { type: 'contactNeedsSync', terminal: true },
+    });
+    expect(countMethod(transport, 'ContactCard/set')).toBe(0);
+  });
+
+  it('edits an unkeyed anniversary and mints only the new detail key', async () => {
+    const baseline = contactFields({
+      fullName: 'Legacy',
+      anniversaries: [{
+        mapKey: null,
+        position: 0,
+        kind: 'birth',
+        date: { kind: 'partial', year: 2000, month: 5, day: 1 },
+      }],
+    });
+    const desired = withContactDetailKeys(contactFields({
+      fullName: 'Legacy',
+      anniversaries: [{
+        ...baseline.anniversaries[0],
+        date: { kind: 'partial', year: 2001, month: 5, day: 2 },
+      }],
+      notes: [{ mapKey: null, position: 0, value: 'New note' }],
+    }), baseline);
+    expect(desired.anniversaries[0].mapKey).toBeNull();
+    expect(desired.notes[0].mapKey).toMatch(/^note-/);
+    const current = {
+      id: 'legacy-date',
+      name: { full: 'Legacy' },
+      anniversaries: {
+        serverDate: {
+          '@type': 'Anniversary',
+          kind: 'birth',
+          label: 'Vendor label',
+          date: {
+            '@type': 'PartialDate',
+            year: 2000,
+            month: 5,
+            day: 1,
+            calendarScale: 'gregory',
+          },
+          'x-server': true,
+        },
+      },
+    };
+    const transport = new MockTransport();
+    transport.handle('ContactCard/get', () => ({ state: 's1', list: [current] }));
+    let patch: any = null;
+    transport.handle('ContactCard/set', ({ update }) => {
+      patch = update['legacy-date'];
+      return { updated: { 'legacy-date': null } };
+    });
+
+    const result = await updateContactCard({
+      transport,
+      account,
+      remoteId: 'legacy-date',
+      baseline,
+      contact: desired,
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(patch['anniversaries/serverDate']).toEqual({
+      ...current.anniversaries.serverDate,
+      date: {
+        ...current.anniversaries.serverDate.date,
+        year: 2001,
+        day: 2,
+      },
+    });
+    expect(patch.notes[desired.notes[0].mapKey!])
+      .toEqual({ '@type': 'Note', note: 'New note' });
+  });
+
+  it('preserves an unexposed server organizationId during a title edit', async () => {
+    const baseline = contactFields({
+      fullName: 'Worker',
+      titles: [{
+        mapKey: 'hiddenTitle',
+        position: 0,
+        value: 'Old role',
+        kind: 'role',
+        organizationMapKey: null,
+      }],
+    });
+    const desired = contactFields({
+      ...baseline,
+      titles: [{ ...baseline.titles[0], value: 'New role' }],
+    });
+    const current = {
+      id: 'hidden-affiliation',
+      name: { full: 'Worker' },
+      organizations: {
+        hiddenOrg: {
+          '@type': 'Organization',
+          contexts: { work: true },
+          sortAs: 'Hidden',
+        },
+      },
+      titles: {
+        hiddenTitle: {
+          '@type': 'Title',
+          name: 'Old role',
+          kind: 'role',
+          organizationId: 'hiddenOrg',
+          'x-server': true,
+        },
+      },
+    };
+    const transport = new MockTransport();
+    transport.handle('ContactCard/get', () => ({ state: 's1', list: [current] }));
+    let patch: any = null;
+    transport.handle('ContactCard/set', ({ update }) => {
+      patch = update['hidden-affiliation'];
+      return { updated: { 'hidden-affiliation': null } };
+    });
+
+    const result = await updateContactCard({
+      transport,
+      account,
+      remoteId: 'hidden-affiliation',
+      baseline,
+      contact: desired,
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(patch['titles/hiddenTitle']).toEqual({
+      ...current.titles.hiddenTitle,
+      name: 'New role',
+    });
+  });
+
+  it('keeps concurrent organization units separate from a user addition', async () => {
+    const baseline = contactFields({
+      fullName: 'Worker',
+      organizations: [{
+        mapKey: 'org1',
+        position: 0,
+        name: 'Example',
+        contexts: ['work'],
+        units: [
+          { position: 0, value: 'Existing' },
+          { position: 1, value: 'Delete Me' },
+          { position: 2, value: 'Keep Me' },
+        ],
+      }],
+    });
+    const desired = contactFields({
+      ...baseline,
+      organizations: [{
+        ...baseline.organizations[0],
+        units: [
+          { position: 0, value: 'Keep Me' },
+          { position: 1, value: 'Existing' },
+          { position: 2, value: 'User Added' },
+        ],
+      }],
+    });
+    const current = {
+      id: 'org-card',
+      name: { full: 'Worker' },
+      organizations: {
+        org1: {
+          '@type': 'Organization',
+          name: 'Example',
+          contexts: { work: true },
+          units: [
+            { '@type': 'OrgUnit', name: 'Existing', 'x-order': 1 },
+            { '@type': 'OrgUnit', name: 'Delete Me', 'x-order': 2 },
+            { '@type': 'OrgUnit', name: 'Keep Me', 'x-order': 3 },
+            { '@type': 'OrgUnit', name: 'Concurrent', 'x-concurrent': true },
+          ],
+        },
+      },
+    };
+    const transport = new MockTransport();
+    transport.handle('ContactCard/get', () => ({ state: 's1', list: [current] }));
+    let patch: any = null;
+    transport.handle('ContactCard/set', ({ update }) => {
+      patch = update['org-card'];
+      return { updated: { 'org-card': null } };
+    });
+
+    const result = await updateContactCard({
+      transport,
+      account,
+      remoteId: 'org-card',
+      baseline,
+      contact: desired,
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(patch['organizations/org1'].units).toEqual([
+      { '@type': 'OrgUnit', name: 'Keep Me', 'x-order': 3 },
+      { '@type': 'OrgUnit', name: 'Existing', 'x-order': 1 },
+      { '@type': 'OrgUnit', name: 'User Added' },
+      { '@type': 'OrgUnit', name: 'Concurrent', 'x-concurrent': true },
+    ]);
   });
 });
 
@@ -602,6 +2899,31 @@ describe('syncContactCardChanges', () => {
     expect(Number(destroyed.is_deleted)).toBe(1);
   });
 
+  it("drops a destroyed card's search tokens along with its suggestion (CS-3.2)", async () => {
+    // The destroyed leg must go through the typed delete handler:
+    // is_deleted alone hides the card from queries that filter on it, but
+    // its name tokens stay behind in contact_search_tokens.
+    const transport = new MockTransport();
+    transport.handle('ContactCard/changes', () => ({
+      oldState: 'cc-0',
+      newState: 'cc-1',
+      hasMoreChanges: false,
+      created: [],
+      updated: [],
+      destroyed: ['c-2'],
+    }));
+
+    await syncContactCardChanges({ transport, account, handlers, sinceState: 'cc-0' });
+
+    const tokens = await engine.all(
+      `SELECT t.token FROM contact_search_tokens t
+        JOIN contacts c ON c.id = t.contact_id
+       WHERE c.account_id = ? AND c.remote_id = ?`,
+      [account.id, 'c-2'],
+    );
+    expect(tokens).toEqual([]);
+  });
+
   it('follows hasMoreChanges across pages and persists each page state', async () => {
     const transport = new MockTransport();
     const seenStates: string[] = [];
@@ -656,6 +2978,80 @@ describe('syncContactCardChanges', () => {
       [account.id, 'c-2'],
     );
     expect(Number(gone.is_deleted)).toBe(1);
+  });
+
+  it('does not advance past a changed card it could not file', async () => {
+    // The mirror of what the full sync does with `skipped`. A card filed in a
+    // book this account has not synced cannot be stored, so it is missing
+    // locally; advancing the checkpoint over it makes that permanent, because
+    // `changes` names what was modified and nothing will modify it again.
+    const transport = new MockTransport();
+    transport.handle('ContactCard/changes', () => ({
+      oldState: 'cc-0',
+      newState: 'cc-1',
+      hasMoreChanges: false,
+      created: ['c-elsewhere'],
+      updated: [],
+      destroyed: [],
+    }));
+    transport.handle('ContactCard/get', () => ({
+      list: [{
+        id: 'c-elsewhere',
+        addressBookId: 'ab-not-synced-here',
+        fullName: 'Filed Elsewhere',
+        emails: [{ email: 'elsewhere@example.com' }],
+      }],
+      state: 'cc-1',
+    }));
+
+    const result = await syncContactCardChanges({
+      transport, account, handlers, sinceState: 'cc-0',
+    });
+
+    expect(
+      await engine.get(
+        'SELECT id FROM contacts WHERE account_id = ? AND remote_id = ?',
+        [account.id, 'c-elsewhere'],
+      ),
+      'the card could not be filed, so it is not here',
+    ).toBeFalsy();
+    expect(result.needsFullSync, 'a delta that dropped a card asks for a rebuild').toBe(true);
+    const stateRow = await handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: account.id,
+      objectType: 'ContactCard',
+    });
+    expect(stateRow?.state ?? null, 'and it does not checkpoint past the card it dropped')
+      .not.toBe('cc-1');
+  });
+
+  it('does not advance past changed cards it was refused', async () => {
+    // The state is persisted after the cards are fetched, so a refused
+    // read-back that is swallowed costs the delta permanently: those ids
+    // are named once and never again, and the next catch-up starts from a
+    // state the cache never actually reached.
+    const transport = new MockTransport();
+    transport.handle('ContactCard/changes', () => ({
+      oldState: 'cc-0',
+      newState: 'cc-1',
+      hasMoreChanges: false,
+      created: [],
+      updated: ['c-1'],
+      destroyed: [],
+    }));
+    transport.handle('ContactCard/get', () => null);
+
+    await expect(syncContactCardChanges({
+      transport, account, handlers, sinceState: 'cc-0',
+    })).rejects.toThrow(/ContactCard\/get/);
+
+    const stateRow = await handlers[DB_RPC.SYNC_STATE_GET]({
+      accountId: account.id,
+      objectType: 'ContactCard',
+    });
+    expect(
+      stateRow?.state ?? null,
+      'the checkpoint must not move past a page that was never applied',
+    ).not.toBe('cc-1');
   });
 
   it('requests a full sync when the server reports more changes without advancing state', async () => {
@@ -714,6 +3110,59 @@ describe('whitelist reconcile cost is independent of contact count', () => {
     );
   }
 
+  it('does not whitelist a trashed sender when sourceSentAt is absent', async () => {
+    await handlers[DB_RPC.CONTACT_TRASH_PUT_ENTRIES]({
+      accountId: account.id,
+      entries: [{
+        uid: 'trashed-sender-uid',
+        remoteId: 'trashed-sender-card',
+        addressBookIds: ['book-trusted'],
+        trashedAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        status: 'trashed',
+        updatedAt: Date.now(),
+        emailKeys: ['trashed@example.com'],
+        displayName: 'Trashed Sender',
+        primaryEmail: 'trashed@example.com',
+        snapshot: {
+          id: 'trashed-sender-card',
+          uid: 'trashed-sender-uid',
+          addressBookIds: { 'book-trusted': true },
+        },
+        media: [],
+      }],
+    });
+    const transport = new MockTransport();
+    expect(await handlers[DB_RPC.QUERY]({
+      sql: 'SELECT email_key FROM contacts_trash_emails WHERE account_id = ?',
+      params: [account.id],
+    })).toEqual([{ email_key: 'trashed@example.com' }]);
+    transport.handle('AddressBook/get', () => ({ list: [], state: 'books-1' }));
+    transport.handle('ContactCard/get', () => ({
+      list: [],
+      notFound: [],
+      state: 'cards-1',
+    }));
+
+    await expect(processMutationRow({
+      transport,
+      account,
+      handlers,
+      row: {
+        mutation_type: 'whitelistSender',
+        request_json: JSON.stringify({
+          senders: [{
+            email: 'trashed@example.com',
+            name: 'Trashed Sender',
+            uid: 'new-trusted-uid',
+          }],
+        }),
+      },
+    })).resolves.toMatchObject({ ok: true });
+    expect(transport.requests.flatMap((request) => request.methodCalls)
+      .some(([name]) => name === 'ContactCard/set')).toBe(false);
+  });
+
   it('batch-whitelisting 200 mails from 150 senders on a 1099-contact book fetches only the 150 new cards', async () => {
     await seedLocalContacts(1099);
     expect((await countContacts()).n).toBe(1099);
@@ -737,7 +3186,7 @@ describe('whitelist reconcile cost is independent of contact count', () => {
     transport.handle('ContactCard/query', (params) => {
       if (!params.filter) {
         fullListQueried = true;
-        return { ids: Array.from({ length: 1099 }, (_, i) => `seed-${i}`), total: 1099, state: 's' };
+        return { ids: Array.from({ length: 1099 }, (_, i) => `seed-${i}`), total: 1099, queryState: 's' };
       }
       return { ids: [], total: 0 }; // existence check: none of the senders carded yet
     });
@@ -766,14 +3215,21 @@ describe('whitelist reconcile cost is independent of contact count', () => {
       })),
     }));
 
+    const inserted = await handlers[DB_RPC.PENDING_MUTATION_INSERT]({
+      accountId: account.id,
+      mutationType: 'whitelistSender',
+      targetMessageId: null,
+      requestJson: JSON.stringify({ senders }),
+    });
+    const row = await engine.get(
+      'SELECT * FROM pending_mutations WHERE id = ?',
+      [inserted.id],
+    );
     const result = await processMutationRow({
       transport,
       account,
       handlers,
-      row: {
-        mutation_type: 'whitelistSender',
-        request_json: JSON.stringify({ senders }),
-      },
+      row,
     });
     expect(result.ok).toBe(true);
 
@@ -791,5 +3247,196 @@ describe('whitelist reconcile cost is independent of contact count', () => {
 
     // The 1099 existing contacts are untouched; exactly 150 were added.
     expect((await countContacts()).n).toBe(1249);
+  });
+});
+
+describe('JSContact ingestion (RFC 9553)', () => {
+  function nothingChanged(transport: MockTransport) {
+    transport.handle('ContactCard/changes', ({ sinceState }) => ({
+      oldState: sinceState,
+      newState: sinceState,
+      created: [],
+      updated: [],
+      destroyed: [],
+      hasMoreChanges: false,
+    }));
+  }
+
+  async function seedDefaultBook() {
+    await handlers[DB_RPC.ADDRESSBOOK_UPSERT_MANY]({
+      accountId: account.id,
+      serviceKind: SERVICE_KIND.JMAP_CONTACTS,
+      addressbooks: [{ remoteId: 'ab-default', name: 'Default', isDefault: true }],
+    });
+  }
+
+  it('reads given and family names from name.components (RFC 9553 §2.2.1.2)', async () => {
+    // RFC 9553 defines Name as components/full — there are no name.given or
+    // name.surname properties, and `full` is optional once components are
+    // set. This card is the shape of RFC 9610's own ContactCard/get example.
+    await seedDefaultBook();
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: ['c-joe'], total: 1, queryState: 'qs-1',
+    }));
+    transport.handle('ContactCard/get', () => ({
+      list: [{
+        id: 'c-joe',
+        uid: 'uid-joe',
+        addressBookIds: { 'ab-default': true },
+        name: {
+          isOrdered: true,
+          components: [
+            { kind: 'given', value: 'Joe' },
+            { kind: 'surname', value: 'Bloggs' },
+          ],
+        },
+        emails: { e1: { address: 'joe.bloggs@example.com' } },
+      }],
+      state: 'cc-1',
+    }));
+    nothingChanged(transport);
+
+    await syncContacts({ transport, account, handlers });
+
+    const row = await engine.get(
+      'SELECT display_name, given_name, family_name FROM contacts WHERE account_id = ? AND remote_id = ?',
+      [account.id, 'c-joe'],
+    );
+    expect(row.given_name).toBe('Joe');
+    expect(row.family_name).toBe('Bloggs');
+    expect(row.display_name).toBe('Joe Bloggs');
+
+    // The CS-3.2 behavior that depends on those columns: the contact is
+    // reachable by name.
+    const matches = await handlers[DB_RPC.CONTACT_AUTOCOMPLETE]({
+      accountId: account.id, prefix: 'joe blo', limit: 10,
+    });
+    expect(matches.map((m: any) => m.email)).toContain('joe.bloggs@example.com');
+  });
+
+  it('tokenizes nicknames so a contact is reachable by one (RFC 9553 §2.2.2)', async () => {
+    // CS-3.2 names nickname among the match inputs "where available"; the
+    // nicknames map is served by Stalwart, so it is available whenever the
+    // card carries one.
+    await seedDefaultBook();
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: ['c-nick'], total: 1, queryState: 'qs-1',
+    }));
+    transport.handle('ContactCard/get', () => ({
+      list: [{
+        id: 'c-nick',
+        addressBookIds: { 'ab-default': true },
+        name: { full: 'Robert Paulson' },
+        nicknames: { n1: { name: 'Ace' } },
+        emails: { e1: { address: 'robert@example.com' } },
+      }],
+      state: 'cc-1',
+    }));
+    nothingChanged(transport);
+
+    await syncContacts({ transport, account, handlers });
+
+    const matches = await handlers[DB_RPC.CONTACT_AUTOCOMPLETE]({
+      accountId: account.id, prefix: 'ace', limit: 10,
+    });
+    expect(matches.map((m: any) => m.email)).toContain('robert@example.com');
+  });
+
+  it('marks only the most-preferred address as preferred (RFC 9553 §1.5.3)', async () => {
+    // pref is a 1-100 ordering where lower is more preferred, not a flag;
+    // treating any pref as "preferred" defeats the CS-3.6 boost and the
+    // CS-3.4 display-name preference rank.
+    await seedDefaultBook();
+    const transport = new MockTransport();
+    transport.handle('ContactCard/query', () => ({
+      ids: ['c-pref'], total: 1, queryState: 'qs-1',
+    }));
+    transport.handle('ContactCard/get', () => ({
+      list: [{
+        id: 'c-pref',
+        addressBookIds: { 'ab-default': true },
+        name: { full: 'Pref Erence' },
+        emails: {
+          e1: { address: 'secondary@example.com', pref: 50 },
+          e2: { address: 'primary@example.com', pref: 1 },
+        },
+      }],
+      state: 'cc-1',
+    }));
+    nothingChanged(transport);
+
+    await syncContacts({ transport, account, handlers });
+
+    const rows = await engine.all(
+      `SELECT ce.email, ce.is_preferred
+         FROM contact_emails ce JOIN contacts c ON c.id = ce.contact_id
+        WHERE c.account_id = ? AND c.remote_id = ? ORDER BY ce.email`,
+      [account.id, 'c-pref'],
+    );
+    expect(rows).toEqual([
+      { email: 'primary@example.com', is_preferred: 1 },
+      { email: 'secondary@example.com', is_preferred: 0 },
+    ]);
+  });
+
+  it('pages the whitelist existence check by the limit the server enforced', async () => {
+    // RFC 8620 §5.5 lets the server clamp `limit` and requires it to echo
+    // the enforced value; measuring a short page against the requested cap
+    // reads a clamped server as "no more rows" and re-creates cards that
+    // already exist. pageAllContacts already honors the echo — this pins
+    // the same rule for existingCardEmails.
+    const senders = [
+      { email: 'a@example.com', name: 'A' },
+      { email: 'b@example.com', name: 'B' },
+    ];
+    const pages = [['card-a'], ['card-b']];
+    const cardEmails: Record<string, string> = {
+      'card-a': 'a@example.com',
+      'card-b': 'b@example.com',
+    };
+    const transport = new MockTransport();
+    let queryCalls = 0;
+    transport.handle('ContactCard/query', (params) => {
+      const page = pages[queryCalls] ?? [];
+      queryCalls += 1;
+      return {
+        ids: page,
+        position: params.position,
+        // The server enforces a page size of 1 regardless of the request.
+        limit: 1,
+        total: 2,
+        queryState: 'qs-1',
+      };
+    });
+    transport.handle('ContactCard/get', (params) => ({
+      list: (params.ids ?? []).map((id: string) => ({
+        id,
+        emails: { e1: { address: cardEmails[id] } },
+      })),
+      state: 'cc-1',
+    }));
+    let created = 0;
+    transport.handle('AddressBook/get', () => ({
+      list: [{ id: 'ab-trust', name: 'Trusted senders' }],
+      state: 'ab-1',
+    }));
+    transport.handle('ContactCard/set', (params) => {
+      created += Object.keys(params.create ?? {}).length;
+      return {
+        created: Object.fromEntries(
+          Object.keys(params.create ?? {}).map((k, i) => [k, { id: `new-${i}` }]),
+        ),
+      };
+    });
+
+    const result = await createTrustedContactCards({ transport, account, senders });
+
+    expect(result.ok).toBe(true);
+    // Both addresses already have cards; nothing may be created.
+    expect(created).toBe(0);
+    expect(result.created ?? 0).toBe(0);
+    expect(result.alreadyTrusted).toBe(true);
   });
 });

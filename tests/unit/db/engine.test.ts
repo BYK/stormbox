@@ -1,13 +1,28 @@
 import { describe, it, expect } from 'vitest';
 
 import { bootTestEngine } from '../../../src/db/bootstrap-memory';
+import { MIGRATION_VERSIONS } from '../../../src/db/engine';
+
+const LATEST_VERSION = MIGRATION_VERSIONS[MIGRATION_VERSIONS.length - 1];
 
 describe('Engine migrations', () => {
   it('records the applied migration version via PRAGMA user_version on a fresh database', async () => {
     const engine = await bootTestEngine();
     const row = await engine.get('PRAGMA user_version');
-    expect(Number(row?.user_version)).toBe(5);
+    expect(LATEST_VERSION).toBe(16);
+    expect(Number(row?.user_version)).toBe(LATEST_VERSION);
     await engine.close();
+  });
+
+  it('numbers migrations contiguously from 1', async () => {
+    // runMigrations skips every version at or below the stored
+    // user_version, so a gap or an out-of-order number means an existing
+    // database can silently skip a migration forever: it would jump
+    // straight past the missing version and never come back for it.
+    expect(MIGRATION_VERSIONS.length).toBeGreaterThan(0);
+    expect(MIGRATION_VERSIONS).toEqual(
+      MIGRATION_VERSIONS.map((_, index) => index + 1),
+    );
   });
 
   it('creates every expected table with the right indexes', async () => {
@@ -20,10 +35,12 @@ describe('Engine migrations', () => {
       'accounts',
       'account_capabilities',
       'account_services',
+      'addressbook_contacts',
       'addressbooks',
       'body_parts',
       'body_values',
       'contact_emails',
+      'contact_search_tokens',
       'contacts',
       'folder_messages',
       'folders',
@@ -35,6 +52,7 @@ describe('Engine migrations', () => {
       'query_view_items',
       'query_view_ranges',
       'query_views',
+      'recipient_usage',
       'sync_jobs',
       'sync_states',
       'threads',
@@ -69,11 +87,15 @@ describe('Engine migrations', () => {
       'query_views_lru',
       'contacts_account_display_name',
       'contacts_account_uid',
-      'contact_emails_lookup',
+      'contacts_account_generation',
+      'contact_emails_key_lookup',
+      'addressbook_contacts_book',
+      'contact_search_tokens_prefix',
     ];
     for (const idx of requiredIndexes) {
       expect(indexNames).toContain(idx);
     }
+    expect(indexNames).not.toContain('pending_mutations_phase');
     await engine.close();
   });
 
@@ -82,7 +104,7 @@ describe('Engine migrations', () => {
     await engine.runMigrations();
     await engine.runMigrations();
     const row = await engine.get('PRAGMA user_version');
-    expect(Number(row?.user_version)).toBe(5);
+    expect(Number(row?.user_version)).toBe(LATEST_VERSION);
     await engine.close();
   });
 });

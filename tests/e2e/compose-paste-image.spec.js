@@ -23,6 +23,17 @@ import {
   clickFolder,
   waitForPendingMutations,
 } from './helpers/ui.js';
+import {
+  composeSendButton,
+  composeSubject,
+  fillRecipient,
+  recipientAddresses,
+  waitForIdentities,
+} from './helpers/compose.js';
+import {
+  createGeneratedImageFile,
+  pasteFilesIntoEditor,
+} from './helpers/editor-paste.js';
 
 /**
  * Compose paste-image (#30) — Verified Consistency triple.
@@ -41,14 +52,7 @@ import {
 test.skip(!localStackEnabled, skipLocalStackMessage);
 
 // 1x1 transparent PNG.
-const PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
-
-function composeInput(page, label) {
-  return page.locator('.compose-dialog .row')
-    .filter({ hasText: new RegExp(`^${label}$`) })
-    .locator('input')
-    .first();
-}
+const PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
 
 async function findSentMessageBySubject(jmap, sentMailbox, subject) {
   const payload = await jmapRequest(jmap, [[
@@ -83,51 +87,17 @@ async function getInlineImageEmail(jmap, emailId) {
   return pickResponse(payload, 'Email/get')?.list?.[0] ?? null;
 }
 
-// Drive Squire's real paste path: build a DataTransfer holding an image
-// File and dispatch a paste event on the editor. Squire detects the
-// image-only clipboard, fires 'pasteImage', and the compose component
-// inlines it as a data: URL.
-async function pasteImageIntoEditor(page, base64) {
-  await page.evaluate((b64) => {
-    const editor = document.querySelector('.compose-dialog .editor[contenteditable]');
-    editor.focus();
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-    const file = new File([bytes], 'paste.png', { type: 'image/png' });
-    const dt = new DataTransfer();
-    dt.items.add(file);
-    // A plain Event with a defined clipboardData works across Chromium and
-    // Firefox, where the ClipboardEvent constructor's clipboardData is
-    // unreliable.
-    const event = new Event('paste', { bubbles: true, cancelable: true });
-    Object.defineProperty(event, 'clipboardData', { value: dt });
-    editor.dispatchEvent(event);
-  }, base64);
+// Squire detects an image-only clipboard, fires 'pasteImage', and the
+// compose component inlines it as a data: URL.
+function pasteImageIntoEditor(editor, base64) {
+  return pasteFilesIntoEditor(editor, [{ base64, name: 'paste.png', type: 'image/png' }]);
 }
 
 // Paste a canvas-generated image of a known size, so it renders large
 // enough to click and measure (a 1x1 px image is too small to resize).
-async function pasteGeneratedImage(page, width, height) {
-  await page.evaluate(({ w, h }) => new Promise((resolve) => {
-    const editor = document.querySelector('.compose-dialog .editor[contenteditable]');
-    editor.focus();
-    const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext('2d');
-    ctx.fillStyle = '#3366cc';
-    ctx.fillRect(0, 0, w, h);
-    canvas.toBlob((blob) => {
-      const file = new File([blob], 'gen.png', { type: 'image/png' });
-      const dt = new DataTransfer();
-      dt.items.add(file);
-      const event = new Event('paste', { bubbles: true, cancelable: true });
-      Object.defineProperty(event, 'clipboardData', { value: dt });
-      editor.dispatchEvent(event);
-      resolve();
-    }, 'image/png');
-  }), { w: width, h: height });
+async function pasteGeneratedImage(editor, width, height) {
+  const image = await createGeneratedImageFile(editor.page(), { width, height, name: 'gen.png' });
+  await pasteFilesIntoEditor(editor, [image]);
 }
 
 // Wait until the editor image has decoded and rendered at full size, so
@@ -169,28 +139,24 @@ test.describe('Compose paste image e2e', () => {
       await clickFolder(page, sent.name);
       await clickFolder(page, 'Inbox');
 
-      await page.keyboard.press('ControlOrMeta+n');
+      await page.keyboard.press('c');
       await expect(page.locator('.compose-dialog')).toBeVisible({ timeout: 10_000 });
 
-      const fromSelect = page.locator('.compose-dialog select').first();
-      await expect.poll(
-        async () => fromSelect.locator('option').count(),
-        { timeout: 30_000, message: 'identity sync should populate the From dropdown' },
-      ).toBeGreaterThan(0);
+      await waitForIdentities(page);
 
-      await composeInput(page, 'To').fill(recipient);
-      await composeInput(page, 'Subject').fill(subject);
+      await fillRecipient(page, 'To', recipient);
+      await composeSubject(page).fill(subject);
 
       const editor = page.locator('.compose-dialog .editor[contenteditable]').first();
       await editor.click();
       await page.keyboard.type('Here is a pasted image:');
 
-      await pasteImageIntoEditor(page, PNG_BASE64);
+      await pasteImageIntoEditor(editor, PNG_BASE64);
 
       // The inlined image appears in the editor before send.
       await expect(editor.locator('img[src^="data:image/"]')).toHaveCount(1, { timeout: 10_000 });
 
-      await page.locator('.compose-dialog button.primary', { hasText: /^Send$/ }).click();
+      await composeSendButton(page).click();
       await expect(page.locator('.compose-dialog')).toBeHidden({ timeout: 30_000 });
       await waitForPendingMutations(page);
 
@@ -271,16 +237,13 @@ test.describe('Compose paste image e2e', () => {
 
   test('Pasted image shows Squire resize handles positioned over it', async ({ sharedPage: page }, testInfo) => {
     try {
-      await page.keyboard.press('ControlOrMeta+n');
+      await page.keyboard.press('c');
       await expect(page.locator('.compose-dialog')).toBeVisible({ timeout: 10_000 });
-      await expect.poll(
-        async () => page.locator('.compose-dialog select').first().locator('option').count(),
-        { timeout: 30_000, message: 'identity sync should populate the From dropdown' },
-      ).toBeGreaterThan(0);
+      await waitForIdentities(page);
 
       const editor = page.locator('.compose-dialog .editor[contenteditable]').first();
       await editor.click();
-      await pasteGeneratedImage(page, 160, 100);
+      await pasteGeneratedImage(editor, 160, 100);
 
       const img = editor.locator('img').first();
       await expect(img).toBeVisible({ timeout: 10_000 });
@@ -324,16 +287,13 @@ test.describe('Compose paste image e2e', () => {
 
   test('Dragging the resize handle shrinks the pasted image', async ({ sharedPage: page }, testInfo) => {
     try {
-      await page.keyboard.press('ControlOrMeta+n');
+      await page.keyboard.press('c');
       await expect(page.locator('.compose-dialog')).toBeVisible({ timeout: 10_000 });
-      await expect.poll(
-        async () => page.locator('.compose-dialog select').first().locator('option').count(),
-        { timeout: 30_000, message: 'identity sync should populate the From dropdown' },
-      ).toBeGreaterThan(0);
+      await waitForIdentities(page);
 
       const editor = page.locator('.compose-dialog .editor[contenteditable]').first();
       await editor.click();
-      await pasteGeneratedImage(page, 400, 300);
+      await pasteGeneratedImage(editor, 400, 300);
 
       const img = editor.locator('img').first();
       await expect(img).toBeVisible({ timeout: 10_000 });

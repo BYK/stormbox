@@ -50,6 +50,11 @@ Stormbox-specific backend.
 - User actions shall enqueue rows in `pending_mutations` and drain
   through the outbox runner. UI code shall not issue ad-hoc protocol
   writes.
+- Ephemeral JMAP upload and download byte transfers that create no
+  durable mail object may use cancellable worker RPCs with progress
+  reporting. They shall not enqueue `pending_mutations` rows. Every
+  `Email/set`, draft replacement, send, and submission mutation shall
+  remain on the outbox path.
 - After a successful protocol write, the local cache shall already
   match the server before the mutation RPC resolves; waiting only for
   an asynchronous push is not sufficient.
@@ -95,6 +100,36 @@ The system shall prioritize the smallest webmail surface suitable for
 an Earlybird audience alpha: reliable sign-in, reading, sending, safe
 display, basic message actions, and recipient autocomplete. Features
 outside that scope must not displace core read/send reliability.
+
+### IX. Themed Widgets, Not Native Chrome
+
+- Controls whose popup or chrome a stylesheet cannot reach — native
+  `<select>` foremost — shall not appear in the product surface. Their
+  popups render OS chrome that ignores the theme and reads differently
+  on every platform.
+- Where the application already has a styled pattern for an
+  interaction — menus, dropdowns, dialogs, toasts — UI shall use that
+  pattern rather than introduce a second look for the same job. Two
+  controls doing the same job shall look the same.
+- Native controls remain correct where the platform's own UI is the
+  feature — file pickers and color pickers — and for primitives a
+  stylesheet fully controls, such as text inputs, checkboxes, and
+  buttons.
+
+### X. Stable Interactive Surfaces
+
+- Loading or switching data within the same semantic surface shall
+  preserve the pane root, header, toolbar, persistent focus targets,
+  column geometry, and scroll containers.
+- Loading and error states shall replace only the data-dependent
+  content region when the surrounding shell remains applicable.
+- Stable chrome shall not be keyed by the selected entity. Controls
+  that are temporarily unavailable shall remain mounted and become
+  inert without replacing their surrounding toolbar.
+- Replacement is appropriate when the semantic surface or workflow
+  genuinely changes.
+- Important selection and loading transitions shall have regression
+  tests that assert DOM identity and expected focus behavior.
 
 ## Technology Commitments
 
@@ -143,7 +178,7 @@ architectural constraints. Feature specs, plans, and tasks must call
 out any conflict before implementation begins. Amendments require an
 update to this file with a brief reason.
 
-**Version**: 1.3.0 | **Ratified**: 2026-05-21 | **Last Amended**: 2026-06-15
+**Version**: 1.6.0 | **Ratified**: 2026-05-21 | **Last Amended**: 2026-08-30
 
 <!-- 1.2.0: Mutation Pipeline (IV) now requires every mail operation to
 support both single and batched messages, with the single action as the
@@ -151,4 +186,14 @@ N=1 case of the batched path.
 1.3.0: Mutation Pipeline (IV) now requires a batch to be a real batch at
 every layer — protocol (a single multi-object request per chunk, not a
 per-item loop), storage (batched SQL), and UI (coalesced into one
-paint) — folding in the former standalone bulk-SQL/UI bullet. -->
+paint) — folding in the former standalone bulk-SQL/UI bullet.
+1.4.0: New principle IX — themed widgets, not native chrome. Prompted
+by the composer's font and size menus shipping as native selects whose
+OS popups sat beside the toolbar's styled menus.
+1.5.0: New principle X — stable interactive surfaces. Selection and
+loading updates preserve applicable UI chrome, geometry, and focus
+instead of replacing the entire surface.
+1.6.0: Mutation Pipeline (IV) now permits ephemeral cancellable JMAP
+upload/download byte-transfer RPCs that create no durable mail object,
+while keeping every Email/set, draft replacement, send, and submission
+mutation on the outbox path. -->

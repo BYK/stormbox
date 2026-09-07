@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useVirtualizer } from '@tanstack/vue-virtual';
 import {
+  Check,
   ChevronRight,
   FolderRoot,
   Pencil,
@@ -13,18 +14,26 @@ import {
 } from '@lucide/vue';
 import { SwitchToggle } from '@thunderbirdops/services-ui';
 
+import {
+  focusModalSurface,
+  useModalFocus,
+} from '../composables/useModalFocus';
 import { useAuthStore } from '../stores/auth-store';
 import { useMailStore } from '../stores/mail-store';
 import type { AccountRow, FolderRow } from '../types';
+import { closeContainingDropdown } from '../utils/dropdown';
 import { folderCapabilities } from '../utils/folder-capabilities';
+import { isComposingKeyEvent } from '../utils/keyboard';
 import { folderSortKey } from '../utils/folder-presentation';
+import AppDropdown from './AppDropdown.vue';
 import FolderCreateDialog from './FolderCreateDialog.vue';
 
 const emit = defineEmits<{ close: [] }>();
 
 const authStore = useAuthStore();
 const mailStore = useMailStore();
-const closeButtonEl = ref<HTMLButtonElement | null>(null);
+const dialogEl = ref<HTMLElement | null>(null);
+useModalFocus(dialogEl, { containTab: true, onDefault: chooseDefaultAction });
 const scrollEl = ref<HTMLElement | null>(null);
 const searchText = ref('');
 const showCreateDialog = ref(false);
@@ -715,6 +724,18 @@ const editorError = ref<string | null>(null);
 const deleteStage = ref<'confirm' | 'escalate' | null>(null);
 const editorBusy = ref(false);
 
+watch(
+  [bulkStage, deleteStage],
+  ([nextBulk, nextDelete], [previousBulk, previousDelete]) => {
+    if (
+      (nextBulk != null && nextBulk !== previousBulk)
+      || (nextDelete != null && nextDelete !== previousDelete)
+    ) {
+      void nextTick(() => focusModalSurface(dialogEl.value));
+    }
+  },
+);
+
 function openEditor(row: DialogFolderRow) {
   editingFolderId.value = row.folder.id;
   editorName.value = row.folder.name ?? '';
@@ -767,6 +788,18 @@ const editorParentOptions = computed<ParentOption[]>(() => {
   return options;
 });
 
+/** The closed control shows the choice without its tree indentation. */
+const editorParentLabel = computed(() => {
+  const chosen = editorParentOptions.value
+    .find((option) => option.id === (editorParentId.value ?? null));
+  return (chosen?.label ?? 'Top Level').replace(/^\u00a0+/, '');
+});
+
+function pickEditorParent(id: number | null, event: Event) {
+  editorParentId.value = id;
+  closeContainingDropdown(event);
+}
+
 async function saveEditor(row: DialogFolderRow) {
   if (editorBusy.value) return;
   const changes: { name?: string; parentFolderId?: number | null } = {};
@@ -790,6 +823,16 @@ async function saveEditor(row: DialogFolderRow) {
   } finally {
     editorBusy.value = false;
   }
+}
+
+/**
+ * Enter confirms an input-method candidate before it ever means "save",
+ * so the rename field acts on it only outside a composition.
+ */
+function onEditorNameEnter(event: KeyboardEvent, row: DialogFolderRow) {
+  if (isComposingKeyEvent(event)) return;
+  event.preventDefault();
+  void saveEditor(row);
 }
 
 async function requestDelete(row: DialogFolderRow) {
@@ -841,12 +884,27 @@ function editedMessageCount(row: DialogFolderRow): number {
   return Number(row.folder.total_emails ?? 0);
 }
 
+function chooseDefaultAction(): void {
+  if (deleteStage.value != null) {
+    deleteStage.value = null;
+    return;
+  }
+  if (bulkStage.value != null) {
+    bulkStage.value = null;
+    return;
+  }
+  emit('close');
+}
+
 // Escape must close the dialog even when focus has drifted to <body>
 // (e.g. after a toggled control is briefly disabled while its mutation
 // is in flight), so listen at the window level instead of relying on
 // bubbling from a focused descendant. An open row editor, bulk
 // confirmation, or nested create dialog swallows the first Escape.
 function onWindowKeydown(event: KeyboardEvent) {
+  // Escape cancels an input-method conversion in the rename or filter
+  // field, so it belongs to the composition rather than to this dialog.
+  if (isComposingKeyEvent(event)) return;
   if (event.key !== 'Escape') return;
   if (showCreateDialog.value) {
     // FolderCreateDialog has its own window listener that closes it.
@@ -864,7 +922,6 @@ function onWindowKeydown(event: KeyboardEvent) {
 }
 
 onMounted(() => {
-  closeButtonEl.value?.focus();
   window.addEventListener('keydown', onWindowKeydown);
 });
 
@@ -883,15 +940,16 @@ onBeforeUnmount(() => {
   <Teleport to="body">
   <div class="folder-subs" role="presentation" @click.self="emit('close')">
     <section
+      ref="dialogEl"
       class="folder-subs__panel"
       role="dialog"
       aria-modal="true"
       aria-labelledby="folder-subs-title"
+      tabindex="-1"
     >
       <header class="folder-subs__header">
         <h2 id="folder-subs-title">Manage Folders</h2>
         <button
-          ref="closeButtonEl"
           type="button"
           class="folder-subs__close"
           aria-label="Close manage folders"
@@ -923,6 +981,13 @@ onBeforeUnmount(() => {
             :ref="measureElement"
             :data-index="virtualRow.index"
             class="folder-subs__item"
+            :class="{
+              // Every transformed row is its own stacking context, so a
+              // dropdown opened in the editor would paint under the rows
+              // that follow; the editing row is lifted above its siblings.
+              'folder-subs__item--editing':
+                item.kind === 'row' && editingFolderId === item.row.folder.id,
+            }"
             :style="{ transform: `translateY(${virtualRow.start}px)` }"
           >
             <h3
@@ -1144,24 +1209,38 @@ onBeforeUnmount(() => {
                       class="folder-subs__editor-input"
                       :disabled="!item.row.canRename || editorBusy"
                       data-folder-rename-input
-                      @keydown.enter.prevent="saveEditor(item.row)"
+                      @keydown.enter="onEditorNameEnter($event, item.row)"
                     />
                   </label>
-                  <label class="folder-subs__editor-field">
-                    <span>Parent</span>
-                    <select
-                      v-model="editorParentId"
-                      class="folder-subs__editor-input"
+                  <div class="folder-subs__editor-field">
+                    <span :id="`folder-move-label-${item.row.folder.id}`">Parent</span>
+                    <AppDropdown
+                      class="folder-subs__parent"
                       :disabled="!item.row.canRename || editorBusy"
                       data-folder-move-select
                     >
-                      <option
-                        v-for="option in editorParentOptions"
-                        :key="option.id ?? 'root'"
-                        :value="option.id"
-                      >{{ option.label }}</option>
-                    </select>
-                  </label>
+                      <summary
+                        class="app-dropdown__summary folder-subs__parent-summary"
+                        :aria-labelledby="`folder-move-label-${item.row.folder.id}`"
+                      >{{ editorParentLabel }}</summary>
+                      <div class="app-dropdown__menu folder-subs__parent-menu" role="menu" aria-label="Move to parent">
+                        <button
+                          v-for="option in editorParentOptions"
+                          :key="option.id ?? 'root'"
+                          type="button"
+                          class="app-dropdown__item"
+                          role="menuitemradio"
+                          :aria-checked="editorParentId === option.id"
+                          :data-folder-move-option="option.id ?? 'root'"
+                          @click="pickEditorParent(option.id, $event)"
+                        >
+                          <Check v-if="editorParentId === option.id" :size="14" />
+                          <span v-else aria-hidden="true" />
+                          <span>{{ option.label }}</span>
+                        </button>
+                      </div>
+                    </AppDropdown>
+                  </div>
                   <p v-if="editorError" class="folder-subs__editor-error">{{ editorError }}</p>
                   <div class="folder-subs__editor-actions">
                     <button
@@ -1455,6 +1534,9 @@ onBeforeUnmount(() => {
   left: 0;
   width: 100%;
 }
+.folder-subs__item--editing {
+  z-index: 1;
+}
 .folder-subs__account-name {
   display: flex;
   align-items: center;
@@ -1740,6 +1822,29 @@ onBeforeUnmount(() => {
 .folder-subs__editor-field > span {
   flex-shrink: 0;
   width: 60px;
+}
+.folder-subs__parent {
+  flex: 1;
+  min-width: 0;
+}
+/* The field look of .folder-subs__editor-input, on a summary. */
+.folder-subs__parent-summary {
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+.folder-subs__parent-summary::after {
+  margin-left: auto;
+}
+.folder-subs__parent-menu {
+  right: 0;
 }
 .folder-subs__editor-input {
   flex: 1;

@@ -234,7 +234,7 @@ describe('FolderManagerDialog cascading subscription toggles', () => {
     await editButton(wrapper, 'Reports').trigger('click');
     await nextTick();
     const parents = wrapper.find('[data-folder-move-select]')
-      .findAll('option')
+      .findAll('.app-dropdown__item')
       .map((option) => option.text().trim());
     expect(parents).toContain('Inbox');
   });
@@ -330,6 +330,33 @@ describe('FolderManagerDialog create entry point', () => {
   });
 });
 
+describe('FolderManagerDialog modal focus', () => {
+  it('contains Tab from the neutral dialog surface', async () => {
+    const mailStore = useMailStore();
+    seed(mailStore);
+    const wrapper = mount(FolderManagerDialog, {
+      attachTo: document.body,
+      global: { stubs: { teleport: true } },
+    });
+    await nextTick();
+    await nextTick();
+
+    const dialog = wrapper.get('[role="dialog"]').element as HTMLElement;
+    expect(document.activeElement).toBe(dialog);
+    dialog.dispatchEvent(new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      key: 'Tab',
+    }));
+    expect(document.activeElement).toBe(
+      wrapper.get('.folder-subs__close').element,
+    );
+
+    wrapper.unmount();
+    document.body.innerHTML = '';
+  });
+});
+
 describe('FolderManagerDialog multi-select + bulk delete', () => {
   it('selecting a parent cascades to its subtree and shows the action bar', async () => {
     const mailStore = useMailStore();
@@ -401,6 +428,31 @@ describe('FolderManagerDialog multi-select + bulk delete', () => {
     }]);
     // Everything deleted -> selection cleared -> bar gone.
     expect(wrapper.find('[data-folder-bulkbar]').exists()).toBe(false);
+  });
+
+  it('uses Cancel as the Enter default for destructive confirmation', async () => {
+    const mailStore = useMailStore();
+    seed(mailStore);
+    mailStore.deleteFolders = vi.fn(async () => ({ ok: true, succeededIds: [] }));
+    const wrapper = mountDialog();
+    await nextTick();
+
+    await selectBox(wrapper, 'Projects').trigger('click');
+    await nextTick();
+    await wrapper.find('[data-folder-bulk-delete]').trigger('click');
+    await nextTick();
+    expect(wrapper.find('[data-folder-bulk-confirm]').exists()).toBe(true);
+
+    wrapper.get('[role="dialog"]').element.dispatchEvent(new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      key: 'Enter',
+    }));
+    await nextTick();
+
+    expect(wrapper.find('[data-folder-bulk-confirm]').exists()).toBe(false);
+    expect(mailStore.deleteFolders).not.toHaveBeenCalled();
+    expect(wrapper.find('[data-folder-bulkbar]').text()).toContain('3 selected');
   });
 
   it('escalates when folders still contain mail and retries with removeEmails', async () => {
@@ -758,6 +810,39 @@ describe('FolderManagerDialog row editor', () => {
     expect(wrapper.find('[data-folder-rename-input]').exists()).toBe(false);
   });
 
+  it('leaves Enter and Escape to an active input-method composition', async () => {
+    // Confirming an IME candidate in the rename field must not save the
+    // folder, and cancelling a conversion must not close the dialog and
+    // throw the typed name away.
+    const mailStore = useMailStore();
+    seed(mailStore);
+    mailStore.updateFolder = vi.fn(async () => ({ ok: true }));
+
+    const wrapper = mountDialog();
+    await nextTick();
+
+    await editButton(wrapper, 'Reports').trigger('click');
+    await nextTick();
+
+    const input = wrapper.find('[data-folder-rename-input]');
+    await input.setValue('四半期');
+    await input.trigger('keydown', { key: 'Enter', isComposing: true });
+    await nextTick();
+
+    expect(mailStore.updateFolder).not.toHaveBeenCalled();
+
+    const escape = new KeyboardEvent('keydown', { key: 'Escape', isComposing: true });
+    window.dispatchEvent(escape);
+    await nextTick();
+
+    expect(wrapper.find('[data-folder-rename-input]').exists()).toBe(true);
+
+    await input.trigger('keydown', { key: 'Enter' });
+    await nextTick();
+
+    expect(mailStore.updateFolder).toHaveBeenCalledWith(20, { name: '四半期' });
+  });
+
   it('moves a folder by selecting a new location', async () => {
     const mailStore = useMailStore();
     seed(mailStore);
@@ -769,7 +854,7 @@ describe('FolderManagerDialog row editor', () => {
     await editButton(wrapper, 'Reports').trigger('click');
     await nextTick();
 
-    await wrapper.find('[data-folder-move-select]').setValue('10');
+    await wrapper.find('[data-folder-move-option="10"]').trigger('click');
     await wrapper.find('[data-folder-save]').trigger('click');
     await nextTick();
 
@@ -787,7 +872,7 @@ describe('FolderManagerDialog row editor', () => {
     await nextTick();
 
     const labels = wrapper.find('[data-folder-move-select]')
-      .findAll('option')
+      .findAll('.app-dropdown__item')
       .map((o) => o.text().replaceAll('\u00a0', ''));
     expect(labels).toContain('Top Level');
     expect(labels).toContain('Reports');
@@ -976,9 +1061,11 @@ describe('FolderManagerDialog row editor', () => {
     await wrapper.find('[data-folder-add="Projects"]').trigger('click');
     await nextTick();
 
-    const parentSelect = wrapper.find('[data-folder-create-parent]');
-    expect(parentSelect.exists()).toBe(true);
+    const parentPicker = wrapper.find('[data-folder-create-parent]');
+    expect(parentPicker.exists()).toBe(true);
     // Projects has id 10 in the seed.
-    expect((parentSelect.element as HTMLSelectElement).value).toBe('10');
+    expect(parentPicker.get('summary').text()).toBe('Projects');
+    expect(parentPicker.get('[data-folder-parent-option="10"]').attributes('aria-checked'))
+      .toBe('true');
   });
 });

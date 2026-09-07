@@ -7,9 +7,59 @@
  * and shared across all stores.
  */
 
+import type {
+  AddressBookInventory,
+  ContactDetail,
+  ContactListRow,
+  ContactTrashDetail,
+  ContactTrashListRow,
+  ContactTrashLookup,
+  IdentityRow,
+  IdentityUpsertInput,
+} from '../types/db';
+import type { ServerClockReferenceLike } from '../utils/schedule-time';
 import { assertSupportedBrowser } from './availability';
 import { BROADCAST_CHANNEL, DB_RPC, SHARED_WORKER_NAME } from './protocol';
-import { RPC_REQUEST, RPC_RESPONSE, TABLES_TOUCHED, WORKER_LOG } from './rpc-dispatch';
+import {
+  RPC_CANCEL,
+  RPC_PROGRESS,
+  RPC_REQUEST,
+  RPC_RESPONSE,
+  TABLES_TOUCHED,
+  WORKER_LOG,
+} from './rpc-dispatch';
+
+export interface BlobTransferProgress {
+  direction: 'upload' | 'download';
+  phase: 'transferring' | 'processing' | 'complete';
+  loaded: number;
+  total: number | null;
+}
+
+export interface AttachmentLimits {
+  maxSizeUpload: number;
+  maxSizeAttachmentsPerEmail: number;
+  maxConcurrentUpload: number;
+}
+
+/** RFC 4865 FUTURERELEASE support as advertised by the account. */
+export interface ScheduleCapability {
+  supported: boolean;
+  maxDelayedSend: number;
+  serverClockReference: ServerClockReferenceLike | null;
+}
+
+export interface JmapUploadMetadata {
+  accountId: string;
+  blobId: string;
+  type: string;
+  size: number;
+}
+
+export interface TransferCallOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: BlobTransferProgress) => void;
+}
 
 /**
  * @typedef {import('./protocol').DB_RPC} DBRpcMethods
@@ -43,7 +93,12 @@ export class Repository {
   _port: MessagePort;
   _channel: BroadcastChannel;
   _nextId: number;
-  _pending: Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>;
+  _pending: Map<number, {
+    resolve: (v: any) => void;
+    reject: (e: any) => void;
+    onProgress?: (progress: BlobTransferProgress) => void;
+    removeAbort?: () => void;
+  }>;
   _listeners: Set<(tables: string[]) => void>;
 
   constructor(port: MessagePort, channel: BroadcastChannel) {
@@ -70,17 +125,47 @@ export class Repository {
 
   /**
    * Low-level RPC. Most callers use one of the named helper methods
-   * below. The result is a JSON-shaped value crossing the MessagePort
-   * boundary, so it is typed loosely; consumers narrow it at the call
-   * site (typed store assignment, explicit cast, or the named helper
-   * method's annotated return type).
+   * below. Values cross through structured clone, including Blob/File for
+   * transfer RPCs. Consumers narrow loosely typed results at the call site
+   * or use a named helper with an annotated return type.
    */
   call<T = any>(method: string, params: any = {}): Promise<T> {
+    return this._call<T>(method, params);
+  }
+
+  _call<T = any>(
+    method: string,
+    params: any = {},
+    options: TransferCallOptions = {},
+  ): Promise<T> {
     const id = this._nextId;
     this._nextId += 1;
     return new Promise<T>((resolve, reject) => {
-      this._pending.set(id, { resolve, reject });
-      this._port.postMessage({ type: RPC_REQUEST, id, method, params });
+      if (options.signal?.aborted) {
+        reject(cancelledRpcError());
+        return;
+      }
+      const onAbort = () => {
+        this._port.postMessage({ type: RPC_CANCEL, id });
+      };
+      if (options.signal) {
+        options.signal.addEventListener('abort', onAbort, { once: true });
+      }
+      this._pending.set(id, {
+        resolve,
+        reject,
+        onProgress: options.onProgress,
+        removeAbort: options.signal
+          ? () => options.signal?.removeEventListener('abort', onAbort)
+          : undefined,
+      });
+      try {
+        this._port.postMessage({ type: RPC_REQUEST, id, method, params });
+      } catch (error) {
+        this._pending.delete(id);
+        options.signal?.removeEventListener('abort', onAbort);
+        reject(error);
+      }
     });
   }
 
@@ -114,6 +199,13 @@ export class Repository {
     });
   }
 
+  getAccountCapabilities(accountId, serviceKind) {
+    return this.call(DB_RPC.ACCOUNT_CAPABILITIES_GET, {
+      accountId,
+      serviceKind,
+    });
+  }
+
   // Folders ------------------------------------------------------------
 
   listFolders(accountId, options = {}) {
@@ -138,12 +230,27 @@ export class Repository {
 
   // Identities ---------------------------------------------------------
 
-  listIdentities(accountId) {
-    return this.call(DB_RPC.IDENTITY_LIST, { accountId });
+  listIdentities(accountId): Promise<IdentityRow[]> {
+    return this.call<IdentityRow[]>(DB_RPC.IDENTITY_LIST, { accountId });
   }
 
-  upsertIdentities(accountId, identities) {
+  getIdentityByRemote(accountId, remoteId): Promise<IdentityRow | null> {
+    return this.call<IdentityRow | null>(DB_RPC.IDENTITY_GET_BY_REMOTE, {
+      accountId,
+      remoteId,
+    });
+  }
+
+  upsertIdentities(accountId, identities: IdentityUpsertInput[]) {
     return this.call(DB_RPC.IDENTITY_UPSERT_MANY, { accountId, identities });
+  }
+
+  deleteLocalIdentity(accountId, remoteId) {
+    return this.call(DB_RPC.IDENTITY_DELETE_LOCAL, { accountId, remoteId });
+  }
+
+  ensureIdentityMutation(input) {
+    return this.call(DB_RPC.IDENTITY_MUTATION_ENSURE, input);
   }
 
   // Threads ------------------------------------------------------------
@@ -223,12 +330,30 @@ export class Repository {
   }
 
   /**
+   * The message's addresses as `{kind, position, name, email}` rows, where
+   * `kind` is one of from, to, cc, bcc, replyTo, sender. Compose reads
+   * these to address a reply, since Cc and Reply-To exist nowhere else in
+   * the cache.
+   */
+  listMessageAddresses(messageId) {
+    return this.call(DB_RPC.MESSAGE_LIST_ADDRESSES, { messageId });
+  }
+
+  /**
    * Return the subset of `ids` that still resolve to a live row in
    * `messages` for `accountId`. Used by the mail-store to drop stale
    * UI ids before enqueuing a mutation.
    */
-  filterExistingMessageIds(accountId, ids) {
-    return this.call(DB_RPC.MESSAGE_FILTER_EXISTING_IDS, { accountId, ids });
+  filterExistingMessageIds(
+    accountId,
+    ids,
+    { excludeScheduled = false }: { excludeScheduled?: boolean } = {},
+  ) {
+    return this.call(DB_RPC.MESSAGE_FILTER_EXISTING_IDS, {
+      accountId,
+      ids,
+      excludeScheduled,
+    });
   }
 
   replaceMessageKeywords(messageId, keywords, keywordsJson) {
@@ -272,6 +397,10 @@ export class Repository {
     });
   }
 
+  ensureAddressbookMutation(input) {
+    return this.call(DB_RPC.ADDRESSBOOK_MUTATION_ENSURE, input);
+  }
+
   upsertContacts(accountId, contacts) {
     return this.call(DB_RPC.CONTACT_UPSERT_MANY, { accountId, contacts });
   }
@@ -281,16 +410,53 @@ export class Repository {
    * view. Components must go through this rather than speaking SQL
    * to the worker.
    */
-  listContacts(accountId, options = {}) {
-    return this.call(DB_RPC.CONTACT_LIST, { accountId, ...options });
+  listContacts(
+    accountId: number,
+    options: { limit?: number } = {},
+  ): Promise<ContactListRow[]> {
+    return this.call<ContactListRow[]>(DB_RPC.CONTACT_LIST, { accountId, ...options });
   }
 
-  getContact(accountId, contactId) {
-    return this.call(DB_RPC.CONTACT_GET, { accountId, contactId });
+  getContact(accountId: number, contactId: number): Promise<ContactDetail | null> {
+    return this.call<ContactDetail | null>(DB_RPC.CONTACT_GET, { accountId, contactId });
   }
 
-  autocompleteContacts(accountId, prefix, limit = 20) {
-    return this.call(DB_RPC.CONTACT_AUTOCOMPLETE, { accountId, prefix, limit });
+  listContactTrash(accountId: number): Promise<ContactTrashListRow[]> {
+    return this.call<ContactTrashListRow[]>(DB_RPC.CONTACT_TRASH_LIST, { accountId });
+  }
+
+  getContactTrash(
+    accountId: number,
+    trashId: number,
+  ): Promise<ContactTrashDetail | null> {
+    return this.call<ContactTrashDetail | null>(
+      DB_RPC.CONTACT_TRASH_GET,
+      { accountId, trashId },
+    );
+  }
+
+  getContactTrashMany(
+    accountId: number,
+    trashIds: number[],
+  ): Promise<ContactTrashLookup[]> {
+    return this.call<ContactTrashLookup[]>(
+      DB_RPC.CONTACT_TRASH_GET_MANY,
+      { accountId, trashIds },
+    );
+  }
+
+  autocompleteContacts(accountId, prefix, limit = 20, exclude = []) {
+    return this.call(DB_RPC.CONTACT_AUTOCOMPLETE, { accountId, prefix, limit, exclude });
+  }
+
+  // Settings -----------------------------------------------------------
+
+  getSettings(accountId) {
+    return this.call(DB_RPC.SETTINGS_GET, { accountId });
+  }
+
+  applySettingsPatch(accountId, patch) {
+    return this.call(DB_RPC.SETTINGS_APPLY_PATCH, { accountId, patch });
   }
 
   // Sync infrastructure ------------------------------------------------
@@ -324,6 +490,48 @@ export class Repository {
     return this.call(DB_RPC.PENDING_MUTATION_GET_ERROR, { mutationId });
   }
 
+  retryPendingDraftMutation(accountId, mutationId) {
+    return this.call(DB_RPC.PENDING_MUTATION_RETRY, { accountId, mutationId });
+  }
+
+  abandonPendingDraftMutation(accountId, mutationId, options = {}) {
+    return this.call(DB_RPC.PENDING_MUTATION_ABANDON_DRAFT, {
+      accountId,
+      mutationId,
+      ...options,
+    });
+  }
+
+  async isEmailClaimedBySend(accountId, remoteId) {
+    const rows = await this.call<any[]>(DB_RPC.QUERY, {
+      sql: `SELECT local_status, phase, request_json, server_response_json
+              FROM pending_mutations
+             WHERE account_id = ?
+               AND mutation_type = 'send'
+               AND local_status IN ('pending','retry','in_flight','conflicted')
+               AND (server_response_json IS NOT NULL OR request_json IS NOT NULL)`,
+      params: [accountId],
+    });
+    return rows.some((row) => {
+      try {
+        const checkpoint = row.server_response_json
+          ? JSON.parse(row.server_response_json)
+          : null;
+        if (checkpoint?.emailRemoteId === remoteId) return true;
+        const request = row.request_json ? JSON.parse(row.request_json) : null;
+        const cleanupIds = Array.isArray(request?.draftEmailIds)
+          ? request.draftEmailIds
+          : [];
+        const cleanupCanStillRun = row.local_status !== 'conflicted'
+          || row.phase === 'submitted'
+          || row.phase === 'cache_pending';
+        return cleanupCanStillRun && cleanupIds.includes(remoteId);
+      } catch {
+        return false;
+      }
+    });
+  }
+
   insertSyncJob(input) {
     return this.call(DB_RPC.SYNC_JOB_INSERT, input);
   }
@@ -336,6 +544,15 @@ export class Repository {
 
   startSyncAccount(input) {
     return this.call(DB_RPC.SYNC_START_ACCOUNT, input);
+  }
+
+  updateSyncAccountAuth(accountId, { token, issuedAt, expiresAt }) {
+    return this.call(DB_RPC.SYNC_UPDATE_ACCOUNT_AUTH, {
+      accountId,
+      token,
+      issuedAt,
+      expiresAt,
+    });
   }
 
   stopSyncAccount(accountId) {
@@ -374,6 +591,23 @@ export class Repository {
   }
 
   /**
+   * Pull the synced settings document from the server before first use,
+   * so a fresh device adopts the stored time zone instead of clobbering
+   * it with a local default.
+   */
+  ensureSettings(accountId) {
+    return this.call(DB_RPC.SYNC_ENSURE_SETTINGS, { accountId });
+  }
+
+  /**
+   * Live FUTURERELEASE delayed-send capability for the account, straight
+   * from a forced session refetch.
+   */
+  getScheduleCapability(accountId: number): Promise<ScheduleCapability> {
+    return this.call<ScheduleCapability>(DB_RPC.SYNC_GET_SCHEDULE_CAPABILITY, { accountId });
+  }
+
+  /**
    * Fetch storage quota from JMAP (if supported), persist locally, and
    * return the snapshot. Null limits mean unlimited / not configured.
    */
@@ -383,6 +617,16 @@ export class Repository {
 
   ensureAddressbooks(accountId) {
     return this.call(DB_RPC.SYNC_ENSURE_ADDRESSBOOKS, { accountId });
+  }
+
+  inventoryAddressbook(
+    accountId: number,
+    addressbookId: number,
+  ): Promise<AddressBookInventory> {
+    return this.call<AddressBookInventory>(
+      DB_RPC.SYNC_INVENTORY_ADDRESSBOOK,
+      { accountId, addressbookId },
+    );
   }
 
   ensureContacts(accountId, addressbookId) {
@@ -405,6 +649,64 @@ export class Repository {
     return this.call(DB_RPC.SYNC_RUN_MUTATION, { accountId, mutationId });
   }
 
+  getAttachmentLimits(accountId: number): Promise<AttachmentLimits> {
+    return this.call<AttachmentLimits>(DB_RPC.SYNC_GET_ATTACHMENT_LIMITS, {
+      accountId,
+    });
+  }
+
+  uploadComposeAttachment(
+    accountId: number,
+    blob: Blob,
+    {
+      type = blob.type || 'application/octet-stream',
+      totalAttachmentBytes = blob.size,
+      signal,
+      onProgress,
+    }: {
+      type?: string;
+      totalAttachmentBytes?: number;
+    } & TransferCallOptions = {},
+  ): Promise<JmapUploadMetadata> {
+    return this._call<JmapUploadMetadata>(
+      DB_RPC.SYNC_UPLOAD_COMPOSE_ATTACHMENT,
+      { accountId, blob, type, totalAttachmentBytes },
+      { signal, onProgress },
+    );
+  }
+
+  downloadAttachment(
+    accountId: number,
+    {
+      blobId,
+      type = 'application/octet-stream',
+      name = 'attachment',
+      maxBytes,
+      truncateAtMaxBytes = false,
+      signal,
+      onProgress,
+    }: {
+      blobId: string;
+      type?: string | null;
+      name?: string | null;
+      maxBytes?: number;
+      truncateAtMaxBytes?: boolean;
+    } & TransferCallOptions,
+  ): Promise<Blob> {
+    return this._call<Blob>(
+      DB_RPC.SYNC_DOWNLOAD_ATTACHMENT,
+      {
+        accountId,
+        blobId,
+        type,
+        name,
+        maxBytes,
+        truncateAtMaxBytes,
+      },
+      { signal, onProgress },
+    );
+  }
+
   /**
    * Download a blob (e.g. an inline cid: image part) through the worker,
    * which has the authenticated transport. Returns { base64, type } or
@@ -420,16 +722,28 @@ export class Repository {
 
   _onMessage(msg) {
     const data = msg.data;
-    if (!data || data.type !== RPC_RESPONSE) {
+    if (!data) {
       return;
     }
+    if (data.type === RPC_PROGRESS) {
+      const pending = this._pending.get(data.id);
+      if (!pending?.onProgress) return;
+      try {
+        pending.onProgress(data.progress);
+      } catch (error) {
+        console.error('Repository progress listener threw', error);
+      }
+      return;
+    }
+    if (data.type !== RPC_RESPONSE) return;
     const pending = this._pending.get(data.id);
     if (!pending) {
       return;
     }
     this._pending.delete(data.id);
+    pending.removeAbort?.();
     if (data.error) {
-      pending.reject(new Error(data.error));
+      pending.reject(deserializeRpcError(data.error));
       return;
     }
     pending.resolve(data.result);
@@ -457,4 +771,21 @@ export class Repository {
       }
     }
   }
+}
+
+function cancelledRpcError() {
+  const error: any = new Error('RPC request was cancelled');
+  error.name = 'AbortError';
+  error.type = 'cancelled';
+  return error;
+}
+
+function deserializeRpcError(serialized: any) {
+  if (typeof serialized === 'string') return new Error(serialized);
+  const error: any = new Error(serialized?.message ?? 'Worker RPC failed');
+  error.name = serialized?.name ?? 'Error';
+  for (const [key, value] of Object.entries(serialized ?? {})) {
+    if (key !== 'name' && key !== 'message') error[key] = value;
+  }
+  return error;
 }

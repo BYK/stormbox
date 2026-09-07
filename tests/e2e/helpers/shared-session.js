@@ -8,6 +8,7 @@ import {
   mailboxByRole,
   sweepOrphanTestMessages,
 } from './jmap-client.js';
+import { discardCompose } from './compose.js';
 import { loginViaOidc } from './oidc-login.js';
 import { selfEmail } from './stack-env.js';
 import {
@@ -121,10 +122,12 @@ export const test = base.extend({
  * Reset the shared page to a known state before a test runs:
  *   1. Sweep accumulated test-mail orphans (one OR'd Email/query).
  *   2. Close any stray compose dialog left by a previous test.
- *   3. Click Inbox to re-anchor the folder selection (no-op if the
+ *   3. Return to the Mail space, in case a previous test left the
+ *      window in Contacts.
+ *   4. Click Inbox to re-anchor the folder selection (no-op if the
  *      previous test left us there, fast in any case because the
  *      folder tree is already loaded).
- *   4. Clear the per-test console buffer.
+ *   5. Clear the per-test console buffer.
  *
  * Specs call this from their own `test.beforeEach` so individual
  * tests can layer additional setup (e.g. extra subject prefixes
@@ -137,17 +140,61 @@ export async function resetSharedSession(page, {
   await sweepOrphanTestMessages(jmap, {
     subjectPrefixes: [...SIMPLE_SPEC_SUBJECT_PREFIXES, ...extraSubjectPrefixes],
   });
-  await page.keyboard.press('Escape').catch(() => {});
   await dismissWelcomeModal(page);
-  const composeOpen = await page.locator('.compose-dialog').count();
-  if (composeOpen > 0) {
-    await page.getByRole('button', { name: /^discard$/i }).click().catch(() => {});
-    await page.locator('.compose-dialog').waitFor({ state: 'hidden', timeout: 5_000 }).catch(() => {});
+  let reloaded = false;
+  for (let remaining = 20; remaining > 0; remaining -= 1) {
+    const before = await page.locator('.compose-dialog').count();
+    if (before === 0) break;
+    if (await page.getByRole('alertdialog', { name: 'Save this draft?' }).count() > 0) {
+      reloaded = true;
+      break;
+    }
+    const expanded = page.locator('.compose-dialog--expanded');
+    if (await expanded.count() > 0) {
+      await discardCompose(page).catch(() => {
+        reloaded = true;
+      });
+      await expect.poll(
+        async () => page.locator('.compose-dialog').count(),
+        { timeout: 5_000 },
+      ).toBeLessThan(before).catch(() => {
+        reloaded = true;
+      });
+    } else {
+      const restore = page.locator('.compose-dock__restore').first();
+      if (await restore.count() === 0) {
+        reloaded = true;
+      } else {
+        await restore.click({ timeout: 1_000 }).catch(() => {
+          reloaded = true;
+        });
+      }
+    }
+    if (reloaded) break;
   }
+  if (reloaded || await page.locator('.compose-dialog').count() > 0) {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await waitForFolderTreeReady(page);
+  }
+  await returnToMailSpace(page);
   await clickFolder(page, 'Inbox');
   if (Array.isArray(page.__consoleLines)) {
     page.__consoleLines.length = 0;
   }
+}
+
+/**
+ * Switch back to the Mail space if the previous test left the window in
+ * Contacts. The Contacts space replaces the folder tree entirely, so
+ * without this the Inbox click below waits out its full timeout looking
+ * for a `.folder-node` that the current view does not render.
+ */
+async function returnToMailSpace(page) {
+  const mail = page.locator('nav[aria-label="Spaces"] button[aria-label="Mail"]');
+  if (await mail.count() === 0) return;
+  if (await mail.first().getAttribute('aria-pressed') === 'true') return;
+  await mail.first().click();
+  await page.locator('.folder-node').first().waitFor({ state: 'visible', timeout: 10_000 });
 }
 
 async function dismissWelcomeModal(page) {

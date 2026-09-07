@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import {
+  INTEGRATION_TEST_OIDC_EMAIL,
   SHARED_TEST_OIDC_EMAIL,
   STACK_STALWART_API_AUTH,
   STACK_STALWART_API_URL,
@@ -17,6 +18,7 @@ import {
 const SMTP_E2E_SECRET = '$app$e2e$$argon2id$v=19$m=102400,t=2,p=8$YVB5aXpQS285N3dFQnQ5eHI0dklMWQ$5AyShFD8q3xhw8U84OYJiZ1wFCZtmMXjUAwdLxSEve0';
 const DEV_STALWART_PRINCIPAL = process.env.DEV_STALWART_PRINCIPAL ?? 'admin@example.org';
 const LOCAL_ACCOUNT_QUOTA_BYTES = 10 * 1024 ** 3;
+const E2E_SENDER_RATE = '10000/1h';
 
 const LOCAL_ACCOUNTS = [
   {
@@ -32,6 +34,11 @@ const LOCAL_ACCOUNTS = [
   {
     id: SHARED_TEST_OIDC_EMAIL,
     description: 'Stormbox shared-folder e2e owner',
+    permissions: ['unlimited-requests'],
+  },
+  {
+    id: INTEGRATION_TEST_OIDC_EMAIL,
+    description: 'Stormbox backend integration tests',
     permissions: ['unlimited-requests'],
   },
 ];
@@ -108,6 +115,52 @@ async function patchPrincipal(id, actions) {
   if (body?.error) {
     throw new Error(`Patch principal ${id} Stalwart error: ${JSON.stringify(body)}`);
   }
+}
+
+async function ensureSenderRateLimit() {
+  const prefix = 'queue.limiter.inbound.sender';
+  const current = await fetch(
+    `${STACK_STALWART_API_URL}/api/settings/list?prefix=${encodeURIComponent(prefix)}`,
+    { headers: { Authorization: STACK_STALWART_API_AUTH, Accept: 'application/json' } },
+  );
+  if (!current.ok) {
+    throw new Error(`Fetch Stalwart sender limiter failed: ${current.status}`);
+  }
+  const currentBody = await current.json();
+  if (currentBody?.data?.items?.rate === E2E_SENDER_RATE) return;
+
+  const update = await fetch(`${STACK_STALWART_API_URL}/api/settings`, {
+    method: 'POST',
+    headers: {
+      Authorization: STACK_STALWART_API_AUTH,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify([{
+      type: 'insert',
+      prefix,
+      values: [['rate', E2E_SENDER_RATE]],
+      assert_empty: false,
+    }]),
+  });
+  if (!update.ok) {
+    throw new Error(`Update Stalwart sender limiter failed: ${update.status} ${await update.text()}`);
+  }
+  const updateBody = await update.json();
+  if (updateBody?.error) {
+    throw new Error(`Update Stalwart sender limiter error: ${JSON.stringify(updateBody)}`);
+  }
+  const reload = await fetch(`${STACK_STALWART_API_URL}/api/reload/`, {
+    headers: { Authorization: STACK_STALWART_API_AUTH, Accept: 'application/json' },
+  });
+  if (!reload.ok) {
+    throw new Error(`Reload Stalwart settings failed: ${reload.status} ${await reload.text()}`);
+  }
+  const reloadBody = await reload.json();
+  if (reloadBody?.data?.errors && Object.keys(reloadBody.data.errors).length > 0) {
+    throw new Error(`Reload Stalwart settings error: ${JSON.stringify(reloadBody.data.errors)}`);
+  }
+  console.log(`[configure-stalwart] sender rate set to ${E2E_SENDER_RATE}`);
 }
 
 // Idempotent. Mirrors what `MailClient.create_account` in the
@@ -188,6 +241,7 @@ function domainForPrincipal(id) {
 }
 
 export async function configureStalwart() {
+  await ensureSenderRateLimit();
   for (const domain of new Set(LOCAL_ACCOUNTS.map((account) => domainForPrincipal(account.id)))) {
     await ensureDomainPrincipal(domain);
   }

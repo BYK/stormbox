@@ -96,6 +96,10 @@
   --warn-bg: rgba(255, 193, 7, 0.1);
   --warn-fg: #ffd166;
   --warn-border: rgba(255, 193, 7, 0.38);
+  /* Errors (invalid pills, inline failures): light red on a red wash,
+     readable over --panel and --panel2. */
+  --error-bg: rgba(255, 107, 107, 0.14);
+  --error-fg: #ff6b6b;
   color-scheme: dark light;
 }
 
@@ -114,6 +118,8 @@ html.dark,
   --warn-bg: rgba(255, 193, 7, 0.1);
   --warn-fg: #ffd166;
   --warn-border: rgba(255, 193, 7, 0.38);
+  --error-bg: rgba(255, 107, 107, 0.14);
+  --error-fg: #ff6b6b;
 }
 
 html.light,
@@ -121,7 +127,7 @@ html.light,
   --bg: #f6f8fc;
   --panel: #ffffff;
   --panel2: #f4f7fb;
-  --border: #dbe1ea;
+  --border: #e8ecf2; /* 1.19:1 on --panel, matching the dark hairline weight */
   --text: #111827;
   --muted: #6b7280;
   /* Light mode adopts services-ui's primary blue (--colour-primary-default,
@@ -135,6 +141,9 @@ html.light,
   --warn-bg: #fdf4d0;
   --warn-fg: #664700;
   --warn-border: #e7c34d;
+  /* Deep red on a solid pale-red field; #a4000f on #fbeaea ≈ 7.6:1. */
+  --error-bg: #fbeaea;
+  --error-fg: #a4000f;
 }
 
 /* If user prefers light and no explicit theme chosen, use light */
@@ -143,7 +152,7 @@ html.light,
     --bg: #f6f8fc;
     --panel: #ffffff;
     --panel2: #f4f7fb;
-    --border: #dbe1ea;
+    --border: #e8ecf2; /* 1.19:1 on --panel, matching the dark hairline weight */
     --text: #111827;
     --muted: #6b7280;
     --accent: #1373d9;
@@ -152,6 +161,8 @@ html.light,
     --warn-bg: #fdf4d0;
     --warn-fg: #664700;
     --warn-border: #e7c34d;
+    --error-bg: #fbeaea;
+    --error-fg: #a4000f;
   }
 }
 
@@ -208,16 +219,73 @@ html.dark {
   --colour-success-hover: #6ed79b;
   --colour-success-pressed: #2e9e63;
 }
-/* Token gotcha: the filled primary button takes its TEXT from
-   --colour-neutral-base (dark in dark mode), which assumes a light button.
-   Our blue needs white text, and that token can't be globally repurposed,
-   so this is the one component-level override required. */
-html.dark .base.primary.filled:not(:disabled) {
-  color: #fff;
+/* Label and icon colour on flat --accent fills in the dark theme: the
+   accent is a light blue (#4f8cff), so the lower surface (#0f1117, 5.8:1)
+   reads where white sits at 3.2:1. The light theme keeps white on its
+   darker blue. Listed with the same state variants as the components so
+   the override outranks their scoped rules; the Bolt palette applies the
+   same treatment via --bolt-filled-fg (assets/bolt-theme.css). */
+html.dark .base.primary.filled:not(:disabled),
+html.dark .app-toggle-button.is-active,
+html.dark .msg-list__filter.is-active,
+html.dark .msg-list__bulk-action--whitelist,
+html.dark .msg-list__bulk-action--whitelist:hover,
+html.dark .msg-list__bulk-action--whitelist:disabled,
+html.dark .msg-list__bulk-action--whitelist:disabled:hover,
+html.dark .message-view__action--whitelist,
+html.dark .message-view__action--whitelist:hover,
+html.dark .message-view__action--whitelist:disabled,
+html.dark .message-view__action--whitelist:disabled:hover,
+html.dark .folder-create__btn--primary,
+html.dark .folder-subs__btn--primary,
+html.dark .kanban-unlock__btn--primary,
+html.dark .settings-dialog__btn--primary,
+html.dark .scheme-picker__option[aria-checked="true"] {
+  color: var(--panel2);
+}
+/* Filled primary buttons are flat --accent at rest; services-ui's own flat
+   hover/pressed states still apply. Its resting gradient is a Bolt-only
+   treatment (assets/bolt-theme.css). */
+.base.primary.filled {
+  /* As a gradient, not a colour: services-ui transitions `background` and
+     its hover state is a gradient. A colour rest state would interpolate
+     background-color through transparent on mouse-out, leaving the button
+     see-through for ~150ms. */
+  background: linear-gradient(var(--accent), var(--accent)) border-box;
 }
 
 * {
   box-sizing: border-box;
+}
+
+details:not([open]) > :not(summary) {
+  display: none;
+}
+
+.contact-editor__add {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  gap: 5px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.app-icon-button.contact-editor__remove {
+  border-radius: 6px;
+}
+
+.contact-editor__add:hover,
+.contact-editor__add:focus-visible {
+  background: var(--rowHover, #f0f1f6);
+  outline: none;
 }
 
 :root {
@@ -245,6 +313,36 @@ body {
   height: var(--app-viewport-height);
   overflow: hidden;
   transition: background-color 0.18s ease, color 0.18s ease;
+}
+
+html .dp--theme-light,
+html .dp--theme-dark {
+  --dp-font-family: var(--font-sans);
+  --dp-font-size: 13px;
+  --dp-border-radius: 6px;
+  --dp-cell-border-radius: 4px;
+  --dp-background-color: var(--panel);
+  --dp-text-color: var(--text);
+  --dp-hover-color: var(--rowHover);
+  --dp-hover-text-color: var(--text);
+  --dp-hover-icon-color: var(--text);
+  --dp-primary-color: var(--accent);
+  --dp-primary-disabled-color: color-mix(in srgb, var(--accent) 48%, transparent);
+  --dp-primary-text-color: #fff;
+  --dp-secondary-color: var(--muted);
+  --dp-border-color: var(--border);
+  --dp-menu-border-color: var(--border);
+  --dp-border-color-hover: var(--accent);
+  --dp-border-color-focus: var(--accent);
+  --dp-disabled-color: color-mix(in srgb, var(--panel) 82%, var(--muted));
+  --dp-disabled-color-text: var(--muted);
+  --dp-scroll-bar-background: var(--panel2);
+  --dp-scroll-bar-color: var(--muted);
+  --dp-icon-color: var(--muted);
+  --dp-danger-color: var(--error-fg);
+  --dp-marker-color: var(--error-fg);
+  --dp-tooltip-color: var(--panel2);
+  --dp-highlight-color: color-mix(in srgb, var(--accent) 16%, transparent);
 }
 
 /* The shell layout lives in App.vue; #app just needs to fill the
@@ -279,6 +377,12 @@ button {
 button:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+/* Initial modal focus belongs to the surface, not an action button. */
+[role="dialog"][aria-modal="true"]:focus,
+[role="alertdialog"][aria-modal="true"]:focus {
+  outline: none;
 }
 
 /* Global input styles */

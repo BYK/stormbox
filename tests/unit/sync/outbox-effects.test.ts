@@ -267,18 +267,22 @@ describe('applySendLocally', () => {
     );
   }
 
-  it('persists the new email and prepends it at position 0 of the open Sent view', async () => {
+  it('persists the new email and files it at the server-reported position', async () => {
     const transport = new MockTransport();
     transport.handle('Email/get', (params: any) => ({
       list: params.ids.map((id: string) => sentEmailFixture(id)),
       state: 'es',
     }));
+    transport.handle('Email/query', () => ({
+      ids: ['em-new'], position: 0, total: 1, queryState: 'sent-qs2',
+    }));
 
-    await applySendLocally({
+    const applied = await applySendLocally({
       transport, account, handlers,
       createdRemoteId: 'em-new',
       sentRemoteId: 'mb-sent',
     });
+    expect(applied).toEqual({ filed: true });
 
     const newRow = await engine.get(
       'SELECT id, is_seen FROM messages WHERE account_id = ? AND remote_id = ?',
@@ -318,12 +322,16 @@ describe('applySendLocally', () => {
       list: params.ids.map((id: string) => sentEmailFixture(id)),
       state: 'es',
     }));
+    sendTransport.handle('Email/query', () => ({
+      ids: ['em-new'], position: 0, total: 2, queryState: 'sent-qs3',
+    }));
 
-    await applySendLocally({
+    const applied = await applySendLocally({
       transport: sendTransport, account, handlers,
       createdRemoteId: 'em-new',
       sentRemoteId: 'mb-sent',
     });
+    expect(applied).toEqual({ filed: true });
 
     const sentView = await loadSentView();
     expect(Number(sentView.total)).toBe(2);
@@ -333,6 +341,77 @@ describe('applySendLocally', () => {
     ]);
   });
 
+  it('derives Sent position, total, and mailbox counters from the server (CS-1.14)', async () => {
+    // While this send was in flight, other sessions filed two more
+    // messages into Sent: the server's truth is 8, so the local "+1"
+    // assumption over the stale 5 would be wrong, and the folder badge
+    // would stay wherever the last push left it.
+    await engine.run(
+      'UPDATE query_views SET total = 5 WHERE account_id = ? AND folder_id = ?',
+      [account.id, sent.id],
+    );
+
+    const transport = new MockTransport();
+    transport.handle('Email/get', (params: any) => ({
+      list: params.ids.map((id: string) => sentEmailFixture(id)),
+      state: 'es',
+    }));
+    transport.handle('Email/query', (params: any) => {
+      expect(params.anchor).toBe('em-new');
+      expect(params.calculateTotal).toBe(true);
+      return { ids: ['em-new'], position: 0, total: 8, queryState: 'sent-qs3' };
+    });
+    transport.handle('Mailbox/get', () => ({
+      list: [{ id: 'mb-sent', totalEmails: 8, unreadEmails: 0 }],
+      state: 's2',
+    }));
+
+    const applied = await applySendLocally({
+      transport, account, handlers,
+      createdRemoteId: 'em-new',
+      sentRemoteId: 'mb-sent',
+    });
+    expect(applied).toEqual({ filed: true });
+
+    const sentView = await loadSentView();
+    expect(Number(sentView.total), 'total must be the server\'s, not a local increment').toBe(8);
+    expect(await loadViewItems(sentView.id)).toEqual([
+      { position: 0, remote_id: 'em-new' },
+    ]);
+
+    const folder = await engine.get(
+      'SELECT total_emails FROM folders WHERE account_id = ? AND remote_id = ?',
+      [account.id, 'mb-sent'],
+    );
+    expect(Number(folder.total_emails), 'the Sent Mailbox counter must be reconciled').toBe(8);
+  });
+
+  it('marks the view stale rather than inventing a position when the server cannot answer', async () => {
+    // CS-1.14 forbids assuming position/total; when the reconciling query
+    // fails, the honest fallback is a stale flag so the next read rebuilds
+    // from Email/query.
+    const transport = new MockTransport();
+    transport.handle('Email/get', (params: any) => ({
+      list: params.ids.map((id: string) => sentEmailFixture(id)),
+      state: 'es',
+    }));
+    transport.handle('Email/query', () => {
+      throw new Error('query lane down');
+    });
+
+    const applied = await applySendLocally({
+      transport, account, handlers,
+      createdRemoteId: 'em-new',
+      sentRemoteId: 'mb-sent',
+    });
+    expect(applied).toEqual({ filed: true });
+
+    const sentView = await loadSentView();
+    expect(Number(sentView.stale)).toBe(1);
+    expect(Number(sentView.total)).toBe(0);
+    expect(await loadViewItems(sentView.id)).toEqual([]);
+  });
+
   it('persists without touching query_views when the Sent folder is unknown locally', async () => {
     const transport = new MockTransport();
     transport.handle('Email/get', (params: any) => ({
@@ -340,17 +419,48 @@ describe('applySendLocally', () => {
       state: 'es',
     }));
 
-    await applySendLocally({
+    const applied = await applySendLocally({
       transport, account, handlers,
       createdRemoteId: 'em-new',
       sentRemoteId: 'mb-unknown',
     });
+    // Reported unfiled: the message is cached, but no local Sent view
+    // claims it, so the caller must mark that view for rebuild.
+    expect(applied).toEqual({ filed: false });
 
     const newRow = await engine.get(
       'SELECT id FROM messages WHERE account_id = ? AND remote_id = ?',
       [account.id, 'em-new'],
     );
     expect(newRow).not.toBeNull();
+
+    const sentView = await loadSentView();
+    expect(Number(sentView.total)).toBe(0);
+    expect(await loadViewItems(sentView.id)).toEqual([]);
+  });
+
+  it('reports unfiled and skips the Sent view when the server left the message elsewhere', async () => {
+    // The failure this guards is Thunderbird bug 1656240: filing the
+    // local Sent copy on the strength of the *requested* target, so a
+    // message the server never moved out of Drafts still shows up in
+    // Sent. Placement comes from the server's mailboxIds, and a
+    // mismatch has to be reported so the caller can mark the view
+    // stale rather than leaving a cache that disagrees.
+    const transport = new MockTransport();
+    transport.handle('Email/get', (params: any) => ({
+      list: params.ids.map((id: string) => ({
+        ...sentEmailFixture(id),
+        mailboxIds: { 'mb-inbox': true },
+      })),
+      state: 'es',
+    }));
+
+    const applied = await applySendLocally({
+      transport, account, handlers,
+      createdRemoteId: 'em-new',
+      sentRemoteId: 'mb-sent',
+    });
+    expect(applied).toEqual({ filed: false });
 
     const sentView = await loadSentView();
     expect(Number(sentView.total)).toBe(0);
@@ -365,14 +475,36 @@ describe('applySendLocally', () => {
       return { list: [], state: 'es' };
     });
 
-    await applySendLocally({
+    const applied = await applySendLocally({
       transport, account, handlers,
       createdRemoteId: null,
       sentRemoteId: 'mb-sent',
     });
+    expect(applied).toEqual({ filed: false });
 
     expect(getCalls).toBe(0);
     const sentView = await loadSentView();
     expect(Number(sentView.total)).toBe(0);
+  });
+
+  it('reports unfiled when the server returns no such Email', async () => {
+    // A send whose Email/get comes back empty must not be reported as
+    // filed: there is nothing to file, and the caller needs to know so
+    // the Sent view is rebuilt from the server instead.
+    const transport = new MockTransport();
+    transport.handle('Email/get', () => ({ list: [], state: 'es' }));
+
+    const applied = await applySendLocally({
+      transport, account, handlers,
+      createdRemoteId: 'em-new',
+      sentRemoteId: 'mb-sent',
+    });
+    expect(applied).toEqual({ filed: false });
+
+    const newRow = await engine.get(
+      'SELECT id FROM messages WHERE account_id = ? AND remote_id = ?',
+      [account.id, 'em-new'],
+    );
+    expect(newRow).toBeNull();
   });
 });

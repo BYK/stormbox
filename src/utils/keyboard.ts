@@ -7,9 +7,27 @@ export function isMacPlatform(): boolean {
   return /Mac|iPhone|iPad|iPod/.test(navigator.platform);
 }
 
+export function shortcutModifierLabel(): '⌘' | 'Ctrl' {
+  return isMacPlatform() ? '⌘' : 'Ctrl';
+}
+
+export function shortcutModifierAria(): 'Meta' | 'Control' {
+  return isMacPlatform() ? 'Meta' : 'Control';
+}
+
 /** Primary modifier: Ctrl on Windows/Linux, Meta (Cmd) on macOS. */
 export function isModKey(event: KeyboardEvent): boolean {
   return isMacPlatform() ? event.metaKey : event.ctrlKey;
+}
+
+/**
+ * True while an input method editor owns the key event.
+ *
+ * `isComposing` is the standard signal. Some browsers and input stacks
+ * report IME-consumed keys only through the legacy 229 key code.
+ */
+export function isComposingKeyEvent(event: KeyboardEvent): boolean {
+  return event.isComposing || event.keyCode === 229;
 }
 
 /**

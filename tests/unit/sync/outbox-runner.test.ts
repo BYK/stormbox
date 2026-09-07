@@ -15,9 +15,14 @@
  */
 
 import {
-  describe, it, expect, beforeEach, afterEach,
+  describe, it, expect, beforeEach, afterEach, vi,
 } from 'vitest';
 
+import {
+  ADDRESSBOOK_PHASE,
+  IDENTITY_PHASE,
+  MUTATION_TYPE,
+} from '../../../src/constants/states';
 import { bootTestEngine } from '../../../src/db/bootstrap-memory';
 import { makeHandlers } from '../../../src/db/handlers';
 import { DB_RPC } from '../../../src/db/protocol';
@@ -78,6 +83,26 @@ async function insertDestroy({ targetMessageId = null } = {}) {
     requestJson: JSON.stringify({}),
   });
   return r.id;
+}
+
+async function insertTargetlessWrite(mutationType = 'whitelistSender') {
+  const result = await handlers[DB_RPC.PENDING_MUTATION_INSERT]({
+    accountId,
+    mutationType,
+    targetMessageId: null,
+    requestJson: JSON.stringify({ senders: [{ email: `${mutationType}@example.com` }] }),
+  });
+  return result.id;
+}
+
+async function insertComposeMutation(mutationType, draftSessionId, targetMessageId = null) {
+  const result = await handlers[DB_RPC.PENDING_MUTATION_INSERT]({
+    accountId,
+    mutationType,
+    targetMessageId,
+    requestJson: JSON.stringify({ draftSessionId }),
+  });
+  return result.id;
 }
 
 async function loadRow(id) {
@@ -184,6 +209,260 @@ describe('OutboxRunner auto-drain', () => {
 });
 
 describe('OutboxRunner per-target serialization', () => {
+  it('serializes different sessions that claim the same draft row', async () => {
+    const target = await seedMessage('shared-draft');
+    const firstBlocked = deferred();
+    const order = [];
+    const firstId = await insertComposeMutation('saveDraft', 'tab-one', target);
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async (row) => {
+        order.push(`start:${row.id}`);
+        if (row.id === firstId) await firstBlocked.promise;
+        order.push(`end:${row.id}`);
+        return { ok: true };
+      },
+      options: { notifyDelayMs: 0 },
+    });
+    const secondId = await insertComposeMutation('saveDraft', 'tab-two', target);
+
+    const draining = runner.drain();
+    await waitFor(() => order.includes(`start:${firstId}`));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(order).not.toContain(`start:${secondId}`);
+    firstBlocked.resolve();
+    await draining;
+
+    expect(order).toEqual([
+      `start:${firstId}`,
+      `end:${firstId}`,
+      `start:${secondId}`,
+      `end:${secondId}`,
+    ]);
+    await runner.stop();
+  });
+
+  it('serializes save, discard, and send in one compose-session lane', async () => {
+    const firstBlocked = deferred();
+    const order = [];
+    const firstId = await insertComposeMutation('saveDraft', 'compose-1');
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async (row) => {
+        order.push(`start:${row.mutation_type}`);
+        if (row.id === firstId) await firstBlocked.promise;
+        order.push(`end:${row.mutation_type}`);
+        return { ok: true };
+      },
+      options: { notifyDelayMs: 0 },
+    });
+    await insertComposeMutation('discardDraft', 'compose-1');
+    await insertComposeMutation('send', 'compose-1');
+
+    const draining = runner.drain();
+    await waitFor(() => order.includes('start:saveDraft'));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(order).toEqual(['start:saveDraft']);
+
+    firstBlocked.resolve();
+    await draining;
+    expect(order).toEqual([
+      'start:saveDraft',
+      'end:saveDraft',
+      'start:discardDraft',
+      'end:discardDraft',
+      'start:send',
+      'end:send',
+    ]);
+    await runner.stop();
+  });
+
+  it('does not execute stale saves abandoned after dequeue', async () => {
+    const firstBlocked = deferred();
+    const processed = [];
+    const firstId = await insertComposeMutation('saveDraft', 'compose-1');
+    const deletedId = await insertComposeMutation('saveDraft', 'compose-1');
+    const convertedId = await insertComposeMutation('saveDraft', 'compose-1');
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async (row) => {
+        processed.push({ id: row.id, type: row.mutation_type });
+        if (row.id === firstId) await firstBlocked.promise;
+        return { ok: true };
+      },
+      options: { notifyDelayMs: 0 },
+    });
+
+    const draining = runner.drain();
+    await waitFor(() => processed.some(({ id }) => id === firstId));
+    await expect(handlers[DB_RPC.PENDING_MUTATION_ABANDON_DRAFT]({
+      accountId,
+      mutationId: deletedId,
+      intent: 'keep-confirmed',
+    })).resolves.toMatchObject({ abandoned: 1 });
+    await expect(handlers[DB_RPC.PENDING_MUTATION_ABANDON_DRAFT]({
+      accountId,
+      mutationId: convertedId,
+      intent: 'discard-all',
+      confirmedEmailIds: ['confirmed-draft'],
+      draftSessionId: 'compose-1',
+    })).resolves.toMatchObject({ converted: 1 });
+
+    firstBlocked.resolve();
+    await draining;
+
+    expect(processed).toEqual([
+      { id: firstId, type: 'saveDraft' },
+      { id: convertedId, type: 'discardDraft' },
+    ]);
+    expect(await loadRow(deletedId)).toBeNull();
+    expect(await loadRow(convertedId)).toBeNull();
+    await runner.stop();
+  });
+
+  it('serializes contact and address-book writes on one account lane', async () => {
+    const firstBlocked = deferred();
+    const order = [];
+    const firstId = await insertTargetlessWrite('whitelistSender');
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async (row) => {
+        order.push(`start:${row.id}`);
+        if (row.id === firstId) await firstBlocked.promise;
+        order.push(`end:${row.id}`);
+        return { ok: true };
+      },
+      options: { notifyDelayMs: 0 },
+    });
+    const secondId = await insertTargetlessWrite('createContact');
+    const thirdId = await insertTargetlessWrite('contactBatch');
+    const fourthId = await insertTargetlessWrite('createAddressbook');
+    const fifthId = await insertTargetlessWrite('destroyAddressbook');
+    const drainPromise = runner.drain();
+
+    await waitFor(() => order.includes(`start:${firstId}`));
+    expect(order).not.toContain(`start:${secondId}`);
+    expect(order).not.toContain(`start:${thirdId}`);
+    expect(order).not.toContain(`start:${fourthId}`);
+    expect(order).not.toContain(`start:${fifthId}`);
+    firstBlocked.resolve();
+    await drainPromise;
+
+    expect(order).toEqual([
+      `start:${firstId}`,
+      `end:${firstId}`,
+      `start:${secondId}`,
+      `end:${secondId}`,
+      `start:${thirdId}`,
+      `end:${thirdId}`,
+      `start:${fourthId}`,
+      `end:${fourthId}`,
+      `start:${fifthId}`,
+      `end:${fifthId}`,
+    ]);
+    await runner.stop();
+  });
+
+  it('serializes account-wide Identity writes with null message targets', async () => {
+    const firstBlocked = deferred();
+    const order = [];
+    const firstId = await insertTargetlessWrite('createIdentity');
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async (row) => {
+        order.push(`start:${row.id}`);
+        if (row.id === firstId) await firstBlocked.promise;
+        order.push(`end:${row.id}`);
+        return { ok: true };
+      },
+      options: { notifyDelayMs: 0 },
+    });
+    const secondId = await insertTargetlessWrite('updateIdentity');
+    const drainPromise = runner.drain();
+
+    await waitFor(() => order.includes(`start:${firstId}`));
+    expect(order).not.toContain(`start:${secondId}`);
+    firstBlocked.resolve();
+    await drainPromise;
+
+    expect(order).toEqual([
+      `start:${firstId}`,
+      `end:${firstId}`,
+      `start:${secondId}`,
+      `end:${secondId}`,
+    ]);
+    await runner.stop();
+  });
+
+  it('serializes settings document writes in one account lane', async () => {
+    const firstBlocked = deferred();
+    const order = [];
+    const firstId = await insertTargetlessWrite('pushSettings');
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async (row) => {
+        order.push(`start:${row.id}`);
+        if (row.id === firstId) await firstBlocked.promise;
+        order.push(`end:${row.id}`);
+        return { ok: true };
+      },
+      options: { notifyDelayMs: 0 },
+    });
+    const secondId = await insertTargetlessWrite('pushSettings');
+    const drainPromise = runner.drain();
+
+    await waitFor(() => order.includes(`start:${firstId}`));
+    expect(order).not.toContain(`start:${secondId}`);
+    firstBlocked.resolve();
+    await drainPromise;
+
+    expect(order).toEqual([
+      `start:${firstId}`,
+      `end:${firstId}`,
+      `start:${secondId}`,
+      `end:${secondId}`,
+    ]);
+    await runner.stop();
+  });
+
+  it('serializes mailbox subscription writes in one account lane', async () => {
+    const firstBlocked = deferred();
+    const order = [];
+    const firstId = await insertTargetlessWrite('setMailboxSubscription');
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async (row) => {
+        order.push(`start:${row.id}`);
+        if (row.id === firstId) await firstBlocked.promise;
+        order.push(`end:${row.id}`);
+        return { ok: true };
+      },
+      options: { notifyDelayMs: 0 },
+    });
+    const secondId = await insertTargetlessWrite('setMailboxSubscription');
+    const drainPromise = runner.drain();
+
+    await waitFor(() => order.includes(`start:${firstId}`));
+    expect(order).not.toContain(`start:${secondId}`);
+    firstBlocked.resolve();
+    await drainPromise;
+
+    expect(order).toEqual([
+      `start:${firstId}`,
+      `end:${firstId}`,
+      `start:${secondId}`,
+      `end:${secondId}`,
+    ]);
+    await runner.stop();
+  });
+
   it('serializes setKeywords + destroy against the same message id', async () => {
     // markRead followed by destroy must not interleave: if the
     // destroy Email/set lands before the setKeywords, the second
@@ -324,6 +603,216 @@ describe('OutboxRunner exponential backoff', () => {
     await runner.stop();
   });
 
+  it('applies a smaller retry cap to draft saves', async () => {
+    let attempts = 0;
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => {
+        attempts += 1;
+        return { ok: false, error: { type: 'serverFail' } };
+      },
+      options: {
+        notifyDelayMs: 0,
+        backoffBaseMs: 5,
+        maxAttempts: 8,
+        maxAttemptsByType: { saveDraft: 3 },
+      },
+    });
+    const mutationId = await insertComposeMutation('saveDraft', 'draft-session');
+
+    const result = await runner.runMutation(mutationId);
+
+    expect(result).toMatchObject({ succeeded: 0, failed: 1 });
+    expect(attempts).toBe(3);
+    expect(Number((await loadRow(mutationId)).attempts)).toBe(3);
+    await runner.stop();
+  });
+
+  it('retries an HTTP authentication failure', async () => {
+    let attempts = 0;
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => {
+        attempts += 1;
+        if (attempts > 1) return { ok: true };
+        const error: any = new Error('JMAP request failed: 401 Unauthorized');
+        error.status = 401;
+        throw error;
+      },
+      options: {
+        notifyDelayMs: 0,
+        backoffBaseMs: 5,
+        maxAttempts: 8,
+      },
+    });
+    const mutationId = await insertComposeMutation('saveDraft', 'draft-session');
+
+    await expect(runner.runMutation(mutationId)).resolves.toMatchObject({
+      succeeded: 1,
+      failed: 0,
+    });
+    expect(attempts).toBe(2);
+    expect(await loadRow(mutationId)).toBeNull();
+    await runner.stop();
+  });
+
+  it('stops retrying a persistent HTTP authentication failure at the attempt cap', async () => {
+    let attempts = 0;
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => {
+        attempts += 1;
+        const error: any = new Error('JMAP request failed: 401 Unauthorized');
+        error.status = 401;
+        throw error;
+      },
+      options: {
+        notifyDelayMs: 0,
+        backoffBaseMs: 5,
+        maxAttempts: 3,
+      },
+    });
+    const mutationId = await insertComposeMutation('saveDraft', 'draft-session');
+
+    await expect(runner.runMutation(mutationId)).resolves.toMatchObject({
+      succeeded: 0,
+      failed: 1,
+      errorType: 'authenticationFailed',
+    });
+    expect(attempts).toBe(3);
+    const row = await loadRow(mutationId);
+    expect(row.local_status).toBe('conflicted');
+    expect(Number(row.attempts)).toBe(3);
+    await runner.stop();
+  });
+
+  it('does not replay a send after an HTTP authentication failure', async () => {
+    // The 401 may have arrived after the server accepted the submission,
+    // so the unsafe-to-replay policy wins over the retryable type.
+    let attempts = 0;
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => {
+        attempts += 1;
+        const error: any = new Error('JMAP request failed: 401 Unauthorized');
+        error.status = 401;
+        throw error;
+      },
+      options: {
+        notifyDelayMs: 0,
+        backoffBaseMs: 5,
+        maxAttempts: 8,
+        unsafeToReplayTypes: ['send'],
+      },
+    });
+    const mutationId = await insertComposeMutation('send', 'draft-session');
+
+    await expect(runner.runMutation(mutationId)).resolves.toMatchObject({
+      succeeded: 0,
+      failed: 1,
+      errorType: 'authenticationFailed',
+    });
+    expect(attempts).toBe(1);
+    const row = await loadRow(mutationId);
+    expect(row.local_status).toBe('conflicted');
+    expect(JSON.parse(row.error_json).terminal).toBe(true);
+    await runner.stop();
+  });
+
+  it('does not retry an HTTP authorization failure', async () => {
+    let attempts = 0;
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => {
+        attempts += 1;
+        const error: any = new Error('JMAP request failed: 403 Forbidden');
+        error.status = 403;
+        throw error;
+      },
+      options: {
+        notifyDelayMs: 0,
+        backoffBaseMs: 5,
+        maxAttempts: 8,
+      },
+    });
+    const mutationId = await insertComposeMutation('saveDraft', 'draft-session');
+
+    await expect(runner.runMutation(mutationId)).resolves.toMatchObject({
+      succeeded: 0,
+      failed: 1,
+      errorType: 'authorizationFailed',
+    });
+    expect(attempts).toBe(1);
+    expect(Number((await loadRow(mutationId)).attempts)).toBe(1);
+    await runner.stop();
+  });
+
+  it.each([
+    ['authenticationFailed', 2, 1, 0],
+    ['authorizationFailed', 1, 0, 1],
+  ])(
+    'classifies JMAP %s method errors',
+    async (type, expectedAttempts, succeeded, failed) => {
+      let attempts = 0;
+      const runner = new OutboxRunner({
+        accountId,
+        handlers,
+        processRow: async () => {
+          attempts += 1;
+          if (type === 'authenticationFailed' && attempts > 1) {
+            return { ok: true };
+          }
+          return { ok: false, error: { type } };
+        },
+        options: {
+          notifyDelayMs: 0,
+          backoffBaseMs: 5,
+          maxAttempts: 8,
+        },
+      });
+      const mutationId = await insertComposeMutation('saveDraft', 'draft-session');
+
+      await expect(runner.runMutation(mutationId)).resolves.toMatchObject({
+        succeeded,
+        failed,
+      });
+      expect(attempts).toBe(expectedAttempts);
+      await runner.stop();
+    },
+  );
+
+  it('honours an explicit terminal flag on an authenticationFailed error', async () => {
+    let attempts = 0;
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => {
+        attempts += 1;
+        return { ok: false, error: { type: 'authenticationFailed', terminal: true } };
+      },
+      options: {
+        notifyDelayMs: 0,
+        backoffBaseMs: 5,
+        maxAttempts: 8,
+      },
+    });
+    const mutationId = await insertComposeMutation('saveDraft', 'draft-session');
+
+    await expect(runner.runMutation(mutationId)).resolves.toMatchObject({
+      succeeded: 0,
+      failed: 1,
+      errorType: 'authenticationFailed',
+    });
+    expect(attempts).toBe(1);
+    expect((await loadRow(mutationId)).local_status).toBe('conflicted');
+    await runner.stop();
+  });
+
   it('records a not_before window in the future after a single transient failure', async () => {
     // Pins the per-attempt backoff math: after attempt N fails, the
     // row's not_before should be ~now + 2^(N-1) * base. We only
@@ -453,10 +942,10 @@ describe('OutboxRunner crash recovery', () => {
     });
     runner.notify({ immediate: true });
     await runner.drain();
-    expect(calls).toEqual([{ id: mutationId, attempts: 4 }]);
+    expect(calls).toEqual([{ id: mutationId, attempts: 5 }]);
     // Attempt counter preserved through the crash: the row that
-    // got partway through several retries should continue aging
-    // toward the cap, not start over.
+    // got partway through several retries continues at the next
+    // attempt rather than starting over.
     const row = await loadRow(mutationId);
     expect(row).toBeNull(); // succeeded -> deleted
     await runner.stop();
@@ -498,7 +987,9 @@ describe('OutboxRunner runMutation', () => {
     // second attempt will fire after the 5ms backoff and push the
     // row to conflicted.
     const result = await runner.runMutation(mutationId);
-    expect(result).toEqual({ attempted: 1, succeeded: 0, failed: 1 });
+    expect(result).toEqual({
+      attempted: 1, succeeded: 0, failed: 1, errorType: 'serverFail',
+    });
     const row = await loadRow(mutationId);
     expect(row.local_status).toBe('conflicted');
     expect(Number(row.attempts)).toBe(2);
@@ -528,6 +1019,7 @@ describe('OutboxRunner runMutation', () => {
       succeeded: 0,
       failed: 1,
       result: perId,
+      errorType: 'notUpdated',
     });
     await runner.stop();
   });
@@ -649,5 +1141,297 @@ describe('OutboxRunner integration with the handlers hook', () => {
       if (runner) await runner.stop();
       await localEngine.close();
     }
+  });
+});
+
+describe('OutboxRunner replay safety', () => {
+  async function strand(mutationId) {
+    await engine.run(
+      `UPDATE pending_mutations SET local_status = 'in_flight', attempts = 3
+        WHERE id = ?`,
+      [mutationId],
+    );
+  }
+
+  async function insertSend({ phase = null } = {}) {
+    const r = await handlers[DB_RPC.PENDING_MUTATION_INSERT]({
+      accountId,
+      mutationType: 'send',
+      requestJson: JSON.stringify({ identityId: 1, to: [{ email: 'a@b.test' }] }),
+    });
+    if (phase) {
+      await engine.run('UPDATE pending_mutations SET phase = ? WHERE id = ?', [phase, r.id]);
+    }
+    return r.id;
+  }
+
+  const PHASE_POLICY = {
+    unsafeToReplayTypes: ['send'],
+    replayablePhases: ['queued', 'created'],
+    completedPhases: ['submitted', 'cache_pending'],
+  };
+  // 'submitting' is deliberately in neither list: a crash there is
+  // indistinguishable from a delivered message.
+
+  it.each([
+    [MUTATION_TYPE.CREATE_IDENTITY, IDENTITY_PHASE.CREATE_SUBMITTING],
+    [MUTATION_TYPE.CREATE_ADDRESSBOOK, ADDRESSBOOK_PHASE.CREATE_SUBMITTING],
+  ])('preserves a stranded %s checkpoint for fail-closed recovery', async (
+    mutationType,
+    phase,
+  ) => {
+    const mutationId = await insertTargetlessWrite(mutationType);
+    await engine.run(
+      `UPDATE pending_mutations
+          SET phase = ?, server_response_json = '{'
+        WHERE id = ?`,
+      [phase, mutationId],
+    );
+    await strand(mutationId);
+
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => ({ ok: true }),
+      options: {
+        notifyDelayMs: 0,
+        unsafeToReplayTypes: [mutationType],
+        replayablePhases: [phase],
+      },
+    });
+    await runner.recoverStranded();
+
+    const row = await loadRow(mutationId);
+    expect(row).toMatchObject({
+      local_status: 'pending',
+      phase,
+      server_response_json: '{',
+    });
+    await runner.stop();
+  });
+
+  it('returns a stranded row to pending so a later boot can retry it', async () => {
+    // Migration 002 resets in_flight rows, but migrations run once per
+    // database version, so a crash after that boot leaves the row
+    // invisible to _loadReadyRows forever.
+    const localMsg = await seedMessage('e-1');
+    const mutationId = await insertSetKeywords({ targetMessageId: localMsg });
+    await strand(mutationId);
+
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => ({ ok: true }),
+      options: { notifyDelayMs: 0 },
+    });
+    await runner.recoverStranded();
+
+    const row = await loadRow(mutationId);
+    expect(row.local_status).toBe('pending');
+    expect(row.not_before).toBeNull();
+    // Preserved so the row keeps aging toward the attempt cap.
+    expect(Number(row.attempts)).toBe(3);
+    await runner.stop();
+  });
+
+  it('resumes a stranded send that never recorded its first phase', async () => {
+    // The first checkpoint precedes Email creation and submission, so a
+    // phaseless row cannot conceal an irreversible send.
+    const mutationId = await insertSend();
+    await strand(mutationId);
+
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => ({ ok: true }),
+      options: { notifyDelayMs: 0, ...PHASE_POLICY },
+    });
+    await runner.recoverStranded();
+
+    const row = await loadRow(mutationId);
+    expect(row.local_status).toBe('pending');
+    expect(row.error_json).toBeNull();
+    expect(JSON.parse(row.request_json).to[0].email).toBe('a@b.test');
+    await runner.stop();
+  });
+
+  it('resumes a stranded send that had not reached submission', async () => {
+    // The checkpoint says an Email exists but was never submitted, so
+    // nothing irreversible happened and the row can safely continue.
+    const mutationId = await insertSend({ phase: 'created' });
+    await strand(mutationId);
+
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => ({ ok: true }),
+      options: { notifyDelayMs: 0, ...PHASE_POLICY },
+    });
+    await runner.recoverStranded();
+
+    const row = await loadRow(mutationId);
+    expect(row.local_status).toBe('pending');
+    expect(row.phase).toBe('created');
+    await runner.stop();
+  });
+
+  it('requeues a stranded send that had already been submitted', async () => {
+    // The message went out before the crash, so reporting a failure would
+    // be a lie and replaying the submission would send a second copy.
+    // The row returns to the queue, where the checkpoint makes it skip to
+    // filing the local copy.
+    const submitted = await insertSend({ phase: 'submitted' });
+    const filing = await insertSend({ phase: 'cache_pending' });
+    await strand(submitted);
+    await strand(filing);
+
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => ({ ok: true }),
+      options: { notifyDelayMs: 0, ...PHASE_POLICY },
+    });
+    await runner.recoverStranded();
+
+    expect((await loadRow(submitted)).local_status).toBe('pending');
+    expect((await loadRow(filing)).local_status).toBe('pending');
+    // The phase survives, which is what stops the resume from
+    // re-submitting.
+    expect((await loadRow(submitted)).phase).toBe('submitted');
+    await runner.stop();
+  });
+
+  it('conflicts a send stranded while its submission was in flight', async () => {
+    // The crash happened inside the submission round trip, so the server
+    // may already have accepted it. This is the case that must never be
+    // replayed, and the reason 'submitting' is written before the call.
+    const mutationId = await insertSend({ phase: 'submitting' });
+    await strand(mutationId);
+
+    const attempted = [];
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async (row) => {
+        attempted.push(row.id);
+        return { ok: true };
+      },
+      options: { notifyDelayMs: 0, ...PHASE_POLICY },
+    });
+    await runner.recoverStranded();
+
+    const row = await loadRow(mutationId);
+    expect(row.local_status).toBe('conflicted');
+    expect(JSON.parse(row.error_json).type).toBe('outcomeUnknown');
+    await runner.drain();
+    expect(attempted).toEqual([]);
+    await runner.stop();
+  });
+
+  it('recovers stranded non-send and phaseless-send rows together', async () => {
+    const localMsg = await seedMessage('e-2');
+    const keywordsId = await insertSetKeywords({ targetMessageId: localMsg });
+    const sendId = await insertSend();
+    await strand(keywordsId);
+    await strand(sendId);
+
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => ({ ok: true }),
+      options: { notifyDelayMs: 0, ...PHASE_POLICY },
+    });
+    await runner.recoverStranded();
+
+    expect((await loadRow(keywordsId)).local_status).toBe('pending');
+    expect((await loadRow(sendId)).local_status).toBe('pending');
+    await runner.stop();
+  });
+
+  it('does not retry a send after a transport error', async () => {
+    // The socket can die after the server accepted the submission, so a
+    // retry could deliver a second copy. Compare with the setKeywords
+    // case above, which does retry a thrown processRow.
+    let calls = 0;
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => {
+        calls += 1;
+        throw new Error('socket reset mid-submission');
+      },
+      options: {
+        notifyDelayMs: 0,
+        backoffBaseMs: 10_000,
+        unsafeToReplayTypes: ['send'],
+      },
+    });
+    const mutationId = await insertSend();
+
+    expect(await runner.runMutation(mutationId)).toEqual({
+      attempted: 1,
+      succeeded: 0,
+      failed: 1,
+      errorType: 'transport',
+    });
+
+    const row = await loadRow(mutationId);
+    expect(calls).toBe(1);
+    expect(row.local_status).toBe('conflicted');
+    const error = JSON.parse(row.error_json);
+    expect(error.type).toBe('transport');
+    expect(error.terminal).toBe(true);
+    await runner.stop();
+  });
+
+  it('tells a caller waiting on a send at teardown that the outcome is unknown', async () => {
+    // The row is parked for a retry that will never come, because the
+    // worker is going away. Nobody can say how far the send got, and
+    // reporting a plain failure is what makes the composer offer Send
+    // again — a second press is a second delivery.
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      // Not thrown, so the runner keeps a retry budget rather than
+      // conflicting the row outright.
+      processRow: async () => ({ ok: false, error: { type: 'serverFail' } }),
+      options: { notifyDelayMs: 0, backoffBaseMs: 60_000, ...PHASE_POLICY },
+    });
+    const mutationId = await insertSend({ phase: 'queued' });
+
+    const pending = runner.runMutation(mutationId);
+    await vi.waitUntil(async () => (await loadRow(mutationId))?.local_status === 'retry');
+    await runner.stop();
+
+    expect(await pending).toEqual({
+      attempted: 1,
+      succeeded: 0,
+      failed: 1,
+      errorType: 'outcomeUnknown',
+    });
+  });
+
+  it('tells a caller waiting on a replayable mutation at teardown that it simply stopped', async () => {
+    // Nothing irreversible can be hiding behind a keyword change, so this
+    // caller is free to report an ordinary failure and try again.
+    const localMsg = await seedMessage('e-stop');
+    const runner = new OutboxRunner({
+      accountId,
+      handlers,
+      processRow: async () => ({ ok: false, error: { type: 'serverFail' } }),
+      options: { notifyDelayMs: 0, backoffBaseMs: 60_000, ...PHASE_POLICY },
+    });
+    const mutationId = await insertSetKeywords({ targetMessageId: localMsg });
+
+    const pending = runner.runMutation(mutationId);
+    await vi.waitUntil(async () => (await loadRow(mutationId))?.local_status === 'retry');
+    await runner.stop();
+
+    expect(await pending).toEqual({
+      attempted: 1,
+      succeeded: 0,
+      failed: 1,
+      errorType: 'stopped',
+    });
   });
 });

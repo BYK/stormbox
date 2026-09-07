@@ -10,6 +10,9 @@
  * a worker).
  */
 
+import { isInlineRasterType } from './raster-images';
+import { randomToken } from './random-token';
+
 export interface InlineImage {
   /** Content-ID without angle brackets; matches `src="cid:<cid>"`. */
   cid: string;
@@ -32,9 +35,7 @@ export interface ExtractedInlineImages {
 const DATA_URI_IMAGE_SRC = /src\s*=\s*(["'])data:(image\/[a-z0-9.+-]+);base64,([^"']*)\1/gi;
 
 function makeCid(): string {
-  const uuid = globalThis.crypto?.randomUUID?.()
-    ?? `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
-  return `${uuid}@stormbox`;
+  return `${randomToken()}@stormbox`;
 }
 
 /**
@@ -44,13 +45,18 @@ function makeCid(): string {
  * inline images is returned unchanged with an empty images array.
  */
 export function extractDataUriImages(html: string): ExtractedInlineImages {
-  if (!html || !html.includes('data:image/')) {
+  if (!html || !/data:image\//i.test(html)) {
     return { html: html ?? '', images: [] };
   }
   const images: InlineImage[] = [];
-  const rewritten = html.replace(DATA_URI_IMAGE_SRC, (_match, _quote, type, payload) => {
+  const rewritten = html.replace(DATA_URI_IMAGE_SRC, (match, _quote, type, payload) => {
+    if (!isInlineRasterType(type)) return match;
     const cid = makeCid();
-    images.push({ cid, type, base64: String(payload).replace(/\s+/g, '') });
+    images.push({
+      cid,
+      type: String(type).toLowerCase(),
+      base64: String(payload).replace(/\s+/g, ''),
+    });
     return `src="cid:${cid}"`;
   });
   return { html: rewritten, images };

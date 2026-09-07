@@ -4,7 +4,7 @@ import { defineConfig, devices } from '@playwright/test';
 
 const PORT = process.env.PLAYWRIGHT_PORT ? Number(process.env.PLAYWRIGHT_PORT) : 3000;
 const LOCAL_STACK = process.env.LOCAL_STACK === '1' || process.env.LOCAL_STACK === 'true';
-const BASE_URL = process.env.PLAYWRIGHT_BASE_URL ?? `https://localhost:${PORT}`;
+const BASE_URL = process.env.PLAYWRIGHT_BASE_URL ?? `http://localhost:${PORT}`;
 
 function stackProxyDefaults() {
   const inDocker = process.env.STORMBOX_IN_DOCKER === '1' || fs.existsSync('/.dockerenv');
@@ -19,10 +19,14 @@ const stackProxies = LOCAL_STACK ? stackProxyDefaults() : {};
 
 const localStackViteEnv = LOCAL_STACK
   ? {
-      VITE_JMAP_SERVER_URL: process.env.VITE_JMAP_SERVER_URL ?? `https://localhost:${PORT}/stalwart-jmap`,
-      VITE_OIDC_ISSUER: process.env.VITE_OIDC_ISSUER ?? `https://localhost:${PORT}/realms/tbpro`,
+      VITE_JMAP_SERVER_URL: process.env.VITE_JMAP_SERVER_URL ?? `${BASE_URL}/stalwart-jmap`,
+      VITE_OIDC_ISSUER: process.env.VITE_OIDC_ISSUER ?? `${BASE_URL}/realms/tbpro`,
       VITE_OIDC_CLIENT_ID: process.env.VITE_OIDC_CLIENT_ID ?? 'thunderbird-stormbox-test',
-      VITE_SENDER_AVATAR_PROXY_URL: process.env.VITE_SENDER_AVATAR_PROXY_URL ?? `https://localhost:${PORT}/sender-avatar`,
+      VITE_SENDER_AVATAR_PROXY_URL: process.env.VITE_SENDER_AVATAR_PROXY_URL ?? `${BASE_URL}/sender-avatar`,
+      // The proxy rewrites Keycloak's advertised origin to this value, so a
+      // lane on a non-default port needs it to follow the lane rather than
+      // fall back to the dev default.
+      VITE_LOCAL_PUBLIC_ORIGIN: process.env.VITE_LOCAL_PUBLIC_ORIGIN ?? BASE_URL,
       VITE_LOCAL_STACK: '1',
     }
   : {};
@@ -163,6 +167,10 @@ export default defineConfig({
   // second Thundermail principal first. The per-test speedup comes
   // from storageState (Keycloak login skipped), not from worker
   // parallelism.
+  //
+  // This bounds one process only. A second `npm run test:e2e:local:full`
+  // races the first just as surely; the lane lock in global setup is what
+  // stops that.
   workers: LOCAL_STACK ? 1 : undefined,
   forbidOnly: !!process.env.CI,
   // One retry covers the occasional Keycloak SSO blip; real
@@ -170,10 +178,17 @@ export default defineConfig({
   retries: LOCAL_STACK ? 1 : 0,
   reporter: process.env.CI ? 'github' : 'list',
   globalSetup: LOCAL_STACK ? './tests/e2e/global-setup.js' : undefined,
+  // Releases the single-lane lock the setup takes. A run killed outright
+  // never gets here, so the lock also clears itself once its holder is gone.
+  globalTeardown: LOCAL_STACK ? './tests/e2e/global-teardown.js' : undefined,
 
   use: {
     baseURL: BASE_URL,
     ignoreHTTPSErrors: true,
+    // A click or fill whose target never becomes actionable fails here
+    // instead of consuming the whole test budget; waits that are genuinely
+    // long belong in an explicit expect or waitFor with its own timeout.
+    actionTimeout: 15_000,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
