@@ -2,6 +2,7 @@
 
 **Status**: Prototype proposed upstream
 **Proposal**: https://ideas.tb.pro/p/visual-server-side-mail-rules-using-jmap-sieve
+**Issue**: https://github.com/thunderbird/stormbox/issues/128
 
 ## Goal
 
