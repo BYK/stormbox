@@ -150,7 +150,8 @@ describe('MailRulesDialog', () => {
     const addNestedCondition = nested.findAll('button')
       .find((button) => button.text().trim() === 'Condition');
     await addNestedCondition!.trigger('click');
-    const nestedValues = nested.findAll('input[aria-label="Condition value"]');
+    const nestedValues = wrapper.get('.condition-group--nested')
+      .findAll('input[aria-label="Condition value"]');
     await nestedValues[1].setValue('manager@example.com');
 
     await wrapper.get('[data-mail-rules-save]').trigger('click');
@@ -190,7 +191,7 @@ describe('MailRulesDialog', () => {
     await flushPromises();
 
     expect(wrapper.get('[data-mail-rules-save]').attributes('disabled')).toBeDefined();
-    expect(condition.attributes('disabled')).toBeDefined();
+    expect(wrapper.get('input[aria-label="Condition value"]').attributes('disabled')).toBeDefined();
 
     releaseSave();
     await flushPromises();
