@@ -31,8 +31,9 @@ function snapshot(overrides: Record<string, unknown> = {}) {
     },
     scripts: [],
     managedScript: null,
+    editableScript: null,
     foreignActiveScript: null,
-    document: { version: 1, rules: [] },
+    document: { version: 2, rules: [] },
     parseError: null,
     ...overrides,
   };
@@ -63,7 +64,10 @@ function mountDialog() {
   });
 }
 
-function installRepo({ foreign = false } = {}) {
+function installRepo({
+  foreign = false,
+  saveGate = null,
+}: { foreign?: boolean; saveGate?: Promise<void> | null } = {}) {
   let serverSnapshot = snapshot(foreign ? {
     scripts: [{ id: 'foreign', name: 'Handwritten filters', isActive: true }],
     foreignActiveScript: { id: 'foreign', name: 'Handwritten filters' },
@@ -76,11 +80,13 @@ function installRepo({ foreign = false } = {}) {
       return { id: 72 };
     }),
     runMutation: vi.fn(async () => {
+      if (saveGate) await saveGate;
       serverSnapshot = snapshot({
         state: 'sieve-state-2',
         document: pendingRequest.document,
         scripts: [{ id: 'managed', name: 'Stormbox Mail Rules', isActive: true }],
         managedScript: { id: 'managed', name: 'Stormbox Mail Rules', isActive: true },
+        editableScript: { id: 'managed', name: 'Stormbox Mail Rules', isActive: true },
       });
       return { attempted: 1, succeeded: 1, failed: 0 };
     }),
@@ -108,6 +114,7 @@ describe('MailRulesDialog', () => {
 
     expect(wrapper.text()).toContain('No rules yet');
     await wrapper.get('[data-mail-rules-add]').trigger('click');
+    expect(wrapper.find('select').exists()).toBe(false);
     await wrapper.get('input[aria-label="Condition value"]').setValue('newsletter');
     await wrapper.get('[data-mail-rules-save]').trigger('click');
     await flushPromises();
@@ -121,6 +128,72 @@ describe('MailRulesDialog', () => {
       conditions: [{ field: 'from', operator: 'contains', value: 'newsletter' }],
       actions: [{ type: 'markRead' }],
     });
+    expect(wrapper.text()).toContain('Rules saved, validated, and activated.');
+  });
+
+  it('builds nested any/all condition groups', async () => {
+    const repo = installRepo();
+    const wrapper = mountDialog();
+    await flushPromises();
+
+    await wrapper.get('[data-mail-rules-add]').trigger('click');
+    await wrapper.get('input[aria-label="Condition value"]').setValue('project');
+    const addGroup = wrapper.findAll('button').find((button) => button.text().trim() === 'Group');
+    expect(addGroup).toBeTruthy();
+    await addGroup!.trigger('click');
+
+    const nested = wrapper.get('.condition-group--nested');
+    await nested.get('summary[aria-label="Nested condition match mode"]').trigger('click');
+    await nested.get('[data-rule-option="any"]').trigger('click');
+    await nested.get('.condition-group__header input[type="checkbox"]').setValue(true);
+    await nested.get('input[aria-label="Condition value"]').setValue('lead@example.com');
+    const addNestedCondition = nested.findAll('button')
+      .find((button) => button.text().trim() === 'Condition');
+    await addNestedCondition!.trigger('click');
+    const nestedValues = nested.findAll('input[aria-label="Condition value"]');
+    await nestedValues[1].setValue('manager@example.com');
+
+    await wrapper.get('[data-mail-rules-save]').trigger('click');
+    await flushPromises();
+
+    const queued = JSON.parse(repo.insertPendingMutation.mock.calls[0][0].requestJson);
+    expect(queued.document.rules[0]).toMatchObject({
+      match: 'all',
+      conditions: [
+        { type: 'condition', value: 'project' },
+        {
+          type: 'group',
+          match: 'any',
+          negated: true,
+          conditions: [
+            { type: 'condition', value: 'lead@example.com' },
+            { type: 'condition', value: 'manager@example.com' },
+          ],
+        },
+      ],
+    });
+  });
+
+  it('locks the draft while a server save is in flight', async () => {
+    let releaseSave = () => {};
+    const saveGate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    installRepo({ saveGate });
+    const wrapper = mountDialog();
+    await flushPromises();
+
+    await wrapper.get('[data-mail-rules-add]').trigger('click');
+    const condition = wrapper.get('input[aria-label="Condition value"]');
+    await condition.setValue('locked');
+    await wrapper.get('[data-mail-rules-save]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get('[data-mail-rules-save]').attributes('disabled')).toBeDefined();
+    expect(condition.attributes('disabled')).toBeDefined();
+
+    releaseSave();
+    await flushPromises();
     expect(wrapper.text()).toContain('Rules saved, validated, and activated.');
   });
 

@@ -25,6 +25,7 @@ export interface MailRulesSnapshot {
   capabilities: SieveRuleCapabilities;
   scripts: RuleScriptSummary[];
   managedScript: RuleScriptSummary | null;
+  editableScript: RuleScriptSummary | null;
   foreignActiveScript: RuleScriptSummary | null;
   document: MailRuleDocument;
   parseError: string | null;
@@ -94,7 +95,9 @@ export const useRulesStore = defineStore('rules', () => {
     const document = normalizeRuleDocument(input);
     // Give immediate editor feedback; the SharedWorker compiles again
     // against a freshly fetched capability snapshot before uploading.
-    compileRules(document, snapshot.value.capabilities);
+    compileRules(document, snapshot.value.capabilities, {
+      managed: snapshot.value.managedScript !== null || snapshot.value.editableScript === null,
+    });
 
     saving.value = true;
     error.value = null;

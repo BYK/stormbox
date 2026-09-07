@@ -7,6 +7,8 @@ import {
 } from '@lucide/vue';
 
 import AppButton from './AppButton.vue';
+import MailRuleSelect from './MailRuleSelect.vue';
+import MailRuleTestEditor from './MailRuleTestEditor.vue';
 import { useAuthStore } from '../stores/auth-store';
 import { useMailStore } from '../stores/mail-store';
 import { MailRulesSaveError, useRulesStore } from '../stores/rules-store';
@@ -18,7 +20,7 @@ import {
   RuleValidationError,
 } from '../sieve/rules';
 import type {
-  MailRule, MailRuleAction, MailRuleCondition, MailRuleDocument,
+  MailRule, MailRuleAction, MailRuleDocument,
 } from '../sieve/rules';
 
 const emit = defineEmits<{ (event: 'close'): void }>();
@@ -28,7 +30,7 @@ const mailStore = useMailStore();
 const rulesStore = useRulesStore();
 const panelEl = ref<HTMLElement | null>(null);
 const closeButtonEl = ref<HTMLButtonElement | null>(null);
-const draft = ref<MailRuleDocument>({ version: 1, rules: [] });
+const draft = ref<MailRuleDocument>({ version: 2, rules: [] });
 const baseline = ref('');
 const localError = ref<string | null>(null);
 const notice = ref<string | null>(null);
@@ -70,6 +72,16 @@ const actionOptions = [
   { value: 'discard', label: 'Discard' },
 ] as const;
 
+const availableActionOptions = computed(() => actionOptions.map((option) => ({
+  ...option,
+  disabled: !actionSupported(option.value),
+})));
+
+const folderSelectOptions = computed(() => folderOptions.value.map((folder) => ({
+  value: folder.remoteId,
+  label: folder.label,
+})));
+
 function actionSupported(type: MailRuleAction['type']): boolean {
   if (type === 'move') return canMove.value;
   if (type === 'markRead' || type === 'star') return canFlags.value;
@@ -95,27 +107,6 @@ function moveRule(index: number, delta: number) {
   draft.value.rules.splice(target, 0, rule);
 }
 
-function addCondition(rule: MailRule) {
-  rule.conditions.push({
-    id: newRuleId('condition'),
-    field: 'from',
-    operator: 'contains',
-    value: '',
-  });
-}
-
-function removeCondition(rule: MailRule, index: number) {
-  if (rule.conditions.length <= 1) return;
-  rule.conditions.splice(index, 1);
-}
-
-function onConditionFieldChange(condition: MailRuleCondition, event: Event) {
-  const value = (event.target as HTMLSelectElement).value as MailRuleCondition['field'];
-  condition.field = value;
-  if (value === 'header' && !condition.headerName) condition.headerName = 'X-Header';
-  if (value !== 'header') delete condition.headerName;
-}
-
 function addAction(rule: MailRule) {
   rule.actions.push(createDefaultAction());
 }
@@ -125,13 +116,12 @@ function removeAction(rule: MailRule, index: number) {
   rule.actions.splice(index, 1);
 }
 
-function onActionTypeChange(rule: MailRule, index: number, event: Event) {
-  const type = (event.target as HTMLSelectElement).value as MailRuleAction['type'];
+function onActionTypeChange(rule: MailRule, index: number, value: string) {
+  const type = value as MailRuleAction['type'];
   rule.actions.splice(index, 1, createAction(type));
 }
 
-function onMoveTargetChange(action: Extract<MailRuleAction, { type: 'move' }>, event: Event) {
-  const mailboxId = (event.target as HTMLSelectElement).value;
+function onMoveTargetChange(action: Extract<MailRuleAction, { type: 'move' }>, mailboxId: string) {
   const target = folderOptions.value.find((folder) => folder.remoteId === mailboxId);
   action.mailboxId = mailboxId;
   action.mailboxName = target?.label ?? action.mailboxName;
@@ -162,7 +152,7 @@ async function load() {
   notice.value = null;
   try {
     await rulesStore.load();
-    draft.value = rulesStore.freshDocument();
+    draft.value = resolveFolderTargets(rulesStore.freshDocument());
     baseline.value = JSON.stringify(draft.value);
   } catch (error) {
     localError.value = errorMessage(error);
@@ -193,7 +183,7 @@ async function persist(takeover: boolean) {
   notice.value = null;
   try {
     await rulesStore.save(draft.value, { takeover });
-    draft.value = rulesStore.freshDocument();
+    draft.value = resolveFolderTargets(rulesStore.freshDocument());
     baseline.value = JSON.stringify(draft.value);
     notice.value = 'Rules saved, validated, and activated.';
   } catch (error) {
@@ -227,6 +217,19 @@ function refreshFolderFallbacks(input: MailRuleDocument): MailRuleDocument {
         );
       }
       action.mailboxName = label;
+    }
+  }
+  return document;
+}
+
+function resolveFolderTargets(input: MailRuleDocument): MailRuleDocument {
+  const document = cloneRuleDocument(input);
+  const foldersByLabel = new Map(folderOptions.value.map((folder) => [folder.label, folder.remoteId]));
+  for (const rule of document.rules) {
+    for (const action of rule.actions) {
+      if (action.type === 'move' && !action.mailboxId) {
+        action.mailboxId = foldersByLabel.get(action.mailboxName) ?? '';
+      }
     }
   }
   return document;
@@ -274,7 +277,7 @@ function onWindowKeydown(event: KeyboardEvent) {
     : panelEl.value;
   if (!focusRoot) return;
   const focusable = [...focusRoot.querySelectorAll<HTMLElement>(
-    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    'button:not([disabled]), input:not([disabled]), summary:not([aria-disabled="true"]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
   )].filter((element) => element.offsetParent !== null);
   if (focusable.length === 0) return;
   const first = focusable[0];
@@ -379,6 +382,17 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
+              <div
+                v-else-if="rulesStore.snapshot.editableScript && !rulesStore.snapshot.managedScript"
+                class="mail-rules__alert"
+                role="status"
+              >
+                <div>
+                  <strong>This existing script is visually compatible.</strong>
+                  <p>Saving will update the same script and normalize its Sieve formatting.</p>
+                </div>
+              </div>
+
               <div class="mail-rules__toolbar">
                 <div class="mail-rules__summary">
                   <Filter :size="17" aria-hidden="true" />
@@ -435,58 +449,14 @@ onBeforeUnmount(() => {
                   </header>
 
                   <div class="mail-rule__section">
-                    <div class="mail-rule__section-title">
-                      <span>When</span>
-                      <select v-model="rule.match" aria-label="Condition match mode">
-                        <option value="all">all conditions match</option>
-                        <option value="any">any condition matches</option>
-                      </select>
-                    </div>
-                    <div
-                      v-for="(condition, conditionIndex) in rule.conditions"
-                      :key="condition.id"
-                      class="mail-rule__row mail-rule__condition"
-                    >
-                      <select
-                        :value="condition.field"
-                        aria-label="Condition field"
-                        @change="onConditionFieldChange(condition, $event)"
-                      >
-                        <option value="from">From</option>
-                        <option value="to">To</option>
-                        <option value="toCc">To or Cc</option>
-                        <option value="subject">Subject</option>
-                        <option value="header">Custom header</option>
-                      </select>
-                      <input
-                        v-if="condition.field === 'header'"
-                        v-model="condition.headerName"
-                        type="text"
-                        aria-label="Header name"
-                        placeholder="X-Header"
-                      />
-                      <select v-model="condition.operator" aria-label="Condition operator">
-                        <option value="is">is</option>
-                        <option value="contains">contains</option>
-                        <option value="matches">matches wildcard</option>
-                      </select>
-                      <input
-                        v-model="condition.value"
-                        type="text"
-                        aria-label="Condition value"
-                        placeholder="Value"
-                      />
-                      <button
-                        class="mail-rules__icon-button"
-                        type="button"
-                        :disabled="rule.conditions.length === 1"
-                        aria-label="Remove condition"
-                        @click="removeCondition(rule, conditionIndex)"
-                      ><X :size="15" aria-hidden="true" /></button>
-                    </div>
-                    <button class="mail-rules__text-button" type="button" @click="addCondition(rule)">
-                      + Add condition
-                    </button>
+                    <MailRuleTestEditor
+                      root
+                      :match="rule.match"
+                      :conditions="rule.conditions"
+                      :disabled="busy"
+                      @update:match="rule.match = $event"
+                      @update:conditions="rule.conditions = $event"
+                    />
                   </div>
 
                   <div class="mail-rule__section">
@@ -496,31 +466,22 @@ onBeforeUnmount(() => {
                       :key="action.id"
                       class="mail-rule__row mail-rule__action"
                     >
-                      <select
-                        :value="action.type"
+                      <MailRuleSelect
+                        :model-value="action.type"
+                        :options="availableActionOptions"
                         aria-label="Rule action"
-                        @change="onActionTypeChange(rule, actionIndex, $event)"
-                      >
-                        <option
-                          v-for="option in actionOptions"
-                          :key="option.value"
-                          :value="option.value"
-                          :disabled="!actionSupported(option.value)"
-                        >{{ option.label }}</option>
-                      </select>
-                      <select
+                        :disabled="busy"
+                        @update:model-value="onActionTypeChange(rule, actionIndex, $event)"
+                      />
+                      <MailRuleSelect
                         v-if="action.type === 'move'"
-                        :value="action.mailboxId"
+                        :model-value="action.mailboxId"
+                        :options="folderSelectOptions"
                         aria-label="Destination folder"
-                        @change="onMoveTargetChange(action, $event)"
-                      >
-                        <option value="" disabled>Select folder</option>
-                        <option
-                          v-for="folder in folderOptions"
-                          :key="folder.remoteId"
-                          :value="folder.remoteId"
-                        >{{ folder.label }}</option>
-                      </select>
+                        placeholder="Select folder"
+                        :disabled="busy"
+                        @update:model-value="onMoveTargetChange(action, $event)"
+                      />
                       <input
                         v-else-if="action.type === 'redirect'"
                         v-model="action.address"
@@ -727,7 +688,7 @@ onBeforeUnmount(() => {
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--panel2);
-  overflow: hidden;
+  overflow: visible;
 }
 .mail-rule__header {
   gap: 6px;
@@ -758,10 +719,6 @@ onBeforeUnmount(() => {
   letter-spacing: 0.04em;
   color: var(--muted);
 }
-.mail-rule__section-title select {
-  text-transform: none;
-  letter-spacing: normal;
-}
 .mail-rule__row {
   display: grid;
   gap: 8px;
@@ -789,8 +746,7 @@ onBeforeUnmount(() => {
   color: var(--muted);
   font-size: 12px;
 }
-.mail-rule input,
-.mail-rule select {
+.mail-rule input {
   box-sizing: border-box;
   width: 100%;
   min-width: 0;
@@ -808,8 +764,7 @@ onBeforeUnmount(() => {
   min-height: 16px;
   accent-color: var(--accent);
 }
-.mail-rule input:focus-visible,
-.mail-rule select:focus-visible {
+.mail-rule input:focus-visible {
   border-color: var(--accent);
   outline: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
   outline-offset: 1px;

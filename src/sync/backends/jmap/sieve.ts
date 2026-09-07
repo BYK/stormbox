@@ -5,6 +5,7 @@ import {
   MANAGED_SCRIPT_NAME,
   normalizeRuleDocument,
   parseManagedRules,
+  parseVisualRules,
   RuleValidationError,
   SIEVE_CAPABILITY,
   uniqueManagedScriptName,
@@ -27,6 +28,7 @@ export interface MailRulesSnapshot {
   capabilities: SieveRuleCapabilities;
   scripts: Array<{ id: string; name: string | null; isActive: boolean }>;
   managedScript: { id: string; name: string | null; isActive: boolean } | null;
+  editableScript: { id: string; name: string | null; isActive: boolean } | null;
   foreignActiveScript: { id: string; name: string | null } | null;
   document: MailRuleDocument;
   parseError: string | null;
@@ -62,6 +64,7 @@ export async function getMailRules({
   const scripts = normalizeScriptList(response.list);
   const managed: Array<{ script: SieveScriptRecord; document: MailRuleDocument }> = [];
   const malformedManaged: string[] = [];
+  const sources = new Map<string, string>();
 
   for (const script of scripts) {
     const bytes = await transport.download({
@@ -71,6 +74,7 @@ export async function getMailRules({
       name: `${script.name || 'script'}.siv`,
     });
     const source = new TextDecoder().decode(bytes);
+    sources.set(script.id, source);
     if (!isManagedRulesScript(source)) continue;
     try {
       const document = parseManagedRules(source);
@@ -86,8 +90,20 @@ export async function getMailRules({
   } else if (managed.length > 1) {
     parseError = 'More than one Stormbox-managed rule script exists. Resolve the duplicate scripts before saving.';
   }
-  const selected = managed.find((entry) => entry.script.isActive) ?? managed[0] ?? null;
   const active = scripts.find((script) => script.isActive) ?? null;
+  const activeManaged = managed.find((entry) => entry.script.id === active?.id) ?? null;
+  let selected = activeManaged;
+  if (!selected && active && malformedManaged.length === 0) {
+    try {
+      selected = {
+        script: active,
+        document: parseVisualRules(sources.get(active.id) ?? ''),
+      };
+    } catch {
+      // An unrepresentable active script remains available for explicit takeover.
+    }
+  }
+  selected ??= managed[0] ?? null;
   const foreignActive = active && active.id !== selected?.script.id ? active : null;
 
   return {
@@ -96,7 +112,10 @@ export async function getMailRules({
     state: typeof response.state === 'string' ? response.state : null,
     capabilities: context.capabilities,
     scripts: scripts.map(publicScript),
-    managedScript: selected ? publicScript(selected.script) : null,
+    managedScript: selected && isManagedRulesScript(sources.get(selected.script.id) ?? '')
+      ? publicScript(selected.script)
+      : null,
+    editableScript: selected ? publicScript(selected.script) : null,
     foreignActiveScript: foreignActive
       ? { id: foreignActive.id, name: foreignActive.name }
       : null,
@@ -151,7 +170,9 @@ export async function runSetSieveRules({
 
   let source: string;
   try {
-    source = compileRules(document, snapshot.capabilities);
+    source = compileRules(document, snapshot.capabilities, {
+      managed: snapshot.managedScript !== null || snapshot.editableScript === null,
+    });
   } catch (error) {
     return terminalError('invalidRules', errorMessage(error));
   }
@@ -195,7 +216,7 @@ export async function runSetSieveRules({
     );
   }
 
-  const managed = snapshot.managedScript;
+  const managed = snapshot.editableScript;
   const creationId = 'stormbox';
   const setRequest: any = {
     accountId: snapshot.accountId,
@@ -306,6 +327,7 @@ function unsupportedSnapshot(): MailRulesSnapshot {
     capabilities: { sieveExtensions: [] },
     scripts: [],
     managedScript: null,
+    editableScript: null,
     foreignActiveScript: null,
     document: emptyRuleDocument(),
     parseError: null,

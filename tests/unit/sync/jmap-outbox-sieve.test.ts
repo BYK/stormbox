@@ -10,14 +10,15 @@ import { JMAP_CAPS } from '../../../src/sync/backends/jmap/transport';
 import { MockTransport } from './_mock-transport';
 
 const DOCUMENT: MailRuleDocument = {
-  version: 1,
+  version: 2,
   rules: [{
     id: 'rule-1',
     name: 'Discard automated noise',
     enabled: true,
     match: 'all',
     conditions: [{
-      id: 'condition-1', field: 'from', operator: 'contains', value: 'noise@example.net',
+      id: 'condition-1', type: 'condition', negated: false,
+      field: 'from', operator: 'contains', value: 'noise@example.net',
     }],
     actions: [{ id: 'action-1', type: 'discard' }],
     stopProcessing: true,
