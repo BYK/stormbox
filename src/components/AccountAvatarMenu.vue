@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import { onClickOutside } from '@vueuse/core';
-import { LogOut, RotateCcw, Settings } from '@lucide/vue';
+import {
+  ListFilter, LogOut, RotateCcw, Settings,
+} from '@lucide/vue';
 
 import { useAuthStore } from '../stores/auth-store';
 import { ACCOUNTS_URL } from '../defines';
@@ -9,6 +11,7 @@ import { senderAvatarStyle, senderInitials } from '../utils/sender-avatar';
 
 const authStore = useAuthStore();
 const emit = defineEmits<{
+  (event: 'show-mail-rules'): void;
   (event: 'show-welcome-modal'): void;
 }>();
 
@@ -34,6 +37,11 @@ function onShowWelcomeModal() {
   if (detailsEl.value) detailsEl.value.open = false;
   emit('show-welcome-modal');
 }
+
+function onShowMailRules() {
+  if (detailsEl.value) detailsEl.value.open = false;
+  emit('show-mail-rules');
+}
 </script>
 
 <template>
@@ -50,6 +58,10 @@ function onShowWelcomeModal() {
         </span>
         <span class="account-menu__email">{{ identityLabel }}</span>
       </div>
+      <button class="account-menu__item" type="button" role="menuitem" @click="onShowMailRules">
+        <ListFilter :size="16" :stroke-width="1.75" aria-hidden="true" />
+        <span>Mail Rules</span>
+      </button>
       <a class="account-menu__item" :href="ACCOUNTS_URL" role="menuitem">
         <Settings :size="16" :stroke-width="1.75" aria-hidden="true" />
         <span>Account Settings</span>

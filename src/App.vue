@@ -45,6 +45,7 @@ import AppDrawer from './components/AppDrawer.vue';
 import TopNavMenu from './components/TopNavMenu.vue';
 import AccountAvatarMenu from './components/AccountAvatarMenu.vue';
 import WelcomeModal from './components/WelcomeModal.vue';
+import MailRulesDialog from './components/MailRulesDialog.vue';
 import SettingsDialog from './components/settings/SettingsDialog.vue';
 import SettingsGearButton from './components/settings/SettingsGearButton.vue';
 // Staff-only Kanban feature (src/features/kanban): the settings dialog's
@@ -153,6 +154,7 @@ const messageListWidth = ref(DEFAULT_COLUMN_WIDTHS.messageList);
 const folderListHidden = ref(false);
 const showWelcomeModal = ref(false);
 const showSettingsDialog = ref(false);
+const showMailRules = ref(false);
 // With 'system' the OS decides, so a manual light/dark button would fight it.
 const showThemeToggle = computed(() => theme.value !== 'system');
 // Modal dialogs own the keyboard: a single-letter mail shortcut must not
@@ -160,7 +162,8 @@ const showThemeToggle = computed(() => theme.value !== 'system');
 const shortcutsEnabled = computed(() =>
   authStore.status === AUTH_STATE.CONNECTED
   && !showWelcomeModal.value
-  && !showSettingsDialog.value,
+  && !showSettingsDialog.value
+  && !showMailRules.value,
 );
 const windowWidth = ref(typeof window === 'undefined' ? COMPACT_READING_WIDTH : window.innerWidth);
 const wantsMessageDetailView = computed(() =>
@@ -771,7 +774,10 @@ function clamp(value: number, min: number, max: number) {
           @toggle-theme="toggleTheme"
           @open-settings="showSettingsDialog = true"
         />
-        <AccountAvatarMenu @show-welcome-modal="showWelcomeModalAgain" />
+        <AccountAvatarMenu
+          @show-mail-rules="showMailRules = true"
+          @show-welcome-modal="showWelcomeModalAgain"
+        />
       </div>
     </header>
 
@@ -886,6 +892,7 @@ function clamp(value: number, min: number, max: number) {
       singular-item-label="message"
       :total="mailStore.bulkOperation.total"
     />
+    <MailRulesDialog v-if="showMailRules" @close="showMailRules = false" />
     <WelcomeModal
       v-if="showWelcomeModal"
       @dismiss="dismissWelcomeModal"
