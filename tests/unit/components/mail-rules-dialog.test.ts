@@ -142,16 +142,19 @@ describe('MailRulesDialog', () => {
     expect(addGroup).toBeTruthy();
     await addGroup!.trigger('click');
 
-    const nested = wrapper.get('.condition-group--nested');
-    await nested.get('summary[aria-label="Nested condition match mode"]').trigger('click');
-    await nested.get('[data-rule-option="any"]').trigger('click');
-    await nested.get('.condition-group__header input[type="checkbox"]').setValue(true);
-    await nested.get('input[aria-label="Condition value"]').setValue('lead@example.com');
-    const addNestedCondition = nested.findAll('button')
+    await wrapper.get('.condition-group--nested summary[aria-label="Nested condition match mode"]')
+      .trigger('click');
+    await wrapper.get('.condition-group--nested [data-rule-option="any"]').trigger('click');
+    await wrapper.get('.condition-group--nested .condition-group__header input[type="checkbox"]')
+      .setValue(true);
+    await wrapper.get('.condition-group--nested input[aria-label="Condition value"]')
+      .setValue('lead@example.com');
+    const addNestedCondition = wrapper.get('.condition-group--nested').findAll('button')
       .find((button) => button.text().trim() === 'Condition');
     await addNestedCondition!.trigger('click');
     const nestedValues = wrapper.get('.condition-group--nested')
       .findAll('input[aria-label="Condition value"]');
+    expect(nestedValues).toHaveLength(2);
     await nestedValues[1].setValue('manager@example.com');
 
     await wrapper.get('[data-mail-rules-save]').trigger('click');
