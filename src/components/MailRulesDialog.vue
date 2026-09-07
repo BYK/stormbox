@@ -469,7 +469,7 @@ onBeforeUnmount(() => {
                       <MailRuleSelect
                         :model-value="action.type"
                         :options="availableActionOptions"
-                        aria-label="Rule action"
+                        control-label="Rule action"
                         :disabled="busy"
                         @update:model-value="onActionTypeChange(rule, actionIndex, $event)"
                       />
@@ -477,7 +477,7 @@ onBeforeUnmount(() => {
                         v-if="action.type === 'move'"
                         :model-value="action.mailboxId"
                         :options="folderSelectOptions"
-                        aria-label="Destination folder"
+                        control-label="Destination folder"
                         placeholder="Select folder"
                         :disabled="busy"
                         @update:model-value="onMoveTargetChange(action, $event)"

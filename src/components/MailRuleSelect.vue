@@ -14,7 +14,7 @@ interface MailRuleSelectOption {
 const props = withDefaults(defineProps<{
   modelValue: string;
   options: readonly MailRuleSelectOption[];
-  ariaLabel: string;
+  controlLabel: string;
   placeholder?: string;
   disabled?: boolean;
 }>(), {
@@ -83,13 +83,13 @@ function selectOption(option: MailRuleSelectOption, event: Event): void {
   <AppDropdown class="mail-rule-select" :disabled="disabled">
     <summary
       class="app-dropdown__summary app-dropdown__summary--control mail-rule-select__summary"
-      :aria-label="ariaLabel"
+      :aria-label="controlLabel"
       :aria-disabled="disabled ? 'true' : undefined"
       aria-haspopup="menu"
       :tabindex="disabled ? -1 : undefined"
       @keydown="openFromKeyboard"
     >{{ selectedLabel }}</summary>
-    <div class="app-dropdown__menu mail-rule-select__menu" role="menu" :aria-label="ariaLabel">
+    <div class="app-dropdown__menu mail-rule-select__menu" role="menu" :aria-label="controlLabel">
       <button
         v-for="option in options"
         :key="option.value"
