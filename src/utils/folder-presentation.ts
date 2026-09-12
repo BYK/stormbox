@@ -28,6 +28,7 @@ export const ROLE_ICON: Partial<Record<MailboxRole, string>> = {
   inbox: inboxIcon,
   sent: sentIcon,
   drafts: draftIcon,
+  scheduled: scheduledIcon,
   archive: archiveIcon,
   trash: trashIcon,
   junk: spamIcon,
@@ -37,6 +38,7 @@ export const ROLE_COLOR: Partial<Record<MailboxRole, string>> = {
   inbox: '#1a73e8',
   sent: '#188038',
   drafts: '#7e22ce',
+  scheduled: '#0e7490',
   archive: '#8b5a2b',
   trash: '#5f6368',
   junk: '#d93025',
@@ -45,7 +47,7 @@ export const ROLE_COLOR: Partial<Record<MailboxRole, string>> = {
   all: '#5f6368',
 };
 
-interface NamedFolderPresentation {
+export interface NamedFolderPresentation {
   icon: string;
   color: string;
 }
@@ -64,12 +66,6 @@ export interface FolderPresentationInput {
   name?: string | null;
   role?: MailboxRole | null;
   is_starred?: 0 | 1 | null;
-  /** Mail-store decoration marking the managed Send Later mailbox. */
-  is_scheduled?: 0 | 1 | null;
-}
-
-function isScheduledFolder(folder: FolderPresentationInput): boolean {
-  return Number(folder.is_scheduled ?? 0) === 1;
 }
 
 export function defaultFolderKey(name: string | null | undefined): string {
@@ -83,9 +79,6 @@ export function defaultFolderKey(name: string | null | undefined): string {
  * the generic folder icon and the goldenrod tone.
  */
 export function folderPresentation(folder: FolderPresentationInput): NamedFolderPresentation {
-  if (isScheduledFolder(folder)) {
-    return { icon: scheduledIcon, color: '#0e7490' };
-  }
   const role = folder.role ?? null;
   const namedDefault = DEFAULT_FOLDER_BY_NAME[defaultFolderKey(folder.name)];
   return {
@@ -94,17 +87,32 @@ export function folderPresentation(folder: FolderPresentationInput): NamedFolder
   };
 }
 
+export interface FolderBadgeInput {
+  role?: MailboxRole | null;
+  unread_emails?: number | string | null;
+  total_emails?: number | string | null;
+}
+
+/**
+ * The number a folder's own sidebar badge shows. Unread for every
+ * folder except Scheduled, whose messages are created `$seen`
+ * (SL-3.3) and would otherwise never badge: there the badge is the
+ * number of sends still waiting to leave (SL-5.7).
+ */
+export function folderBadgeCount(folder: FolderBadgeInput): number {
+  const source = folder.role === 'scheduled' ? folder.total_emails : folder.unread_emails;
+  return Math.max(0, Number(source) || 0);
+}
+
 /**
  * Display order for the role-anchored "main" folders. Anything else
  * sorts after them and falls back to alphabetical.
  */
 export function folderSortKey(folder: FolderPresentationInput): number {
-  // The managed Scheduled mailbox is roleless but anchored right
-  // below Drafts, matching where the messages it holds came from.
-  if (isScheduledFolder(folder)) return 2;
   switch (folder.role) {
     case 'inbox': return 0;
     case 'drafts': return 1;
+    case 'scheduled': return 2;
     case 'sent': return 3;
     case 'archive': return 4;
     case 'junk': return 5;
@@ -119,7 +127,6 @@ export function folderSortKey(folder: FolderPresentationInput): number {
  * folder tree.
  */
 export function isMainFolder(folder: FolderPresentationInput): boolean {
-  if (isScheduledFolder(folder)) return true;
   return folder.role != null && ROLE_ICON[folder.role] != null;
 }
 

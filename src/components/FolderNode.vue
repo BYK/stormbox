@@ -2,6 +2,8 @@
 import { computed } from 'vue';
 import { Star } from '@lucide/vue';
 
+import { folderBadgeCount } from '../utils/folder-presentation';
+
 const props = defineProps({
   folder: { type: Object, required: true },
   currentFolderId: { type: [Number, String, null], default: null },
@@ -13,19 +15,24 @@ const props = defineProps({
   onFolderDragOver: { type: Function, default: null },
   onFolderDragLeave: { type: Function, default: null },
   onFolderDrop: { type: Function, default: null },
+  // `data-tour` value for the row and its subtree so the feature spotlight
+  // can ring a whole section; the component has two roots, so attrs would
+  // not fall through.
+  tourHook: { type: String, default: undefined },
 });
 
 const current = computed(() => props.currentFolderId === props.folder.id);
 const iconSvg = computed(() => props.folder.icon);
 const hasChildren = computed(() => (props.folder.children?.length ?? 0) > 0);
 const collapsed = computed(() => hasChildren.value && props.isCollapsed(props.folder.id));
-// A collapsed parent shows the unread total of its whole subtree; an
-// expanded or leaf folder shows only its own unread count (children
-// surface their own counts when visible).
+// A collapsed parent shows the badge total of its whole subtree; an
+// expanded or leaf folder shows only its own count (children surface
+// their own counts when visible). Scheduled badges its pending sends
+// rather than unread mail (folderBadgeCount).
 const unread = computed(() => (
   collapsed.value
     ? Number(props.folder.subtree_unread) || 0
-    : Number(props.folder.unread_emails) || 0
+    : folderBadgeCount(props.folder)
 ));
 const indent = computed(() => `${10 + (props.folder.depth ?? 0) * 16}px`);
 const style = computed(() => ({
@@ -56,6 +63,7 @@ function toggle() {
       'is-drop-invalid': dropStateValue === 'invalid',
     }"
     :style="style"
+    :data-tour="tourHook"
     @dragenter="onFolderDragEnter?.(folder, $event)"
     @dragover="onFolderDragOver?.(folder, $event)"
     @dragleave="onFolderDragLeave?.(folder, $event)"
@@ -109,6 +117,7 @@ function toggle() {
       :on-folder-drag-over="onFolderDragOver"
       :on-folder-drag-leave="onFolderDragLeave"
       :on-folder-drop="onFolderDrop"
+      :tour-hook="tourHook"
     />
   </template>
 </template>

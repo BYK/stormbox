@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, onUpdated, ref, watch } from 'vue';
 import {
   Bold,
   Check,
@@ -41,6 +41,7 @@ import {
   isInlineRasterType,
   MAX_INLINE_RASTER_BYTES,
 } from '../utils/raster-images';
+import { scriptedPasteDetail } from '../utils/scripted-paste';
 import AppButton from './AppButton.vue';
 import AppDropdown from './AppDropdown.vue';
 
@@ -848,6 +849,30 @@ function handleNativePaste(event: ClipboardEvent): void {
   void classifyAndInsertPastedFiles(files);
 }
 
+const LONE_URL_PATTERN = /^https?:\/\/\S+$/i;
+
+// Files take the native paste-files path; text takes Squire's plain-text
+// paste behaviour, where a lone URL over a selection links that selection.
+function handleScriptedPaste(event: Event): void {
+  const detail = scriptedPasteDetail(event);
+  if (!detail || !squire) return;
+  rememberSelection();
+  if (detail.files && detail.files.length > 0) {
+    void classifyAndInsertPastedFiles(detail.files);
+    return;
+  }
+  const text = detail.text;
+  if (!text) return;
+  runEditorCommand((editor) => {
+    const range = editor.getSelection();
+    if (!range.collapsed && range.toString().trim() !== '' && LONE_URL_PATTERN.test(text)) {
+      editor.makeLink(text);
+    } else {
+      editor.insertPlainText(text, true);
+    }
+  });
+}
+
 function syncAfterKeyboardCommand(editor: Squire, range: Range | null = null) {
   ensureEditorBlocks();
   syncContentFromEditor();
@@ -947,6 +972,62 @@ function updateToolbarOverflow() {
 
 function scheduleToolbarOverflowUpdate() {
   void nextTick().then(updateToolbarOverflow);
+}
+
+/*
+ * WAI-ARIA toolbar pattern (APG "Toolbar"): the toolbar is one Tab stop.
+ * Exactly one top-level control carries tabindex="0" — the one focused most
+ * recently — and Arrow Left/Right, Home and End move between them. Menu
+ * items inside the dropdowns are not toolbar stops; a <details> hides them
+ * until its summary is activated.
+ */
+const TOOLBAR_CONTROL_SELECTOR = 'button, summary, input, select';
+let toolbarTabStop: HTMLElement | null = null;
+
+function toolbarControls(): HTMLElement[] {
+  const toolbar = toolbarEl.value;
+  if (!toolbar) return [];
+  return [...toolbar.querySelectorAll<HTMLElement>(TOOLBAR_CONTROL_SELECTOR)]
+    .filter((control) => !control.closest('.app-dropdown__menu'));
+}
+
+function syncToolbarTabStops() {
+  const controls = toolbarControls();
+  if (!toolbarTabStop || !controls.includes(toolbarTabStop)) {
+    toolbarTabStop = controls[0] ?? null;
+  }
+  controls.forEach((control) => {
+    const tabIndex = control === toolbarTabStop ? 0 : -1;
+    if (control.tabIndex !== tabIndex) control.tabIndex = tabIndex;
+  });
+}
+
+function onToolbarFocusIn(event: FocusEvent) {
+  const target = event.target;
+  if (!(target instanceof HTMLElement) || !toolbarControls().includes(target)) return;
+  toolbarTabStop = target;
+  syncToolbarTabStops();
+}
+
+function onToolbarKeydown(event: KeyboardEvent) {
+  const controls = toolbarControls();
+  const from = controls.indexOf(event.target as HTMLElement);
+  if (from === -1) return;
+  const rtl = toolbarEl.value
+    ? window.getComputedStyle(toolbarEl.value).direction === 'rtl'
+    : false;
+  const forward = rtl ? 'ArrowLeft' : 'ArrowRight';
+  const backward = rtl ? 'ArrowRight' : 'ArrowLeft';
+  let to: number;
+  switch (event.key) {
+    case forward: to = (from + 1) % controls.length; break;
+    case backward: to = (from - 1 + controls.length) % controls.length; break;
+    case 'Home': to = 0; break;
+    case 'End': to = controls.length - 1; break;
+    default: return;
+  }
+  event.preventDefault();
+  controls[to].focus();
 }
 
 function observeToolbarSize() {
@@ -1100,7 +1181,11 @@ onMounted(() => {
   const initialHtml = pendingHtml ?? props.initialHtml;
   pendingHtml = null;
   initEditor(initialHtml);
+  syncToolbarTabStops();
 });
+
+// Overflow re-renders toolbar groups; the single Tab stop has to survive it.
+onUpdated(syncToolbarTabStops);
 
 onUnmounted(() => {
   window.removeEventListener('resize', scheduleToolbarOverflowUpdate);
@@ -1132,6 +1217,8 @@ defineExpose({
       role="toolbar"
       aria-label="Rich text formatting"
       @pointerdown.capture="rememberSelection"
+      @focusin="onToolbarFocusIn"
+      @keydown="onToolbarKeydown"
     >
       <div v-if="isToolbarGroupVisible('style')" class="toolbar-group" data-toolbar-group="style">
         <button
@@ -1262,7 +1349,12 @@ defineExpose({
         </label>
       </div>
 
-      <div v-if="isToolbarGroupVisible('insert')" class="toolbar-group" data-toolbar-group="insert">
+      <div
+        v-if="isToolbarGroupVisible('insert')"
+        class="toolbar-group"
+        data-toolbar-group="insert"
+        data-tour="image-tools"
+      >
         <button
           type="button"
           class="toolbar-button"
@@ -1680,7 +1772,9 @@ defineExpose({
       </div>
     </form>
 
-    <div class="editor-wrap">
+    <!-- Firefox puts scrollable boxes in the Tab sequence; the body inside
+         is the stop, not its scroller. -->
+    <div class="editor-wrap" tabindex="-1">
       <div
         ref="editorEl"
         class="editor"
@@ -1691,6 +1785,7 @@ defineExpose({
         :aria-invalid="ariaInvalid ? 'true' : undefined"
         aria-multiline="true"
         @paste.capture="handleNativePaste"
+        @scripted-paste="handleScriptedPaste"
       />
     </div>
   </div>
@@ -1714,7 +1809,7 @@ defineExpose({
   display: grid;
   gap: 8px;
   padding: 10px;
-  border: 1px solid var(--border, #d6d9e2);
+  border: 1px solid var(--control-border, #d6d9e2);
   border-radius: 6px;
   background: var(--panel2, #f5f6f8);
 }
@@ -1732,7 +1827,7 @@ defineExpose({
 .editor-link-form__field input {
   min-width: 0;
   padding: 7px 9px;
-  border: 1px solid var(--border, #d6d9e2);
+  border: 1px solid var(--control-border, #d6d9e2);
   border-radius: 4px;
   background: var(--panel, #fff);
   color: var(--text, #1a1d24);
@@ -1759,7 +1854,7 @@ defineExpose({
   align-items: center;
   gap: 4px;
   padding: 6px;
-  border: 1px solid var(--border, #d6d9e2);
+  border: 1px solid var(--control-border, #d6d9e2);
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.04);
   overflow: visible;
@@ -1891,7 +1986,7 @@ defineExpose({
 }
 .editor-wrap {
   flex: 1;
-  border: 1px solid var(--border, #d6d9e2);
+  border: 1px solid var(--control-border, #d6d9e2);
   border-radius: 8px;
   padding: 8px;
   overflow-y: auto;

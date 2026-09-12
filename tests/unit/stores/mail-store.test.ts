@@ -574,6 +574,30 @@ describe('selectAllLoadedMessages', () => {
     expect([...mailStore.selectedIds].sort((a, b) => a - b)).toEqual([2, 4]);
   });
 
+  it('with flaggedOnly selects only starred rows, ANDed with unreadOnly', async () => {
+    const { mailStore } = await setupStore({
+      folders: [makeFolder(1, { total_emails: 4 })],
+      views: {
+        1: {
+          rows: [
+            makeRow(1, { is_seen: 1, is_flagged: 1 }),
+            makeRow(2, { is_seen: 0, is_flagged: 0 }),
+            makeRow(3, { is_seen: 0, is_flagged: 1 }),
+            makeRow(4, { is_seen: 1, is_flagged: 0 }),
+          ],
+          total: 4,
+        },
+      },
+    });
+    await flush();
+
+    await mailStore.selectAllLoadedMessages({ flaggedOnly: true });
+    expect([...mailStore.selectedIds].sort((a, b) => a - b)).toEqual([1, 3]);
+
+    await mailStore.selectAllLoadedMessages({ unreadOnly: true, flaggedOnly: true });
+    expect([...mailStore.selectedIds]).toEqual([3]);
+  });
+
   it('does not select rows that only exist in folder_messages but not in the canonical query view', async () => {
     // Selection must mirror what All can render. A row that only
     // lives in folder_messages (because of a stale projection) is
@@ -1044,8 +1068,9 @@ describe('selectMessage marks unread as seen via the auto-drained outbox', () =>
     await flush();
 
     const replaceCalls = [];
-    repo.replaceMessageKeywords = async (messageId, keywords, keywordsJson) => {
-      replaceCalls.push({ messageId, keywords, keywordsJson });
+    repo.replaceMessageKeywordsMany = async (items) => {
+      replaceCalls.push(...items);
+      return { ok: true, applied: items.length };
     };
     const insertCalls = [];
     repo.insertPendingMutation = async (input) => {
@@ -1073,7 +1098,8 @@ describe('selectMessage marks unread as seen via the auto-drained outbox', () =>
     expect(insertCalls).toHaveLength(1);
     expect(insertCalls[0].mutationType).toBe('setKeywords');
     expect(insertCalls[0].targetMessageId).toBe(7);
-    expect(JSON.parse(insertCalls[0].requestJson)).toEqual({ add: ['$seen'], remove: [] });
+    expect(JSON.parse(insertCalls[0].requestJson)).toEqual({ messageIds: [7], add: ['$seen'], remove: [] });
+    expect(JSON.parse(insertCalls[0].optimisticPatchJson)).toEqual({ is_seen: 1 });
 
     // The store must NOT pump the queue itself; that's the worker's
     // job now. If these arrays grow, someone re-added an explicit
@@ -1150,6 +1176,112 @@ describe('selectMessage marks unread as seen via the auto-drained outbox', () =>
       add: ['$seen'],
       remove: [],
     });
+  });
+});
+
+describe('starring ($flagged via setKeywordsMany)', () => {
+  async function seed(rows) {
+    const folder = makeFolder(1, { total_emails: rows.length });
+    const { mailStore, repo } = await setupStore({
+      folders: [folder],
+      views: { 1: { rows, total: rows.length } },
+    });
+    await flush();
+    mailStore.selectFolder(folder.id);
+    await flush();
+    const batches = [];
+    repo.replaceMessageKeywordsMany = async (items) => {
+      batches.push(items);
+      return { ok: true, applied: items.length };
+    };
+    const inserts = [];
+    repo.insertPendingMutation = async (input) => {
+      inserts.push(input);
+      return { id: 100 + inserts.length };
+    };
+    return { mailStore, batches, inserts };
+  }
+
+  it('markManyFlagged stars only the rows that are not already starred, in one batch', async () => {
+    const { mailStore, batches, inserts } = await seed([
+      makeRow(1, { is_flagged: 0, keywords_json: '{"$seen":true}' }),
+      makeRow(2, { is_flagged: 1, keywords_json: '{"$flagged":true}' }),
+      makeRow(3, { is_flagged: 0, keywords_json: '{}' }),
+    ]);
+
+    const changed = await mailStore.markManyFlagged([1, 2, 3], true);
+
+    expect(changed).toBe(2);
+    expect(batches).toHaveLength(1);
+    expect(batches[0].map((item) => item.messageId)).toEqual([1, 3]);
+    expect(batches[0][0].keywords).toEqual(['$seen', '$flagged']);
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0].targetMessageId).toBeNull();
+    expect(JSON.parse(inserts[0].requestJson)).toEqual({
+      messageIds: [1, 3],
+      add: ['$flagged'],
+      remove: [],
+    });
+    expect(JSON.parse(inserts[0].optimisticPatchJson)).toEqual({ is_flagged: 1 });
+  });
+
+  it('markManyFlagged(false) removes the keyword and is a no-op on unstarred rows', async () => {
+    const { mailStore, batches, inserts } = await seed([
+      makeRow(1, { is_flagged: 1, keywords_json: '{"$flagged":true,"$seen":true}' }),
+      makeRow(2, { is_flagged: 0, keywords_json: '{}' }),
+    ]);
+
+    expect(await mailStore.markManyFlagged([2], false)).toBe(0);
+    expect(inserts).toHaveLength(0);
+
+    expect(await mailStore.markManyFlagged([1], false)).toBe(1);
+    expect(batches[0][0].keywords).toEqual(['$seen']);
+    expect(inserts[0].targetMessageId).toBe(1);
+    expect(JSON.parse(inserts[0].requestJson)).toEqual({
+      messageIds: [1],
+      add: [],
+      remove: ['$flagged'],
+    });
+  });
+
+  it('toggleManyFlagged is modal: any starred row in the selection unstars them all', async () => {
+    const { mailStore, inserts } = await seed([
+      makeRow(1, { is_flagged: 0, keywords_json: '{}' }),
+      makeRow(2, { is_flagged: 1, keywords_json: '{"$flagged":true}' }),
+    ]);
+
+    await mailStore.toggleManyFlagged([1, 2]);
+
+    expect(JSON.parse(inserts[0].requestJson)).toEqual({
+      messageIds: [2],
+      add: [],
+      remove: ['$flagged'],
+    });
+  });
+
+  it('toggleManyFlagged stars the whole selection when none is starred', async () => {
+    const { mailStore, inserts } = await seed([
+      makeRow(1, { is_flagged: 0, keywords_json: '{}' }),
+      makeRow(2, { is_flagged: 0, keywords_json: '{}' }),
+    ]);
+
+    await mailStore.toggleManyFlagged([1, 2]);
+
+    expect(JSON.parse(inserts[0].requestJson)).toEqual({
+      messageIds: [1, 2],
+      add: ['$flagged'],
+      remove: [],
+    });
+  });
+
+  it('skips scheduled rows', async () => {
+    const { mailStore, inserts } = await seed([
+      makeRow(1, { is_flagged: 0, keywords_json: '{}', scheduled_undo_status: 'pending' }),
+      makeRow(2, { is_flagged: 0, keywords_json: '{}' }),
+    ]);
+
+    expect(await mailStore.markManyFlagged([1, 2], true)).toBe(1);
+    expect(JSON.parse(inserts[0].requestJson).messageIds).toEqual([2]);
   });
 });
 
@@ -1320,6 +1452,106 @@ describe('junkMessages (mark as junk)', () => {
 
     expect(result).toEqual({ succeeded: 0, failed: 0, skipped: 0 });
     expect(mailStore.error).toBe('No junk folder is configured.');
+  });
+});
+
+describe('cancelScheduledSends (Scheduled folder bulk delete)', () => {
+  function seedScheduled() {
+    const scheduled = makeFolder(2, { role: 'scheduled', may_remove_items: 1, total_emails: 2 });
+    const rows = [
+      makeRow(10, { scheduled_undo_status: 'pending' }),
+      makeRow(11, { scheduled_undo_status: 'pending' }),
+    ];
+    return { scheduled, rows };
+  }
+
+  it('enqueues one durable cancel per message, clears the selection, and reports the batch', async () => {
+    const { scheduled, rows } = seedScheduled();
+    const { mailStore, repo } = await setupStore({
+      folders: [scheduled],
+      views: { 2: { rows, total: 2 } },
+    });
+    await flush();
+    mailStore.selectFolder(scheduled.id);
+    await flush();
+    mailStore.selectedIds = new Set([10, 11]);
+
+    const insertCalls = [];
+    repo.insertPendingMutation = async (input) => {
+      insertCalls.push(input);
+      return { id: 100 + insertCalls.length };
+    };
+    const runCalls = [];
+    repo.runMutation = async (_accountId, mutationId) => {
+      runCalls.push(mutationId);
+      return { attempted: 1, succeeded: 1, failed: 0 };
+    };
+
+    const result = await mailStore.cancelScheduledSends([10, 11]);
+
+    expect(result).toEqual({ succeeded: 2, failed: 0 });
+    expect(insertCalls.map((c) => c.mutationType))
+      .toEqual([MUTATION_TYPE.CANCEL_SCHEDULED_SEND, MUTATION_TYPE.CANCEL_SCHEDULED_SEND]);
+    expect(insertCalls.map((c) => c.targetMessageId)).toEqual([10, 11]);
+    expect(insertCalls.map((c) => JSON.parse(c.requestJson))).toEqual([
+      { messageId: 10 },
+      { messageId: 11 },
+    ]);
+    expect(runCalls).toEqual([101, 102]);
+    expect(mailStore.selectedIds.size).toBe(0);
+    expect(mailStore.notice).toBe('Sending canceled for 2 messages. They are back in Drafts.');
+    expect(mailStore.error).toBeNull();
+  });
+
+  it('never routes the Scheduled delete through destroyMessages', async () => {
+    const { scheduled, rows } = seedScheduled();
+    const { mailStore, repo } = await setupStore({
+      folders: [scheduled],
+      views: { 2: { rows, total: 2 } },
+    });
+    await flush();
+    mailStore.selectFolder(scheduled.id);
+    await flush();
+    repo.insertPendingMutation = vi.fn(async () => ({ id: 1 }));
+
+    await mailStore.destroyMessages([10, 11]);
+
+    expect(repo.insertPendingMutation).not.toHaveBeenCalled();
+    expect(mailStore.error).toBe('Scheduled messages can’t be deleted. Cancel the send instead.');
+  });
+
+  it('surfaces the precise rejection for a lone failure and a tally for a mixed batch', async () => {
+    const { scheduled, rows } = seedScheduled();
+    const { mailStore, repo } = await setupStore({
+      folders: [scheduled],
+      views: { 2: { rows, total: 2 } },
+    });
+    await flush();
+    mailStore.selectFolder(scheduled.id);
+    await flush();
+
+    let nextId = 0;
+    repo.insertPendingMutation = async () => ({ id: ++nextId });
+    repo.runMutation = async (_accountId, mutationId) => (
+      mutationId % 2 === 1
+        ? { attempted: 1, succeeded: 0, failed: 1 }
+        : { attempted: 1, succeeded: 1, failed: 0 }
+    );
+    repo.getPendingMutationError = async () => ({
+      error_json: JSON.stringify({
+        type: 'scheduleAlreadySent',
+        description: 'This message was already sent and can no longer be canceled.',
+      }),
+    });
+
+    expect(await mailStore.cancelScheduledSends([10])).toEqual({ succeeded: 0, failed: 1 });
+    expect(mailStore.error).toBe('This message was already sent and can no longer be canceled.');
+
+    mailStore.error = null;
+    expect(await mailStore.cancelScheduledSends([10, 11])).toEqual({ succeeded: 1, failed: 1 });
+    expect(mailStore.error).toBe(
+      'Could not cancel 1 of 2 scheduled sends yet; they will keep retrying in the background.',
+    );
   });
 });
 

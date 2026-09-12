@@ -5,7 +5,7 @@ import {
 } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
-import { nextTick } from 'vue';
+import { computed, nextTick } from 'vue';
 
 vi.mock('../../../src/services/auth', () => ({
   initOidc: async () => null,
@@ -27,14 +27,55 @@ import { APP_TITLE } from '../../../src/app-config';
 import { useAuthStore } from '../../../src/stores/auth-store';
 import { useMailStore } from '../../../src/stores/mail-store';
 import { useSettingsStore } from '../../../src/stores/settings-store';
+import { COMPOSE_PRESENTATION, useComposeStore } from '../../../src/stores/compose-store';
 import {
   __setRepositoryForTests,
   __resetRepositoryForTests,
 } from '../../../src/composables/useRepository';
+import { TOUR_SUBJECT, TOUR_TYPING_MS_PER_CHAR } from '../../../src/composables/featureSpotlightScripts';
+import { SPOTLIGHT_TIMING } from '../../../src/composables/useFeatureSpotlight';
+import { FEATURE_BEACONS_STORAGE_KEY } from '../../../src/constants/feature-beacons';
+import { useFeatureBeaconsStore } from '../../../src/stores/feature-beacons-store';
 import type { ContactListRow } from '../../../src/types';
+import { stubBeaconLayout, type BeaconLayoutStub } from '../_fixtures/beacon-layout';
+
+// Pointer travel and press precede a step's `prepare`; settle follows it.
+const TRAVEL_MS = SPOTLIGHT_TIMING.pointerTravelMs;
+const PRESS_MS = SPOTLIGHT_TIMING.pointerPressMs;
+const SETTLE_MS = SPOTLIGHT_TIMING.settleMs;
 
 let repoContacts: ContactListRow[] = [];
 let restoreContactListLayout: (() => void) | null = null;
+let beaconLayout: BeaconLayoutStub | null = null;
+
+// Viewport rects for the controls beacons anchor to; the composer's schedule
+// trigger only exists once a compose session is open.
+const BEACON_RECTS = {
+  '.sidebar__compose': {
+    left: 70, top: 60, width: 160, height: 36,
+  },
+  '.app-spaces [aria-label="Contacts"]': {
+    left: 8, top: 120, width: 40, height: 40,
+  },
+  '.app-spaces [data-settings-gear]': {
+    left: 8, top: 600, width: 40, height: 40,
+  },
+  '.compose-dialog--expanded .compose-schedule-menu__trigger': {
+    left: 600, top: 500, width: 30, height: 30,
+  },
+};
+
+// A user who dismissed Welcome before this round and has not seen it.
+function seedExistingUser() {
+  window.localStorage?.removeItem(WHATS_NEW_KEY);
+  beaconLayout = stubBeaconLayout(BEACON_RECTS);
+}
+
+async function settleBeacons() {
+  await flushPromises();
+  await nextTick();
+  await flushPromises();
+}
 
 function stubContactListLayout() {
   const offsetHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
@@ -135,6 +176,7 @@ function makeRepo() {
       };
     },
     async listIdentities() { return []; },
+    async ensureIdentities() {},
   };
 }
 
@@ -152,12 +194,41 @@ function mountApp() {
           template: '<section class="msg-list" :data-filter="quickFilterQuery">list</section>',
         },
         MessageView: { template: '<section class="message-view">view</section>' },
-        ComposeDialog: { template: '<div />' },
+        // Carries the card the compose spotlights stage, the header controls
+        // they press, and the schedule trigger the composeSchedule beacon anchors
+        // to. Like the real dialog, one mounts per session and only the
+        // expanded one carries the modifier the spotlights scope to.
+        ComposeDialog: {
+          props: ['sessionId'],
+          setup(props: { sessionId: string }) {
+            const composeStore = useComposeStore();
+            return { expanded: computed(() => composeStore.activeSessionId === props.sessionId) };
+          },
+          template: '<div v-show="expanded" class="compose-dialog" :class="{ \'compose-dialog--expanded\': expanded }"><div class="compose-dialog__card"><button class="icon icon--minimize" /><div class="compose-close-menu" /><input id="compose-subject" /><details class="compose-schedule-menu"><summary class="compose-schedule-menu__trigger">Schedule</summary></details></div></div>',
+        },
       },
     },
   });
   mountedWrappers.push(wrapper);
   return wrapper;
+}
+
+// Spotlight phases chain one timer after another via microtasks, so each
+// phase is advanced and flushed on its own.
+async function advanceSpotlight(...phasesMs: number[]) {
+  for (const ms of phasesMs) {
+    vi.advanceTimersByTime(ms);
+    await flushPromises();
+  }
+}
+
+// Steps that poll the DOM (waiting for a dialog or directory) chain many
+// short timers; advance in small slices until `done` or the budget runs out.
+async function advanceUntil(done: () => boolean, sliceMs = 50, budgetMs = 20_000) {
+  for (let elapsed = 0; elapsed < budgetMs && !done(); elapsed += sliceMs) {
+    await advanceSpotlight(sliceMs);
+  }
+  expect(done()).toBe(true);
 }
 
 function makePointerEvent(type: string, clientX: number, button = 0) {
@@ -181,32 +252,60 @@ function setWindowWidth(width: number, dispatchResize = false) {
   }
 }
 
-function featureByTitle(wrapper: ReturnType<typeof mountApp>, title: string) {
-  const feature = wrapper.findAll('.welcome__feature')
-    .find((candidate) => candidate.text().includes(title));
-  if (!feature) throw new Error(`Could not find welcome feature: ${title}`);
-  return feature;
+const WELCOME_KEY = 'stormbox.welcomeModalDismissed.v1';
+const WHATS_NEW_KEY = 'stormbox.whatsNewSeen.2026-09-compose';
+const FEATURE_TITLES = [
+  'Compose with confidence',
+  'Send on your schedule',
+  'Attachments and clipboard',
+  'Organize your mail',
+  'Contacts and identities',
+  'Smarter recipients',
+];
+
+function showMeButton(wrapper: ReturnType<typeof mountApp>, title: string) {
+  return wrapper.get(`button[aria-label="Show me: ${title}"]`);
 }
 
-function setElementRect(
-  element: Element,
-  rect: { left: number; top: number; width: number; height: number },
-) {
-  const { left, top, width, height } = rect;
-  Object.defineProperty(element, 'getBoundingClientRect', {
+/** Gear → Settings → "Show welcome"; the dialog is teleported to body. */
+async function reopenWelcomeFromSettings(wrapper: ReturnType<typeof mountApp>) {
+  await wrapper.get('[data-settings-gear]').trigger('click');
+  await nextTick();
+  const button = document.body.querySelector<HTMLButtonElement>(
+    '[data-settings-dialog] [data-show-welcome]',
+  );
+  if (!button) throw new Error('Settings has no "Show welcome" button');
+  button.click();
+  await nextTick();
+}
+
+function pressEscape() {
+  window.dispatchEvent(new KeyboardEvent('keydown', {
+    bubbles: true,
+    cancelable: true,
+    key: 'Escape',
+  }));
+}
+
+function stubReducedMotion(matches: boolean) {
+  const original = window.matchMedia;
+  Object.defineProperty(window, 'matchMedia', {
     configurable: true,
-    value: () => ({
-      x: left,
-      y: top,
-      left,
-      top,
-      width,
-      height,
-      right: left + width,
-      bottom: top + height,
-      toJSON: () => ({}),
+    writable: true,
+    value: (query: string) => ({
+      matches: query.includes('prefers-reduced-motion') ? matches : false,
+      media: query,
+      addEventListener() {},
+      removeEventListener() {},
     }),
   });
+  return () => {
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      writable: true,
+      value: original,
+    });
+  };
 }
 
 beforeEach(() => {
@@ -216,6 +315,7 @@ beforeEach(() => {
   document.title = APP_TITLE;
   window.localStorage?.clear();
   window.localStorage?.setItem('stormbox.welcomeModalDismissed.v1', '1');
+  window.localStorage?.setItem('stormbox.whatsNewSeen.2026-09-compose', '1');
   setWindowWidth(1280);
   const authStore = useAuthStore();
   authStore.status = AUTH_STATE.CONNECTED;
@@ -228,54 +328,43 @@ afterEach(() => {
   }
   restoreContactListLayout?.();
   restoreContactListLayout = null;
+  beaconLayout?.restore();
+  beaconLayout = null;
   vi.useRealTimers();
   __resetRepositoryForTests();
 });
 
 describe('App mail layout', () => {
   it('shows the welcome modal on first login and persists dismissal', async () => {
-    vi.useFakeTimers();
-    window.localStorage?.removeItem('stormbox.welcomeModalDismissed.v1');
+    window.localStorage?.removeItem(WELCOME_KEY);
+    window.localStorage?.removeItem(WHATS_NEW_KEY);
 
     const wrapper = mountApp();
     await nextTick();
 
-    expect(wrapper.get('[role="dialog"]').text()).toContain('Welcome to Thundermail');
-    expect(wrapper.text()).toContain('Quick Filter');
+    const dialog = wrapper.get('[role="dialog"]');
+    expect(dialog.text()).toContain('Welcome to Thundermail');
+    expect(wrapper.findAll('.feature-card h3').map((heading) => heading.text())).toEqual(FEATURE_TITLES);
+    expect(wrapper.findAll('.feature-card__show')).toHaveLength(6);
+    expect(showMeButton(wrapper, 'Send on your schedule').attributes('disabled')).toBeUndefined();
     expect(wrapper.text()).toContain('Keyboard Shortcuts');
-    expect(wrapper.text()).toContain('Ctrl+K');
-    expect(wrapper.text()).not.toContain('Your Thunderbird mail workspace is ready');
     expect(wrapper.findAll('.welcome__shortcut-group h3').map((heading) => heading.text()))
-      .toEqual(['Navigate', 'Message actions', 'Find and compose']);
+      .toEqual(['Find and compose', 'Navigate', 'Message actions']);
+    expect(wrapper.text()).toContain('Ctrl+K');
+    expect(wrapper.findAll('.welcome__shortcut-group').at(2)!.findAll('dd').map((row) => row.text()))
+      .toEqual(['Archive', 'Delete', 'Delete permanently', 'Mark read or unread', 'Star or unstar', 'Select all', 'Clear selection']);
+    expect(wrapper.get('#welcome-scheme-label').text()).toBe('Style');
     const picker = wrapper.get('.welcome [role="radiogroup"]');
     expect(picker.findAll('[role="radio"]').map((radio) => radio.text())).toEqual(['Web', 'Thunderbird']);
     expect(picker.get('[data-shortcut-scheme="web"]').attributes('aria-checked')).toBe('true');
+    expect(wrapper.find('.beacon-menu').exists()).toBe(false);
 
     await wrapper.get('.welcome').trigger('click');
     await nextTick();
     expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
+    expect(window.localStorage.getItem(WELCOME_KEY)).toBeNull();
 
-    await wrapper.get('.welcome__feature--quick-filter').trigger('click');
-    await nextTick();
-
-    expect(wrapper.find('.welcome--spotlighting').exists()).toBe(true);
-    expect(wrapper.find('.quick-filter__search--spotlight').exists()).toBe(true);
-    expect(wrapper.get('.quick-filter__input').attributes('placeholder')).toBe('');
-    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
-
-    vi.advanceTimersByTime(1300);
-    await nextTick();
-
-    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
-
-    vi.advanceTimersByTime(1300);
-    await nextTick();
-
-    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
-    expect(wrapper.find('.welcome--spotlighting').exists()).toBe(false);
-    expect(window.localStorage.getItem('stormbox.welcomeModalDismissed.v1')).toBeNull();
-
-    wrapper.get('[role="dialog"]').element.dispatchEvent(new KeyboardEvent('keydown', {
+    dialog.element.dispatchEvent(new KeyboardEvent('keydown', {
       bubbles: true,
       cancelable: true,
       key: 'Enter',
@@ -283,7 +372,45 @@ describe('App mail layout', () => {
     await nextTick();
 
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
-    expect(window.localStorage.getItem('stormbox.welcomeModalDismissed.v1')).toBe('1');
+    expect(window.localStorage.getItem(WELCOME_KEY)).toBe('1');
+    // Welcome covers the announced features, so beacons never follow it.
+    expect(window.localStorage.getItem(WHATS_NEW_KEY)).toBe('1');
+    expect(wrapper.find('.beacon-menu').exists()).toBe(false);
+    expect(wrapper.find('.feature-beacons').exists()).toBe(false);
+  });
+
+  it('drops the Keyboard Shortcuts section from Welcome in the single-column layout', async () => {
+    window.localStorage?.removeItem(WELCOME_KEY);
+    setWindowWidth(600);
+
+    const wrapper = mountApp();
+    await nextTick();
+
+    expect(wrapper.get('[role="dialog"]').text()).toContain('Welcome to Thundermail');
+    expect(wrapper.findAll('.feature-card h3')).toHaveLength(6);
+    expect(wrapper.text()).not.toContain('Keyboard Shortcuts');
+    expect(wrapper.find('#welcome-shortcuts').exists()).toBe(false);
+    expect(wrapper.find('.welcome [role="radiogroup"]').exists()).toBe(false);
+    expect(wrapper.find('.welcome__primary').exists()).toBe(true);
+
+    // Widening past the breakpoint brings the section back.
+    setWindowWidth(1280, true);
+    await nextTick();
+    expect(wrapper.find('#welcome-shortcuts').exists()).toBe(true);
+  });
+
+  it('closes the welcome modal with Escape when no spotlight is running', async () => {
+    window.localStorage?.removeItem(WELCOME_KEY);
+
+    const wrapper = mountApp();
+    await nextTick();
+    expect(wrapper.find('.welcome').exists()).toBe(true);
+
+    pressEscape();
+    await nextTick();
+
+    expect(wrapper.find('.welcome').exists()).toBe(false);
+    expect(window.localStorage.getItem(WELCOME_KEY)).toBe('1');
   });
 
   it('keeps global shortcuts inactive while the welcome modal is open', async () => {
@@ -325,22 +452,17 @@ describe('App mail layout', () => {
     const wrapper = mountApp();
     await flushPromises();
 
-    const kbds = () => wrapper.findAll('.welcome__shortcut-group kbd').map((kbd) => kbd.text());
-    expect(kbds()).toContain('J');
-    expect(kbds()).toContain('Shift+R');
-    expect(kbds()).toContain('* then A');
-    expect(kbds()).not.toContain('Ctrl+R');
-    // List-scoped in the web scheme, but bound and therefore shown.
-    expect(kbds()).toContain('Home');
+    // First group only: New message, Reply, Reply all, Forward, Quick Filter.
+    const kbds = () => wrapper.findAll('.welcome__shortcut-group').at(0)!.findAll('kbd').map((kbd) => kbd.text());
+    expect(kbds()).toEqual(['C', 'R', 'Shift+R', 'F', '/ or Ctrl+K']);
+    expect(wrapper.get('.welcome__scheme-hint').text()).toBe('Web shortcuts avoid conflicting with the browser. You can change shortcut style later in Settings.');
 
     await wrapper.get('[data-shortcut-scheme="thunderbird"]').trigger('click');
     await flushPromises();
 
     expect(wrapper.get('[data-shortcut-scheme="thunderbird"]').attributes('aria-checked')).toBe('true');
-    expect(kbds()).toContain('Ctrl+R');
-    expect(kbds()).toContain('Home');
-    expect(kbds()).toContain('Ctrl+N or Ctrl+M');
-    expect(kbds()).not.toContain('J');
+    expect(kbds()).toEqual(['Ctrl+N or Ctrl+M', 'Ctrl+R', 'Ctrl+Shift+R', 'Ctrl+L', 'Ctrl+K']);
+    expect(wrapper.get('.welcome__scheme-hint').text()).toBe('Thunderbird shortcuts are the same as desktop, but may conflict with the browser in some cases.');
     expect(useSettingsStore().get('shortcutScheme')).toBe('thunderbird');
     expect(JSON.parse(window.localStorage.getItem('stormbox.settings.v1')!))
       .toMatchObject({ shortcutScheme: 'thunderbird' });
@@ -351,62 +473,518 @@ describe('App mail layout', () => {
     expect(useSettingsStore().get('shortcutScheme')).toBe('web');
   });
 
-  it('anchors the resize spotlight card below the quick filter while highlighting resize handles', async () => {
+  it('runs the compose spotlight on a tour-owned empty session and closes it afterwards', async () => {
     vi.useFakeTimers();
-    window.localStorage?.removeItem('stormbox.welcomeModalDismissed.v1');
+    window.localStorage?.removeItem(WELCOME_KEY);
+    const composeStore = useComposeStore();
 
     const wrapper = mountApp();
     await nextTick();
+    expect(composeStore.sessions).toHaveLength(0);
 
-    setElementRect(wrapper.get('.quick-filter__search').element, {
-      left: 420,
-      top: 8,
-      width: 320,
-      height: 34,
-    });
-    const resizeFeature = featureByTitle(wrapper, 'Resizable mail layout');
-    setElementRect(resizeFeature.element, {
-      left: 100,
-      top: 220,
-      width: 220,
-      height: 72,
-    });
+    await showMeButton(wrapper, 'Compose with confidence').trigger('click');
+    await flushPromises();
 
-    await resizeFeature.trigger('click');
-    await nextTick();
-    await nextTick();
-    await nextTick();
+    expect(composeStore.sessions).toHaveLength(1);
+    expect(composeStore.isExpanded).toBe(true);
+    expect(wrapper.find('.welcome--spotlighting').exists()).toBe(true);
+    expect(wrapper.find('.shell--spotlighting').exists()).toBe(true);
+    const caption = () => wrapper.get('[data-testid="feature-caption"]');
+    expect(caption().text()).toContain('Compose with confidence');
+    expect(caption().text()).toContain('Drafts save themselves as you type');
+    expect(caption().get('.feature-caption__steps').attributes('aria-label')).toBe('Step 1 of 3');
+    expect(showMeButton(wrapper, 'Smarter recipients').attributes('disabled')).toBeDefined();
+    // The panel is hidden but still mounted, so the dialog survives the tour.
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
 
-    expect(wrapper.find('.shell--resize-spotlight').exists()).toBe(true);
-    expect(wrapper.findAll('.column-resizer--spotlight')).toHaveLength(2);
-    expect(wrapper.get('.welcome__feature--active').text()).toContain('Resizable mail layout');
-    expect(wrapper.get('.welcome__feature--active').attributes('style'))
-      .toContain('--spotlight-transform: translate(370px, -86px)');
+    // Step 1 types the tour subject into the composer opened by `prepare`,
+    // one character per timer, before the ring lands on the subject field.
+    // The card is staged (undimmed) rather than ringed.
+    const session = composeStore.activeSession!;
+    expect(session.draft.subject).toBe('');
+    await advanceSpotlight(SETTLE_MS);
+    expect(session.draft.subject).toBe(TOUR_SUBJECT.slice(0, 1));
+    await advanceSpotlight(...TOUR_SUBJECT.slice(1).split('').map(() => TOUR_TYPING_MS_PER_CHAR));
+    expect(session.draft.subject).toBe(TOUR_SUBJECT);
+    // One more per-character pause follows the last character, then the settle.
+    // The typing is the demonstration, so nothing is ringed in this step.
+    await advanceSpotlight(TOUR_TYPING_MS_PER_CHAR, SETTLE_MS);
+    expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-targets')).toBe('');
+    expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-stage'))
+      .toBe('.compose-dialog--expanded .compose-dialog__card');
+
+    // Step 2: the pointer travels to and presses Minimize, then the session
+    // minimizes and the ring glides to the dock.
+    await advanceSpotlight(2600);
+    expect(caption().text()).toContain('Minimize a draft');
+    expect(caption().get('.feature-caption__steps').attributes('aria-label')).toBe('Step 2 of 3');
+    expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-pointer'))
+      .toBe('.compose-dialog--expanded .icon--minimize');
+    expect(composeStore.isExpanded).toBe(true);
+    await advanceSpotlight(TRAVEL_MS, PRESS_MS);
+    expect(composeStore.isExpanded).toBe(false);
+    expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-pointer')).toBeUndefined();
+    await advanceSpotlight(SETTLE_MS);
+    expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-targets'))
+      .toBe('.compose-dock__item');
+    expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-stage'))
+      .toBe('.compose-dock');
+
+    // Step 3 presses the dock item to restore it; when the script ends the
+    // empty session is closed.
+    await advanceSpotlight(3400, TRAVEL_MS, PRESS_MS);
+    expect(composeStore.isExpanded).toBe(true);
+
+    await advanceSpotlight(SETTLE_MS, 3200);
+    expect(session.draft.subject).toBe('');
+    expect(composeStore.sessions).toHaveLength(0);
+    expect(wrapper.find('.welcome--spotlighting').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="spotlight-overlay"]').exists()).toBe(false);
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
+    expect(window.localStorage.getItem(WELCOME_KEY)).toBeNull();
   });
 
-  it('resets spotlighted cards without animating them back into the modal', async () => {
+  it('cancels a running spotlight with Escape before closing the modal', async () => {
     vi.useFakeTimers();
-    window.localStorage?.removeItem('stormbox.welcomeModalDismissed.v1');
+    window.localStorage?.removeItem(WELCOME_KEY);
+    const composeStore = useComposeStore();
 
     const wrapper = mountApp();
     await nextTick();
 
-    await wrapper.get('.welcome__feature--quick-filter').trigger('click');
-    await nextTick();
-
+    await showMeButton(wrapper, 'Smarter recipients').trigger('click');
+    await flushPromises();
+    expect(composeStore.sessions).toHaveLength(1);
     expect(wrapper.find('.welcome--spotlighting').exists()).toBe(true);
 
-    vi.advanceTimersByTime(2600);
-    await nextTick();
+    pressEscape();
+    await flushPromises();
 
+    expect(composeStore.sessions).toHaveLength(0);
     expect(wrapper.find('.welcome--spotlighting').exists()).toBe(false);
-    expect(wrapper.find('.welcome--spotlight-resetting').exists()).toBe(true);
-    expect(wrapper.find('.welcome__feature--active').exists()).toBe(false);
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
 
-    vi.advanceTimersByTime(32);
+    pressEscape();
+    await flushPromises();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+  });
+
+  it('leaves a session the user typed into open after the compose spotlight', async () => {
+    vi.useFakeTimers();
+    window.localStorage?.removeItem(WELCOME_KEY);
+    const composeStore = useComposeStore();
+
+    const wrapper = mountApp();
     await nextTick();
 
-    expect(wrapper.find('.welcome--spotlight-resetting').exists()).toBe(false);
+    await showMeButton(wrapper, 'Attachments and clipboard').trigger('click');
+    await flushPromises();
+    const session = composeStore.activeSession;
+    expect(session).not.toBeNull();
+    composeStore.setBodyContent({ html: '<p>Keep me</p>', text: 'Keep me' }, session!.id);
+    expect(composeStore.isSessionDirty(session!.id)).toBe(true);
+
+    await wrapper.get('.feature-caption__done').trigger('click');
+    await flushPromises();
+
+    expect(composeStore.sessions).toHaveLength(1);
+    expect(wrapper.find('.welcome--spotlighting').exists()).toBe(false);
+  });
+
+  // OB-2.7: the tour never writes into a draft the user has open; it works
+  // in its own session and hands the user's draft back afterwards.
+  it('leaves an open draft untouched during the compose spotlight and re-expands it afterwards', async () => {
+    vi.useFakeTimers();
+    window.localStorage?.removeItem(WELCOME_KEY);
+    const composeStore = useComposeStore();
+
+    const wrapper = mountApp();
+    await nextTick();
+    const userSessionId = composeStore.open({ subject: 'Quarterly numbers' });
+    expect(composeStore.activeSession?.id).toBe(userSessionId);
+
+    await showMeButton(wrapper, 'Compose with confidence').trigger('click');
+    await flushPromises();
+
+    expect(composeStore.sessions).toHaveLength(2);
+    const tourSession = composeStore.activeSession!;
+    expect(tourSession.id).not.toBe(userSessionId);
+    expect(composeStore.sessionById(userSessionId)!.presentation).toBe(COMPOSE_PRESENTATION.MINIMIZED);
+
+    await advanceSpotlight(SETTLE_MS);
+    await advanceSpotlight(...TOUR_SUBJECT.slice(1).split('').map(() => TOUR_TYPING_MS_PER_CHAR));
+    expect(tourSession.draft.subject).toBe(TOUR_SUBJECT);
+    expect(composeStore.sessionById(userSessionId)!.draft.subject).toBe('Quarterly numbers');
+
+    await wrapper.get('.feature-caption__done').trigger('click');
+    await flushPromises();
+
+    expect(composeStore.sessions.map((session) => session.id)).toEqual([userSessionId]);
+    expect(composeStore.activeSession?.id).toBe(userSessionId);
+    expect(composeStore.isExpanded).toBe(true);
+    expect(composeStore.sessionById(userSessionId)!.draft.subject).toBe('Quarterly numbers');
+  });
+
+  it('switches to Contacts for the contacts spotlight and restores the previous space', async () => {
+    vi.useFakeTimers();
+    restoreContactListLayout = stubContactListLayout();
+    window.localStorage?.removeItem(WELCOME_KEY);
+
+    const wrapper = mountApp();
+    await nextTick();
+    const contactsButton = () => wrapper.get('.app-spaces [aria-label="Contacts"]');
+    expect(contactsButton().attributes('aria-pressed')).toBe('false');
+
+    await showMeButton(wrapper, 'Contacts and identities').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-targets'))
+      .toBe('.app-spaces [aria-label="Contacts"]');
+    // This tour rings without a scrim.
+    expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-dim')).toBe('false');
+    expect(wrapper.find('.spotlight-overlay__scrim').exists()).toBe(false);
+    expect(contactsButton().attributes('aria-pressed')).toBe('false');
+
+    // Step 2 presses the Contacts space button before switching.
+    await advanceSpotlight(2600);
+    expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-pointer'))
+      .toBe('.app-spaces [aria-label="Contacts"]');
+    expect(contactsButton().attributes('aria-pressed')).toBe('false');
+    await advanceSpotlight(TRAVEL_MS, PRESS_MS);
+    expect(contactsButton().attributes('aria-pressed')).toBe('true');
+    expect(wrapper.find('.shell--contacts').exists()).toBe(true);
+
+    await advanceSpotlight(SETTLE_MS);
+    expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-targets'))
+      .toBe('.contacts-rail');
+
+    // Step 3 presses Manage identities in the toolbar and opens that directory.
+    const identitiesButton = () => wrapper.get('.contacts__identity-section button');
+    await advanceSpotlight(3600);
+    expect(wrapper.get('[data-testid="feature-caption"]').text()).toContain('Manage identities sets up');
+    expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-pointer'))
+      .toBe('.contacts__identity-section button');
+    expect(identitiesButton().attributes('aria-pressed')).toBe('false');
+    await advanceSpotlight(TRAVEL_MS, PRESS_MS);
+    expect(identitiesButton().attributes('aria-pressed')).toBe('true');
+
+    // With no identities to select the step waits out the directory load,
+    // rings the list, and the tour ends back in Mail on All contacts.
+    await advanceUntil(() => !wrapper.find('.welcome--spotlighting').exists());
+    expect(contactsButton().attributes('aria-pressed')).toBe('false');
+    expect(wrapper.find('.shell--contacts').exists()).toBe(false);
+    expect(wrapper.find('.contacts__identity-section button[aria-pressed="true"]').exists()).toBe(false);
+  });
+
+  it('honours prefers-reduced-motion in the tour', async () => {
+    const restoreMatchMedia = stubReducedMotion(true);
+    try {
+      vi.useFakeTimers();
+      window.localStorage?.removeItem(WELCOME_KEY);
+
+      const wrapper = mountApp();
+      await nextTick();
+      expect(wrapper.find('.welcome--reduced-motion').exists()).toBe(true);
+
+      await showMeButton(wrapper, 'Organize your mail').trigger('click');
+      await flushPromises();
+      expect(wrapper.find('.feature-tour--reduced-motion').exists()).toBe(true);
+      expect(wrapper.find('.spotlight-overlay--static').exists()).toBe(true);
+      pressEscape();
+      await flushPromises();
+
+      // No pointer play and no settle pause: the press's effect lands at once.
+      restoreContactListLayout = stubContactListLayout();
+      await showMeButton(wrapper, 'Contacts and identities').trigger('click');
+      await flushPromises();
+      await advanceSpotlight(2600);
+      expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-pointer')).toBeUndefined();
+      expect(wrapper.find('.shell--contacts').exists()).toBe(true);
+      expect(wrapper.get('[data-testid="spotlight-overlay"]').attributes('data-targets'))
+        .toContain('.contacts-rail');
+    } finally {
+      restoreMatchMedia();
+    }
+  });
+
+  it('gives a user who dismissed Welcome before this announcement beacons instead of a dialog', async () => {
+    seedExistingUser();
+
+    const wrapper = mountApp();
+    await settleBeacons();
+
+    expect(wrapper.find('.welcome').exists()).toBe(false);
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+    expect(wrapper.get('.beacon-menu__pill').text()).toBe('8 new');
+    expect(wrapper.findAll('.feature-beacons__dot').map((dot) => dot.attributes('data-beacon')))
+      .toEqual(['newMessage', 'contacts', 'keyboardShortcuts']);
+    expect(window.localStorage.getItem(WHATS_NEW_KEY)).toBeNull();
+    expect(JSON.parse(window.localStorage.getItem(FEATURE_BEACONS_STORAGE_KEY)!))
+      .toEqual({ seen: [], sessions: 1 });
+
+    await wrapper.get('[data-beacon="newMessage"]').trigger('click');
+    await settleBeacons();
+    const card = wrapper.get('[role="dialog"]');
+    expect(card.text()).toContain('A new composer');
+    expect(card.text()).toContain('Open a message to see the new controls');
+
+    await card.get('.feature-beacons__got-it').trigger('click');
+    await settleBeacons();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+    expect(wrapper.get('.beacon-menu__pill').text()).toBe('7 new');
+    expect(wrapper.find('[data-beacon="newMessage"]').exists()).toBe(false);
+    expect(window.localStorage.getItem(WHATS_NEW_KEY)).toBeNull();
+  });
+
+  it('Dismiss all finishes the round: flag written, pill and dots gone', async () => {
+    seedExistingUser();
+
+    const wrapper = mountApp();
+    await settleBeacons();
+    const menu = wrapper.get('.beacon-menu').element as HTMLDetailsElement;
+    menu.open = true;
+    await nextTick();
+    // A disclosed list, not an ARIA menu: it carries an intro and a footer
+    // action that a menu could not.
+    expect(wrapper.find('.beacon-menu [role="menu"]').exists()).toBe(false);
+    expect(wrapper.get('.beacon-menu__popover').attributes('aria-label')).toBe('New features');
+    expect(wrapper.findAll('.beacon-menu__list .beacon-menu__item')).toHaveLength(8);
+
+    await wrapper.get('.beacon-menu__dismiss').trigger('click');
+    await settleBeacons();
+
+    expect(wrapper.find('.beacon-menu').exists()).toBe(false);
+    expect(wrapper.find('.feature-beacons').exists()).toBe(false);
+    expect(window.localStorage.getItem(WHATS_NEW_KEY)).toBe('1');
+    expect(window.localStorage.getItem(FEATURE_BEACONS_STORAGE_KEY)).toBeNull();
+
+    // A reload with the flag set shows nothing.
+    const second = mountApp();
+    await settleBeacons();
+    expect(second.find('.beacon-menu').exists()).toBe(false);
+    expect(second.find('[role="dialog"]').exists()).toBe(false);
+  });
+
+  it('shows no onboarding UI once both keys are set', async () => {
+    const wrapper = mountApp();
+    await settleBeacons();
+
+    expect(wrapper.find('.welcome').exists()).toBe(false);
+    expect(wrapper.find('.beacon-menu').exists()).toBe(false);
+    expect(wrapper.find('.feature-beacons').exists()).toBe(false);
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+  });
+
+  it('keeps global shortcuts inactive while a beacon card is open', async () => {
+    seedExistingUser();
+
+    const wrapper = mountApp();
+    await settleBeacons();
+
+    const input = wrapper.get('.quick-filter__input').element as HTMLInputElement;
+    const focusSpy = vi.spyOn(input, 'focus');
+    const pressQuickFilter = () => document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'k',
+      bubbles: true,
+      cancelable: true,
+      ctrlKey: true,
+    }));
+
+    // Dots alone leave shortcuts live.
+    pressQuickFilter();
+    await nextTick();
+    expect(focusSpy).toHaveBeenCalledOnce();
+
+    await wrapper.get('[data-beacon="contacts"]').trigger('click');
+    await settleBeacons();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true);
+    pressQuickFilter();
+    await nextTick();
+    expect(focusSpy).toHaveBeenCalledOnce();
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await settleBeacons();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+    pressQuickFilter();
+    await nextTick();
+    expect(focusSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('reveals a composer beacon from the pill by opening a compose session', async () => {
+    seedExistingUser();
+    const composeStore = useComposeStore();
+    const beaconStore = useFeatureBeaconsStore();
+
+    const wrapper = mountApp();
+    await settleBeacons();
+    expect(wrapper.find('[data-beacon="composeSchedule"]').exists()).toBe(false);
+
+    (wrapper.get('.beacon-menu').element as HTMLDetailsElement).open = true;
+    await nextTick();
+    await wrapper.get('[data-beacon-item="composeSchedule"]').trigger('click');
+    await settleBeacons();
+
+    expect(composeStore.sessions).toHaveLength(1);
+    expect(beaconStore.openId).toBe('composeSchedule');
+    expect(wrapper.find('.compose-dialog--expanded .compose-schedule-menu__trigger').exists()).toBe(true);
+    expect(wrapper.get('[data-beacon="composeSchedule"]').attributes('aria-expanded')).toBe('true');
+    expect(wrapper.get('[role="dialog"]').attributes('data-beacon-card')).toBe('composeSchedule');
+    expect(wrapper.get('[role="dialog"]').text()).toContain('Send on your schedule');
+
+    // Revealing again reuses the open session.
+    beaconStore.close();
+    (wrapper.get('.beacon-menu').element as HTMLDetailsElement).open = true;
+    await nextTick();
+    await wrapper.get('[data-beacon-item="composeMinimize"]').trigger('click');
+    await settleBeacons();
+    expect(composeStore.sessions).toHaveLength(1);
+    expect(beaconStore.openId).toBe('composeMinimize');
+  });
+
+  it('reveals a sidebar beacon from the pill by showing a hidden folder list', async () => {
+    seedExistingUser();
+    const beaconStore = useFeatureBeaconsStore();
+
+    const wrapper = mountApp();
+    await settleBeacons();
+    await wrapper.get('[aria-label="Hide folder list"]').trigger('click');
+    await settleBeacons();
+    expect(wrapper.find('.shell').classes()).toContain('shell--folder-list-hidden');
+
+    (wrapper.get('.beacon-menu').element as HTMLDetailsElement).open = true;
+    await nextTick();
+    await wrapper.get('[data-beacon-item="newMessage"]').trigger('click');
+    await settleBeacons();
+
+    expect(wrapper.find('.shell').classes()).not.toContain('shell--folder-list-hidden');
+    expect(beaconStore.openId).toBe('newMessage');
+    expect(wrapper.get('[role="dialog"]').attributes('data-beacon-card')).toBe('newMessage');
+  });
+
+  it('reveals the shortcuts beacon on the Settings gear without leaving the current space or showing the folder list', async () => {
+    seedExistingUser();
+    const beaconStore = useFeatureBeaconsStore();
+
+    const wrapper = mountApp();
+    await settleBeacons();
+    await wrapper.get('[aria-label="Hide folder list"]').trigger('click');
+    await settleBeacons();
+    await wrapper.get('.app-spaces [aria-label="Contacts"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('.shell--contacts').exists()).toBe(true);
+    expect(wrapper.find('.shell').classes()).toContain('shell--folder-list-hidden');
+
+    (wrapper.get('.beacon-menu').element as HTMLDetailsElement).open = true;
+    await nextTick();
+    await wrapper.get('[data-beacon-item="keyboardShortcuts"]').trigger('click');
+    await settleBeacons();
+
+    // The gear is in the always-visible spaces rail, so nothing else moves.
+    expect(wrapper.find('.shell--contacts').exists()).toBe(true);
+    expect(wrapper.find('.shell').classes()).toContain('shell--folder-list-hidden');
+    expect(beaconStore.openId).toBe('keyboardShortcuts');
+    const card = wrapper.get('[role="dialog"]');
+    expect(card.attributes('data-beacon-card')).toBe('keyboardShortcuts');
+    expect(card.text()).toContain('Keyboard shortcuts');
+    expect(card.text()).toContain('Show welcome');
+  });
+
+  it('leaves the card closed when the space change a reveal needs is refused', async () => {
+    seedExistingUser();
+    restoreContactListLayout = stubContactListLayout();
+    repoContacts = [{
+      id: 1,
+      remote_id: 'alice',
+      addressbook_ids: [],
+      display_name: 'Alice Example',
+      email: 'alice@example.com',
+    }];
+    const beaconStore = useFeatureBeaconsStore();
+
+    const wrapper = mountApp();
+    await settleBeacons();
+    await wrapper.get('.app-spaces [aria-label="Contacts"]').trigger('click');
+    await flushPromises();
+    await wrapper.get('[data-entry-key="contact:1"]').trigger('click');
+    await flushPromises();
+    await wrapper.findAll('button')
+      .find((button) => button.attributes('aria-label') === 'Edit')!
+      .trigger('click');
+    await wrapper.get('input[autocomplete="name"]').setValue('Dirty Alice');
+
+    // Leaving dirty Contacts asks first; cancelling keeps the space and
+    // must not pin a card to a control that is not on screen.
+    (wrapper.get('.beacon-menu').element as HTMLDetailsElement).open = true;
+    await nextTick();
+    await wrapper.get('[data-beacon-item="manageFolders"]').trigger('click');
+    await settleBeacons();
+    expect(wrapper.get('[role="alertdialog"]').text()).toContain('Save your changes');
+    expect(beaconStore.openId).toBeNull();
+    await wrapper.findAll('button')
+      .filter((button) => button.text().trim() === 'Cancel')
+      .at(-1)!
+      .trigger('click');
+    await settleBeacons();
+
+    expect(wrapper.find('.shell--contacts').exists()).toBe(true);
+    expect(beaconStore.openId).toBeNull();
+
+    // Discarding lets the reveal through: Mail comes back and the card pins.
+    (wrapper.get('.beacon-menu').element as HTMLDetailsElement).open = true;
+    await nextTick();
+    await wrapper.get('[data-beacon-item="manageFolders"]').trigger('click');
+    await settleBeacons();
+    await wrapper.findAll('button')
+      .find((button) => button.text().trim() === 'Discard')!
+      .trigger('click');
+    await settleBeacons();
+    expect(wrapper.find('.shell--contacts').exists()).toBe(false);
+    expect(beaconStore.openId).toBe('manageFolders');
+  });
+
+  it('hides beacons behind Welcome and keeps them when Welcome is reopened', async () => {
+    seedExistingUser();
+
+    const wrapper = mountApp();
+    await settleBeacons();
+    expect(wrapper.find('.feature-beacons').exists()).toBe(true);
+
+    await reopenWelcomeFromSettings(wrapper);
+    await settleBeacons();
+
+    expect(wrapper.get('[role="dialog"]').text()).toContain('Welcome to Thundermail');
+    expect(wrapper.find('.feature-beacons').exists()).toBe(false);
+
+    pressEscape();
+    await settleBeacons();
+    expect(wrapper.find('.welcome').exists()).toBe(false);
+    expect(wrapper.find('.feature-beacons').exists()).toBe(true);
+    // Opening Settings used the gear, so only the shortcuts beacon retired.
+    expect(wrapper.get('.beacon-menu__pill').text()).toBe('7 new');
+    expect(useFeatureBeaconsStore().seen).toEqual(['keyboardShortcuts']);
+    expect(window.localStorage.getItem(WELCOME_KEY)).toBe('1');
+    expect(window.localStorage.getItem(WHATS_NEW_KEY)).toBeNull();
+  });
+
+  it('reopens Welcome from Settings without touching either key, and not from the account menu', async () => {
+    const wrapper = mountApp();
+    await nextTick();
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false);
+
+    (wrapper.get('.account-menu').element as HTMLDetailsElement).open = true;
+    await nextTick();
+    expect(wrapper.findAll('[role="menuitem"]').map((item) => item.text()))
+      .not.toContainEqual(expect.stringContaining('Welcome'));
+    (wrapper.get('.account-menu').element as HTMLDetailsElement).open = false;
+
+    await reopenWelcomeFromSettings(wrapper);
+    await nextTick();
+
+    // Settings closes as Welcome opens; only one dialog is up.
+    expect(document.body.querySelector('[data-settings-dialog]')).toBeNull();
+    expect(wrapper.get('[role="dialog"]').text()).toContain('Welcome to Thundermail');
+    expect(wrapper.find('.beacon-menu').exists()).toBe(false);
+    expect(window.localStorage.getItem(WELCOME_KEY)).toBe('1');
+    expect(window.localStorage.getItem(WHATS_NEW_KEY)).toBe('1');
   });
 
   it('filters messages from the shared header box in the Mail space', async () => {
@@ -671,17 +1249,22 @@ describe('App mail layout', () => {
     expect(tiles).toHaveLength(3);
     expect(tiles[0].text()).toContain('Mail');
     expect(tiles[0].attributes('aria-current')).toBe('page');
-    expect(tiles[0].get('img').attributes('src')).toBe('/icons/icon-mail.svg');
+    // Glyphs are inline SVG filled with currentColor so the tile states can
+    // recolour them; the current tile alone is styled as such.
+    expect(tiles[0].find('.app-drawer__icon svg [fill="currentColor"]').exists()).toBe(true);
+    expect(tiles[0].classes()).toContain('app-drawer__tile--current');
     expect(tiles[1].text()).toContain('Appointment');
     expect(tiles[1].attributes('href')).toBe(APPOINTMENT_URL);
     expect(tiles[1].attributes('target')).toBe('_blank');
     expect(tiles[1].attributes('rel')).toBe('noopener noreferrer');
-    expect(tiles[1].get('img').attributes('src')).toBe('/icons/icon-appointment.svg');
+    expect(tiles[1].find('.app-drawer__icon svg [fill="currentColor"]').exists()).toBe(true);
+    expect(tiles[1].classes()).not.toContain('app-drawer__tile--current');
     expect(tiles[2].text()).toContain('Send');
     expect(tiles[2].attributes('href')).toBe(SEND_URL);
     expect(tiles[2].attributes('target')).toBe('_blank');
     expect(tiles[2].attributes('rel')).toBe('noopener noreferrer');
-    expect(tiles[2].get('img').attributes('src')).toBe('/icons/icon-send.svg');
+    expect(tiles[2].find('.app-drawer__icon svg [fill="currentColor"]').exists()).toBe(true);
+    expect(tiles[2].classes()).not.toContain('app-drawer__tile--current');
   });
 
   it('collapses the actions into a menu with the same links, settings and theme toggle for compact layouts', async () => {

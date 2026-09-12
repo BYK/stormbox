@@ -280,7 +280,29 @@ test.describe('Recipient control', () => {
       await expect(page.locator('.toolbar-dropdown:not([open]) .toolbar-more__menu').first())
         .toBeHidden();
 
+      // The From picker and the close control are <summary> elements of
+      // closed dropdowns; Tab leaves them in DOM order rather than wrapping.
+      await page.locator('.compose-dialog .from-picker__summary').focus();
+      await page.keyboard.press('Tab');
+      await expect(recipientInput(page, 'To')).toBeFocused();
+
+      // The formatting toolbar is one Tab stop (CS-3.17): Subject → toolbar →
+      // body, with the arrow keys moving between the toolbar's controls.
+      const toolbar = page.getByRole('toolbar', { name: 'Rich text formatting' });
+      await composeSubject(page).focus();
+      await page.keyboard.press('Tab');
+      await expect(toolbar.getByRole('button', { name: 'Bold' })).toBeFocused();
+      await page.keyboard.press('ArrowRight');
+      await expect(toolbar.getByRole('button', { name: 'Italic' })).toBeFocused();
+      await page.keyboard.press('Tab');
+      await expect(page.getByRole('textbox', { name: 'Message body' })).toBeFocused();
+      await page.keyboard.press('Shift+Tab');
+      await expect(toolbar.getByRole('button', { name: 'Italic' })).toBeFocused();
+
+      // The schedule trigger is the last stop; Tab from it wraps to the first.
       await composeSendButton(page).focus();
+      await page.keyboard.press('Tab');
+      await expect(page.locator('.compose-dialog .compose-schedule-menu__trigger')).toBeFocused();
       await page.keyboard.press('Tab');
       await expect(page.getByRole('button', { name: 'Minimize' })).toBeFocused();
 
@@ -312,12 +334,14 @@ test.describe('Recipient control', () => {
     }
   });
 
-  test('leaves Escape able to close the message', async ({ sharedPage: page }) => {
+  test('accepts a Tab suggestion and leaves Escape able to close the message', async ({
+    sharedPage: page,
+  }) => {
     // A list left open on a field the user has moved away from used to make
     // the whole dialog unclosable: the shortcut handler stands down for an
     // expanded combobox, and the control only receives the key when it has
     // focus, so Escape reached nothing at all.
-    const seeded = await seedFindableContact(page, 'Quilla');
+    const seeded = await seedFindableContact(page, `Quilla${Date.now()}`);
     try {
       await openCompose(page);
       const field = recipientInput(page, 'To');
@@ -331,6 +355,8 @@ test.describe('Recipient control', () => {
       // list up.
       await page.keyboard.press('Tab');
       await expect(field).not.toBeFocused();
+      expect(await recipientAddresses(page, 'To')).toEqual([seeded.email]);
+      await expect(invalidRecipients(page, 'To')).toHaveCount(0);
       await expect(
         page.locator('.compose-dialog [role="combobox"][aria-expanded="true"]'),
         'leaving a field takes its list with it',

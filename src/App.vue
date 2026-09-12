@@ -25,11 +25,17 @@ import { BUG_REPORT_URL, FEEDBACK_URL } from './defines';
 import { useAuthStore } from './stores/auth-store';
 import { useMailStore } from './stores/mail-store';
 import { useContactsStore } from './stores/contacts-store';
-import { useComposeStore } from './stores/compose-store';
+import { COMPOSE_PRESENTATION, useComposeStore } from './stores/compose-store';
 import { useSettingsStore } from './stores/settings-store';
 import { AUTH_STATE } from './constants/states';
 import type { Palette, Theme } from './constants/settings';
 import { shortcutAria, shortcutHint } from './constants/shortcuts';
+import {
+  readOnboardingFlag,
+  WELCOME_MODAL_STORAGE_KEY,
+  WHATS_NEW_STORAGE_KEY,
+  writeOnboardingFlag,
+} from './utils/onboarding-storage';
 
 import AppSpaces from './components/AppSpaces.vue';
 import LoginGate from './components/LoginGate.vue';
@@ -46,8 +52,15 @@ import TopNavMenu from './components/TopNavMenu.vue';
 import AccountAvatarMenu from './components/AccountAvatarMenu.vue';
 import WelcomeModal from './components/WelcomeModal.vue';
 import MailRulesDialog from './components/MailRulesDialog.vue';
+import SpotlightOverlay from './components/SpotlightOverlay.vue';
+import FeatureBeaconLayer from './components/FeatureBeaconLayer.vue';
+import FeatureBeaconMenu from './components/FeatureBeaconMenu.vue';
+import { useFeatureSpotlight } from './composables/useFeatureSpotlight';
+import { createSpotlightScripts } from './composables/featureSpotlightScripts';
+import type { SpotlightId } from './constants/feature-tour';
+import { beaconById, type BeaconId } from './constants/feature-beacons';
+import { useFeatureBeaconsStore } from './stores/feature-beacons-store';
 import SettingsDialog from './components/settings/SettingsDialog.vue';
-import SettingsGearButton from './components/settings/SettingsGearButton.vue';
 // Staff-only Kanban feature (src/features/kanban): the settings dialog's
 // staff section gates the flag; the board replaces MessageList only while
 // the flag is on. Both staff pieces are async so a non-staff session never
@@ -64,6 +77,7 @@ const contactsStore = useContactsStore();
 const composeStore = useComposeStore();
 const settingsStore = useSettingsStore();
 const kanbanStore = useKanbanStore();
+const beaconStore = useFeatureBeaconsStore();
 
 type AppSpace = 'contacts' | 'mail';
 
@@ -81,9 +95,6 @@ const contactsDetailVisible = ref(false);
 const sidebarLabel = computed(() =>
   space.value === 'contacts' ? 'address book list' : 'folder list');
 const quickFilterQuery = ref('');
-const quickFilterSpotlight = ref(false);
-const resizeLayoutSpotlight = ref(false);
-const composeActionSpotlight = ref(false);
 const quickFilterPlaceholder = computed(() =>
   space.value === 'contacts' ? 'Filter contacts or identities' : 'Filter messages',
 );
@@ -118,7 +129,6 @@ useTitle(documentTitle, { restoreOnUnmount: false });
 type ResizePane = 'folderList' | 'messageList';
 
 const RESIZE_STORAGE_KEY = 'stormbox.mailColumnWidths.v1';
-const WELCOME_MODAL_STORAGE_KEY = 'stormbox.welcomeModalDismissed.v1';
 const SPACE_RAIL_WIDTH = 56;
 const RESIZER_WIDTH = 6;
 const COMPACT_READING_WIDTH = 1024;
@@ -155,22 +165,43 @@ const folderListHidden = ref(false);
 const showWelcomeModal = ref(false);
 const showSettingsDialog = ref(false);
 const showMailRules = ref(false);
+const spotlight = useFeatureSpotlight(() => createSpotlightScripts({
+  composeStore,
+  currentSpace: () => space.value,
+  changeSpace: requestSpaceChange,
+  reducedMotion: () => spotlight.reducedMotion.value,
+}));
+const {
+  active: activeSpotlight,
+  progress: spotlightProgress,
+  targets: spotlightTargets,
+  stage: spotlightStage,
+  pointer: spotlightPointer,
+  dim: spotlightDim,
+  reducedMotion: spotlightReducedMotion,
+} = spotlight;
+// Dialogs the tour opens teleport to <body>, outside the shell, so they read
+// the spotlight state from a body class (see the folder manager rule below).
+watch(activeSpotlight, (id) => {
+  document.body.classList.toggle('spotlighting', id != null);
+}, { immediate: true });
 // With 'system' the OS decides, so a manual light/dark button would fight it.
 const showThemeToggle = computed(() => theme.value !== 'system');
 // Modal dialogs own the keyboard: a single-letter mail shortcut must not
 // archive or delete the selection behind them, or move focus out of them.
+// An open beacon card counts as one.
 const shortcutsEnabled = computed(() =>
   authStore.status === AUTH_STATE.CONNECTED
   && !showWelcomeModal.value
   && !showSettingsDialog.value
-  && !showMailRules.value,
+  && !showMailRules.value
+  && beaconStore.openId == null,
 );
+// Beacon dots would sit on top of these dialogs' scrims.
+const showFeatureBeacons = computed(() =>
+  !showWelcomeModal.value && !showSettingsDialog.value && !showMailRules.value);
 const windowWidth = ref(typeof window === 'undefined' ? COMPACT_READING_WIDTH : window.innerWidth);
-const wantsMessageDetailView = computed(() =>
-  mailStore.selectedMessageId != null
-  || resizeLayoutSpotlight.value
-  || composeActionSpotlight.value,
-);
+const wantsMessageDetailView = computed(() => mailStore.selectedMessageId != null);
 // Multi-select never opens the message view: the bulk actions live in
 // the message list header, so a checkbox selection hides the reading
 // pane entirely (and works the same in single-column layouts). The
@@ -183,10 +214,11 @@ const showMessageView = computed(() =>
 const displayedMessageView = ref(
   showMessageView.value && !(space.value === 'mail' && windowWidth.value < COMPACT_READING_WIDTH),
 );
+const singleColumnLayout = computed(() => windowWidth.value < SINGLE_COLUMN_WIDTH);
 const shouldUseSingleMailColumn = computed(() =>
   space.value === 'mail'
   && showMessageView.value
-  && windowWidth.value < SINGLE_COLUMN_WIDTH,
+  && singleColumnLayout.value,
 );
 const displayedMessageList = computed(() =>
   !(space.value === 'mail' && shouldUseSingleMailColumn.value),
@@ -199,11 +231,6 @@ const kanbanCompact = computed(() =>
   && displayedMessageList.value
   && displayedMessageView.value);
 let messageViewTimer: number | null = null;
-let quickFilterSpotlightTimer: number | null = null;
-let resizeLayoutSpotlightTimer: number | null = null;
-let composeActionSpotlightTimer: number | null = null;
-let resizeLayoutDemoStart: { folderList: number; messageList: number } | null = null;
-let resizeLayoutDemoTimers: number[] = [];
 let responsiveFolderListHidden = false;
 
 const shellStyle = computed(() => ({
@@ -276,9 +303,6 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   appMounted = false;
   clearMessageViewTimer();
-  clearQuickFilterSpotlightTimer();
-  clearResizeLayoutSpotlightTimer();
-  clearComposeActionSpotlightTimer();
   window.removeEventListener('resize', onWindowResize);
   unwatchSystemTheme();
   settingsStore.detach();
@@ -311,10 +335,12 @@ watch(folderListHidden, () => {
 
 watch(() => authStore.status, (status) => {
   if (status === AUTH_STATE.CONNECTED) {
-    maybeShowWelcomeModal();
+    maybeShowOnboardingModal();
     return;
   }
   showWelcomeModal.value = false;
+  beaconStore.reset();
+  void spotlight.cancel();
 }, { immediate: true });
 
 function startCompose() {
@@ -370,15 +396,17 @@ async function updateQuickFilterQuery(next: string) {
   quickFilterQuery.value = next;
 }
 
-async function requestSpaceChange(next: string) {
-  if (next !== 'mail' && next !== 'contacts') return;
-  if (next === space.value) return;
+/** Resolves true once `next` is the active space; false if leaving was refused. */
+async function requestSpaceChange(next: string): Promise<boolean> {
+  if (next !== 'mail' && next !== 'contacts') return false;
+  if (next === space.value) return true;
   if (
     space.value === 'contacts'
     && contactsViewEl.value
     && !await contactsViewEl.value.requestLeave()
-  ) return;
+  ) return false;
   space.value = next;
+  return true;
 }
 
 function toggleFolderList() {
@@ -393,126 +421,86 @@ function toggleTheme() {
   });
 }
 
-function maybeShowWelcomeModal() {
-  try {
-    if (window.localStorage?.getItem(WELCOME_MODAL_STORAGE_KEY) === '1') {
-      showWelcomeModal.value = false;
-      return;
-    }
-  } catch {
-    // If storage is blocked, keep the welcome as a session-only affordance.
+// Welcome for a new user; feature beacons for a user who dismissed Welcome
+// before this announcement and has not finished the round.
+function maybeShowOnboardingModal() {
+  if (!readOnboardingFlag(WELCOME_MODAL_STORAGE_KEY)) {
+    showWelcomeModal.value = true;
+    return;
   }
-  showWelcomeModal.value = true;
+  showWelcomeModal.value = false;
+  if (!readOnboardingFlag(WHATS_NEW_STORAGE_KEY)) beaconStore.arm();
 }
 
 function dismissWelcomeModal() {
   showWelcomeModal.value = false;
-  quickFilterSpotlight.value = false;
-  resizeLayoutSpotlight.value = false;
-  composeActionSpotlight.value = false;
-  clearQuickFilterSpotlightTimer();
-  clearResizeLayoutSpotlightTimer();
-  clearComposeActionSpotlightTimer();
-  try {
-    window.localStorage?.setItem(WELCOME_MODAL_STORAGE_KEY, '1');
-  } catch {
-    // Dismissal still applies for this session when storage is unavailable.
-  }
+  void spotlight.cancel();
+  writeOnboardingFlag(WELCOME_MODAL_STORAGE_KEY);
+  // Welcome covers every announced feature, so a new user never gets
+  // beacons; a user re-opening Welcome from Settings keeps theirs.
+  if (!beaconStore.enabled) writeOnboardingFlag(WHATS_NEW_STORAGE_KEY);
 }
 
 function showWelcomeModalAgain() {
+  showSettingsDialog.value = false;
   if (authStore.status === AUTH_STATE.CONNECTED) {
+    beaconStore.close();
     showWelcomeModal.value = true;
   }
 }
 
-function spotlightQuickFilter() {
-  quickFilterSpotlight.value = true;
-  clearQuickFilterSpotlightTimer();
-  quickFilterSpotlightTimer = window.setTimeout(() => {
-    quickFilterSpotlightTimer = null;
-    quickFilterSpotlight.value = false;
-  }, 3000);
-}
-
-function spotlightResizeLayout() {
-  resizeLayoutSpotlight.value = true;
-  clearResizeLayoutSpotlightTimer();
-  startResizeLayoutDemo();
-  resizeLayoutSpotlightTimer = window.setTimeout(() => {
-    resizeLayoutSpotlightTimer = null;
-    restoreResizeLayoutDemo();
-    resizeLayoutSpotlight.value = false;
-  }, 4600);
-}
-
-function spotlightComposeActions() {
-  composeActionSpotlight.value = true;
-  clearComposeActionSpotlightTimer();
-  composeActionSpotlightTimer = window.setTimeout(() => {
-    composeActionSpotlightTimer = null;
-    composeActionSpotlight.value = false;
-  }, 3400);
-}
-
-function clearQuickFilterSpotlightTimer() {
-  if (quickFilterSpotlightTimer == null) return;
-  window.clearTimeout(quickFilterSpotlightTimer);
-  quickFilterSpotlightTimer = null;
-}
-
-function clearResizeLayoutSpotlightTimer() {
-  if (resizeLayoutSpotlightTimer == null) return;
-  window.clearTimeout(resizeLayoutSpotlightTimer);
-  resizeLayoutSpotlightTimer = null;
-  restoreResizeLayoutDemo();
-}
-
-function clearComposeActionSpotlightTimer() {
-  if (composeActionSpotlightTimer == null) return;
-  window.clearTimeout(composeActionSpotlightTimer);
-  composeActionSpotlightTimer = null;
-}
-
-function startResizeLayoutDemo() {
-  restoreResizeLayoutDemo();
-  resizeLayoutDemoStart = {
-    folderList: folderListWidth.value,
-    messageList: messageListWidth.value,
-  };
-
-  const applyDemoStep = (delay: number, folderDelta: number, messageDelta: number) => {
-    const timer = window.setTimeout(() => {
-      if (!resizeLayoutDemoStart) return;
-      folderListWidth.value = clamp(
-        resizeLayoutDemoStart.folderList + folderDelta,
-        MIN_COLUMN_WIDTHS.folderList,
-        maxFolderListWidth(messageListWidth.value),
+// Brings a beacon's control on screen (opens the composer, switches space,
+// shows the sidebar) before opening its card; the layer then waits for the
+// anchor to mount (OB-5.3). A space change the user refuses (leaving dirty
+// Contacts) leaves the card closed rather than pinning it to nothing.
+async function revealBeacon(id: BeaconId): Promise<void> {
+  const beacon = beaconById(id);
+  switch (beacon.stage) {
+    case 'composer': {
+      const expanded = composeStore.sessions.find(
+        (session) => session.presentation === COMPOSE_PRESENTATION.EXPANDED,
       );
-      messageListWidth.value = clamp(
-        resizeLayoutDemoStart.messageList + messageDelta,
-        MIN_COLUMN_WIDTHS.messageList,
-        maxMessageListWidth(folderListWidth.value),
-      );
-    }, delay);
-    resizeLayoutDemoTimers.push(timer);
-  };
-
-  applyDemoStep(1200, 40, -30);
-  applyDemoStep(2600, -24, 36);
-  applyDemoStep(3900, 0, 0);
+      if (!expanded) {
+        const minimized = composeStore.sessions.find(
+          (session) => session.presentation === COMPOSE_PRESENTATION.MINIMIZED,
+        );
+        if (minimized) composeStore.restore(minimized.id);
+        else composeStore.open();
+      }
+      break;
+    }
+    case 'contacts':
+      if (!await requestSpaceChange('contacts')) return;
+      break;
+    case undefined:
+      // The spaces bar (Contacts, Settings gear) is always on screen. The
+      // Starred filter is in the message list header; the other unstaged
+      // controls are in the Mail sidebar, which the compact layouts may
+      // have hidden.
+      if (id !== 'contacts' && id !== 'keyboardShortcuts') {
+        if (!await requestSpaceChange('mail')) return;
+        if (id === 'starMessages') {
+          // The single-column layout shows the list or the open message.
+          if (!displayedMessageList.value) mailStore.selectMessage(null);
+        } else if (folderListHidden.value) {
+          toggleFolderList();
+        }
+      }
+      break;
+    default: {
+      const exhaustive: never = beacon.stage;
+      throw new Error(`Unhandled beacon stage ${String(exhaustive)}`);
+    }
+  }
+  beaconStore.open(id);
 }
 
-function restoreResizeLayoutDemo() {
-  for (const timer of resizeLayoutDemoTimers) {
-    window.clearTimeout(timer);
-  }
-  resizeLayoutDemoTimers = [];
-  if (resizeLayoutDemoStart) {
-    folderListWidth.value = resizeLayoutDemoStart.folderList;
-    messageListWidth.value = resizeLayoutDemoStart.messageList;
-    resizeLayoutDemoStart = null;
-  }
+function runSpotlight(id: SpotlightId) {
+  void spotlight.run(id);
+}
+
+function cancelSpotlight() {
+  void spotlight.cancel();
 }
 
 function onWindowResize() {
@@ -530,8 +518,7 @@ function detailPaneVisible() {
 
 function applyResponsiveLayout() {
   const compactLayout = windowWidth.value < COMPACT_READING_WIDTH;
-  const singleColumnLayout = windowWidth.value < SINGLE_COLUMN_WIDTH;
-  const shouldHideFolderList = singleColumnLayout || (compactLayout && detailPaneVisible());
+  const shouldHideFolderList = singleColumnLayout.value || (compactLayout && detailPaneVisible());
   const shouldShowSingleColumn = shouldUseSingleMailColumn.value;
   const willHideFolderList = shouldHideFolderList && !folderListHidden.value;
 
@@ -667,10 +654,6 @@ function unwatchSystemTheme() {
   systemThemeMedia?.removeEventListener?.('change', onSystemThemeChange);
   systemThemeMedia = null;
 }
-
-function clamp(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(value, Math.max(min, max)));
-}
 </script>
 
 <template>
@@ -686,8 +669,7 @@ function clamp(value: number, min: number, max: number) {
       'shell--folder-list-hidden': folderListHidden,
       'shell--contacts': space === 'contacts',
       'shell--column-resizing': activeResizePane !== null,
-      'shell--resize-spotlight': resizeLayoutSpotlight,
-      'shell--compose-spotlight': composeActionSpotlight,
+      'shell--spotlighting': activeSpotlight != null,
     }"
     :style="shellStyle"
   >
@@ -697,11 +679,7 @@ function clamp(value: number, min: number, max: number) {
         <span class="quick-filter__wordmark">Mail</span>
       </div>
 
-      <div
-        class="quick-filter__search"
-        :class="{ 'quick-filter__search--spotlight': quickFilterSpotlight }"
-        role="search"
-      >
+      <div class="quick-filter__search" role="search">
         <input
           ref="quickFilterInputEl"
           class="quick-filter__input"
@@ -710,7 +688,7 @@ function clamp(value: number, min: number, max: number) {
           :value="quickFilterQuery"
           :aria-label="quickFilterAriaLabel"
           :aria-keyshortcuts="quickFilterAriaShortcut"
-          :placeholder="quickFilterSpotlight ? '' : quickFilterPlaceholder"
+          :placeholder="quickFilterPlaceholder"
           autocomplete="off"
           spellcheck="false"
           @input="setQuickFilterQuery"
@@ -753,7 +731,6 @@ function clamp(value: number, min: number, max: number) {
         >
           <Lightbulb :size="18" :stroke-width="1.75" aria-hidden="true" />
         </a>
-        <SettingsGearButton @open="showSettingsDialog = true" />
         <button
           v-if="showThemeToggle"
           class="quick-filter__action theme-toggle"
@@ -774,9 +751,9 @@ function clamp(value: number, min: number, max: number) {
           @toggle-theme="toggleTheme"
           @open-settings="showSettingsDialog = true"
         />
+        <FeatureBeaconMenu @reveal="revealBeacon" />
         <AccountAvatarMenu
           @show-mail-rules="showMailRules = true"
-          @show-welcome-modal="showWelcomeModalAgain"
         />
       </div>
     </header>
@@ -788,6 +765,7 @@ function clamp(value: number, min: number, max: number) {
       :sidebar-label="sidebarLabel"
       @change="requestSpaceChange"
       @toggle-folder-list="toggleFolderList"
+      @open-settings="showSettingsDialog = true"
     />
 
     <div
@@ -798,11 +776,7 @@ function clamp(value: number, min: number, max: number) {
     >
       <aside v-if="space === 'mail'" class="sidebar">
         <header class="sidebar__header">
-          <AppButton
-            class="sidebar__compose"
-            :class="{ 'sidebar__compose--spotlight': composeActionSpotlight }"
-            @click="startCompose"
-          >
+          <AppButton class="sidebar__compose" @click="startCompose">
             <template #iconLeft>
               <Plus :size="16" :stroke-width="2" />
             </template>
@@ -832,7 +806,6 @@ function clamp(value: number, min: number, max: number) {
       :class="{
         'is-active': activeResizePane === 'folderList',
         'column-resizer--hidden': folderListHidden,
-        'column-resizer--spotlight': resizeLayoutSpotlight,
       }"
       role="separator"
       :aria-label="`Resize ${sidebarLabel}`"
@@ -858,7 +831,6 @@ function clamp(value: number, min: number, max: number) {
         class="column-resizer column-resizer--message-list"
         :class="{
           'is-active': activeResizePane === 'messageList',
-          'column-resizer--spotlight': resizeLayoutSpotlight,
         }"
         role="separator"
         aria-label="Resize message list"
@@ -870,10 +842,7 @@ function clamp(value: number, min: number, max: number) {
         @pointerdown="startColumnResize('messageList', $event)"
         @keydown="onResizeHandleKeydown('messageList', $event)"
       />
-      <MessageView
-        v-if="displayedMessageView"
-        :spotlight-actions="composeActionSpotlight"
-      />
+      <MessageView v-if="displayedMessageView" />
     </template>
     <ContactsView
       v-else-if="space === 'contacts'"
@@ -895,15 +864,28 @@ function clamp(value: number, min: number, max: number) {
     <MailRulesDialog v-if="showMailRules" @close="showMailRules = false" />
     <WelcomeModal
       v-if="showWelcomeModal"
+      :active-spotlight="activeSpotlight"
+      :progress="spotlightProgress"
+      :reduced-motion="spotlightReducedMotion"
+      :single-column="singleColumnLayout"
       @dismiss="dismissWelcomeModal"
-      @spotlight-quick-filter="spotlightQuickFilter"
-      @spotlight-resize-layout="spotlightResizeLayout"
-      @spotlight-compose-actions="spotlightComposeActions"
+      @spotlight="runSpotlight"
+      @cancel-spotlight="cancelSpotlight"
     />
+    <SpotlightOverlay
+      :active="activeSpotlight != null"
+      :targets="spotlightTargets"
+      :stage="spotlightStage"
+      :pointer="spotlightPointer"
+      :dim="spotlightDim"
+      :reduced-motion="spotlightReducedMotion"
+    />
+    <FeatureBeaconLayer v-if="showFeatureBeacons && beaconStore.enabled" />
     <SettingsDialog
       v-if="showSettingsDialog"
       :applied-theme="appliedTheme"
       @close="showSettingsDialog = false"
+      @show-welcome="showWelcomeModalAgain"
     />
     <KanbanCelebration v-if="authStore.isStaff" />
   </div>
@@ -917,25 +899,38 @@ function clamp(value: number, min: number, max: number) {
   --border-soft: color-mix(in srgb, var(--border) 55%, transparent);
   --accent-bg: color-mix(in srgb, var(--accent) 22%, var(--panel2));
   --accent-fg: var(--accent);
-  --space-rail-bg: color-mix(in srgb, var(--panel) 88%, #fff);
+  /* Chrome on the Bolt ramp (assets/styles.css). Dark: content on lower,
+     folder list, popovers and dialogs on base, rail and top nav on raised.
+     Light steps the other way (html.light below). */
+  --space-rail-bg: var(--colour-neutral-raised);
   --space-rail-fg: var(--muted);
-  --folder-list-bg: color-mix(in srgb, var(--panel) 96%, #fff);
+  --folder-list-bg: var(--colour-neutral-base);
   /* Top nav: same 56px band as before, sharing the rail's surface. The
      Bolt palette (assets/bolt-theme.css) re-points these tokens. */
   --top-nav-height: 56px;
   --top-nav-bg: var(--space-rail-bg);
-  --top-nav-shadow: transparent;
+  /* Modal look shared by every dialog (the Welcome modal defines it): a
+     base-surface card with a border edge over a dark blurred scrim. */
+  --modal-bg: var(--colour-neutral-base);
+  --modal-surface: var(--modal-bg);
+  --modal-border: var(--control-border);
+  --modal-shadow:
+    0 28px 80px color-mix(in srgb, #000 46%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #fff 8%, transparent);
+  --modal-scrim: color-mix(in srgb, #000 64%, transparent);
+  --modal-scrim-blur: blur(12px);
   --top-nav-wordmark: var(--accent);
   --top-nav-input-bg: var(--surface);
-  --top-nav-popover-bg: color-mix(in srgb, var(--panel) 92%, #fff);
+  --top-nav-popover-bg: var(--colour-neutral-base);
 }
 
 html.light,
 .light {
-  --space-rail-bg: color-mix(in srgb, var(--panel2) 96%, #000);
-  --folder-list-bg: color-mix(in srgb, var(--panel) 97%, #000);
+  /* Content, dialogs and popovers on base, folder list on lower, rail and
+     top nav on subtle. */
+  --space-rail-bg: var(--colour-neutral-subtle);
+  --folder-list-bg: var(--colour-neutral-lower);
   --top-nav-wordmark: var(--accent);
-  --top-nav-popover-bg: var(--panel2);
 }
 
 .shell {
@@ -951,7 +946,7 @@ html.light,
     minmax(var(--message-view-min-width, 320px), 1fr);
   grid-template-rows: auto minmax(0, 1fr);
   height: var(--app-viewport-height);
-  background: var(--bg);
+  background: var(--panel);
   color: var(--text);
   overflow: hidden;
 }
@@ -995,13 +990,32 @@ html.light,
     var(--folder-resizer-width)
     minmax(0, 1fr);
 }
-.shell--resize-spotlight {
-  transition: grid-template-columns 0.55s ease;
+/* While a feature spotlight runs, the tour caption sits along the top edge
+ * (FeatureCardGrid) and the composer sits directly beneath it. The dialog's
+ * own backdrop is dropped so the scrim is the only dimming. The dock lifts
+ * off the bottom edge so its ring is not clipped by the viewport. Three
+ * classes outrank the components' scoped `[data-v]` rules. */
+.shell.shell--spotlighting .compose-dialog {
+  --spotlight-caption-space: 112px;
+  align-items: start;
+  padding-top: var(--spotlight-caption-space);
+  box-sizing: border-box;
+  background: transparent;
 }
-.shell--compose-spotlight .sidebar-slot,
-.shell--compose-spotlight .message-view {
-  position: relative;
-  z-index: 130;
+.shell.shell--spotlighting .compose-dialog__card {
+  height: min(640px, calc(100vh - var(--spotlight-caption-space) - 24px));
+}
+.shell.shell--spotlighting .compose-dock {
+  bottom: 14px;
+}
+.shell.shell--spotlighting .compose-dock__item {
+  border-bottom: 2px solid var(--compose-dock-outline);
+  border-radius: 10px;
+}
+/* The folder manager the tour opens sits above the scrim (120 > 90); its
+ * own backdrop would dim the caption, so the scrim is the only dimming. */
+body.spotlighting .folder-subs {
+  background: transparent;
 }
 /* Grid items default to min-height: auto, which makes inner
  * overflow:auto containers grow to their content instead of scrolling.
@@ -1033,19 +1047,6 @@ html.light,
   padding: 0 16px 0 14px;
   /* No bottom hairline: the bar reads as one surface with the sidebar. */
   background: var(--top-nav-bg);
-}
-/* Drop shadow onto the panes below. The bar itself carries no z-index so
- * the welcome tour can still lift .quick-filter__search above its backdrop. */
-.quick-filter::after {
-  content: "";
-  position: absolute;
-  z-index: 1;
-  top: 100%;
-  left: 0;
-  right: 0;
-  height: 8px;
-  background: linear-gradient(to bottom, var(--top-nav-shadow), transparent);
-  pointer-events: none;
 }
 .quick-filter__brand {
   display: inline-flex;
@@ -1087,6 +1088,9 @@ html.light,
 .quick-filter__actions > .account-menu {
   margin-left: 2px;
 }
+.quick-filter__actions > .beacon-menu {
+  margin: 0 4px;
+}
 .quick-filter__action,
 .quick-filter__action.theme-toggle {
   display: inline-flex;
@@ -1116,25 +1120,10 @@ html.light,
   min-width: 160px;
   margin: 0 auto;
 }
-.quick-filter__search--spotlight {
-  z-index: 130;
-}
-.quick-filter__search--spotlight::before {
-  content: "";
-  position: absolute;
-  inset: -7px;
-  border: 1px solid color-mix(in srgb, var(--accent) 78%, #fff);
-  border-radius: 15px;
-  box-shadow:
-    0 0 0 7px color-mix(in srgb, var(--accent) 18%, transparent),
-    0 18px 46px color-mix(in srgb, #000 32%, transparent);
-  pointer-events: none;
-  animation: quick-filter-spotlight-pulse 1.4s ease-in-out infinite;
-}
 .quick-filter__input {
   width: 100%;
   height: 36px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: 8px;
   background: var(--top-nav-input-bg);
   color: var(--text);
@@ -1145,10 +1134,6 @@ html.light,
 }
 .quick-filter__input--empty {
   padding-right: 70px;
-}
-.quick-filter__search--spotlight .quick-filter__input {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 /* .quick-filter__clear occupies the padding gutter, so the WebKit search
    affordances would sit beside it as a second clear button. */
@@ -1206,26 +1191,6 @@ html.light,
   border-color: var(--border-soft);
   color: var(--text);
   outline: none;
-}
-
-@keyframes quick-filter-spotlight-pulse {
-  0%, 100% {
-    opacity: 0.82;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 1;
-    transform: scale(1.025);
-  }
-}
-
-@keyframes control-spotlight-pulse {
-  0%, 100% {
-    filter: brightness(1);
-  }
-  50% {
-    filter: brightness(1.16);
-  }
 }
 
 @media (max-width: 639px) {
@@ -1287,7 +1252,7 @@ html.light,
   .quick-filter__menu {
     display: block;
   }
-  .quick-filter__actions > :not(.account-menu, .quick-filter__menu) {
+  .quick-filter__actions > :not(.account-menu, .beacon-menu, .quick-filter__menu) {
     display: none;
   }
   .quick-filter__actions > .account-menu {
@@ -1378,15 +1343,6 @@ html.light,
   width: 100%;
   max-width: 100%;
 }
-.sidebar__compose--spotlight {
-  position: relative;
-  z-index: 130;
-  box-shadow:
-    0 0 0 5px color-mix(in srgb, var(--accent) 18%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--accent) 60%, #fff),
-    0 12px 28px color-mix(in srgb, #000 20%, transparent);
-}
-
 .sidebar__account {
   padding: 10px 14px 4px;
   font-size: 11px;
@@ -1443,16 +1399,6 @@ html.light,
 .column-resizer.is-active::before {
   background: var(--accent);
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
-}
-.column-resizer--spotlight {
-  z-index: 90;
-}
-.column-resizer--spotlight::before {
-  background: var(--accent);
-  box-shadow:
-    0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent),
-    0 0 22px color-mix(in srgb, var(--accent) 64%, transparent);
-  animation: control-spotlight-pulse 1.4s ease-in-out infinite;
 }
 body.is-column-resizing {
   cursor: col-resize;

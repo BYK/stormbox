@@ -377,8 +377,10 @@ function onKeydown(event: KeyboardEvent): void {
       return;
     }
     case 'Tab': {
-      // Leaves for the next field either way; what is typed comes with it.
-      commitText();
+      // Tab accepts the highlighted option, then moves to the next field.
+      const candidate = suggestions.value[activeIndex.value] ?? suggestions.value[0];
+      if (candidate) acceptSuggestion(candidate);
+      else commitText();
       return;
     }
     case ',':
@@ -597,7 +599,7 @@ function onPaste(event: ClipboardEvent): void {
   align-items: center;
   gap: 4px;
   padding: 2px 4px;
-  border: 1px solid var(--border, #cfcfcf);
+  border: 1px solid var(--control-border, #cfcfcf);
   border-radius: 4px;
   background: var(--panel2, #fff);
   cursor: text;
