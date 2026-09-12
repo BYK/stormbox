@@ -32,8 +32,9 @@ function snapshot(overrides: Record<string, unknown> = {}) {
     scripts: [],
     managedScript: null,
     editableScript: null,
-    foreignActiveScript: null,
+    source: '',
     document: { version: 2, rules: [] },
+    visualizationError: null,
     parseError: null,
     ...overrides,
   };
@@ -65,12 +66,14 @@ function mountDialog() {
 }
 
 function installRepo({
-  foreign = false,
+  incompatible = false,
   saveGate = null,
-}: { foreign?: boolean; saveGate?: Promise<void> | null } = {}) {
-  let serverSnapshot = snapshot(foreign ? {
+}: { incompatible?: boolean; saveGate?: Promise<void> | null } = {}) {
+  let serverSnapshot = snapshot(incompatible ? {
     scripts: [{ id: 'foreign', name: 'Handwritten filters', isActive: true }],
-    foreignActiveScript: { id: 'foreign', name: 'Handwritten filters' },
+    editableScript: { id: 'foreign', name: 'Handwritten filters', isActive: true },
+    source: 'vacation "Away";\r\n',
+    visualizationError: 'Top-level “vacation” is not represented by the visual editor at line 1.',
   } : {});
   let pendingRequest: any = null;
   const repo = {
@@ -81,13 +84,21 @@ function installRepo({
     }),
     runMutation: vi.fn(async () => {
       if (saveGate) await saveGate;
-      serverSnapshot = snapshot({
-        state: 'sieve-state-2',
-        document: pendingRequest.document,
-        scripts: [{ id: 'managed', name: 'Stormbox Mail Rules', isActive: true }],
-        managedScript: { id: 'managed', name: 'Stormbox Mail Rules', isActive: true },
-        editableScript: { id: 'managed', name: 'Stormbox Mail Rules', isActive: true },
-      });
+      serverSnapshot = pendingRequest.mode === 'source'
+        ? snapshot({
+          state: 'sieve-state-2',
+          scripts: [{ id: 'foreign', name: 'Handwritten filters', isActive: true }],
+          editableScript: { id: 'foreign', name: 'Handwritten filters', isActive: true },
+          source: pendingRequest.source,
+          visualizationError: 'Top-level “vacation” is not represented by the visual editor at line 1.',
+        })
+        : snapshot({
+          state: 'sieve-state-2',
+          document: pendingRequest.document,
+          scripts: [{ id: 'managed', name: 'Stormbox Mail Rules', isActive: true }],
+          managedScript: { id: 'managed', name: 'Stormbox Mail Rules', isActive: true },
+          editableScript: { id: 'managed', name: 'Stormbox Mail Rules', isActive: true },
+        });
       return { attempted: 1, succeeded: 1, failed: 0 };
     }),
     getPendingMutationError: vi.fn(),
@@ -121,7 +132,7 @@ describe('MailRulesDialog', () => {
 
     expect(repo.insertPendingMutation).toHaveBeenCalledTimes(1);
     const queued = JSON.parse(repo.insertPendingMutation.mock.calls[0][0].requestJson);
-    expect(queued.takeover).toBe(false);
+    expect(queued.mode).toBe('visual');
     expect(queued.document.rules).toHaveLength(1);
     expect(queued.document.rules[0]).toMatchObject({
       name: 'New rule',
@@ -178,6 +189,27 @@ describe('MailRulesDialog', () => {
     });
   });
 
+  it('switches between visual rules and their generated source', async () => {
+    installRepo();
+    const wrapper = mountDialog();
+    await flushPromises();
+
+    await wrapper.get('[data-mail-rules-add]').trigger('click');
+    await wrapper.get('input[aria-label="Condition value"]').setValue('newsletter');
+    const sourceTab = wrapper.findAll('.mail-rules__mode-switch button')
+      .find((tab) => tab.text().trim() === 'Source');
+    await sourceTab!.trigger('click');
+
+    expect(wrapper.get('textarea[aria-label="Sieve source"]').element)
+      .toHaveProperty('value', expect.stringContaining('address :contains "From" "newsletter"'));
+
+    const visualTab = wrapper.findAll('.mail-rules__mode-switch button')
+      .find((tab) => tab.text().trim() === 'Visual');
+    await visualTab!.trigger('click');
+    expect(wrapper.get('input[aria-label="Condition value"]').element)
+      .toHaveProperty('value', 'newsletter');
+  });
+
   it('locks the draft while a server save is in flight', async () => {
     let releaseSave = () => {};
     const saveGate = new Promise<void>((resolve) => {
@@ -201,24 +233,34 @@ describe('MailRulesDialog', () => {
     expect(wrapper.text()).toContain('Rules saved, validated, and activated.');
   });
 
-  it('requires confirmation before replacing a foreign active script', async () => {
-    const repo = installRepo({ foreign: true });
+  it('falls back to source and saves an incompatible active script in place', async () => {
+    const repo = installRepo({ incompatible: true });
     const wrapper = mountDialog();
     await flushPromises();
 
     expect(wrapper.text()).toContain('Handwritten filters');
-    await wrapper.get('[data-mail-rules-add]').trigger('click');
-    await wrapper.get('input[aria-label="Condition value"]').setValue('invoice');
+    expect(wrapper.text()).toContain('Top-level “vacation” is not represented by the visual editor at line 1.');
+    const source = wrapper.get('textarea[aria-label="Sieve source"]');
+    expect(source.element).toHaveProperty('value', 'vacation "Away";\r\n');
+
+    const visualTab = wrapper.findAll('.mail-rules__mode-switch button')
+      .find((tab) => tab.text().trim() === 'Visual');
+    await visualTab!.trigger('click');
+    expect(wrapper.get('[role="alert"]').text()).toContain(
+      'Top-level “vacation” is not represented by the visual editor at line 1.',
+    );
+
+    await source.setValue('vacation "Back Monday";\r\n');
     await wrapper.get('[data-mail-rules-save]').trigger('click');
     await flushPromises();
-
-    expect(wrapper.get('[role="alertdialog"]').text()).toContain('Activate Stormbox rules?');
-    expect(repo.insertPendingMutation).not.toHaveBeenCalled();
-
-    await wrapper.get('[data-mail-rules-confirm]').trigger('click');
-    await flushPromises();
     const queued = JSON.parse(repo.insertPendingMutation.mock.calls[0][0].requestJson);
-    expect(queued.takeover).toBe(true);
+    expect(queued).toEqual({
+      mode: 'source',
+      source: 'vacation "Back Monday";\r\n',
+      expectedState: 'sieve-state-1',
+    });
+    expect(wrapper.find('[role="alertdialog"]').exists()).toBe(false);
+    expect(wrapper.text()).toContain('Sieve source saved, validated, and activated.');
   });
 
   it('confirms before discarding an edited draft', async () => {

@@ -226,6 +226,16 @@ export function parseManagedRules(script: string): MailRuleDocument | null {
   });
 }
 
+/** Parse any script that can be represented without changing its executable semantics. */
+export function parseRulesSource(script: string): MailRuleDocument {
+  if (!isManagedRulesScript(script)) return parseVisualRules(script);
+  const document = parseManagedRules(script);
+  if (!document) {
+    throw new RuleValidationError('The Stormbox-managed script could not be read.');
+  }
+  return document;
+}
+
 export function parseVisualRules(script: string): MailRuleDocument {
   const parsed = parseSieve(script);
   for (const statement of parsed.statements) {

@@ -11,12 +11,14 @@ import MailRuleSelect from './MailRuleSelect.vue';
 import MailRuleTestEditor from './MailRuleTestEditor.vue';
 import { useAuthStore } from '../stores/auth-store';
 import { useMailStore } from '../stores/mail-store';
-import { MailRulesSaveError, useRulesStore } from '../stores/rules-store';
+import { useRulesStore } from '../stores/rules-store';
 import {
   cloneRuleDocument,
+  compileRules,
   createEmptyRule,
   newRuleId,
   normalizeRuleDocument,
+  parseRulesSource,
   RuleValidationError,
 } from '../sieve/rules';
 import type {
@@ -30,14 +32,21 @@ const mailStore = useMailStore();
 const rulesStore = useRulesStore();
 const panelEl = ref<HTMLElement | null>(null);
 const closeButtonEl = ref<HTMLButtonElement | null>(null);
+const mode = ref<'visual' | 'source'>('visual');
 const draft = ref<MailRuleDocument>({ version: 2, rules: [] });
 const baseline = ref('');
+const sourceDraft = ref('');
+const sourceBaseline = ref('');
+const visualSourceCheckpoint = ref('');
 const localError = ref<string | null>(null);
+const modeError = ref<string | null>(null);
 const notice = ref<string | null>(null);
-const confirmation = ref<'takeover' | 'discard' | null>(null);
+const confirmation = ref<'discard' | null>(null);
 
 const busy = computed(() => rulesStore.loading || rulesStore.saving);
-const dirty = computed(() => JSON.stringify(draft.value) !== baseline.value);
+const dirty = computed(() =>
+  JSON.stringify(draft.value) !== baseline.value
+  || sourceDraft.value !== sourceBaseline.value);
 const extensions = computed(() => new Set(rulesStore.capabilities.sieveExtensions));
 const canMove = computed(() => extensions.value.has('fileinto'));
 const canFlags = computed(() => extensions.value.has('imap4flags'));
@@ -149,19 +158,69 @@ function createAction(type: MailRuleAction['type']): MailRuleAction {
 
 async function load() {
   localError.value = null;
+  modeError.value = null;
   notice.value = null;
   try {
     await rulesStore.load();
-    draft.value = resolveFolderTargets(rulesStore.freshDocument());
-    baseline.value = JSON.stringify(draft.value);
+    syncDrafts();
   } catch (error) {
     localError.value = errorMessage(error);
   }
 }
 
+function syncDrafts(preferredMode?: 'visual' | 'source') {
+  draft.value = resolveFolderTargets(rulesStore.freshDocument());
+  baseline.value = JSON.stringify(draft.value);
+  visualSourceCheckpoint.value = baseline.value;
+  sourceDraft.value = rulesStore.freshSource();
+  sourceBaseline.value = sourceDraft.value;
+  mode.value = rulesStore.snapshot?.visualizationError
+    ? 'source'
+    : (preferredMode ?? 'visual');
+}
+
+function switchToSource() {
+  if (mode.value === 'source') return;
+  localError.value = null;
+  modeError.value = null;
+  const currentDocument = JSON.stringify(draft.value);
+  if (currentDocument !== visualSourceCheckpoint.value) {
+    try {
+      draft.value = refreshFolderFallbacks(draft.value);
+      sourceDraft.value = compileRules(draft.value, rulesStore.capabilities, {
+        managed: rulesStore.snapshot?.managedScript != null
+          || rulesStore.snapshot?.editableScript == null,
+      });
+      visualSourceCheckpoint.value = JSON.stringify(draft.value);
+    } catch (error) {
+      modeError.value = errorMessage(error);
+      return;
+    }
+  }
+  mode.value = 'source';
+}
+
+function switchToVisual() {
+  if (mode.value === 'visual') return;
+  localError.value = null;
+  modeError.value = null;
+  try {
+    draft.value = resolveFolderTargets(parseRulesSource(sourceDraft.value));
+    visualSourceCheckpoint.value = JSON.stringify(draft.value);
+    mode.value = 'visual';
+  } catch (error) {
+    modeError.value = errorMessage(error);
+  }
+}
+
 function requestSave() {
   localError.value = null;
+  modeError.value = null;
   notice.value = null;
+  if (mode.value === 'source') {
+    void persist();
+    return;
+  }
   try {
     draft.value = refreshFolderFallbacks(draft.value);
     normalizeRuleDocument(draft.value);
@@ -169,37 +228,21 @@ function requestSave() {
     localError.value = errorMessage(error);
     return;
   }
-  if (rulesStore.foreignActiveScript) {
-    confirmation.value = 'takeover';
-    focusConfirmation();
-    return;
-  }
-  persist(false);
+  void persist();
 }
 
-async function persist(takeover: boolean) {
-  confirmation.value = null;
+async function persist() {
   localError.value = null;
   notice.value = null;
   try {
-    await rulesStore.save(draft.value, { takeover });
-    draft.value = resolveFolderTargets(rulesStore.freshDocument());
-    baseline.value = JSON.stringify(draft.value);
-    notice.value = 'Rules saved, validated, and activated.';
+    const savedMode = mode.value;
+    if (savedMode === 'source') await rulesStore.saveSource(sourceDraft.value);
+    else await rulesStore.save(draft.value);
+    syncDrafts(savedMode);
+    notice.value = savedMode === 'source'
+      ? 'Sieve source saved, validated, and activated.'
+      : 'Rules saved, validated, and activated.';
   } catch (error) {
-    if (error instanceof MailRulesSaveError && error.code === 'foreignScriptActive') {
-      const unsaved = cloneRuleDocument(draft.value);
-      try {
-        await rulesStore.load();
-        draft.value = unsaved;
-      } catch (reloadError) {
-        localError.value = errorMessage(reloadError);
-        return;
-      }
-      confirmation.value = 'takeover';
-      focusConfirmation();
-      return;
-    }
     localError.value = errorMessage(error);
   }
 }
@@ -365,55 +408,81 @@ onBeforeUnmount(() => {
             <div v-else-if="rulesStore.snapshot.parseError" class="mail-rules__alert mail-rules__alert--error" role="alert">
               <CircleAlert :size="18" aria-hidden="true" />
               <div>
-                <strong>The managed script is not visually editable.</strong>
+                <strong>Stormbox cannot choose a script to edit.</strong>
                 <p>{{ rulesStore.snapshot.parseError }}</p>
               </div>
             </div>
 
             <template v-else-if="rulesStore.supported">
-              <div v-if="rulesStore.foreignActiveScript" class="mail-rules__alert mail-rules__alert--warning" role="status">
+              <div class="mail-rules__mode-switch" role="group" aria-label="Mail rules editor mode">
+                <button
+                  type="button"
+                  :aria-pressed="mode === 'visual'"
+                  :disabled="busy"
+                  @click="switchToVisual"
+                >Visual</button>
+                <button
+                  type="button"
+                  :aria-pressed="mode === 'source'"
+                  :disabled="busy"
+                  @click="switchToSource"
+                >Source</button>
+              </div>
+
+              <div v-if="modeError" class="mail-rules__alert mail-rules__alert--warning" role="alert">
                 <CircleAlert :size="18" aria-hidden="true" />
                 <div>
-                  <strong>Another Sieve script is active.</strong>
-                  <p>
-                    Saving will deactivate “{{ scriptLabel(rulesStore.foreignActiveScript) }}”,
-                    but it will remain stored on the server.
-                  </p>
+                  <strong>Cannot switch to the visual editor.</strong>
+                  <p>{{ modeError }}</p>
                 </div>
               </div>
 
               <div
-                v-else-if="rulesStore.snapshot.editableScript && !rulesStore.snapshot.managedScript"
+                v-if="mode === 'source' && rulesStore.snapshot.visualizationError && !modeError"
+                class="mail-rules__alert mail-rules__alert--warning"
+                role="status"
+              >
+                <CircleAlert :size="18" aria-hidden="true" />
+                <div>
+                  <strong>This script cannot be represented visually.</strong>
+                  <p>{{ rulesStore.snapshot.visualizationError }}</p>
+                  <p>Edit its complete source below. The server will validate it before saving.</p>
+                </div>
+              </div>
+
+              <div
+                v-else-if="mode === 'visual' && rulesStore.snapshot.editableScript"
                 class="mail-rules__alert"
                 role="status"
               >
                 <div>
-                  <strong>This existing script is visually compatible.</strong>
-                  <p>Saving will update the same script and normalize its Sieve formatting.</p>
+                  <strong>This script is visually compatible.</strong>
+                  <p>Visual saves preserve its behavior, but normalize source formatting and comments.</p>
                 </div>
               </div>
 
-              <div class="mail-rules__toolbar">
-                <div class="mail-rules__summary">
-                  <Filter :size="17" aria-hidden="true" />
-                  <span>{{ draft.rules.length }} {{ draft.rules.length === 1 ? 'rule' : 'rules' }}</span>
+              <div v-if="mode === 'visual'" aria-label="Visual rule editor">
+                <div class="mail-rules__toolbar">
+                  <div class="mail-rules__summary">
+                    <Filter :size="17" aria-hidden="true" />
+                    <span>{{ draft.rules.length }} {{ draft.rules.length === 1 ? 'rule' : 'rules' }}</span>
+                  </div>
+                  <AppButton data-mail-rules-add :disabled="busy" @click="addRule">
+                    <template #iconLeft><Plus :size="16" aria-hidden="true" /></template>
+                    Add rule
+                  </AppButton>
                 </div>
-                <AppButton data-mail-rules-add :disabled="busy" @click="addRule">
-                  <template #iconLeft><Plus :size="16" aria-hidden="true" /></template>
-                  Add rule
-                </AppButton>
-              </div>
 
-              <p v-if="draft.rules.length === 0" class="mail-rules__empty">
-                No rules yet. Add one, or save an empty ruleset to keep all incoming mail unchanged.
-              </p>
+                <p v-if="draft.rules.length === 0" class="mail-rules__empty">
+                  No rules yet. Add one, or save an empty ruleset to keep all incoming mail unchanged.
+                </p>
 
-              <fieldset class="mail-rules__fieldset" :disabled="busy">
-                <article
-                  v-for="(rule, ruleIndex) in draft.rules"
-                  :key="rule.id"
-                  class="mail-rule"
-                >
+                <fieldset class="mail-rules__fieldset" :disabled="busy">
+                  <article
+                    v-for="(rule, ruleIndex) in draft.rules"
+                    :key="rule.id"
+                    class="mail-rule"
+                  >
                   <header class="mail-rule__header">
                     <label class="mail-rule__enabled">
                       <input v-model="rule.enabled" type="checkbox" />
@@ -508,8 +577,28 @@ onBeforeUnmount(() => {
                       Stop processing later rules when this rule matches
                     </label>
                   </div>
-                </article>
-              </fieldset>
+                  </article>
+                </fieldset>
+              </div>
+
+              <div v-else class="mail-rules__source" aria-label="Sieve source editor">
+                <div class="mail-rules__source-heading">
+                  <strong>Sieve source</strong>
+                  <span>
+                    {{ rulesStore.snapshot.editableScript
+                      ? scriptLabel(rulesStore.snapshot.editableScript)
+                      : 'New script' }}
+                  </span>
+                </div>
+                <textarea
+                  v-model="sourceDraft"
+                  aria-label="Sieve source"
+                  :disabled="busy"
+                  autocomplete="off"
+                  autocapitalize="off"
+                  spellcheck="false"
+                />
+              </div>
             </template>
           </template>
         </main>
@@ -532,31 +621,14 @@ onBeforeUnmount(() => {
             class="mail-rules__confirm"
             role="alertdialog"
             aria-modal="true"
-            :aria-labelledby="confirmation === 'takeover' ? 'takeover-title' : 'discard-title'"
+            aria-labelledby="discard-title"
           >
-            <template v-if="confirmation === 'takeover'">
-              <h3 id="takeover-title">Activate Stormbox rules?</h3>
-              <p>
-                This will deactivate “{{ scriptLabel(rulesStore.foreignActiveScript) }}”.
-                Stormbox will preserve that script unchanged so it can be reactivated elsewhere.
-              </p>
-              <div class="mail-rules__confirm-actions">
-                <AppButton variant="outline" :disabled="rulesStore.saving" @click="cancelConfirmation">Cancel</AppButton>
-                <AppButton
-                  data-mail-rules-confirm
-                  :disabled="rulesStore.saving"
-                  @click="persist(true)"
-                >Activate Stormbox rules</AppButton>
-              </div>
-            </template>
-            <template v-else>
-              <h3 id="discard-title">Discard unsaved changes?</h3>
-              <p>Your server-side rules will stay as they were when this editor opened.</p>
-              <div class="mail-rules__confirm-actions">
-                <AppButton variant="outline" @click="cancelConfirmation">Keep editing</AppButton>
-                <AppButton data-mail-rules-confirm @click="confirmDiscard">Discard changes</AppButton>
-              </div>
-            </template>
+            <h3 id="discard-title">Discard unsaved changes?</h3>
+            <p>Your server-side rules will stay as they were when this editor opened.</p>
+            <div class="mail-rules__confirm-actions">
+              <AppButton variant="outline" @click="cancelConfirmation">Keep editing</AppButton>
+              <AppButton data-mail-rules-confirm @click="confirmDiscard">Discard changes</AppButton>
+            </div>
           </section>
         </div>
       </section>
@@ -612,6 +684,40 @@ onBeforeUnmount(() => {
 .mail-rules__body {
   overflow: auto;
   padding: 16px 20px 24px;
+}
+.mail-rules__mode-switch {
+  display: inline-flex;
+  gap: 2px;
+  margin: 0 0 14px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel2);
+}
+.mail-rules__mode-switch button {
+  min-width: 82px;
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+}
+.mail-rules__mode-switch button[aria-pressed="true"] {
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 1px 3px color-mix(in srgb, #000 22%, transparent);
+}
+.mail-rules__mode-switch button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: 1px;
+}
+.mail-rules__mode-switch button:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 .mail-rules__toolbar,
 .mail-rules__footer,
@@ -682,6 +788,45 @@ onBeforeUnmount(() => {
   margin: 0;
   padding: 0;
   border: 0;
+}
+.mail-rules__source {
+  display: grid;
+  gap: 9px;
+}
+.mail-rules__source-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text);
+  font-size: 13px;
+}
+.mail-rules__source-heading span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mail-rules__source textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 430px;
+  padding: 12px 14px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel2);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  tab-size: 2;
+}
+.mail-rules__source textarea:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  outline-offset: 1px;
 }
 .mail-rule {
   margin-bottom: 14px;
