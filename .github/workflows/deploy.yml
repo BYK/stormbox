@@ -2,7 +2,7 @@ name: CI and Deploy to Cloudflare Pages
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci/mail-rules-jmap-sieve]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -25,7 +25,7 @@ permissions:
 # and manually dispatched deploy runs finish.
 concurrency:
   group: "cloudflare-pages-${{ github.ref }}"
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 jobs:
   unit-test:
