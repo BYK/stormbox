@@ -157,7 +157,7 @@ describe('rules store', () => {
         source: rawSource,
         visualizationError: 'Top-level “vacation” is not represented by the visual editor at line 1.',
       })),
-      insertPendingMutation: vi.fn(async () => ({ id: 96 })),
+      insertPendingMutation: vi.fn(async (_input: any) => ({ id: 96 })),
       runMutation: vi.fn(async () => ({ attempted: 1, succeeded: 1, failed: 0 })),
       getPendingMutationError: vi.fn(),
     };
