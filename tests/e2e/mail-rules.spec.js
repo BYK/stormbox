@@ -120,11 +120,6 @@ test.describe('JMAP Sieve mail rules e2e', () => {
       await nestedGroup.getByLabel('Condition value').nth(1).fill('manager@example.com');
       await dialog.locator('[data-mail-rules-save]').click();
 
-      const takeover = page.getByRole('alertdialog', { name: 'Activate Stormbox rules?' });
-      if (await takeover.count()) {
-        await takeover.locator('[data-mail-rules-confirm]').click();
-      }
-
       await expect(dialog).toContainText('Rules saved, validated, and activated.', { timeout: 20_000 });
       await waitForPendingMutations(page);
       await expect.poll(
@@ -159,6 +154,9 @@ test.describe('JMAP Sieve mail rules e2e', () => {
       await expect(savedRule.locator('input[aria-label="Rule name"]')).toHaveValue(RULE_NAME);
       await expect(savedRule.locator('input[aria-label="Condition value"]').first()).toHaveValue(CONDITION_VALUE);
       await expect(savedRule.locator('.condition-group--nested')).toHaveCount(1);
+      await dialog.getByRole('button', { name: 'Source' }).click();
+      await expect(dialog.getByRole('textbox', { name: 'Sieve source' }))
+        .toHaveValue(new RegExp(CONDITION_VALUE));
       await dialog.getByRole('button', { name: 'Close', exact: true }).click();
     } finally {
       await restoreScripts(jmap, before);

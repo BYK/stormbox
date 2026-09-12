@@ -9,11 +9,13 @@
  *   jmap.thundermail.com           → handle HTTP /jmap/* + /.well-known/jmap and /jmap/ws
  *   jmap.byk.im                     → personal fork backed by Thundermail production
  *
- * Each webmail SPA and its bridge are NOT same-origin, so the HTTP
- * half handles CORS itself:
+ * The Thunderbird-hosted SPA lives at `webmail.*.thundermail.com`
+ * (plus the production-configured `alpha-app.thundermail.com`), while
+ * the personal fork lives at `webmail.byk.im`. Because each SPA and its
+ * bridge are NOT same-origin, the HTTP half handles CORS itself:
  * preflights are answered directly, and `Access-Control-*` headers
  * are merged into every response. The allowlist per route is the
- * SPA's paired webmail origin plus localhost for Vite dev hitting stage.
+ * SPA's webmail origin(s) plus localhost for vite dev hitting stage.
  */
 
 export interface Route {
@@ -64,8 +66,13 @@ export const PROD_ROUTE: Route = {
   stalwartOrigin: 'https://mail.thundermail.com',
   httpBridgeOrigin: 'https://jmap.thundermail.com',
   wsBridgeOrigin: 'wss://jmap.thundermail.com',
-  // Prod allowlist is strict: webmail prod only.
-  allowedOrigins: new Set(['https://webmail.thundermail.com']),
+  // Prod allowlist is strict: the hosted prod-configured SPAs only,
+  // no dev origins. alpha-app is the auto-deployed main build that
+  // talks to the production backends.
+  allowedOrigins: new Set([
+    'https://webmail.thundermail.com',
+    'https://alpha-app.thundermail.com',
+  ]),
 };
 
 /**

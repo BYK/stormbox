@@ -1395,6 +1395,38 @@ describe('ComposeDialog accessibility', () => {
     expect(dialog.attributes('role')).toBe('dialog');
   });
 
+  it('lets Tab leave the From picker and the close control instead of wrapping to Minimize', async () => {
+    const { wrapper } = await mountOpenCompose();
+    const from = wrapper.get('.from-picker__summary').element as HTMLElement;
+    const close = wrapper.get('.compose-close-menu__trigger').element as HTMLElement;
+
+    for (const summary of [from, close]) {
+      summary.focus();
+      const tab = new KeyboardEvent('keydown', {
+        key: 'Tab',
+        bubbles: true,
+        cancelable: true,
+      });
+      summary.dispatchEvent(tab);
+      // Not intercepted: the browser moves to the next control in DOM order.
+      expect(tab.defaultPrevented).toBe(false);
+      expect(document.activeElement).toBe(summary);
+    }
+
+    // Shift+Tab from Minimize, the first stop, wraps to the dialog's last one.
+    const minimize = wrapper.get('[aria-label="Minimize"]').element as HTMLButtonElement;
+    minimize.focus();
+    minimize.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Tab',
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    }));
+    expect(document.activeElement).not.toBe(minimize);
+    expect(document.activeElement).not.toBe(close);
+    expect(wrapper.get('footer').element.contains(document.activeElement)).toBe(true);
+  });
+
   it('does not visually preselect an action when Close is activated from the keyboard', async () => {
     const { wrapper, composeStore } = await mountOpenCompose();
     const sessionId = composeStore.activeSessionId;
@@ -1440,6 +1472,41 @@ describe('ComposeManager window presentation', () => {
     expect(composeStore.activeSessionId).toBe(firstId);
     expect(composeStore.sessionById(secondId)?.presentation).toBe('minimized');
     expect(wrapper.get('.compose-dialog--expanded h2').text()).toBe('First draft');
+    wrapper.unmount();
+    composeStore.$reset();
+  });
+
+  it('flies an outline from the card to the dock item on minimize, then removes it', async () => {
+    vi.useFakeTimers();
+    // The landing frame is requested with rAF; run it synchronously here.
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { callback(0); return 0; });
+    const composeStore = useComposeStore();
+    composeStore.identities = [{ id: 1, email: 'sender@example.com' } as any];
+    const id = composeStore.open({ subject: 'Flight draft' });
+    const wrapper = mount(ComposeManager, { attachTo: document.body });
+    await nextTick();
+    const card = wrapper.get('.compose-dialog--expanded .compose-dialog__card').element;
+    vi.spyOn(card, 'getBoundingClientRect').mockReturnValue({
+      top: 100, left: 200, width: 900, height: 600,
+    } as DOMRect);
+
+    composeStore.minimize(id);
+    await nextTick();
+    expect(wrapper.find(`.compose-dock__item[data-session-id="${id}"]`).exists()).toBe(true);
+    // The outline paints at the card, then on the next frame lands on the
+    // (zero-sized in the test DOM) dock item and fades out.
+    await flushPromises();
+    await nextTick();
+    const flight = wrapper.get('[data-testid="compose-dock-flight"]');
+    expect(flight.classes()).toContain('compose-dock-flight--landing');
+    expect(flight.attributes('style')).toContain('top: 0px');
+
+    vi.advanceTimersByTime(380);
+    await nextTick();
+    expect(wrapper.find('[data-testid="compose-dock-flight"]').exists()).toBe(false);
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
     wrapper.unmount();
     composeStore.$reset();
   });

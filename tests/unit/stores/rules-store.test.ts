@@ -54,8 +54,9 @@ function snapshot(overrides: Record<string, unknown> = {}) {
     scripts: [],
     managedScript: null,
     editableScript: null,
-    foreignActiveScript: null,
+    source: '',
     document: document(),
+    visualizationError: null,
     parseError: null,
     ...overrides,
   };
@@ -95,7 +96,7 @@ describe('rules store', () => {
     const store = useRulesStore();
     await store.load();
 
-    await store.save(document(), { takeover: true });
+    await store.save(document());
 
     expect(repo.insertPendingMutation).toHaveBeenCalledTimes(1);
     const pending = repo.insertPendingMutation.mock.calls[0][0];
@@ -106,9 +107,9 @@ describe('rules store', () => {
       optimisticPatchJson: null,
     });
     expect(JSON.parse(pending.requestJson)).toEqual({
+      mode: 'visual',
       document: document(),
       expectedState: 'sieve-state-1',
-      takeover: true,
     });
     expect(repo.runMutation).toHaveBeenCalledWith(7, 93);
     expect(repo.getMailRules).toHaveBeenCalledTimes(2);
@@ -129,6 +130,7 @@ describe('rules store', () => {
         maxSizeScript: new TextEncoder().encode(externalSource).length,
       },
       editableScript: { id: 'personal', name: 'Personal filters', isActive: true },
+      source: externalSource,
     });
     const repo = {
       getMailRules: vi.fn(async () => externalSnapshot),
@@ -147,6 +149,33 @@ describe('rules store', () => {
     expect(repo.insertPendingMutation).toHaveBeenCalledOnce();
   });
 
+  it('queues raw source without requiring visual projection', async () => {
+    const rawSource = 'vacation "Away";\r\n';
+    const repo = {
+      getMailRules: vi.fn(async () => snapshot({
+        editableScript: { id: 'personal', name: 'Personal filters', isActive: true },
+        source: rawSource,
+        visualizationError: 'Top-level “vacation” is not represented by the visual editor at line 1.',
+      })),
+      insertPendingMutation: vi.fn(async (_input: any) => ({ id: 96 })),
+      runMutation: vi.fn(async () => ({ attempted: 1, succeeded: 1, failed: 0 })),
+      getPendingMutationError: vi.fn(),
+    };
+    __setRepositoryForTests(repo);
+    useAuthStore().accountId = 7;
+    const store = useRulesStore();
+    await store.load();
+
+    await store.saveSource('vacation "Back Monday";\r\n');
+
+    const pending = repo.insertPendingMutation.mock.calls[0][0];
+    expect(JSON.parse(pending.requestJson)).toEqual({
+      mode: 'source',
+      source: 'vacation "Back Monday";\r\n',
+      expectedState: 'sieve-state-1',
+    });
+  });
+
   it('surfaces the typed terminal error left by the outbox', async () => {
     const repo = {
       getMailRules: vi.fn(async () => snapshot()),
@@ -154,9 +183,9 @@ describe('rules store', () => {
       runMutation: vi.fn(async () => ({ attempted: 1, succeeded: 0, failed: 1 })),
       getPendingMutationError: vi.fn(async () => ({
         error_json: JSON.stringify({
-          type: 'foreignScriptActive',
-          message: 'Another script is active.',
-          result: { foreignActiveScript: { id: 'foreign' } },
+          type: 'invalidSieve',
+          message: 'The server rejected the script.',
+          result: { validationError: { type: 'invalidSieve' } },
         }),
       })),
     };
@@ -167,11 +196,11 @@ describe('rules store', () => {
 
     await expect(store.save(document())).rejects.toMatchObject({
       name: 'MailRulesSaveError',
-      code: 'foreignScriptActive',
-      message: 'Another script is active.',
-      detail: { foreignActiveScript: { id: 'foreign' } },
+      code: 'invalidSieve',
+      message: 'The server rejected the script.',
+      detail: { validationError: { type: 'invalidSieve' } },
     } satisfies Partial<MailRulesSaveError>);
-    expect(store.error).toBe('Another script is active.');
+    expect(store.error).toBe('The server rejected the script.');
     expect(store.saving).toBe(false);
   });
 

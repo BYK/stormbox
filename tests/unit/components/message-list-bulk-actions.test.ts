@@ -39,6 +39,7 @@ import MessageList from '../../../src/components/MessageList.vue';
 import { useThunderbirdShortcuts } from '../../../src/composables/useThunderbirdShortcuts';
 import { useAuthStore } from '../../../src/stores/auth-store';
 import { useMailStore } from '../../../src/stores/mail-store';
+import { useSettingsStore } from '../../../src/stores/settings-store';
 
 function makeFolder(id, overrides = {}) {
   return {
@@ -133,15 +134,40 @@ describe('MessageList bulk actions header', () => {
         makeRow(3, { subject: 'Match two' }),
       ],
     });
+    // Thunderbird scheme: Ctrl+A is global and reaches the list through the broker.
+    useSettingsStore().settings = { shortcutScheme: 'thunderbird' };
     const shortcuts = mountShortcutBroker();
     mailStore.selectedIds = new Set([2]);
 
-    // Web scheme: `*` then `a` is the global select-all.
-    fireKey('*', { shiftKey: true });
-    const event = fireKey('a');
+    const event = fireKey('a', { ctrlKey: true });
     await nextTick();
 
     expect(event.defaultPrevented).toBe(true);
+    expect([...mailStore.selectedIds].sort((a, b) => a - b)).toEqual([1, 3]);
+    shortcuts.unmount();
+    wrapper.unmount();
+  });
+
+  it('selects only quick-filtered rows from Ctrl+A on the focused list', async () => {
+    const { mailStore, wrapper } = mountList({
+      quickFilterQuery: 'match',
+      rows: [
+        makeRow(1, { subject: 'Match one' }),
+        makeRow(2, { subject: 'Hidden' }),
+        makeRow(3, { subject: 'Match two' }),
+      ],
+    });
+    // Web scheme: Ctrl+A is list-scoped, so the global broker leaves it alone.
+    const shortcuts = mountShortcutBroker();
+
+    const global = fireKey('a', { ctrlKey: true });
+    await nextTick();
+    expect(global.defaultPrevented).toBe(false);
+    expect(mailStore.selectedIds.size).toBe(0);
+
+    await wrapper.get('.msg-list__scroller').trigger('keydown', { key: 'a', ctrlKey: true });
+    await nextTick();
+
     expect([...mailStore.selectedIds].sort((a, b) => a - b)).toEqual([1, 3]);
     shortcuts.unmount();
     wrapper.unmount();
@@ -155,14 +181,48 @@ describe('MessageList bulk actions header', () => {
         makeRow(3, { is_seen: 1 }),
       ],
     });
+    useSettingsStore().settings = { shortcutScheme: 'thunderbird' };
     const shortcuts = mountShortcutBroker();
     await wrapper.get('.msg-list__filter').trigger('click');
 
-    fireKey('*', { shiftKey: true });
-    fireKey('a');
+    fireKey('a', { ctrlKey: true });
     await nextTick();
 
     expect([...mailStore.selectedIds]).toEqual([2]);
+    shortcuts.unmount();
+    wrapper.unmount();
+  });
+
+  it('offers a Starred filter beside Unread that narrows rows and select-all to starred mail', async () => {
+    const { mailStore, wrapper } = mountList({
+      rows: [
+        makeRow(1, { is_flagged: 0 }),
+        makeRow(2, { is_flagged: 1, is_seen: 0 }),
+        makeRow(3, { is_flagged: 1 }),
+      ],
+    });
+    useSettingsStore().settings = { shortcutScheme: 'thunderbird' };
+    const shortcuts = mountShortcutBroker();
+
+    const filters = wrapper.findAll('.msg-list__filter');
+    expect(filters.map((button) => button.text())).toEqual(['Unread', 'Starred']);
+
+    await filters[1].trigger('click');
+    expect(filters[1].attributes('aria-pressed')).toBe('true');
+    expect(wrapper.find('.msg-list__count').text()).toBe('2 messages');
+
+    fireKey('a', { ctrlKey: true });
+    await nextTick();
+    expect([...mailStore.selectedIds].sort()).toEqual([2, 3]);
+
+    // Unread and Starred combine as AND.
+    mailStore.selectedIds = new Set();
+    await nextTick();
+    await wrapper.findAll('.msg-list__filter')[0].trigger('click');
+    fireKey('a', { ctrlKey: true });
+    await nextTick();
+    expect([...mailStore.selectedIds]).toEqual([2]);
+
     shortcuts.unmount();
     wrapper.unmount();
   });
@@ -189,6 +249,7 @@ describe('MessageList bulk actions header', () => {
       'Archive',
       'Junk',
       'Delete',
+      'Star',
       'Mark as read',
       'Mark as unread',
       'Clear selection',
@@ -209,6 +270,7 @@ describe('MessageList bulk actions header', () => {
       'Whitelist senders and move to Inbox',
       'Archive',
       'Delete',
+      'Star',
       'Mark as read',
       'Mark as unread',
       'Clear selection',
@@ -235,6 +297,35 @@ describe('MessageList bulk actions header', () => {
     wrapper.unmount();
   });
 
+  it('offers Cancel send in place of Delete inside the Scheduled folder', async () => {
+    const { mailStore, wrapper } = mountList({
+      folder: makeFolder(2, { name: 'Scheduled', role: 'scheduled' }),
+      rows: [
+        makeRow(1, { scheduled_undo_status: 'pending' }),
+        makeRow(2, { scheduled_undo_status: 'pending' }),
+      ],
+    });
+    mailStore.selectedIds = new Set([1, 2]);
+    await nextTick();
+
+    const actions = wrapper.findAll('.msg-list__bulk-actions .msg-list__bulk-action');
+    expect(actions.map((button) => button.attributes('title'))).toEqual([
+      'Cancel send',
+      'Mark as read',
+      'Mark as unread',
+      'Clear selection',
+    ]);
+
+    const cancelSpy = vi.spyOn(mailStore, 'cancelScheduledSends')
+      .mockResolvedValue({ succeeded: 2, failed: 0 });
+    const destroySpy = vi.spyOn(mailStore, 'destroyMessages').mockResolvedValue(undefined);
+    await wrapper.find('.msg-list__bulk-actions [title="Cancel send"]').trigger('click');
+
+    expect(cancelSpy).toHaveBeenCalledWith([1, 2]);
+    expect(destroySpy).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
   it('dispatches the store actions for the selected ids', async () => {
     const { mailStore, wrapper } = mountList();
     mailStore.selectedIds = new Set([1, 3]);
@@ -256,6 +347,28 @@ describe('MessageList bulk actions header', () => {
     expect(destroySpy).toHaveBeenCalledWith([1, 3]);
     expect(seenSpy).toHaveBeenNthCalledWith(1, [1, 3], true);
     expect(seenSpy).toHaveBeenNthCalledWith(2, [1, 3], false);
+    wrapper.unmount();
+  });
+
+  it('offers a modal Star toggle that reads Unstar once any selected row is starred', async () => {
+    const { mailStore, wrapper } = mountList({
+      rows: [makeRow(1), makeRow(2, { is_flagged: 1 }), makeRow(3)],
+    });
+    mailStore.selectedIds = new Set([1, 3]);
+    await nextTick();
+
+    const star = wrapper.find('.msg-list__bulk-actions .msg-list__bulk-action--star');
+    expect(star.attributes('title')).toBe('Star');
+    expect(star.attributes('aria-pressed')).toBe('false');
+
+    const toggleSpy = vi.spyOn(mailStore, 'toggleManyFlagged').mockResolvedValue(2);
+    await star.trigger('click');
+    expect(toggleSpy).toHaveBeenCalledWith([1, 3]);
+
+    mailStore.selectedIds = new Set([1, 2]);
+    await nextTick();
+    expect(star.attributes('title')).toBe('Unstar');
+    expect(star.attributes('aria-pressed')).toBe('true');
     wrapper.unmount();
   });
 

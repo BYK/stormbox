@@ -3,7 +3,6 @@ import {
   createEmailInMailbox,
   ensureMailbox,
   jmapRequest,
-  listMailboxes,
   pickResponse,
   sweepOrphanTestMessages,
 } from './helpers/jmap-client.js';
@@ -42,10 +41,54 @@ const RENAMED_NAME = 'CrudRenamed';
 const BULK_A = 'BulkCrudA';
 const BULK_B = 'BulkCrudB';
 const SWEEP_SUBJECT = 'CrudSeed e2e';
+const SCHEDULED_NAME = 'Scheduled';
+const SCHEDULED_ROLE = 'scheduled';
+
+async function listServerMailboxes(jmap) {
+  const payload = await jmapRequest(jmap, [[
+    'Mailbox/get',
+    {
+      accountId: jmap.accountId,
+      properties: ['id', 'name', 'role', 'parentId'],
+    },
+    'mailboxList',
+  ]]);
+  return pickResponse(payload, 'Mailbox/get')?.list ?? [];
+}
 
 async function getServerMailboxByName(jmap, name) {
-  const mailboxes = await listMailboxes(jmap);
-  return mailboxes.find((m) => (m.name ?? '') === name) ?? null;
+  return (await listServerMailboxes(jmap))
+    .find((mailbox) => mailbox.name === name && mailbox.parentId == null) ?? null;
+}
+
+async function getServerMailboxByRole(jmap, role) {
+  return (await listServerMailboxes(jmap)).find((mailbox) => mailbox.role === role) ?? null;
+}
+
+async function localFolderRole(page, remoteId) {
+  return page.evaluate(async (id) => {
+    if (!globalThis.__repo) throw new Error('Repository is unavailable');
+    const [account] = await globalThis.__repo.listAccounts();
+    if (!account) throw new Error('Primary account is unavailable');
+    const folders = await globalThis.__repo.listFolders(account.id);
+    return folders.find((folder) => folder.remote_id === id)?.role ?? null;
+  }, remoteId);
+}
+
+async function destroyEmptyServerMailbox(jmap, mailboxId) {
+  const payload = await jmapRequest(jmap, [[
+    'Mailbox/set',
+    {
+      accountId: jmap.accountId,
+      destroy: [mailboxId],
+      onDestroyRemoveEmails: false,
+    },
+    'scheduledCleanup',
+  ]]);
+  const set = pickResponse(payload, 'Mailbox/set');
+  if (set?.destroyed?.includes(mailboxId)) return true;
+  if (set?.notDestroyed?.[mailboxId]) return false;
+  throw new Error(`Mailbox/set did not clean up Scheduled: ${JSON.stringify(set)}`);
 }
 
 async function destroyServerMailboxByName(jmap, name) {
@@ -266,18 +309,65 @@ test.describe('Folder create/rename/delete e2e', () => {
     }
   });
 
-  test('system folders expose no subscription, selection, or edit controls', async ({ sharedPage: page }, testInfo) => {
+  test('default folders, Scheduled included, sit under the account heading with no controls', async ({ sharedPage: page }, testInfo) => {
+    const jmap = await connectJmap();
+    let scheduledMailbox = null;
+    let createdScheduled = false;
+    const dialog = page.locator('[role="dialog"]').filter({ hasText: 'Manage Folders' });
     try {
-      const dialog = await openManageDialog(page, 'Inbox');
+      // Stormbox only creates the Scheduled role folder on the first
+      // scheduled send, so seed it here when the account lacks one.
+      const existingScheduled = await getServerMailboxByRole(jmap, SCHEDULED_ROLE)
+        ?? await getServerMailboxByName(jmap, SCHEDULED_NAME);
+      scheduledMailbox = await ensureMailbox(jmap, { name: SCHEDULED_NAME, role: SCHEDULED_ROLE });
+      createdScheduled = scheduledMailbox.id !== existingScheduled?.id;
+      expect(scheduledMailbox).toMatchObject({ role: SCHEDULED_ROLE, parentId: null });
+      // A legacy roleless Scheduled is already in the sidebar as a user
+      // folder, so wait for the role itself to sync before opening the
+      // dialog, or the default block reflows mid-assertion.
+      await expect.poll(
+        () => localFolderRole(page, scheduledMailbox.id),
+        { timeout: 30_000 },
+      ).toBe(SCHEDULED_ROLE);
       await expect(
-        dialog.locator('.folder-subs__row').filter({ hasText: 'Inbox' }).first(),
-      ).toContainText('always shown', { timeout: 10_000 });
-      await expect(dialog.locator('[data-folder-name="Inbox"]')).toHaveCount(0);
-      await expect(dialog.locator('input[data-folder-select="Inbox"]')).toHaveCount(0);
-      await expect(dialog.locator('[data-folder-edit="Inbox"]')).toHaveCount(0);
+        page.locator('.folder-node__name').filter({ hasText: /^Scheduled$/ }),
+      ).toBeVisible({ timeout: 30_000 });
+
+      await openManageDialog(page);
+      // The default block opens collapsed: its rows are not mounted until
+      // the account heading's chevron expands it. The account may have no
+      // folders of its own here, so only the default rows are checked.
+      const toggle = dialog.locator('button[data-account-toggle]');
+      await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+      await expect(dialog.locator('.folder-subs__row').filter({ hasText: 'Inbox' })).toHaveCount(0);
+      await toggle.click();
+      await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+
+      const itemIndex = (locator) => locator
+        .locator('xpath=ancestor::*[contains(@class, "folder-subs__item")]')
+        .evaluate((el) => Number(el.dataset.index));
+      const rootIdx = await itemIndex(dialog.locator('[data-folder-root]'));
+      for (const name of ['Inbox', 'Drafts', 'Scheduled', 'Sent', 'Junk', 'Deleted']) {
+        const row = dialog.locator('.folder-subs__row').filter({ hasText: name }).first();
+        await expect(row, `${name} is a default folder row`).toContainText('always shown', { timeout: 10_000 });
+        expect(await itemIndex(row), `${name} sits above Top Level`).toBeLessThan(rootIdx);
+        await expect(row.locator('[data-folder-name]')).toHaveCount(0);
+        await expect(row.locator('input[data-folder-select]')).toHaveCount(0);
+        await expect(row.locator('[data-folder-edit]')).toHaveCount(0);
+        await expect(row.locator('[data-folder-star]')).toHaveCount(0);
+        await expect(row.locator('[data-folder-add]'), `${name} hosts child folders`).toHaveCount(1);
+      }
       await page.keyboard.press('Escape');
       await expect(dialog).toBeHidden({ timeout: 5_000 });
     } finally {
+      // A failure above must not leave the dialog open for the next spec
+      // on the shared page.
+      if (await dialog.isVisible().catch(() => false)) {
+        await page.keyboard.press('Escape').catch(() => {});
+      }
+      if (createdScheduled && scheduledMailbox) {
+        await destroyEmptyServerMailbox(jmap, scheduledMailbox.id);
+      }
       await attachConsoleTail(testInfo, consoleLinesFor(page));
     }
   });

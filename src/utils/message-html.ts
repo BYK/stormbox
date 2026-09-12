@@ -339,13 +339,15 @@ export const IFRAME_CSP = [
  *    scrolling in the reading pane. We intentionally avoid colour,
  *    typography, spacing, or other broad design rewrites.
  */
+/** Canvas under the classic palette: --panel, the Bolt ramp's base surface
+ *  in light and lower in dark (assets/styles.css). */
 export const BODY_THEME_COLORS = {
   light: {
-    background: '#ffffff',
+    background: '#fcfcfd',
     color: '#111827',
   },
   dark: {
-    background: '#11131a',
+    background: '#111113',
     color: '#e6e8ef',
   },
 };

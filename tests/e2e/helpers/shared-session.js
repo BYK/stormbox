@@ -105,6 +105,7 @@ export const test = base.extend({
     const page = await ctx.newPage();
     await page.addInitScript(() => {
       window.localStorage.setItem('stormbox.welcomeModalDismissed.v1', '1');
+      window.localStorage.setItem('stormbox.whatsNewSeen.2026-09-compose', '1');
     });
     // The console buffer lives on the page object so per-test
     // beforeEach can reset it without rewiring listeners.
@@ -197,6 +198,7 @@ async function returnToMailSpace(page) {
   await page.locator('.folder-node').first().waitFor({ state: 'visible', timeout: 10_000 });
 }
 
+/** Close the Welcome popup if a new session is showing it. */
 async function dismissWelcomeModal(page) {
   const welcome = page.locator('[role="dialog"]').filter({ hasText: 'Welcome to Thundermail' });
   if (await welcome.count() === 0) return;

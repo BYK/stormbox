@@ -135,6 +135,7 @@ beforeEach(() => {
   __setRepositoryForTests(makeRepo());
   localStorage.clear();
   localStorage.setItem('stormbox.welcomeModalDismissed.v1', '1');
+  localStorage.setItem('stormbox.whatsNewSeen.2026-09-compose', '1');
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
   audio.preloadCelebrationAudio.mockClear();
   audio.playCelebrationAudio.mockClear();
@@ -179,18 +180,16 @@ describe('staff settings in the gear dialog', () => {
     expect(staffSection()).toBeNull();
   });
 
-  it('the gear sits between feedback and the theme toggle; the list is untouched while locked', async () => {
+  it('the gear sits at the foot of the spaces rail above the sidebar toggle; the list is untouched while locked', async () => {
     useAuthStore().recoveryEmail = 'boss@thunderbird.net';
-    localStorage.setItem('stormbox.theme.v1', 'dark');
     const wrapper = mountApp();
     await flushPromises();
 
-    const actions = wrapper.get('.quick-filter__actions');
-    const children = Array.from(actions.element.children);
-    const gearIndex = children.findIndex((el) => el.matches('[data-settings-gear]'));
-    expect(gearIndex).toBeGreaterThan(0);
-    expect(children[gearIndex - 1]?.getAttribute('aria-label')).toBe('Give feedback');
-    expect(children[gearIndex + 1]?.classList.contains('theme-toggle')).toBe(true);
+    expect(wrapper.find('.quick-filter__actions [data-settings-gear]').exists()).toBe(false);
+    const rail = wrapper.get('.app-spaces__bottom-actions');
+    const children = Array.from(rail.element.children);
+    expect(children[0]?.matches('[data-settings-gear]')).toBe(true);
+    expect(children[1]?.getAttribute('aria-label')).toBe('Hide folder list');
     expect(wrapper.find('.msg-list').exists()).toBe(true);
     expect(wrapper.find('[data-testid="kanban-board"]').exists()).toBe(false);
   });

@@ -1,15 +1,36 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { Loader2 } from '@lucide/vue';
 import { NoticeWarningIcon } from '@thunderbirdops/services-ui';
 import AppButton from './AppButton.vue';
 
 import { useAuthStore } from '../stores/auth-store';
+import { getOidc } from '../services/auth';
 import { AUTH_STATE } from '../constants/states';
 import { APP_PASSWORD_ONLY } from '../defines';
+import { hasAutoLoginFlag, withoutAutoLoginFlag } from '../utils/staff-redirect';
 import ThundermailLogo from './ThundermailLogo.vue';
 
 const authStore = useAuthStore();
+
+// A staff redirect from the production origin lands here with the
+// auto-login flag. The flag is dropped from the URL first so a reload or
+// a failed sign-in cannot loop, then the shared Keycloak SSO session
+// completes the sign-in without a click. An already-live OIDC session
+// is connected by initialize(), so only the flag is dropped.
+let autoLoginHandled = false;
+watch(() => authStore.status, (status) => {
+  if (APP_PASSWORD_ONLY || autoLoginHandled || status !== AUTH_STATE.OIDC_READY) return;
+  if (typeof window === 'undefined' || !hasAutoLoginFlag(window.location.search)) return;
+  autoLoginHandled = true;
+  window.history.replaceState(
+    window.history.state,
+    '',
+    withoutAutoLoginFlag(window.location.href),
+  );
+  if (getOidc()?.isUserLoggedIn) return;
+  void authStore.connectViaOidc();
+}, { immediate: true });
 
 const showPasswordForm = ref(APP_PASSWORD_ONLY);
 const username = ref('');
@@ -149,7 +170,7 @@ function togglePassword() {
   display: grid;
   place-items: center;
   min-height: var(--app-viewport-height);
-  background: var(--bg);
+  background: var(--panel);
   color: var(--text);
   padding: clamp(16px, 6vw, 24px);
 }
@@ -212,6 +233,11 @@ function togglePassword() {
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
 }
 
+/* A black shadow cannot read on the dark page; cast a grey one instead. */
+html.dark .login-card {
+  box-shadow: 0 12px 40px rgba(255, 255, 255, 0.1);
+}
+
 .login-card__logo {
   align-self: center;
   margin-bottom: 4px;
@@ -271,7 +297,7 @@ function togglePassword() {
 .login-card__password input {
   padding: 9px 11px;
   background: var(--panel2);
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: 8px;
   color: var(--text);
   font-size: 14px;

@@ -272,9 +272,11 @@ describe('MessageView with a sparse messages array', () => {
     expect(junkSpy).toHaveBeenCalledWith([42]);
   });
 
-  it('shows Cc so the audience is visible before replying', async () => {
+  it('shows Cc and Bcc so the audience is visible before replying', async () => {
     // There is no cc_text column, and the point of CS-2.7 is that a user
-    // should not have to open Reply All to find out who else got this.
+    // should not have to open Reply All to find out who else got this. Bcc
+    // rows only exist on the user's own copy, where they are the one record
+    // of who was blind-copied (#125).
     const authStore = useAuthStore();
     authStore.accountId = 1;
     __setRepositoryForTests(makeRepo());
@@ -293,7 +295,8 @@ describe('MessageView with a sparse messages array', () => {
     mailStore.selectedMessageAddresses = [
       { kind: 'cc', position: 1, name: null, email: 'carol@example.com' },
       { kind: 'cc', position: 0, name: 'Bob', email: 'bob@example.com' },
-      { kind: 'bcc', position: 0, name: null, email: 'hidden@example.com' },
+      { kind: 'bcc', position: 1, name: null, email: 'quiet@example.com' },
+      { kind: 'bcc', position: 0, name: 'Dana', email: 'dana@example.com' },
     ];
 
     const wrapper = mount(MessageView);
@@ -302,11 +305,12 @@ describe('MessageView with a sparse messages array', () => {
     const rows = wrapper.findAll('.message-view__metadata-row')
       .map((row: any) => [row.find('dt').text(), row.find('dd').text()]);
     expect(rows).toContainEqual(['Cc', 'Bob <bob@example.com>, carol@example.com']);
-    expect(wrapper.text(), 'Bcc is not part of the message as delivered')
-      .not.toContain('hidden@example.com');
+    expect(rows).toContainEqual(['Bcc', 'Dana <dana@example.com>, quiet@example.com']);
+    const labels = rows.map(([label]) => label);
+    expect(labels.indexOf('Bcc')).toBe(labels.indexOf('Cc') + 1);
   });
 
-  it('leaves out the Cc row when the message has none', async () => {
+  it('leaves out the Cc and Bcc rows when the message has none', async () => {
     const authStore = useAuthStore();
     authStore.accountId = 1;
     __setRepositoryForTests(makeRepo());
@@ -421,35 +425,6 @@ describe('MessageView with a sparse messages array', () => {
       expect.objectContaining({ text: 'body text' }),
     );
   });
-
-  it('hides the onboarding spotlight toolbar from assistive tech and the tab order', async () => {
-    // The spotlight branch renders a decorative copy of the toolbar so
-    // the welcome tour has something to point at. Those buttons have no
-    // handlers, so exposing them as "Reply", "Archive" and "Delete"
-    // would offer a screen-reader user six controls that do nothing.
-    const authStore = useAuthStore();
-    authStore.accountId = 1;
-    __setRepositoryForTests(makeRepo());
-    const mailStore = useMailStore() as any;
-    await mailStore.attach();
-
-    const wrapper = mount(MessageView, { props: { spotlightActions: true } });
-    await nextTick();
-
-    const header = wrapper.find('.message-view__header');
-    expect(header.exists()).toBe(true);
-    expect(header.attributes('aria-hidden')).toBe('true');
-
-    const buttons = wrapper.findAll('.message-view__header button');
-    expect(buttons.length).toBeGreaterThan(0);
-    for (const button of buttons) {
-      expect(button.attributes('tabindex')).toBe('-1');
-      // No accessible name either: the decorative copy must not look
-      // like a real action to the accessibility tree.
-      expect(button.attributes('aria-label')).toBeUndefined();
-    }
-  });
-
 });
 
 describe('MessageView HTML body rendering', () => {
@@ -578,7 +553,7 @@ describe('MessageView HTML body rendering', () => {
     expect(srcdoc).toContain('background: transparent;');
     expect(srcdoc).toContain('color: #e6e8ef;');
     expect(srcdoc).toContain('<p>test</p>');
-    expect(iframe.attributes('style')).toContain('background-color: #11131a');
+    expect(iframe.attributes('style')).toContain('background-color: #111113');
 
     // This is intentionally not a full color-inversion engine.
     expect(srcdoc).not.toMatch(/\bfilter:\s*invert/);

@@ -75,7 +75,7 @@ describe('JMAP Sieve rules backend', () => {
     expect(transport.requests).toHaveLength(0);
   });
 
-  it('loads a managed script while preserving an unselected active script', async () => {
+  it('uses an incompatible active script as the authoritative source', async () => {
     const transport = new MockTransport(session());
     transport.handle('SieveScript/get', () => ({
       accountId: 'acct-1',
@@ -98,9 +98,12 @@ describe('JMAP Sieve rules backend', () => {
 
     expect(result.supported).toBe(true);
     expect(result.state).toBe('sieve-state-1');
-    expect(withoutIds(result.document)).toEqual(withoutIds(ruleDocument()));
-    expect(result.managedScript).toMatchObject({ id: 'managed', isActive: false });
-    expect(result.foreignActiveScript).toEqual({ id: 'foreign', name: 'Handwritten filters' });
+    expect(result.document).toEqual(emptyRuleDocument());
+    expect(result.managedScript).toBeNull();
+    expect(result.editableScript).toMatchObject({ id: 'foreign', isActive: true });
+    expect(result.source).toBe('vacation "Away";\r\n');
+    expect(result.visualizationError)
+      .toBe('Top-level “vacation” is not represented by the visual editor at line 1.');
     expect(result.capabilities.sieveExtensions).toEqual(EXTENSIONS);
   });
 
@@ -135,7 +138,8 @@ describe('JMAP Sieve rules backend', () => {
     const loaded = await getMailRules({ transport, account: ACCOUNT });
     expect(loaded.managedScript).toBeNull();
     expect(loaded.editableScript).toMatchObject({ id: 'personal', isActive: true });
-    expect(loaded.foreignActiveScript).toBeNull();
+    expect(loaded.visualizationError).toBeNull();
+    expect(loaded.source).toContain('# Rule: Important projects');
     expect(loaded.document.rules[0]).toMatchObject({
       name: 'Important projects',
       match: 'all',
@@ -180,14 +184,14 @@ describe('JMAP Sieve rules backend', () => {
     const loaded = await getMailRules({ transport, account: ACCOUNT });
     expect(loaded.editableScript).toMatchObject({ id: 'personal', isActive: true });
     expect(loaded.managedScript).toBeNull();
-    expect(loaded.foreignActiveScript).toBeNull();
+    expect(loaded.visualizationError).toBeNull();
     expect(loaded.document.rules[0]).toMatchObject({
       conditions: [{ value: 'Active' }],
       actions: [{ type: 'discard' }],
     });
   });
 
-  it('requires explicit takeover, then validates and activates a new managed script', async () => {
+  it('validates and updates an incompatible active script from raw source', async () => {
     const transport = new MockTransport(session());
     let setRequest: any = null;
     transport.handle('SieveScript/get', () => ({
@@ -206,45 +210,33 @@ describe('JMAP Sieve rules backend', () => {
         accountId: 'acct-1',
         oldState: 'sieve-state-1',
         newState: 'sieve-state-2',
-        created: { stormbox: { id: 'managed-new', blobId: 'blob-1' } },
+        updated: { foreign: null },
       };
     });
 
-    const refused = await runSetSieveRules({
-      transport,
-      account: ACCOUNT,
-      request: { document: ruleDocument(), expectedState: 'sieve-state-1' },
-    });
-    expect(refused).toMatchObject({
-      ok: false,
-      error: { type: 'foreignScriptActive', terminal: true },
-    });
-    expect(transport.uploads).toHaveLength(0);
-
+    const source = 'vacation "Back Monday";\r\n';
     const result = await runSetSieveRules({
       transport,
       account: ACCOUNT,
-      request: {
-        document: ruleDocument(), expectedState: 'sieve-state-1', takeover: true,
-      },
+      request: { mode: 'source', source, expectedState: 'sieve-state-1' },
     });
 
     expect(result).toMatchObject({
       ok: true,
-      result: { scriptId: 'managed-new', state: 'sieve-state-2' },
+      result: { scriptId: 'foreign', state: 'sieve-state-2' },
     });
     expect(transport.uploads).toHaveLength(1);
     expect(transport.uploads[0]).toMatchObject({
       accountId: 'acct-1', type: 'application/sieve',
     });
-    expect(new TextDecoder().decode(transport.uploads[0].body))
-      .toContain('# stormbox-managed: mail-rules/v2');
+    expect(new TextDecoder().decode(transport.uploads[0].body)).toBe(source);
     expect(setRequest).toMatchObject({
       accountId: 'acct-1',
       ifInState: 'sieve-state-1',
-      onSuccessActivateScript: '#stormbox',
-      create: { stormbox: { name: MANAGED_SCRIPT_NAME, blobId: 'blob-1' } },
+      onSuccessActivateScript: 'foreign',
+      update: { foreign: { blobId: 'blob-1' } },
     });
+    expect(setRequest.create).toBeUndefined();
     expect(setRequest.destroy).toBeUndefined();
   });
 

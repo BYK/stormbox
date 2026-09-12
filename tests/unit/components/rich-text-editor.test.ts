@@ -5,6 +5,7 @@ import { mount } from '@vue/test-utils';
 import { nextTick } from 'vue';
 
 import RichTextEditor from '../../../src/components/RichTextEditor.vue';
+import { dispatchScriptedPaste } from '../../../src/utils/scripted-paste';
 
 interface EditorContent {
   html: string;
@@ -517,6 +518,36 @@ describe('RichTextEditor toolbar', () => {
     expect(latestUpdate(wrapper)?.html).toMatch(/text-align:\s*center/i);
   });
 
+  it('links the selection when a scripted paste carries a lone URL, inserts other text', async () => {
+    const wrapper = await mountEditor('<p>hello world</p>');
+    const editor = wrapper.get('.editor').element as HTMLElement;
+    selectEditorText(editor);
+
+    dispatchScriptedPaste(editor, { text: 'https://example.com/' });
+    expect(latestUpdate(wrapper)?.html)
+      .toMatch(/<a[^>]+href="https:\/\/example\.com\/"[^>]*>hello<\/a> world/i);
+
+    selectEditorText(editor, 0, 0);
+    dispatchScriptedPaste(editor, { text: 'https://example.com/ and more' });
+    expect(latestUpdate(wrapper)?.text).toContain('https://example.com/ and more');
+  });
+
+  it('routes scripted paste files through the pasted-file path', async () => {
+    const wrapper = await mountEditor('<p>hello</p>');
+    const editor = wrapper.get('.editor').element as HTMLElement;
+    vi.stubGlobal('createImageBitmap', vi.fn(async () => ({ close: vi.fn() })));
+    const file = new File([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])], 'p.png', { type: 'image/png' });
+
+    dispatchScriptedPaste(editor, { files: [file] });
+    for (let index = 0; index < 50 && !(wrapper.emitted('paste-files')?.length); index += 1) {
+      await new Promise((resolve) => { setTimeout(resolve, 5); });
+      await nextTick();
+    }
+
+    expect(latestUpdate(wrapper)?.html).toMatch(/<img[^>]+src="data:image\/png;base64,/i);
+    expect(wrapper.emitted('paste-files')?.[0]?.[0]).toEqual([{ file, kind: 'inline' }]);
+  });
+
   it('opens an image picker and inserts the selected raster image', async () => {
     vi.stubGlobal('createImageBitmap', vi.fn(async () => ({ close: vi.fn() })));
     const wrapper = await mountEditor('<p>hello</p>');
@@ -679,5 +710,61 @@ describe('RichTextEditor toolbar', () => {
     expect(wrapper.find('[data-toolbar-group="insert"]').exists()).toBe(true);
     expect(wrapper.get('.toolbar-more .toolbar-more__menu').text()).toContain('Align left');
     expect(wrapper.get('.toolbar-more .toolbar-more__menu').text()).toContain('Bulleted list');
+  });
+
+  it('is a single Tab stop whose controls are reached with the arrow keys', async () => {
+    const wrapper = await mountEditor();
+    const toolbar = wrapper.get('.compose-toolbar').element as HTMLElement;
+    const controls = () => [...toolbar.querySelectorAll<HTMLElement>('button, summary, input')]
+      .filter((control) => !control.closest('.app-dropdown__menu'));
+    const tabStops = () => controls().filter((control) => control.tabIndex === 0);
+    const menuItems = [...toolbar.querySelectorAll<HTMLElement>('.app-dropdown__menu button')];
+
+    expect(controls().length).toBeGreaterThan(10);
+    expect(tabStops()).toEqual([wrapper.get('[aria-label="Bold"]').element]);
+    expect(menuItems.length).toBeGreaterThan(0);
+    expect(menuItems.every((item) => item.tabIndex !== -1)).toBe(true);
+
+    const press = (key: string) => {
+      const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+      document.activeElement?.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    const bold = wrapper.get('[aria-label="Bold"]').element as HTMLElement;
+    const italic = wrapper.get('[aria-label="Italic"]').element as HTMLElement;
+    bold.focus();
+    expect(press('ArrowRight')).toBe(true);
+    expect(document.activeElement).toBe(italic);
+    // The stop follows focus, so Tab back into the toolbar returns here.
+    expect(tabStops()).toEqual([italic]);
+    expect(press('ArrowLeft')).toBe(true);
+    expect(document.activeElement).toBe(bold);
+    expect(press('End')).toBe(true);
+    expect(document.activeElement).toBe(controls().at(-1));
+    expect(press('ArrowRight')).toBe(true);
+    expect(document.activeElement).toBe(bold);
+    expect(press('Home')).toBe(true);
+    expect(document.activeElement).toBe(bold);
+    expect(press('Tab')).toBe(false);
+
+    // Widening the toolbar re-mounts groups that had overflowed into More.
+    toolbar.querySelectorAll('[data-toolbar-group]').forEach((group: any) => {
+      group.getBoundingClientRect = () => ({ width: 130 } as DOMRect);
+    });
+    (wrapper.get('.toolbar-more').element as any).getBoundingClientRect = () =>
+      ({ width: 70 } as DOMRect);
+    Object.defineProperty(toolbar, 'clientWidth', { configurable: true, value: 300 });
+    window.dispatchEvent(new Event('resize'));
+    await nextTick();
+    await nextTick();
+    expect(wrapper.find('[data-toolbar-group="alignment"]').exists()).toBe(false);
+
+    Object.defineProperty(toolbar, 'clientWidth', { configurable: true, value: 2000 });
+    window.dispatchEvent(new Event('resize'));
+    await nextTick();
+    await nextTick();
+
+    expect(wrapper.find('[data-toolbar-group="alignment"]').exists()).toBe(true);
+    expect(tabStops()).toEqual([bold]);
   });
 });

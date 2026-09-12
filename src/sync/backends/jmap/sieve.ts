@@ -4,8 +4,7 @@ import {
   isManagedRulesScript,
   MANAGED_SCRIPT_NAME,
   normalizeRuleDocument,
-  parseManagedRules,
-  parseVisualRules,
+  parseRulesSource,
   RuleValidationError,
   SIEVE_CAPABILITY,
   uniqueManagedScriptName,
@@ -29,8 +28,9 @@ export interface MailRulesSnapshot {
   scripts: Array<{ id: string; name: string | null; isActive: boolean }>;
   managedScript: { id: string; name: string | null; isActive: boolean } | null;
   editableScript: { id: string; name: string | null; isActive: boolean } | null;
-  foreignActiveScript: { id: string; name: string | null } | null;
+  source: string;
   document: MailRuleDocument;
+  visualizationError: string | null;
   parseError: string | null;
 }
 
@@ -62,8 +62,6 @@ export async function getMailRules({
   });
   const response = requireResponse(raw, 'SieveScript/get');
   const scripts = normalizeScriptList(response.list);
-  const managed: Array<{ script: SieveScriptRecord; document: MailRuleDocument }> = [];
-  const malformedManaged: string[] = [];
   const sources = new Map<string, string>();
 
   for (const script of scripts) {
@@ -75,36 +73,29 @@ export async function getMailRules({
     });
     const source = new TextDecoder().decode(bytes);
     sources.set(script.id, source);
-    if (!isManagedRulesScript(source)) continue;
-    try {
-      const document = parseManagedRules(source);
-      if (document) managed.push({ script, document });
-    } catch (error) {
-      malformedManaged.push(errorMessage(error));
-    }
   }
 
-  let parseError: string | null = null;
-  if (malformedManaged.length > 0) {
-    parseError = malformedManaged[0];
-  } else if (managed.length > 1) {
-    parseError = 'More than one Stormbox-managed rule script exists. Resolve the duplicate scripts before saving.';
-  }
   const active = scripts.find((script) => script.isActive) ?? null;
-  const activeManaged = managed.find((entry) => entry.script.id === active?.id) ?? null;
-  let selected = activeManaged;
-  if (!selected && active && malformedManaged.length === 0) {
+  const managed = scripts.filter((script) =>
+    isManagedRulesScript(sources.get(script.id) ?? ''));
+  let parseError: string | null = null;
+  let selected = active;
+  if (!selected && managed.length > 1) {
+    parseError = 'More than one Stormbox-managed rule script exists. Resolve the duplicate scripts before saving.';
+  } else if (!selected) {
+    selected = managed[0] ?? null;
+  }
+
+  const source = selected ? (sources.get(selected.id) ?? '') : '';
+  let document = emptyRuleDocument();
+  let visualizationError: string | null = null;
+  if (selected && !parseError) {
     try {
-      selected = {
-        script: active,
-        document: parseVisualRules(sources.get(active.id) ?? ''),
-      };
-    } catch {
-      // An unrepresentable active script remains available for explicit takeover.
+      document = parseRulesSource(source);
+    } catch (error) {
+      visualizationError = errorMessage(error);
     }
   }
-  selected ??= managed[0] ?? null;
-  const foreignActive = active && active.id !== selected?.script.id ? active : null;
 
   return {
     supported: true,
@@ -112,14 +103,13 @@ export async function getMailRules({
     state: typeof response.state === 'string' ? response.state : null,
     capabilities: context.capabilities,
     scripts: scripts.map(publicScript),
-    managedScript: selected && isManagedRulesScript(sources.get(selected.script.id) ?? '')
-      ? publicScript(selected.script)
+    managedScript: selected && isManagedRulesScript(source)
+      ? publicScript(selected)
       : null,
-    editableScript: selected ? publicScript(selected.script) : null,
-    foreignActiveScript: foreignActive
-      ? { id: foreignActive.id, name: foreignActive.name }
-      : null,
-    document: selected?.document ?? emptyRuleDocument(),
+    editableScript: selected ? publicScript(selected) : null,
+    source,
+    document,
+    visualizationError,
     parseError,
   };
 }
@@ -135,11 +125,21 @@ export async function runSetSieveRules({
   request: any;
   useWebSocket?: boolean;
 }): Promise<{ ok: boolean; error?: any; result?: any; response?: any }> {
-  let document: MailRuleDocument;
-  try {
-    document = normalizeRuleDocument(request?.document);
-  } catch (error) {
-    return terminalError('invalidRules', errorMessage(error));
+  const mode = request?.mode ?? 'visual';
+  if (mode !== 'visual' && mode !== 'source') {
+    return terminalError('invalidArguments', 'The Sieve editor mode is invalid.');
+  }
+  const sourceMode = mode === 'source';
+  if (sourceMode && typeof request?.source !== 'string') {
+    return terminalError('invalidArguments', 'The Sieve source must be text.');
+  }
+  let document: MailRuleDocument | null = null;
+  if (!sourceMode) {
+    try {
+      document = normalizeRuleDocument(request?.document);
+    } catch (error) {
+      return terminalError('invalidRules', errorMessage(error));
+    }
   }
 
   let snapshot: MailRulesSnapshot;
@@ -160,21 +160,29 @@ export async function runSetSieveRules({
       'The server’s Sieve scripts changed after this editor loaded. Reload before saving.',
     );
   }
-  if (snapshot.foreignActiveScript && request?.takeover !== true) {
-    return terminalError(
-      'foreignScriptActive',
-      'Another Sieve script is active. Explicit confirmation is required before Stormbox activates its script.',
-      { foreignActiveScript: snapshot.foreignActiveScript },
-    );
-  }
 
   let source: string;
-  try {
-    source = compileRules(document, snapshot.capabilities, {
-      managed: snapshot.managedScript !== null || snapshot.editableScript === null,
-    });
-  } catch (error) {
-    return terminalError('invalidRules', errorMessage(error));
+  if (sourceMode) {
+    source = request.source;
+  } else {
+    try {
+      source = compileRules(document, snapshot.capabilities, {
+        managed: snapshot.managedScript !== null || snapshot.editableScript === null,
+      });
+    } catch (error) {
+      return terminalError('invalidRules', errorMessage(error));
+    }
+  }
+
+  const sourceBytes = new TextEncoder().encode(source);
+  if (
+    typeof snapshot.capabilities.maxSizeScript === 'number'
+    && sourceBytes.byteLength > snapshot.capabilities.maxSizeScript
+  ) {
+    return terminalError(
+      'invalidSieve',
+      `The script is ${sourceBytes.byteLength} bytes; the server limit is ${snapshot.capabilities.maxSizeScript}.`,
+    );
   }
 
   let upload;
@@ -182,7 +190,7 @@ export async function runSetSieveRules({
     upload = await transport.upload({
       accountId: snapshot.accountId,
       type: 'application/sieve',
-      body: new TextEncoder().encode(source),
+      body: sourceBytes,
     });
   } catch (error) {
     return { ok: false, error: { type: 'transport', message: errorMessage(error) } };
@@ -211,20 +219,20 @@ export async function runSetSieveRules({
   if (validation.error) {
     return terminalError(
       'invalidSieve',
-      validation.error.description ?? 'The server rejected the generated Sieve script.',
+      validation.error.description ?? 'The server rejected the Sieve script.',
       { validationError: validation.error },
     );
   }
 
-  const managed = snapshot.editableScript;
+  const target = snapshot.editableScript;
   const creationId = 'stormbox';
   const setRequest: any = {
     accountId: snapshot.accountId,
   };
   if (typeof snapshot.state === 'string') setRequest.ifInState = snapshot.state;
-  if (managed) {
-    setRequest.update = { [managed.id]: { blobId: upload.blobId } };
-    setRequest.onSuccessActivateScript = managed.id;
+  if (target) {
+    setRequest.update = { [target.id]: { blobId: upload.blobId } };
+    setRequest.onSuccessActivateScript = target.id;
   } else {
     setRequest.create = {
       [creationId]: {
@@ -248,8 +256,8 @@ export async function runSetSieveRules({
   const setResponse = pickResponse(setRaw, 'SieveScript/set');
   if (!setResponse) return methodFailure(setRaw, 'SieveScript/set');
 
-  const setError = managed
-    ? setResponse.notUpdated?.[managed.id]
+  const setError = target
+    ? setResponse.notUpdated?.[target.id]
     : setResponse.notCreated?.[creationId];
   if (setError) {
     const type = setError.type === 'stateMismatch' ? 'sieveStateMismatch' : (setError.type ?? 'sieveSetFailed');
@@ -258,7 +266,7 @@ export async function runSetSieveRules({
     });
   }
 
-  const scriptId = managed?.id ?? setResponse.created?.[creationId]?.id ?? null;
+  const scriptId = target?.id ?? setResponse.created?.[creationId]?.id ?? null;
   if (!scriptId) {
     return { ok: false, error: { type: 'noResponse', message: 'The server did not report the saved script.' } };
   }
@@ -328,8 +336,9 @@ function unsupportedSnapshot(): MailRulesSnapshot {
     scripts: [],
     managedScript: null,
     editableScript: null,
-    foreignActiveScript: null,
+    source: '',
     document: emptyRuleDocument(),
+    visualizationError: null,
     parseError: null,
   };
 }

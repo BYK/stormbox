@@ -26,8 +26,9 @@ export interface MailRulesSnapshot {
   scripts: RuleScriptSummary[];
   managedScript: RuleScriptSummary | null;
   editableScript: RuleScriptSummary | null;
-  foreignActiveScript: RuleScriptSummary | null;
+  source: string;
   document: MailRuleDocument;
+  visualizationError: string | null;
   parseError: string | null;
 }
 
@@ -53,7 +54,6 @@ export const useRulesStore = defineStore('rules', () => {
   const supported = computed(() => snapshot.value?.supported === true);
   const capabilities = computed<SieveRuleCapabilities>(() =>
     snapshot.value?.capabilities ?? { sieveExtensions: [] });
-  const foreignActiveScript = computed(() => snapshot.value?.foreignActiveScript ?? null);
 
   async function load(): Promise<MailRulesSnapshot> {
     if (authStore.accountId == null) {
@@ -77,10 +77,33 @@ export const useRulesStore = defineStore('rules', () => {
     }
   }
 
-  async function save(
-    input: MailRuleDocument,
-    { takeover = false }: { takeover?: boolean } = {},
-  ): Promise<MailRulesSnapshot> {
+  async function save(input: MailRuleDocument): Promise<MailRulesSnapshot> {
+    const current = await requireWritableSnapshot();
+    const document = normalizeRuleDocument(input);
+    // Give immediate editor feedback; the SharedWorker compiles again
+    // against a freshly fetched capability snapshot before uploading.
+    compileRules(document, current.capabilities, {
+      managed: current.managedScript !== null || current.editableScript === null,
+    });
+    return persist({ mode: 'visual', document }, current);
+  }
+
+  async function saveSource(source: string): Promise<MailRulesSnapshot> {
+    const current = await requireWritableSnapshot();
+    const size = new TextEncoder().encode(source).byteLength;
+    if (
+      typeof current.capabilities.maxSizeScript === 'number'
+      && size > current.capabilities.maxSizeScript
+    ) {
+      throw new MailRulesSaveError(
+        'invalidSieve',
+        `The script is ${size} bytes; the server limit is ${current.capabilities.maxSizeScript}.`,
+      );
+    }
+    return persist({ mode: 'source', source }, current);
+  }
+
+  async function requireWritableSnapshot(): Promise<MailRulesSnapshot> {
     if (authStore.accountId == null) {
       throw new MailRulesSaveError('notConnected', 'Sign in before saving mail rules.');
     }
@@ -91,30 +114,32 @@ export const useRulesStore = defineStore('rules', () => {
     if (snapshot.value.parseError) {
       throw new MailRulesSaveError('managedScriptUnreadable', snapshot.value.parseError);
     }
+    return snapshot.value;
+  }
 
-    const document = normalizeRuleDocument(input);
-    // Give immediate editor feedback; the SharedWorker compiles again
-    // against a freshly fetched capability snapshot before uploading.
-    compileRules(document, snapshot.value.capabilities, {
-      managed: snapshot.value.managedScript !== null || snapshot.value.editableScript === null,
-    });
-
+  async function persist(
+    request: Record<string, unknown>,
+    current: MailRulesSnapshot,
+  ): Promise<MailRulesSnapshot> {
+    const accountId = authStore.accountId;
+    if (accountId == null) {
+      throw new MailRulesSaveError('notConnected', 'Sign in before saving mail rules.');
+    }
     saving.value = true;
     error.value = null;
     try {
       const repo = await getRepositoryAsync();
       const inserted = await repo.insertPendingMutation({
-        accountId: authStore.accountId,
+        accountId,
         mutationType: MUTATION_TYPE.SET_SIEVE_RULES,
         targetMessageId: null,
         requestJson: JSON.stringify({
-          document,
-          expectedState: snapshot.value.state,
-          takeover,
+          ...request,
+          expectedState: current.state,
         }),
         optimisticPatchJson: null,
       });
-      const outcome = await repo.runMutation(authStore.accountId, inserted.id);
+      const outcome = await repo.runMutation(accountId, inserted.id);
       if ((outcome?.failed ?? 0) > 0) {
         const row = await repo.getPendingMutationError(inserted.id);
         const detail = parseErrorJson(row?.error_json);
@@ -138,6 +163,10 @@ export const useRulesStore = defineStore('rules', () => {
     return cloneRuleDocument(snapshot.value?.document ?? emptyRuleDocument());
   }
 
+  function freshSource(): string {
+    return snapshot.value?.source ?? '';
+  }
+
   function $reset() {
     loading.value = false;
     saving.value = false;
@@ -152,10 +181,11 @@ export const useRulesStore = defineStore('rules', () => {
     snapshot,
     supported,
     capabilities,
-    foreignActiveScript,
     load,
     save,
+    saveSource,
     freshDocument,
+    freshSource,
     $reset,
   };
 });

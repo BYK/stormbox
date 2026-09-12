@@ -13,9 +13,11 @@ vi.mock('../../../src/services/auth', () => ({
 }));
 
 import App from '../../../src/App.vue';
+import { BEACON_IDS } from '../../../src/constants/feature-beacons';
 import { AUTH_STATE } from '../../../src/constants/states';
 import { useAuthStore } from '../../../src/stores/auth-store';
 import { useComposeStore } from '../../../src/stores/compose-store';
+import { useFeatureBeaconsStore } from '../../../src/stores/feature-beacons-store';
 import { useSettingsStore } from '../../../src/stores/settings-store';
 import {
   __resetRepositoryForTests,
@@ -87,6 +89,7 @@ beforeEach(() => {
   __setRepositoryForTests(makeRepo());
   localStorage.clear();
   localStorage.setItem('stormbox.welcomeModalDismissed.v1', '1');
+  localStorage.setItem('stormbox.whatsNewSeen.2026-09-compose', '1');
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
   matchesLight = false;
   vi.stubGlobal('matchMedia', vi.fn(() => ({
@@ -114,7 +117,7 @@ describe('settings gear and dialog', () => {
 
     const gear = wrapper.get('[data-settings-gear]');
     expect(gear.attributes('aria-label')).toBe('Settings');
-    expect(gear.classes()).toContain('quick-filter__action');
+    expect(gear.classes()).toContain('app-spaces__item');
     expect(dialog()).toBeNull();
 
     const panel = await openSettings(wrapper);
@@ -124,19 +127,48 @@ describe('settings gear and dialog', () => {
     expect(document.activeElement).toBe(panel);
   });
 
-  it('non-staff see exactly the shortcut picker and the follow-system switch', async () => {
+  it('non-staff see exactly the shortcut picker, the follow-system switch and the Welcome button', async () => {
     const wrapper = mountApp();
     await flushPromises();
     const panel = await openSettings(wrapper);
 
     const titles = Array.from(panel.querySelectorAll('.settings-dialog__row-title'))
       .map((el) => el.textContent);
-    expect(titles).toEqual(['Keyboard shortcuts', 'Follow system theme']);
+    expect(titles).toEqual(['Keyboard shortcuts', 'Follow system theme', 'Welcome & shortcuts']);
     expect(panel.querySelector('[role="radiogroup"]')).not.toBeNull();
     expect(panel.querySelector('[data-system-theme-toggle]')).not.toBeNull();
+    expect(panel.querySelector('[data-show-welcome]')!.textContent!.trim()).toBe('Show welcome');
     expect(panel.querySelector('hr')).toBeNull();
     expect(panel.textContent).not.toContain('Staff settings');
     expect(panel.querySelector('[data-kanban-unlock-code]')).toBeNull();
+    expect(panel.querySelector('[data-refresh-beacons]')).toBeNull();
+  });
+
+  it('staff can restart a finished beacon round from Settings, which closes to show it', async () => {
+    useAuthStore().recoveryEmail = 'boss@thunderbird.net';
+    const wrapper = mountApp();
+    await flushPromises();
+    const beaconStore = useFeatureBeaconsStore();
+    expect(beaconStore.enabled).toBe(false);
+    expect(wrapper.find('.beacon-menu').exists()).toBe(false);
+
+    const panel = await openSettings(wrapper);
+    const refresh = await vi.waitFor(() => {
+      const button = panel.querySelector<HTMLButtonElement>('[data-refresh-beacons]');
+      if (!button) throw new Error('refresh button not rendered');
+      return button;
+    });
+    expect(refresh.textContent!.trim()).toBe('Refresh beacons');
+
+    refresh.click();
+    await flushPromises();
+
+    expect(dialog()).toBeNull();
+    expect(beaconStore.enabled).toBe(true);
+    expect(beaconStore.sessions).toBe(1);
+    expect(beaconStore.count).toBe(BEACON_IDS.length);
+    expect(localStorage.getItem('stormbox.whatsNewSeen.2026-09-compose')).toBeNull();
+    expect(wrapper.get('.beacon-menu').text()).toContain(`${BEACON_IDS.length} new`);
   });
 
   it('staff get a rule and Staff settings with the feature code below', async () => {

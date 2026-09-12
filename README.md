@@ -73,14 +73,15 @@ the current hostname:
 
 - `webmail.stage-thundermail.com` -> `https://jmap.stage-thundermail.com`
   (HTTP) and `wss://jmap.stage-thundermail.com/jmap/ws` (WS)
-- `webmail.thundermail.com` -> `https://jmap.thundermail.com` (HTTP) and
-  `wss://jmap.thundermail.com/jmap/ws` (WS)
+- `webmail.thundermail.com` and `alpha-app.thundermail.com` ->
+  `https://jmap.thundermail.com` (HTTP) and `wss://jmap.thundermail.com/jmap/ws`
+  (WS)
 - hosted sender avatars -> [`https://avatars.thunderbird.net`](https://avatars.thunderbird.net)
   ([thunderbird/avatars](https://github.com/thunderbird/avatars))
 - dev/local product links -> stage services (`accounts-stage.tb.pro`,
   `appointment-stage.tb.pro`, `send-stage.tb.pro`)
 - hosted stage product links -> stage services
-- hosted prod product links -> production services
+- hosted prod and alpha product links -> production services
 
 To point a local build at another JMAP server or bridge, set
 `VITE_JMAP_SERVER_URL` in `.env.local`. The WebSocket auth bridge URL is derived
@@ -91,6 +92,37 @@ To override product links, set `VITE_ACCOUNTS_URL`, `VITE_APPOINTMENT_URL`, or
 Deployments whose origin is not registered with the configured OIDC client can
 set `VITE_APP_PASSWORD_ONLY=1` to show the app-password form directly and skip
 OIDC initialization.
+
+### Hosted deployments
+
+`.github/workflows/deploy.yml` publishes three Cloudflare Pages projects:
+
+| Target  | Origin                            | Backends   | Keycloak client              | Deploys                                    |
+|---------|-----------------------------------|------------|------------------------------|--------------------------------------------|
+| stage   | `webmail.stage-thundermail.com`   | stage      | `thunderbird-stormbox`       | every push to `main`, or manual dispatch   |
+| alpha   | `alpha-app.thundermail.com`       | production | `thunderbird-stormbox-alpha` | every push to `main`, or manual dispatch   |
+| prod    | `webmail.thundermail.com`         | production | `thunderbird-stormbox`       | manual dispatch from `main` only           |
+
+Alpha is the production configuration on the latest `main`, with its own
+Keycloak client in the production `tbpro` realm so its root, redirect and web
+origin URLs are set per origin. The Keycloak SSO session is realm-wide, so a
+user signed in through one client signs in to the other without a prompt.
+Staff sign-ins
+(OIDC `recovery_email` on a staff domain, see `src/constants/staff.ts`) on
+`webmail.thundermail.com` are redirected to alpha before a local account is
+created; the prod build sets `VITE_STAFF_APP_URL` to the alpha origin and an
+empty value disables the redirect. The redirect carries `?auto-login=1` so the
+alpha origin signs in through the shared Keycloak session without a click.
+
+Adding a hosted origin needs, besides the workflow job: the Cloudflare Pages
+project and custom domain, the origin in the bridge allowlist
+(`infra/jmap-bridge/src/routes.ts`, redeployed with `npm run deploy:production`),
+and a Keycloak client for the origin. The client mirrors
+`thunderbird-stormbox` (and what `tests/fixtures/configure-keycloak.mjs`
+builds locally): public client, standard flow, PKCE `S256`, root/home URL and
+`/*` redirect URIs and post-logout redirect URIs on the origin, the origin as
+web origin, and the `recovery_email` protocol mapper (or the client scope that
+carries it), which `isStaff` reads.
 
 Contacts Trash limits live in `stormbox.config.json`. Before deployment, set
 `contactsTrash.serverFileStorage` to the Stalwart FileStorage `maxSize`,
