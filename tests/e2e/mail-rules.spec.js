@@ -155,7 +155,8 @@ test.describe('JMAP Sieve mail rules e2e', () => {
       await expect(savedRule.locator('input[aria-label="Condition value"]').first()).toHaveValue(CONDITION_VALUE);
       await expect(savedRule.locator('.condition-group--nested')).toHaveCount(1);
       await dialog.getByRole('button', { name: 'Source' }).click();
-      await expect(dialog.getByLabel('Sieve source')).toHaveValue(new RegExp(CONDITION_VALUE));
+      await expect(dialog.getByRole('textbox', { name: 'Sieve source' }))
+        .toHaveValue(new RegExp(CONDITION_VALUE));
       await dialog.getByRole('button', { name: 'Close', exact: true }).click();
     } finally {
       await restoreScripts(jmap, before);
