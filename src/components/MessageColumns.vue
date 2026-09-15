@@ -133,6 +133,7 @@ defineExpose({ addColumn, removeColumn });
         :list-id="column.id"
         :column-index="index + 1"
         :primary="column.primary"
+        :sole-column="columns.length === 1"
         :quick-filter-query="quickFilterQuery"
         :can-add-column="columnsStore.canAddColumn"
         @add-column="addColumn"

@@ -50,6 +50,12 @@ const props = withDefaults(defineProps<{
   /** 1-based position, for the region label. */
   columnIndex?: number;
   primary?: boolean;
+  /**
+   * True while this is the only column. The folder list already names
+   * the folder then, so the header keeps the single list's layout: no
+   * title, filters at the start.
+   */
+  soleColumn?: boolean;
   quickFilterQuery?: string;
   canAddColumn?: boolean;
 }>(), {
@@ -57,9 +63,13 @@ const props = withDefaults(defineProps<{
   listId: '',
   columnIndex: 1,
   primary: true,
+  soleColumn: true,
   quickFilterQuery: '',
   canAddColumn: true,
 });
+
+/** The primary column names its folder only beside other columns. */
+const showsTitle = computed(() => !props.primary || !props.soleColumn);
 
 const emit = defineEmits<{
   'add-column': [];
@@ -692,6 +702,7 @@ defineExpose({ focusColumnControl, focusFolderPicker });
       </template>
       <template #normal-actions>
         <MessageListHeaderTitle
+          v-if="showsTitle"
           ref="titleEl"
           :primary="primary"
           :folder="folder"
@@ -703,7 +714,10 @@ defineExpose({ focusColumnControl, focusFolderPicker });
         <div
           v-if="folderId != null"
           class="msg-list__filters"
-          :class="{ 'msg-list__filters--icons': !headerFilterLabels }"
+          :class="{
+            'msg-list__filters--icons': !headerFilterLabels,
+            'msg-list__filters--lead': !showsTitle,
+          }"
           role="group"
           aria-label="Message filters"
         >
@@ -940,6 +954,12 @@ defineExpose({ focusColumnControl, focusFolderPicker });
   display: flex;
   align-items: center;
   gap: 4px;
+}
+/* Without a title the filters take the row's spare width, keeping the
+   count and the corner controls at the end. */
+.msg-list__filters--lead {
+  flex: 1 1 0;
+  min-width: 0;
 }
 .msg-list__filters--icons .msg-list__filter {
   display: inline-grid;

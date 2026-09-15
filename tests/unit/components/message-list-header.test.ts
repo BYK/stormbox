@@ -170,8 +170,31 @@ describe('message list header tiers', () => {
     expect(head.find('.msg-list__refresh').exists()).toBe(true);
     expect(head.find('.msg-list__add-column').exists()).toBe(true);
     expect(head.find('[data-more-menu]').exists()).toBe(false);
-    expect(head.find('.msg-list__title').text()).toBe('Inbox');
+    // Alone, the column keeps the single list's header: no folder title,
+    // the filters lead the row.
+    expect(head.find('.msg-list__title').exists()).toBe(false);
+    expect(head.find('.msg-list__filters').classes()).toContain('msg-list__filters--lead');
     expect(wrapper.find('.msg-list__titlebar').exists()).toBe(false);
+  });
+
+  it('names the primary column\'s folder only once another column is open', async () => {
+    seedInbox();
+    const wrapper = mountAtWidth(600);
+    await nextTick();
+    const store = useMessageColumnsStore();
+    const id = store.addColumn()!;
+    store.setColumnFolder(id, 2);
+    await nextTick();
+
+    const [primary, second] = wrapper.findAll('.msg-list .msg-list__header');
+    expect(primary.find('.msg-list__title').text()).toBe('Inbox');
+    expect(primary.find('.msg-list__filters').classes()).not.toContain('msg-list__filters--lead');
+    expect(second.find('.msg-list__folder-trigger').text()).toContain('Archive');
+
+    store.removeColumn(id);
+    await nextTick();
+    expect(header(wrapper).find('.msg-list__title').exists()).toBe(false);
+    expect(header(wrapper).find('.msg-list__filters').classes()).toContain('msg-list__filters--lead');
   });
 
   it('drops the total count first as the column narrows', async () => {

@@ -78,10 +78,12 @@ smaller change than a second cache, and it lets the primary column be
   (`useMessageDropTarget`). Row DOM ids are prefixed with `listId` so
   `aria-activedescendant` stays unique when two columns show one folder.
 - `MessageListHeaderTitle.vue` — the folder at the start of the header
-  row: a static title on the primary column, the folder dropdown (listbox
-  of the folder list's folders with icons and labelled account groups) on
-  the others; the row's only flexible item, so its name truncates. The
-  panel is at least as wide as its trigger.
+  row: a static title on the primary column (only while another column is
+  open; alone, the folder list names the folder and the filters lead the
+  row as in the single list), the folder dropdown (listbox of the folder
+  list's folders with icons and labelled account groups) on the others;
+  the row's only flexible item, so its name truncates. The panel is at
+  least as wide as its trigger.
 - `MessageListMoreMenu.vue` — the header's overflow menu (`role="menu"` on
   `AppDropdown`, groups as `role="group"` labelled by their heading, items
   with roving `tabindex="-1"`, arrow/Home/End through `useMenuKeyboard`,
@@ -109,7 +111,8 @@ smaller change than a second cache, and it lets the primary column be
 
 One row at every column width and in every state; nothing wraps. Normal
 state, left to right: select-all, folder title or dropdown (flexible,
-truncating), Unread and Starred, total count, Refresh, `+` or `×`, More.
+truncating; absent on a sole column, where the filters take its place),
+Unread and Starred, total count, Refresh, `+` or `×`, More.
 Tiers by measured list width (`useMessageListHeader`): the count hides
 below 520px, the filters turn icon-only below 440px, Refresh and `+`/`×`
 move into the More menu below 340px. While rows are checked: select-all,

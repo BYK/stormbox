@@ -304,11 +304,17 @@ test.describe('Message list columns e2e', () => {
       const inboxIds = await getEmailMailboxIds(jmap, inboxId);
       expect(inboxIds?.[inbox.id], 'the Inbox row must be untouched').toBe(true);
 
-      // Deleting the open message previews its neighbour; close that
+      // Deleting the open message previews its neighbour, which mounts
+      // after a short preload delay; keep closing until no pane is left
       // before switching layouts.
-      const back = page.locator('.message-view__action--back');
-      if (await back.count()) await back.click();
-      await expect(page.locator('.message-view')).toHaveCount(0);
+      await expect.poll(
+        async () => {
+          const back = page.locator('.message-view__action--back');
+          if (await back.count()) await back.click().catch(() => {});
+          return page.locator('.message-view').count();
+        },
+        { timeout: 10_000, message: 'the reading pane should close after the delete' },
+      ).toBe(0);
 
       // Single-column layout: opening a message covers the columns and
       // closing it brings both back unchanged.
