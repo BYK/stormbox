@@ -37,6 +37,7 @@ import { adaptHtmlForDarkMode } from '../utils/dark-email';
 import { formatAddressList } from '../utils/address-parse';
 import { titleWithShortcut, type ShortcutAction } from '../constants/shortcuts';
 import { plaintextToHtml } from '../utils/plaintext-html';
+import { isScheduledMessage } from '../utils/scheduled-message';
 import archiveIcon from '../assets/icons/tb-folder-archive.svg?raw';
 import junkIcon from '../assets/icons/tb-folder-spam.svg?raw';
 import forwardIcon from '../assets/icons/tb-forward.svg?raw';
@@ -106,13 +107,12 @@ const textHtml = computed(() => {
     ADD_ATTR: ['target'],
   });
 });
-const message = computed(() =>
-  // The messages array is positional and can carry explicit `undefined`
-  // slots (sparse query_view_items, mid-shrink, etc.) — guard the slot
-  // access so find() doesn't throw on a hole.
-  mailStore.messages.find((m) => m?.id === mailStore.selectedMessageId) ?? null,
-);
+// The open message is resolved by the store from the folder it was
+// opened in, so a message read from any list column shows here.
+const message = computed(() => mailStore.openMessage ?? null);
 const selectedMessageId = computed(() => mailStore.selectedMessageId);
+/** Folder the open message was opened from; folder-specific actions act on it. */
+const messageSource = computed(() => ({ sourceFolderId: mailStore.openMessageFolderId }));
 const messageAccountId = computed(() => message.value?.account_id ?? null);
 const attachmentParts = computed(() => (
   Array.isArray(body.value?.attachments) ? body.value.attachments : []
@@ -526,17 +526,19 @@ async function forward() {
 async function archive() {
   if (!message.value) return;
   try {
-    await mailStore.archiveMessages([message.value.id]);
+    await mailStore.archiveMessages([message.value.id], messageSource.value);
   } catch (err) {
     console.warn('[message-view] archive failed', err?.message ?? err);
   }
 }
 
 // Whitelisting only makes sense for messages currently in the Junk
-// folder; the toolbar button is gated on this.
-const isInJunkFolder = computed(() => mailStore.currentFolder?.role === 'junk');
+// folder; the toolbar button is gated on this. Archiving from Archive
+// is a no-op, so that button is gated the same way.
+const isInJunkFolder = computed(() => mailStore.openMessageFolder?.role === 'junk');
+const isInArchiveFolder = computed(() => mailStore.openMessageFolder?.role === 'archive');
 const canWhitelistInJunk = computed(() => {
-  const current = mailStore.currentFolder;
+  const current = mailStore.openMessageFolder;
   return current?.role === 'junk'
     && mailStore.primaryFolders.some((folder) => folder.id === current.id);
 });
@@ -546,7 +548,7 @@ async function whitelistSender() {
   if (!message.value || whitelisting.value) return;
   whitelisting.value = true;
   try {
-    await mailStore.whitelistSender(message.value.id);
+    await mailStore.whitelistSender(message.value.id, messageSource.value);
   } catch (err) {
     console.warn('[message-view] whitelist failed', err?.message ?? err);
   } finally {
@@ -557,26 +559,25 @@ async function whitelistSender() {
 async function junk() {
   if (!message.value) return;
   try {
-    await mailStore.junkMessages([message.value.id]);
+    await mailStore.junkMessages([message.value.id], messageSource.value);
   } catch (err) {
     console.warn('[message-view] junk failed', err?.message ?? err);
   }
 }
 
 // Send Later: a scheduled message renders through the normal detail
-// view; the scheduling columns on its row only add this banner, swap
-// the toolbar to read-only + Cancel Send, and label the Date row with
-// the send time.
+// view. While its submission is pending the toolbar is read-only and the
+// banner owns Cancel Send; a settled row keeps the ordinary toolbar and
+// only shows the banner while its filing handoff is in flight. Either
+// way the Date row is labeled with the send time.
 const scheduledStatus = computed(() => {
   const value = message.value?.scheduled_undo_status;
-  return value === 'pending' || value === 'unknown' || value === 'final' || value === 'canceled'
+  return value === 'pending' || value === 'final' || value === 'canceled'
     ? value
     : null;
 });
-const isScheduledMessage = computed(() => scheduledStatus.value != null);
-const canCancelScheduled = computed(
-  () => scheduledStatus.value === 'pending' || scheduledStatus.value === 'unknown',
-);
+const hasScheduledBanner = computed(() => scheduledStatus.value != null);
+const isPendingScheduled = computed(() => isScheduledMessage(message.value));
 const cancelingScheduled = ref(false);
 
 function describeTimeUntil(ms) {
@@ -598,8 +599,6 @@ const scheduledBannerText = computed(() => {
       const relative = describeTimeUntil(sendAt);
       return `Scheduled to send ${fmtDate(sendAt)}${relative ? ` (${relative})` : ''}.`;
     }
-    case 'unknown':
-      return 'The scheduled time has passed, but the server has not confirmed sending yet.';
     case 'final':
       return 'This message was sent and is moving to your Sent folder.';
     case 'canceled':
@@ -624,7 +623,7 @@ async function cancelScheduledSend() {
 async function destroy() {
   if (!message.value) return;
   try {
-    await mailStore.destroyMessage(message.value.id);
+    await mailStore.destroyMessage(message.value.id, messageSource.value);
   } catch (err) {
     // The store has already populated mailStore.error with a
     // human-readable string in describeMutationFailure. Suppress the
@@ -665,11 +664,11 @@ function closeMessageView() {
         >
           <span class="message-view__whitelist-label">Not junk</span>
         </button>
-        <!-- A scheduled message is read-only: the toolbar keeps only
-             Back and the view-mode toggle, and the banner below owns
-             Cancel Send. -->
-        <template v-if="!isScheduledMessage">
-          <AppIconButton class="message-view__action" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
+        <!-- A pending scheduled message is read-only: the toolbar keeps
+             only Back and the view-mode toggle, and the banner below
+             owns Cancel Send. -->
+        <template v-if="!isPendingScheduled">
+          <AppIconButton v-if="!isInArchiveFolder" class="message-view__action" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="archiveIcon" />
           </AppIconButton>
           <AppIconButton v-if="!isInJunkFolder" class="message-view__action" @click="junk" title="Junk" aria-label="Mark as junk">
@@ -700,11 +699,11 @@ function closeMessageView() {
           <Sun v-else :size="16" :stroke-width="1.75" />
         </AppIconButton>
       </header>
-      <div v-if="isScheduledMessage" class="message-view__scheduled" role="status">
+      <div v-if="hasScheduledBanner" class="message-view__scheduled" role="status">
         <Clock :size="16" :stroke-width="1.75" aria-hidden="true" />
         <span class="message-view__scheduled-text">{{ scheduledBannerText }}</span>
         <button
-          v-if="canCancelScheduled"
+          v-if="isPendingScheduled"
           class="message-view__scheduled-cancel"
           type="button"
           :disabled="cancelingScheduled"
@@ -736,9 +735,9 @@ function closeMessageView() {
             <dd><h2>{{ message.subject || '(no subject)' }}</h2></dd>
           </div>
           <div class="message-view__metadata-row">
-            <dt>{{ isScheduledMessage ? 'Send at' : 'Date' }}</dt>
+            <dt>{{ hasScheduledBanner ? 'Send at' : 'Date' }}</dt>
             <dd class="message-view__date">
-              {{ fmtDate(isScheduledMessage ? (message.sent_at ?? message.received_at) : message.received_at) }}
+              {{ fmtDate(hasScheduledBanner ? (message.sent_at ?? message.received_at) : message.received_at) }}
             </dd>
           </div>
         </dl>
@@ -823,6 +822,19 @@ function closeMessageView() {
   padding: 11px var(--message-toolbar-edge-inset);
   overflow: hidden;
   border-bottom: 1px solid var(--border);
+  container-type: inline-size;
+}
+/* At the pane's minimum width (240px) up to eight toolbar buttons must
+   fit: they narrow and their negative margins take back the flex gap.
+   (A container can only be queried from its descendants, hence the
+   rule targets the buttons, not the header.) */
+@container (max-width: 279px) {
+  .message-view__header .message-view__action {
+    width: 28px;
+    flex-basis: 28px;
+    margin-left: -4px;
+    margin-right: -4px;
+  }
 }
 .message-view__details {
   flex: 0 0 auto;

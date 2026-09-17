@@ -244,7 +244,7 @@ function makeRepo(): any {
         .map(Number)
         .filter((id) =>
           Number.isFinite(id)
-          && (!excludeScheduled || byId.get(id)?.scheduled_undo_status == null));
+          && (!excludeScheduled || byId.get(id)?.scheduled_undo_status !== 'pending'));
     },
     async getPendingMutationError() { return null; },
   };
@@ -1503,10 +1503,11 @@ describe('cancelScheduledSends (Scheduled folder bulk delete)', () => {
     expect(mailStore.error).toBeNull();
   });
 
-  it('never routes the Scheduled delete through destroyMessages', async () => {
+  it('never routes a pending send through destroyMessages', async () => {
     const { scheduled, rows } = seedScheduled();
+    const trash = makeFolder(3, { role: 'trash', may_add_items: 1 });
     const { mailStore, repo } = await setupStore({
-      folders: [scheduled],
+      folders: [scheduled, trash],
       views: { 2: { rows, total: 2 } },
     });
     await flush();
@@ -1518,6 +1519,40 @@ describe('cancelScheduledSends (Scheduled folder bulk delete)', () => {
 
     expect(repo.insertPendingMutation).not.toHaveBeenCalled();
     expect(mailStore.error).toBe('Scheduled messages can’t be deleted. Cancel the send instead.');
+  });
+
+  it('deletes mail in the Scheduled folder whose send is not pending', async () => {
+    // A sent message another client put back into Scheduled, and a row
+    // whose filing handoff is in flight: neither holds a submission the
+    // delete could strand, so the folder itself blocks nothing.
+    const scheduled = makeFolder(2, { role: 'scheduled', may_remove_items: 1, total_emails: 2 });
+    const trash = makeFolder(3, { role: 'trash', may_add_items: 1 });
+    const rows = [
+      makeRow(10, { scheduled_undo_status: null }),
+      makeRow(11, { scheduled_undo_status: 'final' }),
+    ];
+    const { mailStore, repo } = await setupStore({
+      folders: [scheduled, trash],
+      views: { 2: { rows, total: 2 } },
+    });
+    await flush();
+    mailStore.selectFolder(scheduled.id);
+    await flush();
+    const inserted = [];
+    repo.insertPendingMutation = async (input) => {
+      inserted.push(input);
+      return { id: 100 + inserted.length };
+    };
+
+    await mailStore.destroyMessages([10, 11]);
+
+    expect(mailStore.error).toBeNull();
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0].mutationType).toBe(MUTATION_TYPE.MOVE_TO_FOLDERS);
+    expect(JSON.parse(inserted[0].requestJson)).toEqual({
+      messageIds: [10, 11], addFolderIds: [trash.id], removeFolderIds: [scheduled.id],
+    });
+    expect(mailStore.messages.map((row) => row?.id)).toEqual([]);
   });
 
   it('surfaces the precise rejection for a lone failure and a tally for a mixed batch', async () => {
@@ -3117,5 +3152,272 @@ describe('folder create/rename/delete actions', () => {
       await runner.stop();
       await engine.close();
     }
+  });
+});
+
+describe('per-folder views for message list columns', () => {
+  it('binds a folder view, primes its first page and pins the displayed folders for push refresh', async () => {
+    const pinned: number[][] = [];
+    const { mailStore, repo } = await setupStore({
+      folders: [makeFolder(1), makeFolder(2, { total_emails: 2 })],
+      views: {
+        1: { rows: [makeRow(1)], total: 1 },
+        2: { rows: [makeRow(21), makeRow(22)], total: 2 },
+      },
+    });
+    repo.setActiveFolderViews = async (_accountId, folderIds) => {
+      pinned.push([...folderIds].sort((a, b) => a - b));
+    };
+    await flush();
+    expect(mailStore.currentFolderId).toBe(1);
+    // A folder no column shows has no view yet.
+    expect(mailStore.folderView(2).messages).toEqual([]);
+
+    const release = mailStore.bindFolderView(2);
+    await flush();
+
+    expect(mailStore.folderView(2).messages.map((row) => row?.id)).toEqual([21, 22]);
+    expect(mailStore.folderView(2).total).toBe(2);
+    expect(mailStore.folderView(2).isLoading).toBe(false);
+    // The primary column's aliases still describe the primary folder.
+    expect(mailStore.messages.map((row) => row?.id)).toEqual([1]);
+    expect(pinned.at(-1)).toEqual([1, 2]);
+
+    release();
+    expect(pinned.at(-1)).toEqual([1]);
+    // The cache outlives the binding so re-binding paints without a fetch.
+    const fetches = repo._calls.ensureFolderWindow;
+    mailStore.bindFolderView(2);
+    await flush();
+    expect(repo._calls.ensureFolderWindow).toBe(fetches);
+  });
+
+  it('re-reads every bound folder on a MESSAGES broadcast, not just the primary one', async () => {
+    const { mailStore, repo } = await setupStore({
+      folders: [makeFolder(1), makeFolder(2, { total_emails: 1 })],
+      views: {
+        1: { rows: [makeRow(1)], total: 1 },
+        2: { rows: [makeRow(21)], total: 1 },
+      },
+    });
+    mailStore.bindFolderView(2);
+    await flush();
+    expect(mailStore.folderView(2).messages.map((row) => row?.id)).toEqual([21]);
+
+    // A peer delivered mail to folder 2 (a change the sync layer wrote to SQLite).
+    repo.setView(2, { rows: [makeRow(23), makeRow(21)], total: 2 });
+    repo.triggerBroadcast([TABLE_FAMILIES.MESSAGES]);
+    await flush(10);
+
+    expect(mailStore.folderView(2).messages.map((row) => row?.id)).toEqual([23, 21]);
+    expect(mailStore.folderView(2).total).toBe(2);
+    expect(mailStore.messages.map((row) => row?.id)).toEqual([1]);
+  });
+
+  it('records the folder a message was opened from and resolves the open row from it', async () => {
+    const { mailStore } = await setupStore({
+      folders: [makeFolder(1), makeFolder(2, { total_emails: 1 })],
+      views: {
+        1: { rows: [makeRow(1)], total: 1 },
+        2: { rows: [makeRow(21, { subject: 'From column two' })], total: 1 },
+      },
+    });
+    mailStore.bindFolderView(2);
+    await flush();
+
+    mailStore.selectMessage(21, 2);
+    expect(mailStore.selectedMessageId).toBe(21);
+    expect(mailStore.selectedMessageFolderId).toBe(2);
+    expect(mailStore.focusedFolderId).toBe(2);
+    expect(mailStore.openMessage?.subject).toBe('From column two');
+    expect(mailStore.openMessageFolder?.id).toBe(2);
+    // The folder list's selection is untouched.
+    expect(mailStore.currentFolderId).toBe(1);
+
+    // Picking another primary folder leaves the other column's open message alone...
+    mailStore.selectFolder(1);
+    expect(mailStore.selectedMessageId).toBe(21);
+    // ...but a selection or open message in the picked folder is dropped.
+    mailStore.selectMessage(1, 1);
+    mailStore.selectFolder(1);
+    expect(mailStore.selectedMessageId).toBeNull();
+  });
+
+  it('keeps one selection across columns, attributed to its folder', async () => {
+    const { mailStore } = await setupStore({
+      folders: [makeFolder(1), makeFolder(2, { total_emails: 2 })],
+      views: {
+        1: { rows: [makeRow(1), makeRow(2)], total: 2 },
+        2: { rows: [makeRow(21), makeRow(22)], total: 2 },
+      },
+    });
+    mailStore.bindFolderView(2);
+    await flush();
+
+    mailStore.setSelection(2, new Set([21]));
+    expect(mailStore.selectionFolderId).toBe(2);
+    // A direct write keeps the attribution while rows remain.
+    mailStore.selectedIds = new Set([21, 22]);
+    expect(mailStore.selectionFolderId).toBe(2);
+    // Claiming for another folder replaces the set; clearing drops the owner.
+    mailStore.setSelection(1, new Set([1]));
+    expect([...mailStore.selectedIds]).toEqual([1]);
+    expect(mailStore.selectionFolderId).toBe(1);
+    mailStore.clearSelection();
+    expect(mailStore.selectionFolderId).toBeNull();
+
+    // selectAll for a column fills the selection from that folder's canonical view.
+    await mailStore.selectAllLoadedMessages({ folderId: 2 });
+    expect([...mailStore.selectedIds].sort((a, b) => a - b)).toEqual([21, 22]);
+    expect(mailStore.selectionFolderId).toBe(2);
+  });
+
+  it('repaints both columns of a cross-column move from the local cache', async () => {
+    const inbox = makeFolder(1, { total_emails: 2, may_remove_items: 1, may_add_items: 1 });
+    const archive = makeFolder(2, {
+      role: 'archive', total_emails: 1, may_remove_items: 1, may_add_items: 1,
+    });
+    const { mailStore, repo } = await setupStore({
+      folders: [inbox, archive],
+      views: {
+        1: { rows: [makeRow(7), makeRow(8)], total: 2 },
+        2: { rows: [makeRow(21)], total: 1 },
+      },
+    });
+    mailStore.bindFolderView(2);
+    await flush();
+    const fetchesBefore = repo._calls.ensureFolderWindow;
+    repo.insertPendingMutation = async () => ({ id: 91 });
+    repo.runMutation = async () => {
+      // The outbox placed the moved row in the destination view.
+      repo.setView(1, { rows: [makeRow(8)], total: 1 });
+      repo.setView(2, { rows: [makeRow(7), makeRow(21)], total: 2 });
+      return { attempted: 1, succeeded: 1, failed: 0 };
+    };
+
+    const result = await mailStore.moveMessages([7], 2, { sourceFolderId: 1 });
+    await flush();
+
+    expect(result).toEqual({ succeeded: 1, failed: 0, skipped: 0 });
+    expect(mailStore.messages.map((row) => row?.id)).toEqual([8]);
+    expect(mailStore.totalForFolder).toBe(1);
+    expect(mailStore.folderView(2).messages.map((row) => row?.id)).toEqual([7, 21]);
+    expect(mailStore.folderView(2).total).toBe(2);
+    // Both repaints came from SQLite; the move was the only server call.
+    expect(repo._calls.ensureFolderWindow).toBe(fetchesBefore);
+  });
+
+  it('refetches a destination column whose view the outbox could not place into', async () => {
+    const inbox = makeFolder(1, { total_emails: 1, may_remove_items: 1, may_add_items: 1 });
+    const archive = makeFolder(2, {
+      role: 'archive', total_emails: 1, may_remove_items: 1, may_add_items: 1,
+    });
+    const { mailStore, repo } = await setupStore({
+      folders: [inbox, archive],
+      views: {
+        1: { rows: [makeRow(7)], total: 1 },
+        2: { rows: [makeRow(21)], total: 1 },
+      },
+    });
+    mailStore.bindFolderView(2);
+    await flush();
+    const fetchesBefore = repo._calls.ensureFolderWindow;
+    repo.insertPendingMutation = async () => ({ id: 92 });
+    repo.runMutation = async () => {
+      repo.setView(1, { rows: [], total: 0 });
+      repo.setView(2, { rows: [makeRow(7), makeRow(21)], total: 2, stale: true });
+      return { attempted: 1, succeeded: 1, failed: 0 };
+    };
+
+    await mailStore.moveMessages([7], 2, { sourceFolderId: 1 });
+    await flush(10);
+
+    expect(mailStore.folderView(2).messages.map((row) => row?.id)).toEqual([7, 21]);
+    expect(repo._calls.ensureFolderWindow).toBe(fetchesBefore + 1);
+  });
+
+  it('refreshes one column\'s folder without touching the others', async () => {
+    const { mailStore, repo } = await setupStore({
+      folders: [makeFolder(1), makeFolder(2, { total_emails: 1 })],
+      views: {
+        1: { rows: [makeRow(1)], total: 1 },
+        2: { rows: [makeRow(21)], total: 1 },
+      },
+    });
+    mailStore.bindFolderView(2);
+    await flush();
+    const resetFolders: number[] = [];
+    repo.setView(2, { rows: [makeRow(22), makeRow(21)], total: 2 });
+    repo.resetViewForFolder = async (_accountId, folderId) => {
+      resetFolders.push(Number(folderId));
+      return { deleted: 1 };
+    };
+
+    await mailStore.refresh(2);
+    await flush();
+
+    expect(resetFolders).toEqual([2]);
+    expect(mailStore.folderView(2).messages.map((row) => row?.id)).toEqual([22, 21]);
+    expect(mailStore.folderView(2).isLoading).toBe(false);
+    expect(mailStore.messages.map((row) => row?.id)).toEqual([1]);
+  });
+
+  it('runs one manual refresh per folder at a time', async () => {
+    // Two columns showing the same folder each have a Refresh control.
+    const { mailStore, repo } = await setupStore({
+      folders: [makeFolder(1), makeFolder(2, { total_emails: 1 })],
+      views: {
+        1: { rows: [makeRow(1)], total: 1 },
+        2: { rows: [makeRow(21)], total: 1 },
+      },
+    });
+    mailStore.bindFolderView(2);
+    await flush();
+    let resets = 0;
+    repo.resetViewForFolder = async () => {
+      resets += 1;
+      await new Promise((resolve) => { setTimeout(resolve, 5); });
+      return { deleted: 1 };
+    };
+
+    const first = mailStore.refresh(2);
+    const second = mailStore.refresh(2);
+    await Promise.all([first, second]);
+    await flush();
+    expect(resets).toBe(1);
+
+    // Once settled the next click refreshes again.
+    await mailStore.refresh(2);
+    expect(resets).toBe(2);
+  });
+
+  it('drops a folder\'s open message, cursor and checked rows once no column shows it', async () => {
+    const { mailStore } = await setupStore({
+      folders: [makeFolder(1), makeFolder(2, { total_emails: 2 })],
+      views: {
+        1: { rows: [makeRow(1)], total: 1 },
+        2: { rows: [makeRow(21), makeRow(22)], total: 2 },
+      },
+    });
+    const release = mailStore.bindFolderView(2);
+    await flush();
+    mailStore.selectMessage(21, 2);
+    mailStore.setSelection(2, new Set([22]));
+
+    // Still shown: nothing changes.
+    mailStore.releaseFolderInteractions(2);
+    expect(mailStore.selectedMessageId).toBe(21);
+    expect([...mailStore.selectedIds]).toEqual([22]);
+
+    release();
+    mailStore.releaseFolderInteractions(2);
+    expect(mailStore.selectedMessageId).toBeNull();
+    expect(mailStore.focusedMessageId).toBeNull();
+    expect(mailStore.selectedIds.size).toBe(0);
+
+    // The primary folder is always shown.
+    mailStore.selectMessage(1, 1);
+    mailStore.releaseFolderInteractions(1);
+    expect(mailStore.selectedMessageId).toBe(1);
   });
 });

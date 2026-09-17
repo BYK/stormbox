@@ -25,6 +25,7 @@ import {
   isComposingKeyEvent,
   isEditableTarget,
 } from '../utils/keyboard';
+import { isScheduledMessage } from '../utils/scheduled-message';
 
 export interface UseThunderbirdShortcutsOptions {
   /** Current app space ('mail' | 'contacts'). */
@@ -46,17 +47,57 @@ export type MessageListNavigationCommand =
 export interface MessageListCommands {
   navigate: (command: MessageListNavigationCommand) => void;
   selectAll: () => void;
+  /** Folder the registering list shows; a list without one matches any target. */
+  folderId?: () => number | null;
+  /** True for the primary column, the fallback when no list owns the target. */
+  primary?: () => boolean;
+  /** True while keyboard focus is inside the registering list. */
+  containsFocus?: () => boolean;
 }
 
-let activeMessageListCommands: MessageListCommands | null = null;
+const messageListCommandRegistry: MessageListCommands[] = [];
 
+/**
+ * Register one list column's navigation commands. Every mounted column
+ * registers; the global handler routes a command to the column whose
+ * folder owns the checked rows, then the cursor, then the open message,
+ * then to the primary column.
+ */
 export function registerMessageListCommands(commands: MessageListCommands): () => void {
-  activeMessageListCommands = commands;
+  messageListCommandRegistry.push(commands);
   return () => {
-    if (activeMessageListCommands === commands) {
-      activeMessageListCommands = null;
-    }
+    const index = messageListCommandRegistry.indexOf(commands);
+    if (index >= 0) messageListCommandRegistry.splice(index, 1);
   };
+}
+
+/** Folder whose rows a message shortcut should act on, or null for none. */
+function targetFolderId(mailStore: ReturnType<typeof useMailStore>): number | null {
+  if (mailStore.selectedIds.size > 0) return mailStore.selectionFolderId ?? mailStore.currentFolderId;
+  if (mailStore.focusedMessageId != null && mailStore.focusedFolderId != null) {
+    return mailStore.focusedFolderId;
+  }
+  if (mailStore.selectedMessageId != null) return mailStore.openMessageFolderId;
+  return mailStore.currentFolderId;
+}
+
+function resolveMessageListCommands(
+  mailStore: ReturnType<typeof useMailStore>,
+): MessageListCommands | null {
+  if (messageListCommandRegistry.length === 0) return null;
+  const target = targetFolderId(mailStore);
+  const owners = messageListCommandRegistry.filter((entry) => {
+    const folderId = entry.folderId?.();
+    return folderId !== undefined && folderId != null && Number(folderId) === Number(target);
+  });
+  // Two columns may show the same folder; the one the keyboard is in
+  // wins, since the filters that shape navigation are per column.
+  return owners.find((entry) => entry.containsFocus?.() === true)
+    ?? owners[0]
+    ?? messageListCommandRegistry.find((entry) => entry.primary?.() === true)
+    ?? messageListCommandRegistry.find((entry) => entry.folderId === undefined)
+    ?? messageListCommandRegistry[messageListCommandRegistry.length - 1]
+    ?? null;
 }
 
 function getTargetIds(mailStore: ReturnType<typeof useMailStore>): number[] {
@@ -69,21 +110,25 @@ function getTargetIds(mailStore: ReturnType<typeof useMailStore>): number[] {
   return [];
 }
 
+/** Folder the targeted rows belong to: the checked column's, else the open message's. */
+function sourceFolderForTargets(mailStore: ReturnType<typeof useMailStore>): number | null {
+  if (mailStore.selectedIds.size > 0) return mailStore.selectionFolderId;
+  if (mailStore.selectedMessageId != null) return mailStore.selectedMessageFolderId;
+  return null;
+}
+
 function getSingleMessage(mailStore: ReturnType<typeof useMailStore>) {
   const ids = getTargetIds(mailStore);
   if (ids.length !== 1) return null;
-  return mailStore.messages.find((m) => m?.id === ids[0]) ?? null;
+  return mailStore.findLoadedRow(ids[0], sourceFolderForTargets(mailStore)) ?? null;
 }
 
 function hasScheduledTarget(
   mailStore: ReturnType<typeof useMailStore>,
   ids: number[],
 ): boolean {
-  const targets = new Set(ids);
-  return mailStore.messages.some((message) =>
-    message?.id != null
-    && targets.has(Number(message.id))
-    && message.scheduled_undo_status != null);
+  const folderId = sourceFolderForTargets(mailStore);
+  return ids.some((id) => isScheduledMessage(mailStore.findLoadedRow(Number(id), folderId)));
 }
 
 type ShortcutHandler = (event: KeyboardEvent) => void | Promise<void>;
@@ -187,13 +232,13 @@ export function useThunderbirdShortcuts({
       // they settle a tick later. The handler stays synchronous — it has a
       // keystroke to preventDefault — and the composer opens when the read
       // returns, which is the same latency the toolbar buttons have.
-      // Scheduled (Send Later) mail is read-only outgoing mail, so these
+      // A pending scheduled send is read-only outgoing mail, so these
       // stand down for it just like the hidden toolbar buttons.
       case 'reply':
       case 'replyAll':
       case 'forward': {
         const singleTarget = getSingleMessage(mailStore);
-        const single = singleTarget?.scheduled_undo_status == null ? singleTarget : null;
+        const single = isScheduledMessage(singleTarget) ? null : singleTarget;
         if (!single) return;
         event.preventDefault();
         const body = mailStore.messageBody ?? {};
@@ -203,14 +248,20 @@ export function useThunderbirdShortcuts({
         return;
       }
 
-      case 'selectAll':
-        if (!activeMessageListCommands) return;
+      case 'selectAll': {
+        const commands = resolveMessageListCommands(mailStore);
+        if (!commands) return;
         event.preventDefault();
-        activeMessageListCommands.selectAll();
+        commands.selectAll();
         return;
+      }
 
       case 'clearSelection':
         if (mailStore.selectedIds.size === 0) return;
+        // An open dropdown (a column's folder picker or More menu) owns
+        // Escape: it closes on the same capture-phase listener, registered
+        // after this one, so the selection must not go with it.
+        if (document.querySelector('details.app-dropdown[open]')) return;
         event.preventDefault();
         mailStore.clearSelection();
         return;
@@ -224,18 +275,21 @@ export function useThunderbirdShortcuts({
         if (targetIds == null) return;
         event.preventDefault();
         if (targetIds.length === 0) return;
+        // The rows may belong to a column other than the primary one;
+        // name their folder so the store acts on it.
+        const source = { sourceFolderId: sourceFolderForTargets(mailStore) };
         if (action === 'archive') {
-          void mailStore.archiveMessages(targetIds);
+          void mailStore.archiveMessages(targetIds, source);
         } else if (action === 'toggleRead') {
-          void mailStore.toggleManySeen(targetIds);
+          void mailStore.toggleManySeen(targetIds, source);
         } else if (action === 'toggleStar') {
-          void mailStore.toggleManyFlagged(targetIds);
+          void mailStore.toggleManyFlagged(targetIds, source);
         } else {
           try {
             if (action === 'deleteForever') {
-              await mailStore.permanentlyDestroyMessages(targetIds);
+              await mailStore.permanentlyDestroyMessages(targetIds, source);
             } else {
-              await mailStore.destroyMessages(targetIds);
+              await mailStore.destroyMessages(targetIds, source);
             }
           } catch (err) {
             console.warn(`[shortcuts] ${action} failed`, err);
@@ -249,11 +303,13 @@ export function useThunderbirdShortcuts({
       case 'nextUnread':
       case 'previousUnread':
       case 'first':
-      case 'last':
-        if (!activeMessageListCommands) return;
+      case 'last': {
+        const commands = resolveMessageListCommands(mailStore);
+        if (!commands) return;
         event.preventDefault();
-        activeMessageListCommands.navigate(action);
+        commands.navigate(action);
         return;
+      }
 
       default: {
         const unhandled: never = action;

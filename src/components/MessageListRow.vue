@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
  * One positioned message-list row. Owns the row's markup and styling so
- * every list surface (folder list, kanban columns) renders the same row;
+ * every list surface renders the same row;
  * selection, focus and drag state come in as props and every interaction
  * is emitted back to the owner.
  */
@@ -18,6 +18,7 @@ import {
   rowTimestamp,
   type MessageRowLike,
 } from '../utils/message-row-presentation';
+import { isScheduledMessage } from '../utils/scheduled-message';
 
 const props = withDefaults(defineProps<{
   message: MessageRowLike & { id: number };
@@ -32,6 +33,12 @@ const props = withDefaults(defineProps<{
   /** False on surfaces without multi-select: no checkbox is rendered. */
   selectable?: boolean;
   /**
+   * Prefix of the row's DOM id (`${domIdPrefix}${message.id}`). Lists
+   * that can show one folder side by side pass a per-list prefix so
+   * `aria-activedescendant` and row anchors stay unique in the page.
+   */
+  domIdPrefix?: string;
+  /**
    * Overlay star / archive / delete at the row's inline-end on hover. The
    * star keeps its slot when the row is not hovered so a starred message
    * shows its star in the same place; the summary reserves that slot and
@@ -40,6 +47,8 @@ const props = withDefaults(defineProps<{
    * shows the star (set or not) and never archive or delete.
    */
   hoverActions?: boolean;
+  /** False where archiving is a no-op (the Archive folder): the overlay drops its Archive button. */
+  archiveAction?: boolean;
 }>(), {
   focused: false,
   selected: false,
@@ -48,6 +57,8 @@ const props = withDefaults(defineProps<{
   sort: 'received',
   selectable: true,
   hoverActions: false,
+  archiveAction: true,
+  domIdPrefix: 'msg-row-',
 });
 
 const emit = defineEmits<{
@@ -72,7 +83,7 @@ const dateText = computed(() => fmtDate(rowTimestamp(props.message, props.sort))
 
 <template>
   <li
-    :id="`msg-row-${message.id}`"
+    :id="`${domIdPrefix}${message.id}`"
     :data-index="index"
     role="option"
     :aria-selected="selected"
@@ -96,7 +107,7 @@ const dateText = computed(() => fmtDate(rowTimestamp(props.message, props.sort))
       class="msg-list__item"
       :class="{ 'msg-list__item--hover-actions': hoverActions }"
       tabindex="-1"
-      :draggable="message.scheduled_undo_status == null"
+      :draggable="!isScheduledMessage(message)"
       @click="emit('row-click', $event)"
       @dragstart="emit('dragstart', $event)"
       @dragend="emit('dragend', $event)"
@@ -160,6 +171,7 @@ const dateText = computed(() => fmtDate(rowTimestamp(props.message, props.sort))
               <Star :size="17" :stroke-width="1.75" :fill="isFlagged ? 'currentColor' : 'none'" />
             </button>
             <button
+              v-if="archiveAction"
               type="button"
               class="msg-list__action"
               tabindex="-1"
@@ -475,6 +487,17 @@ const dateText = computed(() => fmtDate(rowTimestamp(props.message, props.sort))
     "from icons date"
     "subject subject subject";
   row-gap: 2px;
+}
+/* Stacked rows keep the star slot on the sender line so the overlay never
+   sits on the wrapped subject. */
+.msg-list--card .msg-list__item--hover-actions .msg-list__summary {
+  grid-template-columns: minmax(0, 1fr) auto 34px 64px;
+  grid-template-areas:
+    "from icons star date"
+    "subject subject subject subject";
+}
+.msg-list--card .msg-list__actions {
+  top: 9px;
 }
 .msg-list--card .msg-list__from,
 .msg-list--card .msg-list__subject {

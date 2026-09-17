@@ -205,6 +205,13 @@ export function makeSyncRpcHandlers({
     [DB_RPC.SYNC_ENSURE_FOLDER_WINDOW]: async ({ accountId, folderId, range }) =>
       syncClient.ensureFolderWindow(accountId, folderId, range ?? {}),
 
+    [DB_RPC.SYNC_SET_ACTIVE_FOLDER_VIEWS]: async ({ accountId, folderIds }) => {
+      const backend = backends.get(accountId);
+      if (!backend) return { applied: false };
+      backend.setActiveFolderViews(folderIds ?? []);
+      return { applied: true };
+    },
+
     [DB_RPC.SYNC_ENSURE_MESSAGE_BODY]: async ({ accountId, messageId }) =>
       syncClient.ensureMessageBody(accountId, messageId),
 
@@ -280,12 +287,15 @@ export function makeSyncRpcHandlers({
       return backend.drainOutbox(limit);
     },
 
-    [DB_RPC.SYNC_RUN_MUTATION]: async ({ accountId, mutationId }) => {
+    [DB_RPC.SYNC_RUN_MUTATION]: async (
+      { accountId, mutationId },
+      { reportProgress }: any = {},
+    ) => {
       const backend = backends.get(accountId);
       if (!backend) {
         return { attempted: 0, succeeded: 0, failed: 0 };
       }
-      return backend.runMutation(mutationId);
+      return backend.runMutation(mutationId, { onProgress: reportProgress });
     },
 
     [DB_RPC.SYNC_GET_ATTACHMENT_LIMITS]: async ({ accountId }) => {

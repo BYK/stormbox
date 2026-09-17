@@ -102,6 +102,7 @@ export const DB_RPC = Object.freeze({
   QUERY_VIEW_APPLY_CHANGES: 'queryView.applyChanges',
   QUERY_VIEW_DROP_REMOTE_IDS: 'queryView.dropRemoteIds',
   FOLDER_WINDOW_PERSIST_BATCH: 'folderWindow.persistBatch',
+  FOLDER_WINDOW_VIEW_STATE: 'folderWindow.viewState',
   FOLDER_WINDOW_APPLY_CHANGES_BATCH: 'folderWindow.applyChangesBatch',
   QUERY_VIEW_RESET_FOR_FOLDER: 'queryView.resetForFolder',
   /**
@@ -174,6 +175,7 @@ export const DB_RPC = Object.freeze({
   SYNC_STOP_ACCOUNT: 'sync.stopAccount',
   SYNC_ENSURE_FOLDER_TREE: 'sync.ensureFolderTree',
   SYNC_ENSURE_FOLDER_WINDOW: 'sync.ensureFolderWindow',
+  SYNC_SET_ACTIVE_FOLDER_VIEWS: 'sync.setActiveFolderViews',
   SYNC_ENSURE_MESSAGE_BODY: 'sync.ensureMessageBody',
   SYNC_ENSURE_MESSAGE_BODIES: 'sync.ensureMessageBodies',
   SYNC_MESSAGE_BODY_FOR_DISPLAY: 'sync.messageBodyForDisplay',
@@ -211,3 +213,18 @@ export const TABLE_FAMILIES = Object.freeze({
   SYNC: 'sync',
   MUTATIONS: 'mutations',
 });
+
+/**
+ * Progress a `SYNC_RUN_MUTATION` call reports before it resolves. A send
+ * reports `submitted` once the server has accepted the submission and the
+ * acceptance is checkpointed, so the caller can stop waiting while filing
+ * and draft cleanup continue in the outbox (CS-1.3, CS-1.16).
+ */
+export interface SendMutationProgress {
+  kind: 'send';
+  phase: 'submitted';
+  createdRemoteId: string;
+  submissionRemoteId: string;
+}
+
+export type MutationProgress = SendMutationProgress;

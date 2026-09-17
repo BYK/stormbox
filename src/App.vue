@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import {
   computed,
-  defineAsyncComponent,
   nextTick,
   onBeforeUnmount,
   onMounted,
@@ -24,6 +23,11 @@ import { BUG_REPORT_URL, FEEDBACK_URL } from './defines';
 
 import { useAuthStore } from './stores/auth-store';
 import { useMailStore } from './stores/mail-store';
+import {
+  MESSAGE_COLUMN_MIN_WIDTH,
+  MESSAGE_COLUMN_RESIZER_WIDTH,
+  useMessageColumnsStore,
+} from './stores/message-columns-store';
 import { useContactsStore } from './stores/contacts-store';
 import { COMPOSE_PRESENTATION, useComposeStore } from './stores/compose-store';
 import { useSettingsStore } from './stores/settings-store';
@@ -40,7 +44,7 @@ import {
 import AppSpaces from './components/AppSpaces.vue';
 import LoginGate from './components/LoginGate.vue';
 import FolderTree from './components/FolderTree.vue';
-import MessageList from './components/MessageList.vue';
+import MessageColumns from './components/MessageColumns.vue';
 import MessageView from './components/MessageView.vue';
 import ComposeManager from './components/ComposeManager.vue';
 import ContactsView from './components/ContactsView.vue';
@@ -61,22 +65,13 @@ import type { SpotlightId } from './constants/feature-tour';
 import { beaconById, type BeaconId } from './constants/feature-beacons';
 import { useFeatureBeaconsStore } from './stores/feature-beacons-store';
 import SettingsDialog from './components/settings/SettingsDialog.vue';
-// Staff-only Kanban feature (src/features/kanban): the settings dialog's
-// staff section gates the flag; the board replaces MessageList only while
-// the flag is on. Both staff pieces are async so a non-staff session never
-// downloads the feature (the celebration chunk carries fireworks and the
-// audio clip).
-import { useKanbanStore } from './features/kanban/kanban-store';
-
-const KanbanBoard = defineAsyncComponent(() => import('./features/kanban/KanbanBoard.vue'));
-const KanbanCelebration = defineAsyncComponent(() => import('./features/kanban/KanbanCelebration.vue'));
 
 const authStore = useAuthStore();
 const mailStore = useMailStore();
+const columnsStore = useMessageColumnsStore();
 const contactsStore = useContactsStore();
 const composeStore = useComposeStore();
 const settingsStore = useSettingsStore();
-const kanbanStore = useKanbanStore();
 const beaconStore = useFeatureBeaconsStore();
 
 type AppSpace = 'contacts' | 'mail';
@@ -126,7 +121,7 @@ const documentTitle = computed(() => {
 });
 useTitle(documentTitle, { restoreOnUnmount: false });
 
-type ResizePane = 'folderList' | 'messageList';
+type ResizePane = 'folderList';
 
 const RESIZE_STORAGE_KEY = 'stormbox.mailColumnWidths.v1';
 const SPACE_RAIL_WIDTH = 56;
@@ -137,16 +132,14 @@ const FOLDER_LIST_TRANSITION_MS = 360;
 const MESSAGE_VIEW_PRELOAD_MS = 50;
 const DEFAULT_COLUMN_WIDTHS = {
   folderList: 240,
-  messageList: 360,
 };
 const MIN_COLUMN_WIDTHS = {
   folderList: 180,
-  messageList: 280,
+  messageList: MESSAGE_COLUMN_MIN_WIDTH,
   messageView: 240,
 };
 const MAX_COLUMN_WIDTHS = {
   folderList: 420,
-  messageList: 720,
 };
 const shellEl = ref<HTMLElement | null>(null);
 const quickFilterInputEl = ref<HTMLInputElement | null>(null);
@@ -160,7 +153,6 @@ watch(palette, (value) => applyPalette(value));
 const themeToggleLabel = computed(() =>
   appliedTheme.value === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
 const folderListWidth = ref(DEFAULT_COLUMN_WIDTHS.folderList);
-const messageListWidth = ref(DEFAULT_COLUMN_WIDTHS.messageList);
 const folderListHidden = ref(false);
 const showWelcomeModal = ref(false);
 const showSettingsDialog = ref(false);
@@ -204,12 +196,9 @@ const windowWidth = ref(typeof window === 'undefined' ? COMPACT_READING_WIDTH : 
 const wantsMessageDetailView = computed(() => mailStore.selectedMessageId != null);
 // Multi-select never opens the message view: the bulk actions live in
 // the message list header, so a checkbox selection hides the reading
-// pane entirely (and works the same in single-column layouts). The
-// kanban board's column selection follows the same rule.
+// pane entirely (and works the same in single-column layouts).
 const showMessageView = computed(() =>
-  wantsMessageDetailView.value
-  && mailStore.selectedIds.size === 0
-  && !(kanbanStore.enabled && kanbanStore.hasSelection),
+  wantsMessageDetailView.value && mailStore.selectedIds.size === 0,
 );
 const displayedMessageView = ref(
   showMessageView.value && !(space.value === 'mail' && windowWidth.value < COMPACT_READING_WIDTH),
@@ -223,19 +212,23 @@ const shouldUseSingleMailColumn = computed(() =>
 const displayedMessageList = computed(() =>
   !(space.value === 'mail' && shouldUseSingleMailColumn.value),
 );
-// The board beside an open message sizes its own track and carries its
-// own handle, so the shell's list width and list resizer step aside.
-const kanbanCompact = computed(() =>
-  space.value === 'mail'
-  && kanbanStore.enabled
-  && displayedMessageList.value
-  && displayedMessageView.value);
 let messageViewTimer: number | null = null;
 let responsiveFolderListHidden = false;
 
+// Width the columns area asks for: every column plus the handle after
+// each one (the last handle exists only beside the reading pane). The
+// grid track caps it so the reading pane keeps its minimum; the area
+// then scrolls horizontally.
+const messageColumnsWidth = computed(() => {
+  const columns = columnsStore.columns;
+  const resizers = Math.max(0, columns.length - 1) + (displayedMessageView.value ? 1 : 0);
+  return columns.reduce((sum, column) => sum + column.width, 0)
+    + resizers * MESSAGE_COLUMN_RESIZER_WIDTH;
+});
+
 const shellStyle = computed(() => ({
   '--folder-list-width': `${folderListWidth.value}px`,
-  '--message-list-width': `${messageListWidth.value}px`,
+  '--message-columns-width': `${messageColumnsWidth.value}px`,
   '--message-list-min-width': `${MIN_COLUMN_WIDTHS.messageList}px`,
   '--message-view-min-width': `${MIN_COLUMN_WIDTHS.messageView}px`,
   '--column-resizer-width': `${RESIZER_WIDTH}px`,
@@ -251,21 +244,12 @@ const {
   panes: {
     folderList: {
       get: () => folderListWidth.value,
-      max: (widths) => maxFolderListWidth(widths.messageList),
+      max: () => maxFolderListWidth(),
       min: () => MIN_COLUMN_WIDTHS.folderList,
       set: (width) => {
         folderListWidth.value = width;
       },
       storageKey: 'folderList',
-    },
-    messageList: {
-      get: () => messageListWidth.value,
-      max: (widths) => maxMessageListWidth(widths.folderList),
-      min: () => MIN_COLUMN_WIDTHS.messageList,
-      set: (width) => {
-        messageListWidth.value = width;
-      },
-      storageKey: 'messageList',
     },
   },
   storageKey: RESIZE_STORAGE_KEY,
@@ -330,6 +314,11 @@ watch(contactsDetailVisible, () => {
 });
 
 watch(folderListHidden, () => {
+  clampColumnWidths();
+});
+
+// Another column needs its minimum beside the folder list.
+watch(() => columnsStore.columns.length, () => {
   clampColumnWidths();
 });
 
@@ -566,47 +555,39 @@ function clearMessageViewTimer() {
 
 function availablePaneWidth() {
   const shellWidth = shellEl.value?.clientWidth || window.innerWidth || 0;
-  const messageViewResizer = space.value === 'mail' && displayedMessageView.value && !kanbanCompact.value ? 1 : 0;
-  const resizerCount = (folderListHidden.value ? 0 : 1) + messageViewResizer;
+  const resizerCount = folderListHidden.value ? 0 : 1;
   return Math.max(0, shellWidth - SPACE_RAIL_WIDTH - resizerCount * RESIZER_WIDTH);
 }
 
-// Width the columns beside the sidebar need so it can never push them into
+// Width the panes beside the sidebar need so it can never push them into
 // horizontal overflow (R-10.1): the Contacts columns at their minimums, and in
-// Mail the message list at its current width plus the message view minimum.
-function sidebarNeighbourReserve(messageList: number) {
+// Mail every open message list column at its minimum (with the handles
+// between them) plus the message view minimum. The columns area only scrolls
+// once even that does not fit beside the folder list's own minimum.
+function sidebarNeighbourReserve() {
   if (space.value === 'contacts') {
     return contactsDetailVisible.value
       ? DIRECTORY_COLUMN_MIN_WIDTHS.list + DIRECTORY_RESIZER_WIDTH + DIRECTORY_COLUMN_MIN_WIDTHS.detail
       : DIRECTORY_COLUMN_MIN_WIDTHS.list;
   }
-  if (kanbanCompact.value) {
-    return kanbanStore.compactBoardWidth + MIN_COLUMN_WIDTHS.messageView;
-  }
+  const columnCount = Math.max(1, columnsStore.columns.length);
+  const columnsMinimum = columnCount * MESSAGE_COLUMN_MIN_WIDTH
+    + (columnCount - 1) * MESSAGE_COLUMN_RESIZER_WIDTH;
   return displayedMessageView.value
-    ? messageList + MIN_COLUMN_WIDTHS.messageView
-    : MIN_COLUMN_WIDTHS.messageList;
+    ? columnsMinimum + MESSAGE_COLUMN_RESIZER_WIDTH + MIN_COLUMN_WIDTHS.messageView
+    : columnsMinimum;
 }
 
-function maxFolderListWidth(messageList: number) {
+function maxFolderListWidth() {
   return Math.min(
     MAX_COLUMN_WIDTHS.folderList,
-    availablePaneWidth() - sidebarNeighbourReserve(messageList),
+    availablePaneWidth() - sidebarNeighbourReserve(),
   );
-}
-
-function maxMessageListWidth(folderList: number) {
-  const reserve = displayedMessageView.value ? MIN_COLUMN_WIDTHS.messageView : 0;
-  const folderReserve = folderListHidden.value ? 0 : folderList;
-  return Math.min(MAX_COLUMN_WIDTHS.messageList, availablePaneWidth() - folderReserve - reserve);
 }
 
 function clampColumnWidths() {
   if (!folderListHidden.value) {
     clampPane('folderList');
-  }
-  if (space.value === 'mail') {
-    clampPane('messageList');
   }
 }
 
@@ -665,7 +646,6 @@ function unwatchSystemTheme() {
     :class="{
       'shell--message-view-hidden': space === 'mail' && !displayedMessageView,
       'shell--message-list-hidden': space === 'mail' && !displayedMessageList,
-      'shell--kanban-compact': kanbanCompact,
       'shell--folder-list-hidden': folderListHidden,
       'shell--contacts': space === 'contacts',
       'shell--column-resizing': activeResizePane !== null,
@@ -811,7 +791,7 @@ function unwatchSystemTheme() {
       :aria-label="`Resize ${sidebarLabel}`"
       aria-orientation="vertical"
       :aria-valuemin="MIN_COLUMN_WIDTHS.folderList"
-      :aria-valuemax="maxFolderListWidth(messageListWidth)"
+      :aria-valuemax="maxFolderListWidth()"
       :aria-valuenow="folderListWidth"
       :aria-hidden="folderListHidden"
       :tabindex="folderListHidden ? -1 : 0"
@@ -820,27 +800,10 @@ function unwatchSystemTheme() {
     />
 
     <template v-if="space === 'mail'">
-      <KanbanBoard
-        v-if="displayedMessageList && kanbanStore.enabled"
-        :compact="displayedMessageView"
+      <MessageColumns
+        v-if="displayedMessageList"
         :quick-filter-query="quickFilterQuery"
-      />
-      <MessageList v-else-if="displayedMessageList" :quick-filter-query="quickFilterQuery" />
-      <div
-        v-if="displayedMessageView && displayedMessageList && !kanbanCompact"
-        class="column-resizer column-resizer--message-list"
-        :class="{
-          'is-active': activeResizePane === 'messageList',
-        }"
-        role="separator"
-        aria-label="Resize message list"
-        aria-orientation="vertical"
-        :aria-valuemin="MIN_COLUMN_WIDTHS.messageList"
-        :aria-valuemax="maxMessageListWidth(folderListWidth)"
-        :aria-valuenow="messageListWidth"
-        tabindex="0"
-        @pointerdown="startColumnResize('messageList', $event)"
-        @keydown="onResizeHandleKeydown('messageList', $event)"
+        :reading-pane-visible="displayedMessageView"
       />
       <MessageView v-if="displayedMessageView" />
     </template>
@@ -887,7 +850,6 @@ function unwatchSystemTheme() {
       @close="showSettingsDialog = false"
       @show-welcome="showWelcomeModalAgain"
     />
-    <KanbanCelebration v-if="authStore.isStaff" />
   </div>
 </template>
 
@@ -933,6 +895,10 @@ html.light,
   --top-nav-wordmark: var(--accent);
 }
 
+/* The columns area asks for the sum of its column widths; the grid gives
+   it that much only while the reading pane keeps its minimum, and the
+   area scrolls horizontally past that (the column handles live inside
+   it, so no resizer track sits between the two). */
 .shell {
   position: relative;
   --folder-resizer-width: var(--column-resizer-width, 6px);
@@ -941,8 +907,7 @@ html.light,
     56px
     auto
     var(--folder-resizer-width)
-    minmax(var(--message-list-min-width, 280px), var(--message-list-width, 360px))
-    var(--column-resizer-width, 6px)
+    minmax(var(--message-list-min-width, 280px), var(--message-columns-width, 360px))
     minmax(var(--message-view-min-width, 320px), 1fr);
   grid-template-rows: auto minmax(0, 1fr);
   height: var(--app-viewport-height);
@@ -956,7 +921,6 @@ html.light,
     auto
     var(--folder-resizer-width)
     minmax(var(--message-list-min-width, 280px), 1fr)
-    0px
     0px;
 }
 .shell--message-list-hidden {
@@ -965,23 +929,10 @@ html.light,
     auto
     var(--folder-resizer-width)
     0px
-    0px
     minmax(0, 1fr);
 }
 .shell--folder-list-hidden {
   --folder-resizer-width: 0px;
-}
-/* Kanban board beside an open message: the board sets its own width
- * (two columns plus their handles) and its last handle replaces the
- * shell's list resizer. */
-.shell--kanban-compact {
-  grid-template-columns:
-    56px
-    auto
-    var(--folder-resizer-width)
-    auto
-    0px
-    minmax(var(--message-view-min-width, 320px), 1fr);
 }
 .shell--contacts {
   grid-template-columns:
@@ -1022,15 +973,11 @@ body.spotlighting .folder-subs {
  * Force every shell column to be allowed to shrink so its children can
  * own the vertical scroll. */
 .shell > * { min-height: 0; min-width: 0; }
-.shell > .msg-list {
-  grid-column: 4;
-  border-right: 0;
-}
-.shell > .kanban-board {
+.shell > .msg-columns {
   grid-column: 4;
 }
 .shell > .message-view {
-  grid-column: 6;
+  grid-column: 5;
 }
 .shell--message-list-hidden > .message-view {
   grid-column: 4 / -1;
@@ -1230,7 +1177,7 @@ body.spotlighting .folder-subs {
   .shell .column-resizer--folder-list {
     display: none;
   }
-  .shell--message-view-hidden > .msg-list,
+  .shell--message-view-hidden > .msg-columns,
   .shell--message-list-hidden > .message-view {
     grid-column: 2 / -1;
   }
@@ -1285,10 +1232,10 @@ body.spotlighting .folder-subs {
   .shell .sidebar-slot--hidden {
     width: min(var(--folder-list-width, 240px), 100vw);
   }
-  .shell > .msg-list,
+  .shell > .msg-columns,
   .shell > .message-view,
   .shell > .contacts,
-  .shell--message-view-hidden > .msg-list,
+  .shell--message-view-hidden > .msg-columns,
   .shell--message-list-hidden > .message-view {
     grid-column: 1;
     grid-row: 2;

@@ -31,7 +31,7 @@ import type {
   Repository,
   ScheduleCapability,
 } from '../db/repository';
-import { TABLE_FAMILIES } from '../db/protocol';
+import { TABLE_FAMILIES, type MutationProgress } from '../db/protocol';
 import {
   createComposeAttachmentController,
   type AttachmentPreflightObligation,
@@ -156,6 +156,8 @@ function emptyDraft(): Draft {
 export const COMPOSE_PRESENTATION = {
   EXPANDED: 'expanded',
   MINIMIZED: 'minimized',
+  /** Off screen while its send is in flight; the send toast is its only representation (CS-1.16). */
+  HIDDEN: 'hidden',
 } as const;
 
 export type ComposePresentation =
@@ -207,6 +209,15 @@ export interface ComposeSession {
   id: string;
   presentation: ComposePresentation;
   status: ComposeState;
+  /** Target time of the send in flight; null for a send-now or when idle. */
+  sendingScheduledAt: string | null;
+  /**
+   * The send failed while the session was off screen and another composer
+   * was expanded, so the session docked instead of returning; the send toast
+   * reports the failure and offers Open until the session is restored or
+   * the notice dismissed (CS-1.16).
+   */
+  dockedSendFailure: boolean;
   error: string | null;
   saveError: string | null;
   isSaving: boolean;
@@ -257,10 +268,19 @@ export function isExpandedPresentation(presentation: ComposePresentation): boole
     case COMPOSE_PRESENTATION.EXPANDED:
       return true;
     case COMPOSE_PRESENTATION.MINIMIZED:
+    case COMPOSE_PRESENTATION.HIDDEN:
       return false;
     default:
       return assertNever(presentation);
   }
+}
+
+/** The session's name in the dock and the send toast: subject, then first recipient, then “New message” (CD-1.6). */
+export function sessionLabel(session: ComposeSession): string {
+  const subject = session.draft.subject.trim();
+  if (subject) return subject;
+  const recipient = session.draft.to[0] ?? session.draft.cc[0] ?? session.draft.bcc[0];
+  return recipient?.name?.trim() || recipient?.email || 'New message';
 }
 
 function makeSessionId(): string {
@@ -569,6 +589,8 @@ export const useComposeStore = defineStore('compose', () => {
     blocked: boolean;
     /** Autosave is parked while a scripted demo writes into the session (OB-2.7). */
     held: boolean;
+    /** The session's one send in flight; later activations join it (CS-1.15). */
+    sending: Promise<boolean> | null;
   }>();
   const attachmentController = createComposeAttachmentController({
     sessionById,
@@ -602,6 +624,7 @@ export const useComposeStore = defineStore('compose', () => {
         queued: false,
         blocked: false,
         held: false,
+        sending: null,
       };
       autosaveRuntime.set(sessionId, runtime);
     }
@@ -1421,7 +1444,6 @@ export const useComposeStore = defineStore('compose', () => {
   ): string {
     prefillGeneration += 1;
     const expanded = activeSession.value;
-    if (expanded?.status === COMPOSE_STATE.SENDING) return expanded.id;
     if (expanded) expanded.presentation = COMPOSE_PRESENTATION.MINIMIZED;
 
     const initialAttachments = [...(prefill.attachments ?? [])];
@@ -1443,6 +1465,8 @@ export const useComposeStore = defineStore('compose', () => {
       id,
       presentation: COMPOSE_PRESENTATION.EXPANDED,
       status: COMPOSE_STATE.EDITING,
+      sendingScheduledAt: null,
+      dockedSendFailure: false,
       error: null,
       saveError: null,
       isSaving: false,
@@ -1512,27 +1536,53 @@ export const useComposeStore = defineStore('compose', () => {
     return true;
   }
 
+  /** Dock an expanded session. A hidden session stays off screen until its send settles (CS-1.16). */
   function minimize(sessionId: string | null = activeSessionId.value): boolean {
     const session = sessionById(sessionId);
     if (!session
-        || session.status === COMPOSE_STATE.SENDING
+        || session.presentation === COMPOSE_PRESENTATION.HIDDEN
         || session.isSaving
         || session.isDiscarding) return false;
-    session.presentation = COMPOSE_PRESENTATION.MINIMIZED;
-    if (activeSessionId.value === session.id) activeSessionId.value = null;
+    dock(session);
     return true;
   }
 
+  function dock(session: ComposeSession): void {
+    session.presentation = COMPOSE_PRESENTATION.MINIMIZED;
+    if (activeSessionId.value === session.id) activeSessionId.value = null;
+  }
+
+  /** Off screen for the send: not expanded, not in the dock; the send toast stands in (CS-1.16). */
+  function hide(session: ComposeSession): void {
+    session.presentation = COMPOSE_PRESENTATION.HIDDEN;
+    if (activeSessionId.value === session.id) activeSessionId.value = null;
+  }
+
+  /**
+   * Bring a docked session back to the screen. A hidden session has no
+   * Restore: its send has to settle first, and failSend decides where it
+   * lands (CS-1.16).
+   */
   function restore(sessionId: string): boolean {
     const session = sessionById(sessionId);
-    if (!session) return false;
+    if (!session || session.presentation === COMPOSE_PRESENTATION.HIDDEN) return false;
+    expand(session);
+    return true;
+  }
+
+  function expand(session: ComposeSession): void {
+    session.dockedSendFailure = false;
     const expanded = activeSession.value;
-    if (expanded?.id === session.id) return true;
-    if (expanded?.status === COMPOSE_STATE.SENDING) return false;
+    if (expanded?.id === session.id) return;
     if (expanded) expanded.presentation = COMPOSE_PRESENTATION.MINIMIZED;
     session.presentation = COMPOSE_PRESENTATION.EXPANDED;
     activeSessionId.value = session.id;
-    return true;
+  }
+
+  /** Dismiss the failure toast of a docked session without opening it. */
+  function dismissSendFailureNotice(sessionId: string): void {
+    const session = sessionById(sessionId);
+    if (session) session.dockedSendFailure = false;
   }
 
   function selectFromIndex(
@@ -2486,10 +2536,6 @@ export const useComposeStore = defineStore('compose', () => {
       return restore(existing.id) ? existing.id : null;
     }
     if (!repo || authStore.accountId == null) return null;
-    if (activeSession.value?.status === COMPOSE_STATE.SENDING) {
-      setNotice('Finish the current send before opening another draft.');
-      return null;
-    }
     const accountId = authStore.accountId;
     const stillCurrent = () =>
       gesture === prefillGeneration && authStore.accountId === accountId;
@@ -2569,11 +2615,21 @@ export const useComposeStore = defineStore('compose', () => {
     const session = sessionById(sessionId);
     if (session) {
       session.status = COMPOSE_STATE.FAILED;
+      session.sendingScheduledAt = null;
       session.error = message;
       const runtime = autosaveRuntime.get(session.id);
       if (runtime) {
         runtime.blocked = false;
         scheduleAutosave(session.id);
+      }
+      // A send fails off screen. The message comes back when nothing else
+      // is being written; otherwise it docks with the failure marked and
+      // the send toast offers to open it (CS-1.16).
+      if (!isExpandedPresentation(session.presentation) && !activeSession.value) {
+        expand(session);
+      } else if (session.presentation === COMPOSE_PRESENTATION.HIDDEN) {
+        dock(session);
+        session.dockedSendFailure = true;
       }
     } else {
       fallbackStatus.value = COMPOSE_STATE.FAILED;
@@ -2655,15 +2711,31 @@ export const useComposeStore = defineStore('compose', () => {
    * submission. Scheduling is the same durable SEND mutation with one
    * extra field, so every guard, ambiguity rule, and retry path here
    * covers both; only the user-facing copy differs.
+   *
+   * A session has one send lane. The lane is claimed synchronously, so an
+   * activation that arrives while a send is in flight — including while
+   * it waits for the session's autosave — joins that send and receives
+   * its outcome instead of queueing a second delivery (CS-1.15).
    */
-  async function send(
+  function send(
     sessionId: string | null = activeSessionId.value,
     scheduledAt: string | null = null,
   ): Promise<boolean> {
     const session = sessionById(sessionId);
-    if (!session
-        || session.status === COMPOSE_STATE.SENDING
-        || session.isDiscarding) return false;
+    if (!session || session.isDiscarding) return Promise.resolve(false);
+    const runtime = runtimeFor(session.id);
+    if (runtime.sending) return runtime.sending;
+    const lane = performSend(session, scheduledAt).finally(() => {
+      if (runtime.sending === lane) runtime.sending = null;
+    });
+    runtime.sending = lane;
+    return lane;
+  }
+
+  async function performSend(
+    session: ComposeSession,
+    scheduledAt: string | null,
+  ): Promise<boolean> {
     const initialAttachmentError = attachmentSendError(session);
     if (initialAttachmentError) return failSend(initialAttachmentError, session.id);
     if (runtimeFor(session.id).blocked && session.saveError) {
@@ -2699,6 +2771,15 @@ export const useComposeStore = defineStore('compose', () => {
     // semantics.
     const outbox = folders.find((f) => f.role === ('outbox' as MailboxRole));
 
+    // Everything above ran synchronously from the activation, so the
+    // session is marked sending before the first await below: the Send
+    // control reads this status and goes inert on the same tick.
+    session.status = COMPOSE_STATE.SENDING;
+    session.sendingScheduledAt = scheduledAt;
+    session.error = null;
+    // The screen goes back to the user while the server does its work:
+    // the session leaves it and the send toast reports for it (CS-1.16).
+    hide(session);
     const sessionRuntime = runtimeFor(session.id);
     clearAutosaveTimer(session.id);
     sessionRuntime.blocked = true;
@@ -2706,16 +2787,26 @@ export const useComposeStore = defineStore('compose', () => {
     if (!sessionById(session.id)) return false;
     const currentAttachmentError = attachmentSendError(session);
     if (currentAttachmentError) return failSend(currentAttachmentError, session.id);
-    session.presentation = COMPOSE_PRESENTATION.EXPANDED;
-    activeSessionId.value = session.id;
-    session.status = COMPOSE_STATE.SENDING;
-    session.error = null;
     // The composer this send belongs to. Logout ($reset) and opening
     // another message both bump the counter, and neither waits for an
     // in-flight send, so the result below has to prove it is still
     // relevant before touching shared state.
     const generation = session.generation;
     const stillCurrent = () => sessionById(session.id)?.generation === generation;
+    // Acceptance is what the user is waiting for (CS-1.3, CS-1.13); the
+    // Sent copy and draft cleanup are the outbox's work and continue
+    // after the composer has closed.
+    let accepted = false;
+    const acceptSend = (filed: boolean | undefined) => {
+      accepted = true;
+      session.status = COMPOSE_STATE.SENT;
+      close(session.id);
+      setNotice(scheduledAt
+        ? 'Message scheduled.'
+        : filed === false
+          ? 'Message sent. It will be visible in your Sent folder shortly.'
+          : 'Message sent.');
+    };
     try {
       const captured = capturedAttachments(session);
       const sendRequest = {
@@ -2762,8 +2853,20 @@ export const useComposeStore = defineStore('compose', () => {
       // drainOutbox's failed/succeeded tally and our success branch
       // could have falsely reported a send failure.
       const result = typeof repo.runMutation === 'function' && mutation?.id != null
-        ? await repo.runMutation(authStore.accountId, mutation.id)
+        ? await repo.runMutation(authStore.accountId, mutation.id, {
+            onProgress: (progress: MutationProgress) => {
+              if (progress?.kind !== 'send' || progress.phase !== 'submitted') return;
+              if (!accepted && stillCurrent()) acceptSend(undefined);
+            },
+          })
         : await repo.drainOutbox(authStore.accountId);
+      if (accepted) {
+        // Closed at acceptance; only the filing report is still of use.
+        if (result.result?.filed === false && !scheduledAt) {
+          setNotice('Message sent. It will be visible in your Sent folder shortly.');
+        }
+        return true;
+      }
       // A mutation can fail after the server accepted the message: local
       // filing into Sent is repair work that runs past the point of no
       // return. Calling that a failed send would invite a second press of
@@ -2838,16 +2941,7 @@ export const useComposeStore = defineStore('compose', () => {
         return failSend('Send failed; the message stays in your outbox.', session.id);
       }
       if (!stillCurrent()) return true;
-      session.status = COMPOSE_STATE.SENT;
-      close(session.id);
-      // Confirmation is deliberately about acceptance, not arrival: the
-      // server has taken the message, and nothing the client can observe
-      // proves it reached the recipient (CS-1.13).
-      setNotice(scheduledAt
-        ? 'Message scheduled.'
-        : result.result?.filed === false
-          ? 'Message accepted for delivery. Your Sent folder will show it shortly.'
-          : 'Message accepted for delivery.');
+      acceptSend(result.result?.filed);
       return true;
     } catch (err: any) {
       if (!stillCurrent()) return false;
@@ -2887,9 +2981,9 @@ export const useComposeStore = defineStore('compose', () => {
     timeZone?: string,
   ): Promise<boolean> {
     const session = sessionById(sessionId);
-    if (!session
-        || session.status === COMPOSE_STATE.SENDING
-        || session.isDiscarding) return false;
+    if (!session || session.isDiscarding) return false;
+    const runtime = runtimeFor(session.id);
+    if (runtime.sending) return runtime.sending;
     if (schedulingSessions.has(session.id)) return false;
     schedulingSessions.add(session.id);
     try {
@@ -2948,6 +3042,7 @@ export const useComposeStore = defineStore('compose', () => {
     close,
     minimize,
     restore,
+    dismissSendFailureNotice,
     isSessionDirty,
     isSessionMeaningfullyNonEmpty,
     uncheckpointedAttachmentCount,

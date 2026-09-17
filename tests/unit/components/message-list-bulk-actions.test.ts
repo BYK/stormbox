@@ -227,6 +227,49 @@ describe('MessageList bulk actions header', () => {
     wrapper.unmount();
   });
 
+  it('keeps the open message selected when it matches the filter being enabled', async () => {
+    const { mailStore, wrapper } = mountList({
+      rows: [
+        makeRow(1),
+        makeRow(2, { is_flagged: 1, is_seen: 0, subject: 'Matching message' }),
+      ],
+    });
+    mailStore.selectMessage(2, 1);
+    await nextTick();
+
+    await wrapper.find('.msg-list__filter--starred').trigger('click');
+    expect(mailStore.selectedMessageId).toBe(2);
+    expect(mailStore.openMessageFolderId).toBe(1);
+
+    await wrapper.findAll('.msg-list__filter')[0].trigger('click');
+    expect(mailStore.selectedMessageId).toBe(2);
+
+    await wrapper.setProps({ quickFilterQuery: 'matching' });
+    await nextTick();
+    expect(mailStore.selectedMessageId).toBe(2);
+    wrapper.unmount();
+  });
+
+  it('closes the open message only when a new filter excludes it', async () => {
+    const { mailStore, wrapper } = mountList({
+      rows: [
+        makeRow(1, { subject: 'Does not match' }),
+        makeRow(2, { is_flagged: 1, subject: 'Matching message' }),
+      ],
+    });
+    mailStore.selectMessage(1, 1);
+    await nextTick();
+
+    await wrapper.find('.msg-list__filter--starred').trigger('click');
+    expect(mailStore.selectedMessageId).toBeNull();
+
+    mailStore.selectMessage(2, 1);
+    await wrapper.setProps({ quickFilterQuery: 'not present' });
+    await nextTick();
+    expect(mailStore.selectedMessageId).toBeNull();
+    wrapper.unmount();
+  });
+
   it('shows the filter buttons and no bulk actions without a selection', async () => {
     const { wrapper } = mountList();
     await nextTick();
@@ -278,6 +321,20 @@ describe('MessageList bulk actions header', () => {
     wrapper.unmount();
   });
 
+  it('omits Archive from the bulk toolbar and the row overlay inside the Archive folder', async () => {
+    const { mailStore, wrapper } = mountList({
+      folder: makeFolder(2, { name: 'Archive', role: 'archive' }),
+    });
+    mailStore.selectedIds = new Set([1]);
+    await nextTick();
+
+    const titles = wrapper
+      .findAll('.msg-list__bulk-actions .msg-list__bulk-action')
+      .map((button) => button.attributes('title'));
+    expect(titles).toEqual(['Junk', 'Delete', 'Star', 'Mark as read', 'Mark as unread', 'Clear selection']);
+    wrapper.unmount();
+  });
+
   it('shows neither Junk nor Not junk actions in a shared Junk folder', async () => {
     const { mailStore, wrapper } = mountList({
       folder: makeFolder(2, {
@@ -297,15 +354,18 @@ describe('MessageList bulk actions header', () => {
     wrapper.unmount();
   });
 
-  it('offers Cancel send in place of Delete inside the Scheduled folder', async () => {
+  it('offers Cancel send in place of Delete while a pending send is selected', async () => {
+    // Row 3 is a sent message another client put back into Scheduled:
+    // the cancel only targets the rows that still hold a submission.
     const { mailStore, wrapper } = mountList({
       folder: makeFolder(2, { name: 'Scheduled', role: 'scheduled' }),
       rows: [
         makeRow(1, { scheduled_undo_status: 'pending' }),
         makeRow(2, { scheduled_undo_status: 'pending' }),
+        makeRow(3, { scheduled_undo_status: null }),
       ],
     });
-    mailStore.selectedIds = new Set([1, 2]);
+    mailStore.selectedIds = new Set([1, 2, 3]);
     await nextTick();
 
     const actions = wrapper.findAll('.msg-list__bulk-actions .msg-list__bulk-action');
@@ -326,6 +386,34 @@ describe('MessageList bulk actions header', () => {
     wrapper.unmount();
   });
 
+  it('keeps the ordinary actions for non-pending mail selected in the Scheduled folder', async () => {
+    const { mailStore, wrapper } = mountList({
+      folder: makeFolder(2, { name: 'Scheduled', role: 'scheduled' }),
+      rows: [
+        makeRow(1, { scheduled_undo_status: 'pending' }),
+        makeRow(3, { scheduled_undo_status: null }),
+      ],
+    });
+    mailStore.selectedIds = new Set([3]);
+    await nextTick();
+
+    const actions = wrapper.findAll('.msg-list__bulk-actions .msg-list__bulk-action');
+    expect(actions.map((button) => button.attributes('title'))).toEqual([
+      'Archive',
+      'Junk',
+      'Delete',
+      'Star',
+      'Mark as read',
+      'Mark as unread',
+      'Clear selection',
+    ]);
+
+    const destroySpy = vi.spyOn(mailStore, 'destroyMessages').mockResolvedValue(undefined);
+    await wrapper.find('.msg-list__bulk-actions [title="Delete"]').trigger('click');
+    expect(destroySpy).toHaveBeenCalledWith([3], { sourceFolderId: 2 });
+    wrapper.unmount();
+  });
+
   it('dispatches the store actions for the selected ids', async () => {
     const { mailStore, wrapper } = mountList();
     mailStore.selectedIds = new Set([1, 3]);
@@ -342,11 +430,14 @@ describe('MessageList bulk actions header', () => {
     await wrapper.find('.msg-list__bulk-actions [title="Mark as read"]').trigger('click');
     await wrapper.find('.msg-list__bulk-actions [title="Mark as unread"]').trigger('click');
 
-    expect(archiveSpy).toHaveBeenCalledWith([1, 3]);
-    expect(junkSpy).toHaveBeenCalledWith([1, 3]);
-    expect(destroySpy).toHaveBeenCalledWith([1, 3]);
-    expect(seenSpy).toHaveBeenNthCalledWith(1, [1, 3], true);
-    expect(seenSpy).toHaveBeenNthCalledWith(2, [1, 3], false);
+    // Every action names the column's folder so a column showing another
+    // folder than the primary one acts on its own rows.
+    const source = { sourceFolderId: 1 };
+    expect(archiveSpy).toHaveBeenCalledWith([1, 3], source);
+    expect(junkSpy).toHaveBeenCalledWith([1, 3], source);
+    expect(destroySpy).toHaveBeenCalledWith([1, 3], source);
+    expect(seenSpy).toHaveBeenNthCalledWith(1, [1, 3], true, source);
+    expect(seenSpy).toHaveBeenNthCalledWith(2, [1, 3], false, source);
     wrapper.unmount();
   });
 
@@ -363,7 +454,7 @@ describe('MessageList bulk actions header', () => {
 
     const toggleSpy = vi.spyOn(mailStore, 'toggleManyFlagged').mockResolvedValue(2);
     await star.trigger('click');
-    expect(toggleSpy).toHaveBeenCalledWith([1, 3]);
+    expect(toggleSpy).toHaveBeenCalledWith([1, 3], { sourceFolderId: 1 });
 
     mailStore.selectedIds = new Set([1, 2]);
     await nextTick();

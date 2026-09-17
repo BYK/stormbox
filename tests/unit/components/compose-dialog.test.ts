@@ -17,14 +17,16 @@ import ComposeDialog from '../../../src/components/ComposeDialog.vue';
 import ComposeManager from '../../../src/components/ComposeManager.vue';
 import RichTextEditor from '../../../src/components/RichTextEditor.vue';
 import ScheduleSendDialog from '../../../src/components/ScheduleSendDialog.vue';
+import StoreErrorToast from '../../../src/components/StoreErrorToast.vue';
 import {
   __resetRepositoryForTests,
   __setRepositoryForTests,
 } from '../../../src/composables/useRepository';
 import { COMPOSE_STATE } from '../../../src/constants/states';
 import { useAuthStore } from '../../../src/stores/auth-store';
-import { useComposeStore } from '../../../src/stores/compose-store';
+import { COMPOSE_PRESENTATION, useComposeStore } from '../../../src/stores/compose-store';
 import { useContactsStore } from '../../../src/stores/contacts-store';
+import { useMailStore } from '../../../src/stores/mail-store';
 import { useSettingsStore } from '../../../src/stores/settings-store';
 
 const mountedWrappers: Array<{ unmount: () => void }> = [];
@@ -850,6 +852,95 @@ describe('ComposeDialog send control', () => {
     expect(wrapper.find('[role="alert"]').exists()).toBe(false);
   });
 
+  it('turns a burst of Send activations into one send and goes inert (CS-1.15)', async () => {
+    // Enter held on the focused Send button fires a click per key repeat;
+    // Ctrl+Enter can land in the same burst. Every activation after the
+    // first must join the send already claimed, and the message must not
+    // accept edits or another Send until the outcome is known.
+    let releaseSave: (result: any) => void = () => {};
+    const mutations: string[] = [];
+    __setRepositoryForTests({
+      subscribe: vi.fn(() => () => {}),
+      getAccount: vi.fn(async () => ({ id: 1, primary_email: 'sender@example.com' })),
+      listIdentities: vi.fn(async () => [{ id: 1, name: 'Sender', email: 'sender@example.com' }]),
+      ensureIdentities: vi.fn(async () => {}),
+      insertPendingMutation: vi.fn(async (input: any) => {
+        mutations.push(input.mutationType);
+        return { id: mutations.length };
+      }),
+      runMutation: vi.fn(async (_accountId: number, id: number) => (id === 1
+        ? new Promise((resolve) => { releaseSave = resolve; })
+        : new Promise(() => {}))),
+    });
+    useAuthStore().accountId = 1;
+    useMailStore().folders = [{
+      id: 10, account_id: 1, remote_id: 'mb-drafts', role: 'drafts', name: 'Drafts',
+    } as any];
+    const composeStore = useComposeStore();
+    await composeStore.attach();
+    await flushPromises();
+    const sessionId = composeStore.open({ to: [{ email: 'recipient@example.com' }] });
+    const wrapper = mount(ComposeManager, { attachTo: document.body, global: { stubs: { teleport: true } } });
+    mountedWrappers.push(wrapper);
+    await nextTick();
+    // A draft save is on the wire when Send is pressed.
+    composeStore.sessionById(sessionId)!.draft.subject = 'Once';
+    void composeStore.saveDraft(sessionId, { explicit: true });
+    await flushPromises();
+    expect(mutations).toEqual(['saveDraft']);
+
+    const send = wrapper.get('footer .compose-send');
+    const dialog = wrapper.get('.compose-dialog').element as HTMLElement;
+    await send.trigger('click');
+    await send.trigger('click');
+    dialog.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true,
+    }));
+    await nextTick();
+
+    const session = composeStore.sessionById(sessionId)!;
+    expect(session.status).toBe(COMPOSE_STATE.SENDING);
+    expect(send.attributes('disabled')).toBeDefined();
+    expect(send.text()).toBe('Sending…');
+    expect((wrapper.get('.compose-dialog__body').element as HTMLElement).inert).toBe(true);
+    // The composer has left the screen: neither expanded nor in the dock
+    // (CS-1.16); the send toast stands in for it.
+    expect(wrapper.find('.compose-dialog--expanded').exists()).toBe(false);
+    expect(wrapper.find('.compose-dock__item').exists()).toBe(false);
+    expect(session.presentation).toBe(COMPOSE_PRESENTATION.HIDDEN);
+    const toast = mount(StoreErrorToast, { attachTo: document.body });
+    mountedWrappers.push(toast);
+    await nextTick();
+    const progress = toast.get(`.store-error-toast__item[data-session-id="${sessionId}"]`);
+    expect(progress.classes()).toContain('store-error-toast__item--progress');
+    expect(progress.text()).toBe('Sending “Once”…');
+    expect(progress.find('.store-error-toast__dismiss').exists()).toBe(false);
+    expect(progress.find('.store-error-toast__action').exists()).toBe(false);
+
+    releaseSave({
+      attempted: 1,
+      succeeded: 1,
+      failed: 0,
+      result: {
+        revision: 1,
+        emailId: 'draft-1',
+        localMessageId: 1,
+        messageId: '<revision-1@example.com>',
+        payloadHash: 'hash-1',
+      },
+    });
+    await flushPromises();
+    expect(mutations).toEqual(['saveDraft', 'send']);
+    // Still sending once the save has answered: still off screen, still
+    // reported by the toast.
+    expect(session.status).toBe(COMPOSE_STATE.SENDING);
+    expect(session.presentation).toBe(COMPOSE_PRESENTATION.HIDDEN);
+    expect(wrapper.find('.compose-dialog--expanded').exists()).toBe(false);
+    expect(wrapper.find('.compose-dock__item').exists()).toBe(false);
+    expect(toast.get(`.store-error-toast__item[data-session-id="${sessionId}"]`).text())
+      .toBe('Sending “Once”…');
+  });
+
   it('keeps Discard available but disables conflicting actions while saving', async () => {
     const { wrapper, composeStore } = await mountOpenCompose();
     const session = composeStore.activeSession!;
@@ -1117,7 +1208,7 @@ describe('ComposeDialog scheduled send control', () => {
     expect(schedule).toHaveBeenCalledTimes(1);
     expect(wrapper.get('.compose-send').text()).toBe('Scheduling…');
     expect(wrapper.get('.compose-send').attributes('disabled')).toBeDefined();
-    expect(wrapper.get('[aria-label="Minimize"]').attributes('disabled')).toBeDefined();
+    // The window may not be closed while scheduling.
     expect(wrapper.get('[aria-label="Close options"]').attributes('aria-disabled')).toBe('true');
 
     finish(false);
@@ -1453,6 +1544,47 @@ describe('ComposeDialog accessibility', () => {
 });
 
 describe('ComposeManager window presentation', () => {
+  it('keeps a sending session out of the dock and marks a docked failure', async () => {
+    // A session is off screen while it sends (CS-1.16); the dock only ever
+    // carries the failure that docked it (CD-1.7).
+    const composeStore = useComposeStore();
+    const id = composeStore.open({ subject: 'Design review' });
+    composeStore.minimize(id);
+    const otherId = composeStore.open({ subject: 'Another draft' });
+    composeStore.minimize(otherId);
+    const wrapper = mount(ComposeManager, {
+      attachTo: document.body,
+      global: { stubs: { ComposeDialog: true } },
+    });
+    mountedWrappers.push(wrapper);
+    try {
+      await nextTick();
+      const item = wrapper.get(`[data-session-id="${id}"]`);
+      expect(item.find('.compose-dock__status').exists()).toBe(false);
+      expect(item.get('.compose-dock__close').attributes('disabled')).toBeUndefined();
+
+      const session = composeStore.sessionById(id)!;
+      session.status = COMPOSE_STATE.SENDING;
+      session.presentation = COMPOSE_PRESENTATION.HIDDEN;
+      await nextTick();
+      expect(wrapper.find(`[data-session-id="${id}"]`).exists()).toBe(false);
+      expect(wrapper.get(`[data-session-id="${otherId}"]`).find('.compose-dock__status').exists())
+        .toBe(false);
+
+      session.status = COMPOSE_STATE.FAILED;
+      session.presentation = COMPOSE_PRESENTATION.MINIMIZED;
+      session.error = 'Send failed';
+      await nextTick();
+      const failed = wrapper.get(`[data-session-id="${id}"]`);
+      expect(failed.get('.compose-dock__title').text()).toBe('Design review');
+      expect(failed.get('.compose-dock__status').text()).toBe('Send failed');
+      expect(failed.get('.compose-dock__error').attributes('aria-label')).toBe('Send failed');
+      expect(failed.get('.compose-dock__close').attributes('disabled')).toBeUndefined();
+    } finally {
+      composeStore.$reset();
+    }
+  });
+
   it('shows one expanded session and docks every minimized session', async () => {
     const composeStore = useComposeStore();
     composeStore.identities = [{ id: 1, email: 'sender@example.com' } as any];

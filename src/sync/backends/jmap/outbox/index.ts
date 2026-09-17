@@ -28,9 +28,6 @@
  *                      Identity/set writes with authoritative read-back
  *   'createAddressbook' / 'updateAddressbook' / 'destroyAddressbook'
  *                      AddressBook/set writes with authoritative inventory
- *   'createEmails'     Email/set create of ready-made emails into one
- *                      mailbox, checkpointed (at-most-once) and
- *                      reconciled like a copy (kanban seed)
  *   'setSieveRules'    SieveScript upload, validation, and activation
  *                      through JMAP for Sieve (RFC 9661)
  *
@@ -61,7 +58,7 @@
  */
 
 import { MUTATION_TYPE as MUTATION_TYPES } from '../../../../constants/states';
-import { DB_RPC } from '../../../../db/protocol';
+import { DB_RPC, type MutationProgress } from '../../../../db/protocol';
 import { deleteRow, markFailed, markRow } from './batch';
 import {
   runCreateAddressBook,
@@ -70,7 +67,6 @@ import {
 } from './operations/addressbooks';
 import { runCancelScheduledSend } from './operations/cancel-scheduled-send';
 import { runCopyToFolders } from './operations/copy-to-folders';
-import { runCreateEmails } from './operations/create-emails';
 import { runCreateMailbox } from './operations/create-mailbox';
 import {
   runContactBatch,
@@ -154,7 +150,15 @@ export async function drainOutbox({
  * for the runner's retryable-vs-terminal classification.
  */
 export async function processMutationRow({
-  transport, account, handlers, row, useWebSocket = false,
+  transport, account, handlers, row, useWebSocket = false, onProgress,
+}: {
+  transport: any;
+  account: any;
+  handlers: Record<string, (params: any) => Promise<any>>;
+  row: any;
+  useWebSocket?: boolean;
+  /** Receives a send's `submitted` report; other mutation types report nothing. */
+  onProgress?: (progress: MutationProgress) => void;
 }): Promise<{ ok: boolean; error?: any; response?: any; result?: any }> {
   const identityWrite = row.mutation_type === MUTATION_TYPES.CREATE_IDENTITY
     || row.mutation_type === MUTATION_TYPES.UPDATE_IDENTITY
@@ -164,8 +168,7 @@ export async function processMutationRow({
     || row.mutation_type === MUTATION_TYPES.CONTACT_TRASH
     || row.mutation_type === MUTATION_TYPES.CREATE_ADDRESSBOOK
     || row.mutation_type === MUTATION_TYPES.UPDATE_ADDRESSBOOK
-    || row.mutation_type === MUTATION_TYPES.DESTROY_ADDRESSBOOK
-    || row.mutation_type === MUTATION_TYPES.CREATE_EMAILS;
+    || row.mutation_type === MUTATION_TYPES.DESTROY_ADDRESSBOOK;
   const currentRows = checkpointedWrite
     ? await handlers[DB_RPC.QUERY]({
         sql: 'SELECT * FROM pending_mutations WHERE id = ? LIMIT 1',
@@ -197,7 +200,9 @@ export async function processMutationRow({
       return runDestroy({ transport, handlers, row, request, useWebSocket });
     case MUTATION_TYPES.SEND:
       return toProcessResult(
-        await runSend({ transport, account, handlers, row, request, useWebSocket }),
+        await runSend({
+          transport, account, handlers, row, request, useWebSocket, onProgress,
+        }),
       );
     case MUTATION_TYPES.CANCEL_SCHEDULED_SEND:
       return runCancelScheduledSend({
@@ -262,10 +267,6 @@ export async function processMutationRow({
       return runUpdateMailbox({ transport, handlers, request, useWebSocket });
     case MUTATION_TYPES.DESTROY_MAILBOX:
       return runDestroyMailbox({ transport, handlers, request, useWebSocket });
-    case MUTATION_TYPES.CREATE_EMAILS:
-      return runCreateEmails({
-        transport, account, handlers, request, row: currentRow, useWebSocket,
-      });
     case MUTATION_TYPES.PUSH_SETTINGS:
       return runPushSettings({ transport, account, handlers, useWebSocket });
     case MUTATION_TYPES.PUSH_CONTACTS_TRASH:
