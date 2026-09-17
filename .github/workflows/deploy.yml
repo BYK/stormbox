@@ -2,7 +2,7 @@ name: CI and Deploy to Cloudflare Pages
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci/mail-rules-jmap-sieve]
   pull_request:
     branches: [main]
   workflow_dispatch:
