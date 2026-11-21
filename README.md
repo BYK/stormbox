@@ -232,3 +232,33 @@ stormbox/
 - **wa-sqlite**: browser-local SQLite storage.
 - **Squire**: rich-text compose editor.
 - **@tanstack/vue-virtual**: virtualized message lists.
+
+## Attention prototype
+
+Open **Attention** from the spaces bar to see recent Inbox messages grouped by
+conversation and ranked by pending action. Use **Done** or **Snooze** to clear a
+bundle from the current view. An unanswered request stays visible when updates
+arrive. A new request can reopen a completed bundle. **Use local model**
+optionally downloads multilingual E5 and runs it in a browser worker for
+ambiguous messages. Rules keep explicit requests visible when the model is
+unavailable.
+
+The prototype starts with the signed-in JMAP account. To add IMAP inboxes, run
+the [mail relay](infra/imap-relay/README.md), forward `/api/imap/v1` on the same
+origin, and use **Connect IMAP accounts** in Attention. Multiple configured IMAP
+accounts appear alongside JMAP. Attention supports recent IMAP Inbox reads and
+plain-text message bodies. Existing JMAP folders, compose, and Sieve rules use
+Stormbox's normal paths. IMAP compose and full folder management are outside
+this prototype's UI.
+
+Build the app with `npm run build` and serve `dist/` over HTTPS (HTTP on
+localhost also works). The installed service worker caches the app shell,
+and SQLite keeps the inbox windows, downloaded bodies, and bundle state. Open
+mail once online to make its body available offline. Offline bundle state stays
+in this browser profile. Existing JMAP Compose also queues mail while offline.
+
+For Web Push, configure the [notification relay](infra/push-relay/README.md)
+and forward `/api/push` on the same origin. Enable notifications from Attention
+after pairing. The IMAP relay watches its configured inboxes and publishes
+generic arrival notices. Direct JMAP live changes still use Stormbox's existing
+WebSocket path. Web Push on iOS requires an installed Home Screen app.

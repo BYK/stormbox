@@ -12,13 +12,14 @@ import { computed, ref } from 'vue';
 
 import { initOidc, getOidc } from '../services/auth';
 import { currentHref, reloadLocation, replaceLocation } from '../services/navigation';
-import { JMAP_SERVER_URL, JMAP_WS_PROXY_URL, STAFF_APP_URL } from '../defines';
+import { JMAP_SERVER_URL, JMAP_WS_PROXY_URL, STAFF_APP_URL, jmapAccountOriginForServer } from '../defines';
 import { AUTH_STATE } from '../constants/states';
 import type { AuthState } from '../constants/states';
 import { isStaffEmail } from '../constants/staff';
 import { staffRedirectUrl } from '../utils/staff-redirect';
 import { getRepositoryAsync } from '../composables/useRepository';
 import { DatabaseUnavailableError } from '../db/availability';
+import { readCachedAccount, writeCachedAccount } from '../pwa/cached-account';
 
 interface BasicAuth { kind: 'basic'; username: string; password: string }
 interface BearerAuth {
@@ -109,6 +110,7 @@ export const useAuthStore = defineStore('auth', () => {
   const error = ref<string | null>(null);
   const authServerUnavailable = ref(false);
   const databaseUnavailable = ref(false);
+  const isOfflineSession = ref(false);
 
   /**
    * Global staff flag: gates staff-only UI. The same claim decides the
@@ -135,6 +137,7 @@ export const useAuthStore = defineStore('auth', () => {
   let tokenSyncAccountId: number | null = null;
   let tokenRenewalTimer: ReturnType<typeof setTimeout> | null = null;
   let tokenUpdateRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  let offlineSessionGeneration = 0;
 
   const hasStorageQuota = computed(() =>
     quotaHardLimitBytes.value != null && quotaHardLimitBytes.value > 0,
@@ -168,11 +171,37 @@ export const useAuthStore = defineStore('auth', () => {
     quotaHardLimitBytes.value = snapshot?.hardLimitBytes ?? null;
   }
 
+  async function openCachedSession(): Promise<boolean> {
+    const cached = readCachedAccount();
+    if (!cached || cached.server_origin !== jmapAccountOriginForServer(JMAP_SERVER_URL)) return false;
+    const generation = offlineSessionGeneration;
+    try {
+      const repo = await getRepositoryAsync();
+      const row = await repo.getAccount(cached.id);
+      if (generation !== offlineSessionGeneration || status.value !== AUTH_STATE.IDLE) return false;
+      if (!row || row.server_origin !== cached.server_origin
+          || row.remote_account_id !== cached.remote_account_id) return false;
+      isOfflineSession.value = true;
+      accountId.value = row.id;
+      username.value = row.display_name ?? row.primary_email;
+      quotaUsedBytes.value = row.quota_used_bytes;
+      quotaHardLimitBytes.value = row.quota_hard_limit_bytes;
+      return true;
+    } catch (error) {
+      reportDatabaseError(error);
+      return false;
+    }
+  }
+
   /**
    * Select the explicit password flow or connect through OIDC once on boot.
    */
   async function initialize(): Promise<void> {
     if (status.value !== AUTH_STATE.IDLE) {
+      return;
+    }
+    if (globalThis.navigator?.onLine === false) {
+      await openCachedSession();
       return;
     }
     if (appPasswordMode.value) {
@@ -200,6 +229,13 @@ export const useAuthStore = defineStore('auth', () => {
     }
     status.value = AUTH_STATE.OIDC_READY;
     await connectViaOidc();
+  }
+
+  async function reconnectCachedSession(): Promise<void> {
+    if (!isOfflineSession.value || appPasswordMode.value || databaseUnavailable.value) return;
+    if (status.value !== AUTH_STATE.IDLE && status.value !== AUTH_STATE.FAILED) return;
+    status.value = AUTH_STATE.IDLE;
+    await initialize();
   }
 
   function reportOidcInitializationError(err: unknown): void {
@@ -529,8 +565,17 @@ export const useAuthStore = defineStore('auth', () => {
       username.value = displayName;
       email.value = emailClaim;
       recoveryEmail.value = recoveryEmailClaim;
+      isOfflineSession.value = false;
       status.value = AUTH_STATE.CONNECTED;
       refreshStorageQuota().catch(() => {});
+      const generation = ++offlineSessionGeneration;
+      if (typeof repo.getAccount === 'function') {
+        void repo.getAccount(result.accountId).then((row) => {
+          if (row && generation === offlineSessionGeneration && accountId.value === row.id) {
+            writeCachedAccount(row);
+          }
+        }).catch((error) => console.warn('Could not remember the offline account', error));
+      }
       return true;
     } catch (err: any) {
       if (databaseUnavailable.value || reportDatabaseError(err)) return false;
@@ -555,11 +600,14 @@ export const useAuthStore = defineStore('auth', () => {
     error.value = null;
     authServerUnavailable.value = false;
     databaseUnavailable.value = false;
+    isOfflineSession.value = false;
     status.value = AUTH_STATE.IDLE;
     clearStorageQuota();
   }
 
   async function logout(): Promise<void> {
+    offlineSessionGeneration += 1;
+    writeCachedAccount(null);
     stopTokenSync();
     if (accountId.value != null) {
       try {
@@ -588,6 +636,7 @@ export const useAuthStore = defineStore('auth', () => {
     error,
     authServerUnavailable,
     databaseUnavailable,
+    isOfflineSession,
     reportDatabaseError,
     serverOrigin,
     serverHostname,
@@ -600,6 +649,7 @@ export const useAuthStore = defineStore('auth', () => {
     storageProgressWidth,
     refreshStorageQuota,
     initialize,
+    reconnectCachedSession,
     connectWithPassword,
     connectViaOidc,
     cancelOidcLogin,

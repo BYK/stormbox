@@ -9,7 +9,7 @@ describe('Engine migrations', () => {
   it('records the applied migration version via PRAGMA user_version on a fresh database', async () => {
     const engine = await bootTestEngine();
     const row = await engine.get('PRAGMA user_version');
-    expect(LATEST_VERSION).toBe(17);
+    expect(LATEST_VERSION).toBe(18);
     expect(Number(row?.user_version)).toBe(LATEST_VERSION);
     await engine.close();
   });
@@ -37,6 +37,10 @@ describe('Engine migrations', () => {
       'account_services',
       'addressbook_contacts',
       'addressbooks',
+      'attention_bundle_states',
+      'attention_imap_accounts',
+      'attention_imap_bodies',
+      'attention_imap_pairing',
       'body_parts',
       'body_values',
       'contact_emails',

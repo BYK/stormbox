@@ -9,6 +9,10 @@ Implementation notes live in `docs/architecture/`.
 
 ### I. Browser-Owned Mail Client
 
+The downstream Attention feature retains direct JMAP and adds an optional,
+self-hostable IMAP and Web Push relay. The relay transports mail and arrival
+events. The client owns local storage, bundle state, and triage.
+
 The system shall remain a fully in-browser webmail client with no
 server-side mail application component. Self-hosters must be able to
 run Stormbox against any supported mail server without adding a
@@ -89,6 +93,9 @@ a Content-Security-Policy that forbids scripts and active content.
 Links shall not navigate the host page.
 
 ### VII. Single-Account MVP, Extensible Model
+
+The downstream Attention space reads across the signed-in JMAP account and
+paired relay accounts. Server identifiers and cached state are account-scoped.
 
 The MVP supports a single active account. Storage and service
 boundaries shall not assume only one account or one provider will

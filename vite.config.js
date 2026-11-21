@@ -5,6 +5,7 @@ import vue from "@vitejs/plugin-vue";
 import basicSsl from "@vitejs/plugin-basic-ssl";
 
 import { APP_TITLE } from "./src/app-config.js";
+import { precacheBuild } from "./src/pwa/precache-build.mjs";
 import {
   jmapWsDevProxyPlugin,
   keycloakDevProxy,
@@ -17,6 +18,18 @@ import {
 const localStack = process.env.VITE_LOCAL_STACK === "1";
 const devHttps = process.env.VITE_DEV_HTTPS === "1";
 const publicOrigin = localStackPublicOrigin();
+const mailRelayTarget = process.env.STORMBOX_MAIL_RELAY_TARGET;
+const pushRelayTarget = process.env.STORMBOX_PUSH_RELAY_TARGET;
+const proxies = {
+  ...(mailRelayTarget ? { "/api/imap/v1": mailRelayTarget } : {}),
+  ...(pushRelayTarget ? { "/api/push": pushRelayTarget } : {}),
+  ...(localStack ? {
+    "/realms": keycloakDevProxy(process.env.KEYCLOAK_PROXY ?? localStackHttpTarget(8999)),
+    "/resources": keycloakDevProxy(process.env.KEYCLOAK_PROXY ?? localStackHttpTarget(8999)),
+    "/stalwart-jmap": stalwartJmapDevProxy(process.env.STALWART_JMAP_PROXY ?? localStackHttpTarget(8081)),
+    "/sender-avatar": senderAvatarDevProxy(),
+  } : {}),
+};
 
 function appHtmlConfigPlugin() {
   return {
@@ -44,6 +57,7 @@ export default defineConfig({
   plugins: [
     appHtmlConfigPlugin(),
     vue(),
+    precacheBuild(),
     ...(devHttps ? [basicSsl()] : []),
     ...(localStack ? [jmapWsDevProxyPlugin()] : []),
   ],
@@ -61,23 +75,9 @@ export default defineConfig({
       "sancus.thunderbird.net",
       ".thunderbird.net",
     ],
-    ...(localStack
-      ? {
-          proxy: {
-            "/realms": keycloakDevProxy(
-              process.env.KEYCLOAK_PROXY ?? localStackHttpTarget(8999),
-            ),
-            "/resources": keycloakDevProxy(
-              process.env.KEYCLOAK_PROXY ?? localStackHttpTarget(8999),
-            ),
-            "/stalwart-jmap": stalwartJmapDevProxy(
-              process.env.STALWART_JMAP_PROXY ?? localStackHttpTarget(8081),
-            ),
-            "/sender-avatar": senderAvatarDevProxy(),
-          },
-        }
-      : {}),
+    proxy: proxies,
   },
+  preview: { proxy: proxies },
   define: localStack
     ? {
         // Expose for debugging in the browser console during local-stack dev.

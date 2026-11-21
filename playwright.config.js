@@ -4,6 +4,7 @@ import { defineConfig, devices } from '@playwright/test';
 
 const PORT = process.env.PLAYWRIGHT_PORT ? Number(process.env.PLAYWRIGHT_PORT) : 3000;
 const LOCAL_STACK = process.env.LOCAL_STACK === '1' || process.env.LOCAL_STACK === 'true';
+const PWA = process.env.PLAYWRIGHT_PWA === '1';
 const BASE_URL = process.env.PLAYWRIGHT_BASE_URL ?? `http://localhost:${PORT}`;
 
 function stackProxyDefaults() {
@@ -34,12 +35,14 @@ const localStackViteEnv = LOCAL_STACK
 function buildWebServer() {
   if (LOCAL_STACK) {
     return {
-      command: `npm run dev -- --host 0.0.0.0 --port ${PORT}`,
+      command: PWA
+        ? `npm run build && npm run dev -- preview --host 0.0.0.0 --port ${PORT} --strictPort`
+        : `npm run dev -- --host 0.0.0.0 --port ${PORT}`,
       url: BASE_URL,
       // Default to reusing an already-running vite under LOCAL_STACK so
       // iterative local runs skip the ~5s vite boot. Opt out with
       // PLAYWRIGHT_NO_REUSE=1 if you suspect a stale dev server.
-      reuseExistingServer: process.env.PLAYWRIGHT_NO_REUSE !== '1',
+      reuseExistingServer: !PWA && process.env.PLAYWRIGHT_NO_REUSE !== '1',
       timeout: 60_000,
       ignoreHTTPSErrors: true,
       env: {

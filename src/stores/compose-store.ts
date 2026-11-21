@@ -2804,6 +2804,10 @@ export const useComposeStore = defineStore('compose', () => {
       return failSend('Resolve the draft save failure before sending.', session.id);
     }
     if (!repo || authStore.accountId == null) return failSend('Not connected.', session.id);
+    const queueOffline = authStore.isOfflineSession || globalThis.navigator?.onLine === false;
+    if (queueOffline && scheduledAt) {
+      return failSend('Reconnect your account to schedule a message.', session.id);
+    }
     const identity = identityForSession(session);
     if (!identity) return failSend('No identities are configured.', session.id);
     commitPendingRecipientText(session);
@@ -2906,6 +2910,15 @@ export const useComposeStore = defineStore('compose', () => {
         requestJson: JSON.stringify(sendRequest),
         optimisticPatchJson: null,
       });
+      if (queueOffline) {
+        if (mutation?.id == null) throw new Error('Could not queue this message.');
+        if (stillCurrent()) {
+          session.status = COMPOSE_STATE.SENT;
+          close(session.id);
+          setNotice('Message queued. It will send when your account reconnects.');
+        }
+        return true;
+      }
       // Wait on THIS row specifically rather than draining the whole
       // account queue. drainOutbox would also block on any unrelated
       // pending setKeywords / move rows that happen to be in flight,

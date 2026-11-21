@@ -10,6 +10,7 @@
 
 import { bootProductionEngine } from './bootstrap-idb';
 import { makeHandlers } from './handlers';
+import { makeAttentionHandlers } from './attention';
 import {
   makeBroadcaster,
   serveRpcPort,
@@ -73,10 +74,10 @@ function getHandlers() {
     // on the next backend.start, so dropping a pre-start notify is
     // safe.
     const outboxNotifier: { dispatch: (accountId?: number, mutationId?: number) => void } = { dispatch: () => {} };
-    const repoHandlers = lifecycle.storageHandlers(makeHandlers(engine, broadcaster, {
+    const repoHandlers = lifecycle.storageHandlers({ ...makeHandlers(engine, broadcaster, {
       onMutationInserted: ({ accountId, mutationId }) =>
         outboxNotifier.dispatch(accountId, mutationId),
-    }));
+    }), ...makeAttentionHandlers(engine, broadcaster) });
     let stopSync: () => Promise<void> = async () => {};
     const syncHandlers = makeSyncRpcHandlers({
       handlers: repoHandlers,

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import { Mail, Settings, Users } from '@lucide/vue';
+import { ListTodo, Mail, Settings, Users } from '@lucide/vue';
 import AppToggleButton from './AppToggleButton.vue';
 
 const props = defineProps({
@@ -34,6 +34,15 @@ function pick(name) { emit('change', name); }
     </AppToggleButton>
     <AppToggleButton
       class="app-spaces__item"
+      :active="props.active === 'attention'"
+      aria-label="Attention"
+      title="Attention"
+      @click="pick('attention')"
+    >
+      <ListTodo :size="20" :stroke-width="1.75" />
+    </AppToggleButton>
+    <AppToggleButton
+      class="app-spaces__item"
       :active="props.active === 'contacts'"
       @click="pick('contacts')"
       aria-label="Contacts"
@@ -54,6 +63,7 @@ function pick(name) { emit('change', name); }
         <Settings :size="20" :stroke-width="1.75" aria-hidden="true" />
       </AppToggleButton>
       <AppToggleButton
+        v-if="props.active !== 'attention'"
         class="app-spaces__item"
         :active="!props.folderListHidden"
         :aria-label="folderListToggleLabel"

@@ -7,6 +7,9 @@
  * and shared across all stores.
  */
 
+import type { AttentionCache } from './attention';
+import type { ImapMessageLocation } from '../sync/backends/imap/attention-relay';
+import type { BundleState } from '../triage/smart-sort';
 import type {
   AddressBookInventory,
   ContactDetail,
@@ -296,6 +299,30 @@ export class Repository {
       accountId,
       serviceKind,
     });
+  }
+
+  getAttentionCache(ownerId: number) {
+    return this.call<AttentionCache>(DB_RPC.ATTENTION_GET, { ownerId });
+  }
+
+  pairAttentionRelay(ownerId: number, accessToken: string) {
+    return this.call<string[]>(DB_RPC.ATTENTION_PAIR, { ownerId, accessToken });
+  }
+
+  disconnectAttentionRelay(ownerId: number) {
+    return this.call<void>(DB_RPC.ATTENTION_DISCONNECT, { ownerId });
+  }
+
+  refreshAttentionRelay(ownerId: number) {
+    return this.call<string[]>(DB_RPC.ATTENTION_REFRESH, { ownerId });
+  }
+
+  readAttentionImapMessage(ownerId: number, location: ImapMessageLocation) {
+    return this.call<string>(DB_RPC.ATTENTION_BODY, { ownerId, location });
+  }
+
+  setAttentionBundleState(ownerId: number, bundleId: string, state: BundleState | null, replacedIds: string[]) {
+    return this.call<void>(DB_RPC.ATTENTION_SET_STATE, { ownerId, bundleId, state, replacedIds });
   }
 
   // Folders ------------------------------------------------------------

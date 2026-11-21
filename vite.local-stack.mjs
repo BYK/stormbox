@@ -345,15 +345,17 @@ function proxyJmapWebSocket(req, clientSocket, head, target, logger) {
 
 export function jmapWsDevProxyPlugin(target = "http://127.0.0.1:8787") {
   const proxyTarget = new URL(target);
+  function configure(server) {
+    server.httpServer?.on("upgrade", (req, socket, head) => {
+      if (!req.url?.startsWith("/jmap/ws")) return;
+      proxyJmapWebSocket(req, socket, head, proxyTarget, server.config.logger);
+    });
+  }
   return {
     name: "stormbox:jmap-ws-dev-proxy",
     apply: "serve",
-    configureServer(server) {
-      server.httpServer?.on("upgrade", (req, socket, head) => {
-        if (!req.url?.startsWith("/jmap/ws")) return;
-        proxyJmapWebSocket(req, socket, head, proxyTarget, server.config.logger);
-      });
-    },
+    configureServer: configure,
+    configurePreviewServer: configure,
   };
 }
 

@@ -1532,6 +1532,18 @@ describe('compose-store send safety', () => {
     return JSON.parse(lastRepo.insertPendingMutation.mock.calls[0][0].requestJson);
   }
 
+  it('acknowledges a durably queued send offline without retrying or claiming delivery', async () => {
+    const compose = await composerWithOutcome({ attempted: 0, succeeded: 0, failed: 0 });
+    useAuthStore().isOfflineSession = true;
+    const id = compose.open({ to: [{ email: 'rcpt@example.com' }], subject: 'Offline send' });
+    await expect(compose.send(id)).resolves.toBe(true);
+    expect(lastRepo.insertPendingMutation).toHaveBeenCalledOnce();
+    expect(lastRepo.runMutation).not.toHaveBeenCalled();
+    expect(queuedSend().subject).toBe('Offline send');
+    expect(compose.sessionById(id)).toBeNull();
+    expect(compose.notice).toContain('Message queued');
+  });
+
   it('queues at most one mutation while a send is in flight', async () => {
     const composeStore = await composerWithOutcome({
       attempted: 1, succeeded: 1, failed: 0, result: { filed: true },

@@ -90,6 +90,7 @@ onBeforeUnmount(() => window.removeEventListener('pageshow', onPageShow));
             Sign in
           </AppButton>
         </form>
+        <slot />
         <div v-if="isBusy || isFailed" class="login-card__busy" role="status" aria-live="polite">
           <Loader2 v-if="isBusy" :size="32" :stroke-width="2" class="login-card__spinner" aria-hidden="true" />
           <p class="login-card__status">{{ statusLabel }}</p>

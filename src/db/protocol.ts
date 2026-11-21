@@ -52,6 +52,13 @@ export interface WorkerStatus {
 }
 
 export const DB_RPC = Object.freeze({
+  ATTENTION_GET: 'attention.get',
+  ATTENTION_PAIR: 'attention.pair',
+  ATTENTION_DISCONNECT: 'attention.disconnect',
+  ATTENTION_REFRESH: 'attention.refresh',
+  ATTENTION_BODY: 'attention.body',
+  ATTENTION_SET_STATE: 'attention.setState',
+
   HEALTHCHECK: 'db.healthcheck',
   WORKER_STATUS: 'worker.status',
   WORKER_RESTART: 'worker.restart',
@@ -213,6 +220,7 @@ export const DB_RPC = Object.freeze({
  */
 export const TABLE_FAMILIES = Object.freeze({
   ACCOUNTS: 'accounts',
+  ATTENTION: 'attention',
   FOLDERS: 'folders',
   MESSAGES: 'messages',
   THREADS: 'threads',

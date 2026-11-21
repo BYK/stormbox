@@ -7,7 +7,7 @@ import {
   ref,
   watch,
 } from 'vue';
-import { useTitle } from '@vueuse/core';
+import { useOnline, useTitle } from '@vueuse/core';
 import { Bug, Lightbulb, Moon, Plus, Sun, X } from '@lucide/vue';
 import AppButton from './components/AppButton.vue';
 import mailGlyph from './assets/icons/tb-mail-glyph.svg?raw';
@@ -36,6 +36,8 @@ import type { Palette, Theme } from './constants/settings';
 import { shortcutAria, shortcutHint } from './constants/shortcuts';
 
 import AppSpaces from './components/AppSpaces.vue';
+import UnifiedAttention from './components/UnifiedAttention.vue';
+import { onWebPushOpenAttention } from './push/client';
 import LoginGate from './components/LoginGate.vue';
 import PlannedMaintenanceNotice from './components/PlannedMaintenanceNotice.vue';
 import FolderTree from './components/FolderTree.vue';
@@ -71,14 +73,14 @@ const composeStore = useComposeStore();
 const settingsStore = useSettingsStore();
 const beaconStore = useFeatureBeaconsStore();
 
-type AppSpace = 'contacts' | 'mail';
+type AppSpace = 'attention' | 'contacts' | 'mail';
 
 interface ContactsViewHandle {
   requestFilterChange: (next: string) => Promise<boolean>;
   requestLeave: () => Promise<boolean>;
 }
 
-const space = ref<AppSpace>('mail');
+const space = ref<AppSpace>(new URLSearchParams(window.location.search).get('view') === 'attention' ? 'attention' : 'mail');
 const contactsViewEl = ref<ContactsViewHandle | null>(null);
 // ContactsView teleports its address-book rail into this shell element so the
 // rail shares the folder list's slot, width, toggle, and drawer (CT-1.3).
@@ -102,7 +104,27 @@ const quickFilterShortcutLabel = computed(() =>
 const quickFilterAriaShortcut = computed(() =>
   shortcutAria('quickFilter', shortcutScheme.value) ?? undefined);
 
-const showLogin = computed(() => authStore.status !== AUTH_STATE.CONNECTED);
+const isOnline = useOnline();
+const offlineSignInRequested = ref(false);
+const showLogin = computed(() => authStore.status !== AUTH_STATE.CONNECTED
+  && (!authStore.isOfflineSession || authStore.databaseUnavailable || offlineSignInRequested.value));
+
+watch(isOnline, (online) => {
+  if (!online) offlineSignInRequested.value = false;
+  else if (authStore.isOfflineSession) void authStore.reconnectCachedSession();
+  else if (authStore.status === AUTH_STATE.IDLE) void authStore.initialize();
+});
+watch(() => authStore.isOfflineSession, (cached) => {
+  if (!cached) offlineSignInRequested.value = false;
+});
+
+function restoreOfflineConnection() {
+  if (authStore.appPasswordMode) {
+    offlineSignInRequested.value = true;
+  } else {
+    void authStore.reconnectCachedSession();
+  }
+}
 
 const inboxUnread = computed(() => {
   const inbox = mailStore.folders.find((folder) => folder.role === 'inbox');
@@ -162,7 +184,7 @@ watch(tagManagerRequest.requested, () => {
 });
 const spotlight = useFeatureSpotlight(() => createSpotlightScripts({
   composeStore,
-  currentSpace: () => space.value,
+  currentSpace: () => space.value === 'contacts' ? 'contacts' : 'mail',
   changeSpace: requestSpaceChange,
   reducedMotion: () => spotlight.reducedMotion.value,
 }));
@@ -187,7 +209,7 @@ const messageViewMaximized = ref(false);
 // archive or delete the selection behind them, or move focus out of them.
 // An open beacon card counts as one.
 const shortcutsEnabled = computed(() =>
-  authStore.status === AUTH_STATE.CONNECTED
+  !showLogin.value
   && (!messageViewMaximized.value || composeStore.isExpanded)
   && !showWelcomeModal.value
   && !showSettingsDialog.value
@@ -269,14 +291,16 @@ const {
 
 useThunderbirdShortcuts({
   space,
-  enabled: shortcutsEnabled,
+  enabled: computed(() => space.value !== 'attention' && shortcutsEnabled.value),
   focusQuickFilter: focusQuickFilterInput,
 });
 
 let appMounted = false;
+let removePushListener: (() => void) | undefined;
 
 onMounted(async () => {
   appMounted = true;
+  removePushListener = onWebPushOpenAttention(() => { void requestSpaceChange('attention'); });
   applyTheme(theme.value);
   applyPalette(palette.value);
   watchSystemTheme();
@@ -304,6 +328,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   appMounted = false;
+  removePushListener?.();
   clearMessageViewTimer();
   window.removeEventListener('resize', onWindowResize);
   unwatchSystemTheme();
@@ -414,15 +439,26 @@ async function updateQuickFilterQuery(next: string) {
 
 /** Resolves true once `next` is the active space; false if leaving was refused. */
 async function requestSpaceChange(next: string): Promise<boolean> {
-  if (next !== 'mail' && next !== 'contacts') return false;
+  if (next !== 'mail' && next !== 'contacts' && next !== 'attention') return false;
   if (next === space.value) return true;
   if (
     space.value === 'contacts'
     && contactsViewEl.value
     && !await contactsViewEl.value.requestLeave()
   ) return false;
+  const url = new URL(window.location.href);
+  if (next === 'attention') url.searchParams.set('view', 'attention');
+  else if (url.searchParams.get('view') === 'attention') url.searchParams.delete('view');
+  if (url.href !== window.location.href) window.history.replaceState(window.history.state, '', url);
   space.value = next;
+  quickFilterQuery.value = '';
   return true;
+}
+
+async function openAttentionMail(messageId: number, folderId: number) {
+  await requestSpaceChange('mail');
+  if (mailStore.currentFolderId !== folderId) mailStore.selectFolder(folderId);
+  mailStore.selectMessage(messageId, folderId);
 }
 
 function toggleFolderList() {
@@ -660,7 +696,11 @@ function unwatchSystemTheme() {
 </script>
 
 <template>
-  <LoginGate v-if="showLogin" />
+  <LoginGate v-if="showLogin">
+    <AppButton v-if="offlineSignInRequested" @click="offlineSignInRequested = false">
+      Back to downloaded mail
+    </AppButton>
+  </LoginGate>
   <div
     v-else
     ref="shellEl"
@@ -671,13 +711,26 @@ function unwatchSystemTheme() {
       'shell--message-view-maximized': messageViewMaximized,
       'shell--folder-list-hidden': folderListHidden,
       'shell--contacts': space === 'contacts',
+      'shell--attention': space === 'attention',
       'shell--column-resizing': activeResizePane !== null,
       'shell--spotlighting': activeSpotlight != null,
     }"
     :style="shellStyle"
   >
+    <div
+      v-if="(!isOnline || authStore.isOfflineSession) && !messageViewMaximized"
+      class="shell__notice shell__offline"
+    >
+      <span role="status">{{ isOnline ? 'Viewing downloaded mail' : 'Offline · Viewing downloaded mail' }}</span>
+      <AppButton
+        v-if="isOnline && authStore.isOfflineSession"
+        @click="restoreOfflineConnection"
+      >
+        Reconnect account
+      </AppButton>
+    </div>
     <PlannedMaintenanceNotice
-      v-if="!messageViewMaximized && displayedMessageList"
+      v-else-if="!messageViewMaximized && displayedMessageList"
       class="shell__notice"
       @dismiss="quickFilterInputEl?.focus()"
     />
@@ -780,6 +833,7 @@ function unwatchSystemTheme() {
     />
 
     <div
+      v-if="space !== 'attention'"
       class="sidebar-slot"
       :class="{ 'sidebar-slot--hidden': folderListHidden }"
       :aria-hidden="folderListHidden || messageViewMaximized"
@@ -813,6 +867,7 @@ function unwatchSystemTheme() {
     </div>
 
     <div
+      v-if="space !== 'attention'"
       class="column-resizer column-resizer--folder-list"
       :class="{
         'is-active': activeResizePane === 'folderList',
@@ -851,6 +906,15 @@ function unwatchSystemTheme() {
       :filter-query="quickFilterQuery"
       :rail-target="`#${CONTACTS_SIDEBAR_ID}`"
       @detail-visible-change="contactsDetailVisible = $event"
+    />
+
+    <UnifiedAttention
+      v-else-if="space === 'attention' && authStore.accountId != null"
+      :key="authStore.accountId"
+      :owner-id="authStore.accountId"
+      :address="authStore.username || ''"
+      :search="quickFilterQuery"
+      @open-mail="openAttentionMail"
     />
 
     <ComposeManager />
@@ -979,6 +1043,12 @@ html.light,
 .shell--folder-list-hidden {
   --folder-resizer-width: 0px;
 }
+.shell--attention {
+  grid-template-columns: 56px minmax(0, 1fr);
+}
+.shell > .unified-attention {
+  grid-column: 2 / -1;
+}
 .shell--contacts {
   grid-template-columns:
     56px
@@ -1048,6 +1118,13 @@ body.spotlighting .folder-subs {
 .shell__notice {
   grid-column: 1 / -1;
   background: var(--top-nav-bg);
+}
+.shell__offline {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 4px 12px;
 }
 
 .quick-filter {
@@ -1283,7 +1360,8 @@ body.spotlighting .folder-subs {
 @media (max-width: 639px) {
   .shell,
   .shell--message-view-hidden,
-  .shell--message-list-hidden {
+  .shell--message-list-hidden,
+  .shell--attention {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto minmax(0, 1fr) var(--spaces-bar-height);
   }
@@ -1308,6 +1386,7 @@ body.spotlighting .folder-subs {
   .shell > .msg-columns,
   .shell > .message-view,
   .shell > .contacts,
+  .shell > .unified-attention,
   .shell--message-view-hidden > .msg-columns,
   .shell--message-list-hidden > .message-view {
     grid-column: 1;
@@ -1322,7 +1401,7 @@ body.spotlighting .folder-subs {
   .shell:has(> .shell__notice) > .app-spaces {
     grid-row: 4;
   }
-  .shell:has(> .shell__notice) > :is(.msg-columns, .message-view, .contacts) {
+  .shell:has(> .shell__notice) > :is(.msg-columns, .message-view, .contacts, .unified-attention) {
     grid-row: 3;
   }
   .shell:has(> .shell__notice) > .sidebar-slot {

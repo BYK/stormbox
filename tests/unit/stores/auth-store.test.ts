@@ -47,6 +47,7 @@ import {
 import { useAuthStore } from '../../../src/stores/auth-store';
 import { AUTH_STATE } from '../../../src/constants/states';
 import { DatabaseUnavailableError } from '../../../src/db/availability';
+import { readCachedAccount, writeCachedAccount } from '../../../src/pwa/cached-account';
 
 function makeRepo() {
   return {
@@ -88,6 +89,58 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe('auth-store', () => {
+  it('opens only the previously authenticated account offline and forgets it on logout', async () => {
+    definesOverrides.JMAP_SERVER_URL = 'https://mail.example.net';
+    const account = {
+      id: 42,
+      server_origin: 'https://mail.example.net',
+      remote_account_id: 'owner',
+      display_name: 'Owner',
+    };
+    const repo = { ...makeRepo(), getAccount: vi.fn().mockResolvedValue(account) };
+    __setRepositoryForTests(repo);
+    expect(await useAuthStore().connectWithPassword({ username: 'owner', password: 'secret' })).toBe(true);
+    await vi.waitFor(() => expect(readCachedAccount()).toEqual({
+      id: 42,
+      server_origin: 'https://mail.example.net',
+      remote_account_id: 'owner',
+    }));
+
+    vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(false);
+    setActivePinia(createPinia());
+    const reopened = useAuthStore();
+    await reopened.initialize();
+    expect(reopened.isOfflineSession).toBe(true);
+    expect(reopened.accountId).toBe(42);
+    expect(reopened.isConnected).toBe(false);
+    expect(authService.initOidc).not.toHaveBeenCalled();
+    expect(repo.startSyncAccount).toHaveBeenCalledOnce();
+
+    await reopened.logout();
+    expect(readCachedAccount()).toBeNull();
+    setActivePinia(createPinia());
+    const signedOut = useAuthStore();
+    await signedOut.initialize();
+    expect(signedOut.isOfflineSession).toBe(false);
+    expect(signedOut.accountId).toBeNull();
+  });
+
+  it('rejects a cached account reference when SQLite gives the id to another account', async () => {
+    definesOverrides.JMAP_SERVER_URL = 'https://mail.example.net';
+    const cached = { id: 42, server_origin: 'https://mail.example.net', remote_account_id: 'owner' };
+    writeCachedAccount(cached);
+    const repo = { ...makeRepo(), getAccount: vi.fn().mockResolvedValue({
+      ...cached, remote_account_id: 'someone-else',
+    }) };
+    __setRepositoryForTests(repo);
+    vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(false);
+    const auth = useAuthStore();
+    await auth.initialize();
+    expect(auth.isOfflineSession).toBe(false);
+    expect(auth.accountId).toBeNull();
+    expect(repo.startSyncAccount).not.toHaveBeenCalled();
+  });
+
   it.each([
     'mail.thundermail.com',
     'mail.stage-thundermail.com',

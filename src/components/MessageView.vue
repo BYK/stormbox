@@ -23,6 +23,7 @@ import { useMessageAttachments } from '../composables/useMessageAttachments';
 import { useMessageTags } from '../composables/useMessageTags';
 import { requestTagManager } from '../composables/useTagManagerRequest';
 import { invokeThunderbirdShortcut } from '../composables/useThunderbirdShortcuts';
+import { useAuthStore } from '../stores/auth-store';
 import { useComposeStore } from '../stores/compose-store';
 import { useMailStore } from '../stores/mail-store';
 import { useSettingsStore } from '../stores/settings-store';
@@ -120,6 +121,7 @@ async function toggleMaximized() {
 }
 
 const mailStore = useMailStore();
+const authStore = useAuthStore();
 const composeStore = useComposeStore();
 const settingsStore = useSettingsStore();
 const shortcutScheme = computed(() => settingsStore.get('shortcutScheme'));
@@ -1004,7 +1006,11 @@ function closeMessageView() {
           />
         </div>
         <div v-else-if="textHtml" class="message-view__text" v-html="textHtml" />
-        <p v-else-if="!bodyLoaded" class="message-view__placeholder">Loading message…</p>
+        <p v-else-if="!bodyLoaded" class="message-view__placeholder">
+          {{ authStore.isOfflineSession && message?.body_fetched_at == null
+            ? 'Reconnect to download this message.'
+            : 'Loading message…' }}
+        </p>
         <MessageAttachmentPreviews
           :rows="attachmentRows"
           @preview="previewAttachment"

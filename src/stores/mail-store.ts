@@ -376,6 +376,7 @@ export const useMailStore = defineStore('mail', () => {
     getRepo: () => repo,
     getAccountId: () => authStore.accountId ?? null,
     isSelected: (messageId) => selectedMessageId.value === messageId,
+    canPrefetch: () => !authStore.isOfflineSession,
   });
   const messageBody = bodyPrefetch.messageBody;
   /**
@@ -720,6 +721,14 @@ export const useMailStore = defineStore('mail', () => {
     watch(inbox, (newInbox) => {
       if (newInbox && currentFolderId.value == null) {
         selectFolder(newInbox.id);
+      }
+    });
+    watch(() => authStore.isOfflineSession, (offline, wasOffline) => {
+      if (offline || !wasOffline || !authStore.isConnected) return;
+      for (const state of folderStates.values()) state.paintedRanges = [];
+      for (const folderId of activeFolderIds()) {
+        const range = folderStates.get(folderId)?.requestedRange;
+        void ensureLoaded(range?.start ?? 0, range?.end ?? PAGE_SIZE, folderId);
       }
     });
 
@@ -1101,7 +1110,7 @@ export const useMailStore = defineStore('mail', () => {
    * through endless resets.
    */
   async function checkAndRepairFolderViewDrift(state: FolderCache) {
-    if (!repo || authStore.accountId == null) return;
+    if (!repo || authStore.accountId == null || authStore.isOfflineSession) return;
     if (!isLiveState(state)) return;
     if (state.needsFreshWindow) return;
     if (state.driftCheckInflight) return state.driftCheckInflight;
@@ -1247,7 +1256,7 @@ export const useMailStore = defineStore('mail', () => {
     // skips this cache hit: its query_view_items may still contain a
     // complete old page, but the server-side query state is known to
     // have changed.
-    if (!state.needsFreshWindow) {
+    if (!state.needsFreshWindow || authStore.isOfflineSession) {
       const cached = await repo.listMessagesForView({
         accountId: accountIdForFolder(state.folderId),
         folderId: state.folderId,
@@ -1256,6 +1265,11 @@ export const useMailStore = defineStore('mail', () => {
         limit,
       });
       if (!isLiveState(state)) return;
+      if (authStore.isOfflineSession) {
+        if (cached.length > 0) _splice(state, offset, cached);
+        addRange(state.paintedRanges, offset, offset + limit);
+        return;
+      }
       const expectedFromTotal = state.total > 0
         ? Math.max(0, Math.min(limit, state.total - offset))
         : null;
@@ -1448,7 +1462,7 @@ export const useMailStore = defineStore('mail', () => {
           state.total = newTotal;
         }
       }
-      if (progress?.stale) {
+      if (progress?.stale && !authStore.isOfflineSession) {
         invalidateFolderStateForFreshWindow(state.folderId);
         await ensureLoaded(0, PAGE_SIZE, state.folderId);
         return;
@@ -1714,7 +1728,7 @@ export const useMailStore = defineStore('mail', () => {
         sort: state.sortProp,
       });
       if (!isLiveState(state)) return;
-      if (progress?.stale) {
+      if (progress?.stale && !authStore.isOfflineSession) {
         invalidateFolderStateForFreshWindow(state.folderId);
         await ensureLoaded(0, PAGE_SIZE, state.folderId);
         return;

@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@floating-ui/dom": "1.8.0",
+    "@huggingface/transformers": "4.2.0",
     "@journeyapps/wa-sqlite": "2.0.9",
     "@lucide/vue": "1.16.0",
     "@tanstack/vue-virtual": "3.13.26",
@@ -37,6 +38,7 @@
     "linkify-string": "4.3.3",
     "linkifyjs": "4.3.3",
     "oidc-spa": "10.2.3",
+    "onnxruntime-web": "1.26.0-dev.20260416-b7804b056c",
     "pinia": "3.0.4",
     "squire-rte": "2.4.6",
     "vue": "3.5.35",

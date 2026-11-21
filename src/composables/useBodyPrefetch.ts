@@ -41,6 +41,7 @@ export interface BodyPrefetchDeps {
   getRepo: () => Repository | null;
   getAccountId: () => number | null;
   isSelected: (messageId: number) => boolean;
+  canPrefetch?: () => boolean;
 }
 
 export function useBodyPrefetch(deps: BodyPrefetchDeps) {
@@ -60,7 +61,7 @@ export function useBodyPrefetch(deps: BodyPrefetchDeps) {
     messageIds: Array<number | undefined | null>,
     { priority = false }: { priority?: boolean } = {},
   ) {
-    if (!Array.isArray(messageIds) || messageIds.length === 0) return;
+    if (deps.canPrefetch?.() === false || !Array.isArray(messageIds) || messageIds.length === 0) return;
     const deduped: number[] = [];
     for (const id of messageIds) {
       if (id == null) continue;
