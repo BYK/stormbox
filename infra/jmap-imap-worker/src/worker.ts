@@ -1,4 +1,6 @@
 import { type Env, accessToken, mailAccounts, MAX_IMAP_ACCOUNTS } from './config';
+import { GOOGLE_CALLBACK_PATH, GOOGLE_START_PATH, googleOAuthConfiguration } from './google-auth';
+import { cancelGoogleLink, finishGoogleLink, startGoogleLink } from './google-link';
 import { authorization, consumeSessionAssertion, HttpError, json, matchesToken, pairedAuthorization, readJson, sessionCookie } from './http';
 import { jmap, session, type JmapStore } from './jmap';
 import {
@@ -71,9 +73,22 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
   }
   const secret = accessToken(env);
   if (!secret && !env.RELAY_SESSION_KEY) throw new HttpError(503, 'gateway_not_configured');
+  if (url.pathname === GOOGLE_CALLBACK_PATH && request.method === 'GET') {
+    const configured = mailAccounts(env);
+    return finishGoogleLink(request, url, env, configured, MAX_IMAP_ACCOUNTS - configured.length);
+  }
+  if (url.pathname === GOOGLE_START_PATH && request.method === 'POST') {
+    if (!googleOAuthConfiguration(env)) throw new HttpError(404, 'google_oauth_unavailable');
+    if (!managedAuthorized(request, url, env)) throw new HttpError(401, 'unauthorized');
+    return startGoogleLink(request, env);
+  }
   if (parts.length === 1 && parts[0] === 'session') {
     if (request.headers.get('Origin') !== env.PUBLIC_ORIGIN) throw new HttpError(403, 'invalid_origin');
-    if (request.method === 'DELETE') return json(null, 204, { 'Set-Cookie': sessionCookie(env, false) });
+    if (request.method === 'DELETE') {
+      const headers = new Headers({ 'Set-Cookie': sessionCookie(env, false) });
+      await cancelGoogleLink(request, env, headers).catch(() => {});
+      return json(null, 204, headers);
+    }
     if (request.method !== 'POST') throw new HttpError(405, 'method_not_allowed');
     const input = await readJson(request, 4096);
     const paired = env.RELAY_SESSION_KEY
@@ -92,7 +107,10 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
   const managed = managedAuthorized(request, url, env);
   if (parts.length === 1 && request.method === 'GET') {
     const configured = accounts.map(({ id, email, name }) => ({ id, email, name: name ?? email }));
-    return json({ accounts: [...configured, ...(managed ? await listManagedAccounts(env) : [])] });
+    return json({
+      accounts: [...configured, ...(managed ? await listManagedAccounts(env) : [])],
+      ...(managed && googleOAuthConfiguration(env) ? { googleOAuth: true } : {}),
+    });
   }
   if (parts.length === 1 && request.method === 'POST') {
     if (!managed) throw new HttpError(401, 'unauthorized');

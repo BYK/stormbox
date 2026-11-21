@@ -13,7 +13,7 @@ import type { AttentionCache } from '../db/attention';
 import type { Repository } from '../db/repository';
 import { useMailStore } from '../stores/mail-store';
 import { browserSessionEnabled } from '../services/browser-session';
-import type { ImapAttentionAction, ImapMessageLocation } from '../sync/backends/imap/attention-relay';
+import { GOOGLE_IMAP_RESULTS, type GoogleImapResult, type ImapAttentionAction, type ImapMessageLocation } from '../sync/backends/imap/attention-relay';
 import { browserTriageMessageKey, createBrowserTriageRanker, type BrowserTriageProgress } from '../triage/browser-model';
 import { buildTriageBundles, markBundleDone, snoozeBundle, type BundleState, type TriageBundle, type TriageClassification, type TriageMessage } from '../triage/smart-sort';
 import { disableWebPush, enableWebPush, getWebPushPublicKey, isWebPushEnabled, onWebPushRefresh } from '../push/client';
@@ -35,6 +35,7 @@ const loading = ref(true);
 const busy = ref(false);
 const error = ref('');
 const manageImap = ref(false);
+const googleImapResult = ref<GoogleImapResult>();
 const jmapFolder = shallowRef<FolderRow>();
 const jmapRows = shallowRef<MessageRow[]>([]);
 const cache = shallowRef<AttentionCache>({ paired: false, accounts: [], states: {} });
@@ -415,6 +416,14 @@ onMounted(async () => {
     });
     await loadCache();
     if (!active) return;
+    const url = new URL(window.location.href);
+    const result = GOOGLE_IMAP_RESULTS.find((status) => status === url.searchParams.get('google_imap'));
+    if (result) {
+      googleImapResult.value = result;
+      manageImap.value = true;
+      url.searchParams.delete('google_imap');
+      window.history.replaceState(window.history.state, '', url);
+    }
     void refresh();
     if (cache.value.paired) void prepareWebPush();
     window.addEventListener('online', onVisible);
@@ -489,10 +498,11 @@ onBeforeUnmount(() => {
       :owner-id="ownerId"
       :paired="cache.paired"
       :automatic="browserSessionEnabled(JMAP_SERVER_URL)"
+      :google-result="googleImapResult"
       :disconnect="disconnectRelay"
       @paired="relayPaired"
       @account-change="refreshAfterAccountChange"
-      @close="manageImap = false"
+      @close="manageImap = false; googleImapResult = undefined"
     />
     <div ref="reader" class="unified-attention__reader" tabindex="-1">
       <MessageView

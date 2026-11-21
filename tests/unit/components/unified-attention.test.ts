@@ -12,6 +12,41 @@ import type { FolderRow } from '../../../src/types';
 
 vi.mock('../../../src/services/auth', () => ({ initOidc: vi.fn(), getOidc: vi.fn() }));
 
+it('reopens account management once on return from Google', async () => {
+  const before = window.location.href;
+  window.history.replaceState(null, '', '/?view=attention&google_imap=connected');
+  const refreshAttentionRelay = vi.fn(async () => []);
+  __setRepositoryForTests({
+    subscribe: () => () => {},
+    getAttentionCache: async () => ({ paired: true, accounts: [], states: {} }),
+    folderByRole: async () => undefined,
+    refreshAttentionRelay,
+    listAttentionRelayAccounts: async () => ({
+      accounts: [{ id: 'managed_work', email: 'owner@example.org', name: 'Work' }], googleOAuth: true,
+    }),
+  });
+  const wrapper = mount(UnifiedAttention, {
+    props: { ownerId: 1, address: 'owner@example.org' },
+    global: { plugins: [createPinia()], stubs: { Teleport: true } },
+  });
+
+  try {
+    await flushPromises();
+    expect(wrapper.get('[role="dialog"]').text()).toContain('Google account connected.');
+    expect(window.location.search).toBe('?view=attention');
+    expect(refreshAttentionRelay).toHaveBeenCalledWith(1);
+    await wrapper.get('[aria-label="Close IMAP accounts"]').trigger('click');
+    const manage = wrapper.findAll('button').find((button) => button.text() === 'Manage IMAP accounts');
+    await manage!.trigger('click');
+    await flushPromises();
+    expect(wrapper.get('[role="dialog"]').text()).not.toContain('Google account connected.');
+  } finally {
+    wrapper.unmount();
+    __resetRepositoryForTests();
+    window.history.replaceState(null, '', before);
+  }
+});
+
 it('opens the regular JMAP reader in Attention and keeps the filter and focus on return', async () => {
   const pinia = createPinia();
   const auth = useAuthStore(pinia);

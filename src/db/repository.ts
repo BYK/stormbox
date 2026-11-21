@@ -9,7 +9,7 @@
 
 import type { AttentionCache } from './attention';
 import { MUTATION_TYPE } from '../constants/states';
-import type { ImapAttentionAction, ImapMessageLocation, RelayAccount, RelayAccountInput } from '../sync/backends/imap/attention-relay';
+import type { ImapAttentionAction, ImapMessageLocation, RelayAccount, RelayAccountInput, RelayAccountSettings } from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
 import type {
   AddressBookInventory,
@@ -319,7 +319,11 @@ export class Repository {
   }
 
   listAttentionRelayAccounts(ownerId: number) {
-    return this.call<RelayAccount[]>(DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS, { ownerId });
+    return this.call<RelayAccountSettings>(DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS, { ownerId });
+  }
+
+  startAttentionGoogleOAuth(ownerId: number, accountId?: string) {
+    return this.call<string>(DB_RPC.ATTENTION_START_GOOGLE_OAUTH, { ownerId, accountId });
   }
 
   saveAttentionRelayAccount(ownerId: number, account: RelayAccountInput) {

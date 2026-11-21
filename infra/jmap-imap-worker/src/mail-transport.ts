@@ -19,11 +19,13 @@ export interface MailConnection {
   password: string;
 }
 
+export type ImapConnection = MailConnection | (Omit<MailConnection, 'password'> & { accessToken: string });
+
 export interface MailAccount {
   id: string;
   email: string;
   name?: string;
-  imap: MailConnection;
+  imap: ImapConnection;
   smtp?: MailConnection;
 }
 
@@ -140,14 +142,16 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     allowHalfOpen: options?.allowHalfOpen ?? false,
   }));
 
-  async function withClient<T>(options: MailConnection, task: (client: ImapFlow) => Promise<T>): Promise<T> {
+  async function withClient<T>(options: ImapConnection, task: (client: ImapFlow) => Promise<T>): Promise<T> {
     const useStartTls = options.mode === 'starttls';
     const client = new ImapFlow({
       host: options.host,
       port: options.port ?? (useStartTls ? 143 : 993),
       secure: !useStartTls,
       doSTARTTLS: useStartTls,
-      auth: { user: options.user, pass: options.password },
+      auth: 'accessToken' in options
+        ? { user: options.user, accessToken: options.accessToken }
+        : { user: options.user, pass: options.password },
       connectionTimeout: 10_000,
       greetingTimeout: 10_000,
       socketTimeout: 30_000,

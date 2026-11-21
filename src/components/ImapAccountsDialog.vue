@@ -1,15 +1,22 @@
 <script setup lang="ts">
 import { X } from '@lucide/vue';
-import { nextTick, onMounted, ref, useId } from 'vue';
+import { computed, nextTick, onMounted, ref, useId } from 'vue';
 import { useOnline } from '@vueuse/core';
 
 import { useModalFocus } from '../composables/useModalFocus';
 import { getRepositoryAsync } from '../composables/useRepository';
-import type { RelayAccount, RelayAccountInput } from '../sync/backends/imap/attention-relay';
+import { replaceLocation } from '../services/navigation';
+import type { GoogleImapResult, RelayAccount, RelayAccountInput } from '../sync/backends/imap/attention-relay';
 import AppButton from './AppButton.vue';
 import AppIconButton from './AppIconButton.vue';
 
-const props = defineProps<{ ownerId: number; paired: boolean; automatic: boolean; disconnect: () => Promise<void> }>();
+const props = defineProps<{
+  ownerId: number;
+  paired: boolean;
+  automatic: boolean;
+  googleResult?: GoogleImapResult;
+  disconnect: () => Promise<void>;
+}>();
 const emit = defineEmits<{
   close: [];
   paired: [failedAccounts: string[]];
@@ -31,11 +38,15 @@ const editing = ref<RelayAccount>();
 const removing = ref<RelayAccount>();
 const token = ref('');
 const provider = ref<'gmail' | 'imap'>('gmail');
+const googleOAuth = ref(false);
+const useAppPassword = ref(false);
+const googleSignIn = computed(() => provider.value === 'gmail' && googleOAuth.value && !useAppPassword.value && !editing.value);
 const email = ref('');
 const password = ref('');
 const host = ref('');
 const user = ref('');
 const mode = ref<'tls' | 'starttls'>('tls');
+let pendingGoogleResult = props.googleResult;
 
 useModalFocus(dialog, { containTab: true, initialFocus: tokenInput });
 
@@ -65,8 +76,23 @@ async function run(operation: () => Promise<void>) {
 
 async function loadAccounts() {
   const repo = await getRepositoryAsync();
-  accounts.value = await repo.listAttentionRelayAccounts(props.ownerId);
+  const settings = await repo.listAttentionRelayAccounts(props.ownerId);
+  accounts.value = settings.accounts;
+  googleOAuth.value = settings.googleOAuth === true;
   if (!accounts.value.length) openForm();
+  if (pendingGoogleResult === 'connected') {
+    notice.value = 'Google account connected.';
+    if (!props.automatic) emit('account-change');
+  } else if (pendingGoogleResult === 'cancelled') {
+    notice.value = 'Google sign-in was cancelled.';
+  } else if (pendingGoogleResult === 'blocked') {
+    error.value = 'Your organization blocked this Google connection. Ask your Google Workspace administrator to approve Stormbox.';
+  } else if (pendingGoogleResult === 'account_mismatch') {
+    error.value = 'You selected a different Google account. Try again with the account you want to reconnect.';
+  } else if (pendingGoogleResult === 'failed') {
+    error.value = 'Google did not connect the account. Try signing in again.';
+  }
+  pendingGoogleResult = undefined;
 }
 
 onMounted(() => {
@@ -77,6 +103,7 @@ onMounted(() => {
 function openForm(account?: RelayAccount) {
   editing.value = account;
   provider.value = !account || account.host === 'imap.gmail.com' ? 'gmail' : 'imap';
+  useAppPassword.value = false;
   email.value = account?.email ?? '';
   password.value = '';
   host.value = account?.host ?? '';
@@ -86,6 +113,22 @@ function openForm(account?: RelayAccount) {
   notice.value = '';
   screen.value = 'form';
   void nextTick(() => (account ? passwordInput : emailInput).value?.focus());
+}
+
+function toggleAppPassword() {
+  useAppPassword.value = !useAppPassword.value;
+  error.value = '';
+  password.value = '';
+  if (useAppPassword.value) void nextTick(() => emailInput.value?.focus());
+}
+
+async function connectGoogle(account?: RelayAccount) {
+  if (!googleOAuth.value) return;
+  await run(async () => {
+    const repo = await getRepositoryAsync();
+    const url = await repo.startAttentionGoogleOAuth(props.ownerId, account?.id);
+    replaceLocation(url);
+  });
 }
 
 function showList() {
@@ -197,48 +240,61 @@ async function disconnectBrowser() {
           </footer>
         </form>
 
-        <form v-else-if="screen === 'form'" class="imap-accounts__form" @submit.prevent="save">
+        <form v-else-if="screen === 'form'" class="imap-accounts__form" @submit.prevent="googleSignIn ? connectGoogle() : save()">
           <fieldset v-if="!editing" :disabled="busy">
             <legend>Email provider</legend>
             <label class="imap-accounts__choice"><input v-model="provider" type="radio" value="gmail" /> Gmail</label>
             <label class="imap-accounts__choice"><input v-model="provider" type="radio" value="imap" /> Other IMAP</label>
           </fieldset>
-          <label>
-            Email address
-            <input ref="emailInput" v-model="email" type="email" autocomplete="email" required :readonly="Boolean(editing)" :disabled="busy" />
-          </label>
-          <template v-if="provider === 'imap'">
-            <label>
-              IMAP hostname
-              <input v-model="host" placeholder="imap.example.com" spellcheck="false" required :readonly="Boolean(editing)" :disabled="busy" />
-            </label>
-            <label>
-              IMAP username
-              <input v-model="user" autocomplete="username" :placeholder="email || 'Same as email address'" :readonly="Boolean(editing)" :disabled="busy" />
-            </label>
-            <fieldset :disabled="busy || Boolean(editing)">
-              <legend>Connection security</legend>
-              <label class="imap-accounts__choice"><input v-model="mode" type="radio" value="tls" /> TLS (993)</label>
-              <label class="imap-accounts__choice"><input v-model="mode" type="radio" value="starttls" /> STARTTLS (143)</label>
-            </fieldset>
+          <template v-if="googleSignIn">
+            <p>Choose the Google account you want to connect.</p>
+            <footer class="imap-accounts__footer">
+              <AppButton variant="outline" :disabled="busy" @click="showList">Back</AppButton>
+              <AppButton variant="outline" :disabled="busy" @click="toggleAppPassword">Use an app password</AppButton>
+              <AppButton form-action="submit" :disabled="busy || !online">Connect with Google</AppButton>
+            </footer>
           </template>
-          <label>
-            {{ provider === 'gmail' ? 'Google app password' : 'IMAP password' }}
-            <input ref="passwordInput" v-model="password" type="password" autocomplete="new-password" required :disabled="busy" />
-          </label>
-          <p v-if="provider === 'gmail'">
-            Create an app password for Stormbox in <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer">Google App Passwords</a>.
-          </p>
-          <footer class="imap-accounts__footer">
-            <AppButton variant="outline" :disabled="busy" @click="showList">Back</AppButton>
-            <AppButton form-action="submit" :disabled="busy || !online || !email.trim() || !password || (provider === 'imap' && !host.trim())">
-              {{ busy ? 'Connecting…' : editing ? 'Update password' : 'Connect account' }}
-            </AppButton>
-          </footer>
+          <template v-else>
+            <label>
+              Email address
+              <input ref="emailInput" v-model="email" type="email" autocomplete="email" required :readonly="Boolean(editing)" :disabled="busy" />
+            </label>
+            <template v-if="provider === 'imap'">
+              <label>
+                IMAP hostname
+                <input v-model="host" placeholder="imap.example.com" spellcheck="false" required :readonly="Boolean(editing)" :disabled="busy" />
+              </label>
+              <label>
+                IMAP username
+                <input v-model="user" autocomplete="username" :placeholder="email || 'Same as email address'" :readonly="Boolean(editing)" :disabled="busy" />
+              </label>
+              <fieldset :disabled="busy || Boolean(editing)">
+                <legend>Connection security</legend>
+                <label class="imap-accounts__choice"><input v-model="mode" type="radio" value="tls" /> TLS (993)</label>
+                <label class="imap-accounts__choice"><input v-model="mode" type="radio" value="starttls" /> STARTTLS (143)</label>
+              </fieldset>
+            </template>
+            <label>
+              {{ provider === 'gmail' ? 'Google app password' : 'IMAP password' }}
+              <input ref="passwordInput" v-model="password" type="password" autocomplete="new-password" required :disabled="busy" />
+            </label>
+            <p v-if="provider === 'gmail'">
+              Create an app password for Stormbox in <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer">Google App Passwords</a>.
+            </p>
+            <footer class="imap-accounts__footer">
+              <AppButton variant="outline" :disabled="busy" @click="showList">Back</AppButton>
+              <AppButton v-if="googleOAuth && provider === 'gmail' && !editing" variant="outline" :disabled="busy" @click="toggleAppPassword">
+                Use Google sign-in
+              </AppButton>
+              <AppButton form-action="submit" :disabled="busy || !online || !email.trim() || !password || (provider === 'imap' && !host.trim())">
+                {{ busy ? 'Connecting…' : editing ? 'Update password' : 'Connect account' }}
+              </AppButton>
+            </footer>
+          </template>
         </form>
 
         <template v-else-if="screen === 'remove' && removing">
-          <p>Remove {{ removing.email }} from Attention? You can connect it again with its app password.</p>
+          <p>Remove {{ removing.email }} from Attention? You can reconnect it later.</p>
           <footer class="imap-accounts__footer">
             <AppButton variant="outline" :disabled="busy" @click="showList">Cancel</AppButton>
             <AppButton :disabled="busy || !online" @click="remove">Remove account</AppButton>
@@ -253,7 +309,13 @@ async function disconnectBrowser() {
                 <span v-if="account.name !== account.email">{{ account.email }}</span>
               </div>
               <div v-if="account.managed" class="imap-accounts__row-actions">
-                <AppButton variant="outline" :disabled="busy || !online" @click="openForm(account)">Update password</AppButton>
+                <AppButton
+                  v-if="account.auth === 'google-oauth'"
+                  variant="outline"
+                  :disabled="busy || !online || !googleOAuth"
+                  @click="connectGoogle(account)"
+                >Reconnect Google</AppButton>
+                <AppButton v-else variant="outline" :disabled="busy || !online" @click="openForm(account)">Update password</AppButton>
                 <AppIconButton danger :aria-label="`Remove ${account.email}`" :disabled="busy || !online" @click="confirmRemove(account)">
                   <X :size="16" aria-hidden="true" />
                 </AppIconButton>

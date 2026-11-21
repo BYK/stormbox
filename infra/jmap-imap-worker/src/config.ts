@@ -11,6 +11,8 @@ export interface Env extends PushEnv {
   RELAY_ACCESS_TOKEN?: string;
   IMAP_ACCOUNTS?: string;
   IMAP_ACCOUNT_ENCRYPTION_KEY?: string;
+  GOOGLE_OAUTH_CLIENT_ID?: string;
+  GOOGLE_OAUTH_CLIENT_SECRET?: string;
   MANAGED_ACCOUNTS?: DurableObjectNamespace<ManagedAccounts>;
   MAILBOXES: DurableObjectNamespace<AccountState>;
 }

@@ -71,6 +71,35 @@ Gmail uses `imap.gmail.com` on port 993 and a Google app password. Changes to
 an existing account's login endpoint require removing and adding the account
 again. A new app password can replace an existing password in place.
 
+### Google Workspace IMAP with OAuth
+
+Create a **Web application** OAuth client in [Google Auth Platform](https://console.cloud.google.com/auth/clients).
+For a Workspace-only client, use an Internal app in the organization's Google
+Cloud project. The Workspace administrator can control whether the client can
+access Gmail. [Google OAuth app states and administrator controls](https://developers.google.com/identity/protocols/oauth2/production-readiness/overview)
+For a personal Google Cloud project, use an External audience and add the
+Workspace address as a test user. External apps in Testing receive
+seven-day refresh tokens for this mail scope. The Workspace policy
+still governs access. [Google OAuth token expiration](https://developers.google.com/identity/protocols/oauth2#expiration)
+
+Register this authorized redirect URI for the BYK deployment.
+
+```text
+https://webmail.byk.im/api/imap/v1/oauth/google/callback
+```
+
+Authorize the `openid`, `email`, and `https://mail.google.com/` scopes.
+Google requires the full mail scope for user-authorized IMAP connections.
+[Gmail XOAUTH2 documentation](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol)
+
+Set `GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` as secrets on
+`stormbox-jmap-imap`. The account manager offers **Connect with Google** when
+the Worker has both values and supports the existing encrypted account registry.
+The Worker stores the refresh token in that registry and exchanges it for
+short-lived access tokens for IMAP. **Reconnect Google** obtains a fresh
+grant for the same account. Gmail app passwords remain available in the
+account manager.
+
 For Web Push, set `WEB_PUSH_VAPID_PUBLIC_KEY`, `WEB_PUSH_VAPID_PRIVATE_KEY`, and
 `WEB_PUSH_VAPID_SUBJECT`. Configure the `/api/push/*` route when the Worker is
 ready to serve it. When adding this route with Wrangler, pass both routes

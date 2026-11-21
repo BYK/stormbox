@@ -260,7 +260,11 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     [DB_RPC.ATTENTION_REFRESH]: async ({ ownerId }) => refreshOnce(ownerId),
     [DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS]: async ({ ownerId }) => {
       await requirePairing(ownerId);
-      return relay.accounts();
+      return relay.accountSettings();
+    },
+    [DB_RPC.ATTENTION_START_GOOGLE_OAUTH]: async ({ ownerId, accountId }) => {
+      await requirePairing(ownerId);
+      return relay.startGoogleOAuth(accountId);
     },
     [DB_RPC.ATTENTION_SAVE_RELAY_ACCOUNT]: async ({ ownerId, account }: { ownerId: number; account: RelayAccountInput }) =>
       serializeRelayOperation(ownerId, async () => {

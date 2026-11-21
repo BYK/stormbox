@@ -12,7 +12,16 @@ export interface RelayAccount {
   port?: number;
   mode?: 'tls' | 'starttls';
   user?: string;
+  auth?: 'google-oauth';
 }
+
+export interface RelayAccountSettings {
+  accounts: RelayAccount[];
+  googleOAuth?: boolean;
+}
+
+export const GOOGLE_IMAP_RESULTS = ['connected', 'cancelled', 'blocked', 'account_mismatch', 'failed'] as const;
+export type GoogleImapResult = typeof GOOGLE_IMAP_RESULTS[number];
 
 export interface RelayAccountInput {
   email: string;
@@ -103,7 +112,27 @@ export class AttentionRelay {
   }
 
   async accounts(): Promise<RelayAccount[]> {
-    return (await this.json<{ accounts: RelayAccount[] }>('/accounts')).accounts;
+    return (await this.accountSettings()).accounts;
+  }
+
+  accountSettings(): Promise<RelayAccountSettings> {
+    return this.json('/accounts');
+  }
+
+  async startGoogleOAuth(accountId?: string): Promise<string> {
+    const response = await this.request('/oauth/google/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId }),
+    });
+    const { url } = await response.json();
+    if (typeof url !== 'string') throw new Error('The relay did not return a Google sign-in URL.');
+    const authorization = URL.parse(url);
+    if (authorization?.origin !== 'https://accounts.google.com' || authorization.pathname !== '/o/oauth2/v2/auth'
+      || authorization.username || authorization.password) {
+      throw new Error('The relay returned an unexpected Google sign-in URL.');
+    }
+    return authorization.href;
   }
 
   async saveAccount(account: RelayAccountInput): Promise<RelayAccount> {
@@ -184,6 +213,8 @@ export class AttentionRelay {
       account_identity_changed: 'Remove this account before connecting it to a different IMAP server or username.',
       account_changed: 'The account changed while you were editing it. Reopen account management and try again.',
       mail_unavailable: 'The relay could not connect to the IMAP server. Check the hostname and TLS settings.',
+      google_oauth_unavailable: 'Google sign-in has not been configured for this mail relay.',
+      google_reconnect_required: 'Reconnect this Google account in Manage IMAP accounts.',
     };
     const message = (Object.hasOwn(messages, code) ? messages[code] : undefined)
       ?? (response.status === 401 ? 'Connect the mail relay to access IMAP mail.'

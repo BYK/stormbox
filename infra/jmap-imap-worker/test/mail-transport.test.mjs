@@ -72,7 +72,7 @@ const sample = [
   '',
 ].join('\r\n');
 
-function makeImapSocket({ mailboxSize = 1, trash = false, supportsMove = true } = {}) {
+function makeImapSocket({ mailboxSize = 1, trash = false, supportsMove = true, oauth = false } = {}) {
   const calls = [];
   let connections = 0;
   let moved = false;
@@ -83,7 +83,7 @@ function makeImapSocket({ mailboxSize = 1, trash = false, supportsMove = true } 
     assert.equal(options.secureTransport, 'on');
     let current = 'INBOX';
     let authTag;
-    const capability = `IMAP4rev1 AUTH=PLAIN UIDPLUS${supportsMove ? ' MOVE' : ''}`;
+    const capability = `IMAP4rev1 AUTH=${oauth ? 'XOAUTH2' : 'PLAIN'} UIDPLUS${supportsMove ? ' MOVE' : ''}`;
     return scriptedSocket(`* OK [CAPABILITY ${capability}] fixture ready\r\n`, (line, write) => {
       calls.push(line);
       if (authTag) {
@@ -183,6 +183,19 @@ test('verifies credentials by opening Inbox read-only without fetching or changi
   await createMailTransport(fixture.connect).verifyImapAccount(account);
   assert.equal(fixture.calls.some((line) => / EXAMINE INBOX$/i.test(line)), true);
   assert.equal(fixture.calls.some((line) => / (FETCH|UID (FETCH|STORE)|SELECT) /i.test(line)), false);
+});
+
+test('authenticates an IMAP OAuth connection with XOAUTH2 and uses the verified mailbox address', async () => {
+  const fixture = makeImapSocket({ oauth: true });
+  const { password, ...server } = endpoint;
+  await createMailTransport(fixture.connect).verifyImapAccount({
+    ...account, imap: { ...server, accessToken: 'fixture-access-token' },
+  });
+  const auth = fixture.calls.findIndex((line) => / AUTHENTICATE XOAUTH2$/.test(line));
+  assert.ok(auth >= 0);
+  assert.equal(Buffer.from(fixture.calls[auth + 1], 'base64').toString('utf8'),
+    `user=${server.user}\x01auth=Bearer fixture-access-token\x01\x01`);
+  assert.equal(fixture.calls.some((line) => / (LOGIN|AUTHENTICATE PLAIN) /.test(line)), false);
 });
 
 test('updates flags and moves only to IMAP Trash, with a safe retry after a completed move', async () => {

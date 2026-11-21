@@ -57,6 +57,7 @@ export const DB_RPC = Object.freeze({
   ATTENTION_DISCONNECT: 'attention.disconnect',
   ATTENTION_REFRESH: 'attention.refresh',
   ATTENTION_LIST_RELAY_ACCOUNTS: 'attention.listRelayAccounts',
+  ATTENTION_START_GOOGLE_OAUTH: 'attention.startGoogleOauth',
   ATTENTION_SAVE_RELAY_ACCOUNT: 'attention.saveRelayAccount',
   ATTENTION_REMOVE_RELAY_ACCOUNT: 'attention.removeRelayAccount',
   ATTENTION_BODY: 'attention.body',

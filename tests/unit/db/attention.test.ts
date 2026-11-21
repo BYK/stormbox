@@ -3,6 +3,7 @@ import { MUTATION_TYPE } from '../../../src/constants/states';
 import { makeAttentionHandlers } from '../../../src/db/attention';
 import { bootTestEngine } from '../../../src/db/bootstrap-memory';
 import { DB_RPC } from '../../../src/db/protocol';
+import { AttentionRelay } from '../../../src/sync/backends/imap/attention-relay';
 import { processMutationRow } from '../../../src/sync/backends/jmap/outbox';
 
 let engine: Awaited<ReturnType<typeof bootTestEngine>>;
@@ -53,6 +54,20 @@ const ownerId = 1;
 const workMessage = { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid: 12 };
 
 describe('Attention cache', () => {
+  it('allows Google authorization redirects only to the Google consent endpoint', async () => {
+    const google = 'https://accounts.google.com/o/oauth2/v2/auth?state=test';
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json({ url: google }))
+      .mockResolvedValueOnce(Response.json({ url: 'https://accounts.google.com.example.org/o/oauth2/v2/auth' }));
+    const relay = new AttentionRelay(fetcher);
+
+    expect(await relay.startGoogleOAuth('work')).toBe(google);
+    expect(fetcher).toHaveBeenCalledWith('/api/imap/v1/oauth/google/start', expect.objectContaining({
+      method: 'POST', credentials: 'same-origin', body: '{"accountId":"work"}',
+    }));
+    await expect(relay.startGoogleOAuth()).rejects.toThrow('unexpected Google sign-in URL');
+  });
+
   it('pairing lists isolated accounts and preserves downloaded bodies without a network', async () => {
     const { server, handlers } = fakeRelay();
     await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'pair-this-browser' });
