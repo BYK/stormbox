@@ -34,8 +34,8 @@ ONNXRUNTIME_NODE_INSTALL=skip
 ```
 
 `VITE_APP_PASSWORD_ONLY=1` avoids offering Thundermail OIDC from an
-unregistered redirect origin. The app password remains in browser
-session memory and is sent directly to the JMAP bridge over HTTPS.
+unregistered redirect origin. Sign-in sends the app password to the
+JMAP bridge over HTTPS and establishes a browser session.
 
 `ONNXRUNTIME_NODE_INSTALL=skip` skips extra native runtime downloads. The
 Attention model uses the bundled browser runtime.
@@ -49,6 +49,18 @@ Cloudflare account ID. Supply it together with a scoped API token:
 cd infra/jmap-bridge
 CLOUDFLARE_ACCOUNT_ID=... CLOUDFLARE_API_TOKEN=... npm run deploy:byk
 ```
+
+Provision the BYK bridge's browser session key once before deploying the
+app-password sign-in flow. Replacing it signs out browsers that used the old key.
+
+```bash
+openssl rand -base64 32 | npx wrangler secret put BROWSER_SESSION_KEY --config wrangler.byk.toml
+```
+
+The bridge validates the app password against Thundermail and encrypts it
+in a host-only, HttpOnly cookie valid for 30 days. The only browser origin
+permitted to use the cookie is `https://webmail.byk.im`. Signing out deletes
+the cookie and clears the account used to reopen offline mail.
 
 The token needs account-level Cloudflare Pages edit and Workers Scripts
 edit access, plus Zone read, DNS edit, and Workers Routes edit access

@@ -146,6 +146,9 @@ async function dispatch(request, response, config, service) {
     const { destination } = await readJson(request, 4096);
     return respond(response, 200, await service.moveMessage(account, mailbox, uidValidity, uid, mailboxPath(destination)));
   }
+  if (parts.length === 5 && action === 'trash' && method === 'POST') {
+    return respond(response, 200, await service.trashMessage(account, mailbox, uidValidity, uid));
+  }
   throw new RelayError(404, 'not_found');
 }
 

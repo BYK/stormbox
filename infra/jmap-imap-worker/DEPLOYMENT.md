@@ -77,7 +77,9 @@ curl --silent --show-error --include https://webmail.byk.im/api/imap/v1/accounts
 
 The app returns HTML, the health endpoint returns JSON, and the accounts
 endpoint requires a bearer token or a paired browser. Open **Attention → Connect IMAP accounts**, enter the relay access token,
-and open a message from the linked account. Independent JMAP clients can use
+and open a message from the linked account. Attention can update IMAP stars and
+read state. Delete requires an IMAP server that advertises `MOVE` and a
+mailbox marked `\Trash`. Independent JMAP clients can use
 `/.well-known/jmap` on the `workers.dev` URL emitted by Wrangler with the relay
 access token as a bearer credential. The preview covers mailbox and message
 reads.

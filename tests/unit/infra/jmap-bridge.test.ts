@@ -107,6 +107,106 @@ describe('jmap-bridge routes.allowedOrigins', () => {
   });
 });
 
+describe('BYK JMAP browser sessions', () => {
+  const origin = 'https://webmail.byk.im';
+  const bridge = 'https://jmap.byk.im';
+  const auth = `Basic ${btoa('test@example.net:password-for-tests')}`;
+  const env = { BROWSER_SESSION_KEY: btoa('a'.repeat(32)) };
+  const sessionEndpoint = `${bridge}/jmap/browser-session`;
+  let upstream: ReturnType<typeof vi.fn>;
+
+  function signInRequest(from = origin, url = sessionEndpoint) {
+    return new Request(url, { method: 'POST', headers: { Origin: from, Authorization: auth } });
+  }
+
+  beforeEach(() => {
+    upstream = vi.fn(() => Response.json(JSON.parse(STAGE_SESSION_BODY), {
+      headers: { 'Set-Cookie': 'upstream-secret=unused' },
+    }));
+    vi.stubGlobal('fetch', upstream);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('issues an encrypted host-only cookie and forwards only Authorization to JMAP', async () => {
+    const response = await worker.fetch(signInRequest(), env);
+    expect(response.status).toBe(204);
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBe(origin);
+    expect(response.headers.get('Access-Control-Allow-Credentials')).toBe('true');
+    const setCookie = response.headers.get('Set-Cookie')!;
+    expect(setCookie).toMatch(/^__Host-stormbox-jmap=[\w-]+; Path=\/; Secure; HttpOnly; SameSite=Strict; Max-Age=2592000$/);
+    expect(setCookie).not.toContain(auth.split(' ')[1]);
+    const cookie = setCookie.split(';')[0];
+
+    const resumed = await worker.fetch(new Request(`${bridge}/jmap/session`, {
+      headers: { Origin: origin, Cookie: cookie, 'X-Stormbox-Session': '1' },
+    }), env);
+    expect(resumed.status).toBe(200);
+    expect(resumed.headers.get('Cache-Control')).toBe('no-store');
+    expect(resumed.headers.get('Set-Cookie')).toBeNull();
+    const forwarded = upstream.mock.calls[1][1].headers;
+    expect(forwarded.get('Authorization')).toBe(auth);
+    expect(forwarded.get('Cookie')).toBeNull();
+    expect(forwarded.get('X-Stormbox-Session')).toBeNull();
+
+    await worker.fetch(new Request(`${bridge}/jmap/ws`, {
+      headers: { Origin: origin, Upgrade: 'websocket', Cookie: cookie },
+    }), env);
+    const upgrade = upstream.mock.calls[2][0] as Request;
+    expect(upgrade.url).toBe('https://mail.thundermail.com/jmap/ws');
+    expect(upgrade.headers.get('Authorization')).toBe(auth);
+    expect(upgrade.headers.get('Cookie')).toBeNull();
+  });
+
+  it('only allows cookie sign-in and use from the exact BYK webmail origin', async () => {
+    const cookie = (await worker.fetch(signInRequest(), env)).headers.get('Set-Cookie')!.split(';')[0];
+    upstream.mockClear();
+    for (const from of ['https://jmap.byk.im', 'https://other.byk.im', 'https://webmail.byk.im.example.org', 'http://webmail.byk.im']) {
+      expect((await worker.fetch(signInRequest(from), env)).status).toBe(403);
+      const resumed = await worker.fetch(new Request(`${bridge}/jmap/session`, {
+        headers: { Origin: from, Cookie: cookie, 'X-Stormbox-Session': '1' },
+      }), env);
+      expect(resumed.status).toBe(401);
+      expect(resumed.headers.get('Access-Control-Allow-Credentials')).toBeNull();
+      expect((await worker.fetch(new Request(`${bridge}/jmap/ws`, {
+        headers: { Origin: from, Upgrade: 'websocket', Cookie: cookie },
+      }), env)).status).toBe(403);
+    }
+    expect((await worker.fetch(signInRequest(origin, 'http://jmap.byk.im/jmap/browser-session'), env)).status).toBe(403);
+    expect((await worker.fetch(signInRequest('https://webmail.thundermail.com', 'https://jmap.thundermail.com/jmap/browser-session'), env)).status).toBe(403);
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it('rejects sessions without an authenticated mail account', async () => {
+    upstream.mockReturnValueOnce(Response.json({ accounts: {}, primaryAccounts: {} }));
+    const response = await worker.fetch(signInRequest(), env);
+    expect(response.status).toBe(401);
+    expect(response.headers.get('Set-Cookie')).toBeNull();
+    expect((await worker.fetch(signInRequest())).status).toBe(503);
+  });
+
+  it('rejects tampered and expired sessions and expires the cookie at logout', async () => {
+    const now = 1_700_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const cookie = (await worker.fetch(signInRequest(), env)).headers.get('Set-Cookie')!.split(';')[0];
+    upstream.mockClear();
+    const resume = (value: string) => worker.fetch(new Request(`${bridge}/jmap/session`, {
+      headers: { Origin: origin, Cookie: value, 'X-Stormbox-Session': '1' },
+    }), env);
+    expect((await resume(`${cookie.slice(0, -5)}aaaaa`)).status).toBe(401);
+    clock.mockReturnValue(now + 30 * 24 * 60 * 60 * 1000);
+    expect((await resume(cookie)).status).toBe(401);
+    expect(upstream).not.toHaveBeenCalled();
+
+    const logout = await worker.fetch(new Request(sessionEndpoint, { method: 'DELETE', headers: { Origin: origin } }), env);
+    expect(logout.status).toBe(204);
+    expect(logout.headers.get('Set-Cookie')).toBe('__Host-stormbox-jmap=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // http.ts rewriting helpers
 // ---------------------------------------------------------------------------

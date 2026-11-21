@@ -16,7 +16,7 @@ import {
   serveRpcPort,
   WORKER_RESTARTED,
 } from './rpc-dispatch';
-import { BROADCAST_CHANNEL } from './protocol';
+import { BROADCAST_CHANNEL, DB_RPC } from './protocol';
 import { attachWorkerLogger, wlog } from './worker-log';
 import { createWorkerLifecycle } from './worker-lifecycle';
 import { claimDatabaseOwnership, needsFirefoxLockWorkaround } from './worker-ownership';
@@ -84,7 +84,9 @@ function getHandlers() {
       outboxNotifier,
       registerShutdown: (stop) => { stopSync = stop; },
     });
-    return lifecycle.requestHandlers({ ...repoHandlers, ...syncHandlers }, {
+    const publicRepoHandlers = { ...repoHandlers };
+    delete publicRepoHandlers[DB_RPC.ATTENTION_APPLY_IMAP_ACTION];
+    return lifecycle.requestHandlers({ ...publicRepoHandlers, ...syncHandlers }, {
       stopSync: () => stopSync(),
       closeStorage: () => engine.close(),
     });

@@ -73,7 +73,7 @@ export interface ImapMessageBody extends ImapMessage {
 
 export type MailTransportErrorCode = 'authentication_failed' | 'invalid_message' | 'mailbox_changed'
   | 'mail_unavailable' | 'message_not_found' | 'message_too_large' | 'move_not_supported'
-  | 'same_mailbox' | 'smtp_not_configured' | 'submission_rejected' | 'submission_unknown';
+  | 'same_mailbox' | 'trash_not_configured' | 'smtp_not_configured' | 'submission_rejected' | 'submission_unknown';
 
 export class MailTransportError extends Error {
   readonly code: MailTransportErrorCode;
@@ -296,19 +296,33 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     });
   }
 
+  async function moveSelectedMessage(client: ImapFlow, mailbox: string, uid: number, destination: string) {
+    if (mailbox === destination) throw new MailTransportError('same_mailbox');
+    if (!client.capabilities.has('MOVE')) throw new MailTransportError('move_not_supported');
+    if (!await client.fetchOne(uid, { uid: true }, { uid: true })) return { status: 'absent' as const };
+    const moved = await client.messageMove(uid, destination, { uid: true });
+    if (!moved) throw new MailTransportError('mail_unavailable');
+    return {
+      status: 'moved' as const,
+      destination,
+      uid: moved.uidMap?.get(uid) ?? null,
+      uidValidity: moved.uidValidity?.toString() ?? null,
+    };
+  }
+
   function moveMessage(account: MailAccount, mailbox: string, uidValidity: string, uid: number, destination: string) {
     if (mailbox === destination) throw new MailTransportError('same_mailbox');
-    return withMailbox(account, mailbox, { readOnly: false, uidValidity }, async (client) => {
-      if (!client.capabilities.has('MOVE')) throw new MailTransportError('move_not_supported');
-      if (!await client.fetchOne(uid, { uid: true }, { uid: true })) return { status: 'absent' as const };
-      const moved = await client.messageMove(uid, destination, { uid: true });
-      if (!moved) throw new MailTransportError('mail_unavailable');
-      return {
-        status: 'moved' as const,
-        destination,
-        uid: moved.uidMap?.get(uid) ?? null,
-        uidValidity: moved.uidValidity?.toString() ?? null,
-      };
+    return withMailbox(account, mailbox, { readOnly: false, uidValidity }, (client) =>
+      moveSelectedMessage(client, mailbox, uid, destination));
+  }
+
+  function trashMessage(account: MailAccount, mailbox: string, uidValidity: string, uid: number) {
+    return withClient(account.imap, async (client) => {
+      const trash = (await client.list()).find(({ flags }) =>
+        flags.has('\\Trash') && !flags.has('\\Noselect') && !flags.has('\\NonExistent'));
+      if (!trash) throw new MailTransportError('trash_not_configured');
+      return withSelectedMailbox(client, mailbox, { readOnly: false, uidValidity }, () =>
+        moveSelectedMessage(client, mailbox, uid, trash.path));
     });
   }
 
@@ -349,9 +363,9 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     }
   }
 
-  return { listMailboxes, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, moveMessage, submitMessage };
+  return { listMailboxes, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, moveMessage, trashMessage, submitMessage };
 }
 
 export const {
-  listMailboxes, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, moveMessage, submitMessage,
+  listMailboxes, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, moveMessage, trashMessage, submitMessage,
 } = createMailTransport();

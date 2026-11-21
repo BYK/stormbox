@@ -25,7 +25,8 @@ type ConnectAuth =
       issuedAt: number | null;
       expiresAt: number | null;
     }
-  | { kind: 'basic'; username: string; password: string };
+  | { kind: 'basic'; username: string; password: string }
+  | { kind: 'browser-session' };
 
 interface MutableAuth {
   current: ConnectAuth;
@@ -38,7 +39,8 @@ interface MutableAuth {
  * @property {string} serverOrigin  Origin of the JMAP server.
  * @property {{ kind: 'basic', username: string, password: string }
  *           | { kind: 'bearer', token: string, issuedAt?: number,
- *               expiresAt?: number }} auth
+ *               expiresAt?: number }
+ *           | { kind: 'browser-session' }} auth
  *                                  Auth handed to the transport's getAuthHeader.
  *                                  bearer tokens are the OIDC happy path; basic
  *                                  tokens cover self-host setups.
@@ -131,6 +133,7 @@ export function makeSyncRpcHandlers({
         sessionUrl: input.sessionUrl,
         getAuthHeader: makeAuthHeader(() => mutableAuth.current),
         getWsCredential: makeWsCredential(() => mutableAuth.current),
+        useBrowserSession: mutableAuth.current.kind === 'browser-session',
         wsProxyUrl: input.wsProxyUrl ?? null,
         fetch: boundFetch,
         WebSocketImpl: wsCtor,
@@ -427,6 +430,7 @@ function copyAuth(auth: any): ConnectAuth {
       && typeof auth.password === 'string') {
     return { kind: 'basic', username: auth.username, password: auth.password };
   }
+  if (auth?.kind === 'browser-session') return { kind: 'browser-session' };
   throw new Error(`Unsupported auth kind: ${auth?.kind}`);
 }
 
@@ -451,7 +455,8 @@ function makeAuthHeader(getAuth: () => ConnectAuth) {
   return async () => {
     const auth = getAuth();
     if (auth.kind === 'bearer') return `Bearer ${auth.token}`;
-    return `Basic ${base64Utf8(`${auth.username}:${auth.password}`)}`;
+    if (auth.kind === 'basic') return `Basic ${base64Utf8(`${auth.username}:${auth.password}`)}`;
+    return undefined;
   };
 }
 
@@ -464,10 +469,11 @@ function makeWsCredential(getAuth: () => ConnectAuth) {
   return async () => {
     const auth = getAuth();
     if (auth.kind === 'bearer') return { kind: 'bearer', token: auth.token };
-    return {
+    if (auth.kind === 'basic') return {
       kind: 'basic',
       token: base64Utf8(`${auth.username}:${auth.password}`),
     };
+    return null;
   };
 }
 

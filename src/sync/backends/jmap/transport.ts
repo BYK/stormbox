@@ -296,7 +296,7 @@ export function isAuthenticationError(error: any): boolean {
  * @typedef {object} TransportOptions
  * @property {string} sessionUrl       Absolute URL of the JMAP session
  *                                     document (https://host/.well-known/jmap).
- * @property {() => Promise<string>} getAuthHeader
+ * @property {() => Promise<string | undefined>} getAuthHeader
  *                                     Async producer of the value for the
  *                                     Authorization header (Basic/Bearer).
  * @property {() => Promise<WsCredential>} [getWsCredential]
@@ -356,7 +356,8 @@ function wsRequestTimeoutError(requestId: string, elapsedMs: number) {
 
 export class JmapTransport {
   _sessionUrl: string;
-  _getAuthHeader: () => Promise<string>;
+  _getAuthHeader: () => Promise<string | undefined>;
+  _browserSessionOrigin: string | null;
   _getWsCredential: any;
   _wsProxyUrl: string | null;
   _fetch: typeof fetch;
@@ -381,6 +382,7 @@ export class JmapTransport {
   constructor(options: any) {
     this._sessionUrl = options.sessionUrl;
     this._getAuthHeader = options.getAuthHeader;
+    this._browserSessionOrigin = options.useBrowserSession ? new URL(this._sessionUrl).origin : null;
     this._getWsCredential = options.getWsCredential ?? null;
     this._wsProxyUrl = options.wsProxyUrl ?? null;
     this._fetch = options.fetch ?? globalThis.fetch;
@@ -496,6 +498,15 @@ export class JmapTransport {
     timeoutKind?: 'deadline' | 'idle';
     bindActivity?: (onActivity: () => void) => void;
   }): Promise<T> {
+    if (this._browserSessionOrigin) {
+      this._assertBrowserSessionOrigin(url);
+      init = {
+        ...init,
+        headers: { ...init.headers, 'X-Stormbox-Session': '1' },
+        credentials: 'include',
+        redirect: 'error',
+      };
+    }
     if (this._aborted) throw abortedError(label, 0);
     const controller = new AbortController();
     const external: AbortSignal | undefined = init.signal;
@@ -564,6 +575,13 @@ export class JmapTransport {
     }
   }
 
+  _assertBrowserSessionOrigin(url: string): void {
+    const destination = new URL(url);
+    if (destination.protocol !== 'https:' || destination.origin !== this._browserSessionOrigin) {
+      throw new Error('Browser sign-in is only sent to the configured mail gateway.');
+    }
+  }
+
   _uploadWithFetchIdleTimeout(url: string, {
     auth,
     type,
@@ -573,7 +591,7 @@ export class JmapTransport {
     onProgress,
     label,
   }: {
-    auth: string;
+    auth: string | undefined;
     type: string;
     body: any;
     bodySize: number | null;
@@ -609,7 +627,7 @@ export class JmapTransport {
     return this._fetchWithDeadline(url, {
       method: 'POST',
       headers: {
-        Authorization: auth,
+        ...(auth ? { Authorization: auth } : {}),
         'Content-Type': type,
         Accept: 'application/json',
       },
@@ -657,7 +675,7 @@ export class JmapTransport {
     onProgress,
     label,
   }: {
-    auth: string;
+    auth: string | undefined;
     type: string;
     body: any;
     bodySize: number | null;
@@ -818,8 +836,13 @@ export class JmapTransport {
       signal?.addEventListener('abort', onSignalAbort, { once: true });
       this._inFlightHttp.add(request);
       try {
+        if (this._browserSessionOrigin) this._assertBrowserSessionOrigin(url);
         request.open('POST', url, true);
-        request.setRequestHeader('Authorization', auth);
+        if (this._browserSessionOrigin) {
+          request.withCredentials = true;
+          request.setRequestHeader('X-Stormbox-Session', '1');
+        }
+        if (auth) request.setRequestHeader('Authorization', auth);
         request.setRequestHeader('Content-Type', type || 'application/octet-stream');
         request.setRequestHeader('Accept', 'application/json');
         armTimeout();
@@ -844,7 +867,7 @@ export class JmapTransport {
     const auth = await this._getAuthHeader();
     this._session = await this._fetchWithDeadline(this._sessionUrl, {
       headers: {
-        Authorization: auth,
+        ...(auth ? { Authorization: auth } : {}),
         Accept: 'application/json',
       },
       mode: 'cors',
@@ -927,7 +950,7 @@ export class JmapTransport {
       return await this._fetchWithDeadline(this._session.apiUrl, {
         method: 'POST',
         headers: {
-          Authorization: auth,
+          ...(auth ? { Authorization: auth } : {}),
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
@@ -1069,7 +1092,7 @@ export class JmapTransport {
     const auth = await this._getAuthHeader();
     wlog.info('jmap-transport', `download ${blobId} (${type})`);
     return this._fetchWithDeadline(url, {
-      headers: { Authorization: auth },
+      headers: auth ? { Authorization: auth } : {},
       mode: 'cors',
       credentials: 'omit',
       signal,
@@ -1126,6 +1149,12 @@ export class JmapTransport {
       // non-browser clients that can set Authorization headers).
       const baseUrl = this._wsProxyUrl ?? wsCap.url;
       const wsUrl = new URL(baseUrl);
+      if (this._browserSessionOrigin) {
+        const expected = this._browserSessionOrigin.replace(/^https:/, 'wss:');
+        if (wsUrl.origin !== expected || wsUrl.protocol !== 'wss:') {
+          throw new Error('Browser sign-in is only sent to the configured mail gateway.');
+        }
+      }
       if (this._wsProxyUrl && this._getWsCredential) {
         const cred = await this._getWsCredential();
         if (cred?.kind === 'bearer') wsUrl.searchParams.set('access_token', cred.token);

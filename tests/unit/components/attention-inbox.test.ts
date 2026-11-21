@@ -77,7 +77,10 @@ describe('AttentionInbox', () => {
     expect(members.isVisible()).toBe(true);
     await members.findAll('button')[1].trigger('click');
 
-    expect(wrapper.emitted('open')).toEqual([[request.leading.message], [followup.message]]);
+    expect(wrapper.emitted('open')).toEqual([
+      [request.leading.message, wrapper.get('.attention-inbox__row .attention-inbox__preview').element],
+      [followup.message, members.findAll('button')[1].element],
+    ]);
     wrapper.unmount();
   });
 

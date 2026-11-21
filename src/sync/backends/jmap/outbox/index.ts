@@ -273,6 +273,10 @@ export async function processMutationRow({
       return runPushContactsTrash({ transport, account, handlers, useWebSocket });
     case MUTATION_TYPES.SET_SIEVE_RULES:
       return runSetSieveRules({ transport, account, request, useWebSocket });
+    case MUTATION_TYPES.ATTENTION_IMAP:
+      return handlers[DB_RPC.ATTENTION_APPLY_IMAP_ACTION]({
+        ownerId: row.account_id, location: request?.location, action: request?.action,
+      });
     default:
       return {
         ok: false,

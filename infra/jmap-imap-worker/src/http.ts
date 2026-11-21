@@ -67,7 +67,12 @@ export function authorization(request: Request, env: Env, allowPairing = false):
   if (!secret) return false;
   const bearer = /^Bearer ([^\s]+)$/i.exec(request.headers.get('Authorization') ?? '');
   if (bearer && matchesToken(bearer[1], secret)) return true;
-  if (!allowPairing || (request.method !== 'GET' && request.headers.get('Origin') !== env.PUBLIC_ORIGIN)) return false;
+  return allowPairing && pairedAuthorization(request, env);
+}
+
+export function pairedAuthorization(request: Request, env: Env): boolean {
+  const secret = accessToken(env);
+  if (!secret || (request.method !== 'GET' && request.headers.get('Origin') !== env.PUBLIC_ORIGIN)) return false;
   const cookies = (request.headers.get('Cookie') ?? '').split(/;\s*/).filter((item) => item.startsWith(`${COOKIE}=`));
   if (cookies.length !== 1) return false;
   const match = /^\d{13}\.[A-Za-z0-9_-]{43}$/.test(cookies[0].slice(COOKIE.length + 1))

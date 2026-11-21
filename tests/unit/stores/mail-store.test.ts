@@ -16,11 +16,12 @@ import {
   describe, it, expect, beforeEach, afterEach, vi,
 } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
-import { nextTick } from 'vue';
+import { nextTick, shallowRef } from 'vue';
 
 import { useMailStore } from '../../../src/stores/mail-store';
 import { useAuthStore } from '../../../src/stores/auth-store';
 import { useSettingsStore } from '../../../src/stores/settings-store';
+import type { MessageRow } from '../../../src/types';
 import {
   __setRepositoryForTests,
   __resetRepositoryForTests,
@@ -1088,6 +1089,30 @@ describe('enqueueVisibleBodyPrefetch (scroll-driven body prefetch)', () => {
 });
 
 describe('selectMessage marks unread as seen via the auto-drained outbox', () => {
+  it('reads the current row from Attention without switching the regular folder', async () => {
+    const folder = makeFolder(1);
+    const attentionFolder = makeFolder(2, { role: null });
+    const { mailStore, repo } = await setupStore({
+      folders: [folder, attentionFolder],
+      views: { 1: { rows: [], total: 0 } },
+    });
+    const row = shallowRef(makeRow(17, { is_seen: 0, is_flagged: 1, keywords_json: '{"$flagged":true}' }) as MessageRow);
+    const insert = vi.fn(async () => ({ id: 99 }));
+    repo.insertPendingMutation = insert;
+
+    mailStore.selectMessage(row.value.id, attentionFolder.id, () => row.value);
+    await flush();
+
+    expect(mailStore.currentFolderId).toBe(folder.id);
+    expect(mailStore.openMessage?.id).toBe(row.value.id);
+    expect(mailStore.openMessageFolderId).toBe(attentionFolder.id);
+    expect(insert).toHaveBeenCalledWith(expect.objectContaining({ mutationType: 'setKeywords', targetMessageId: row.value.id }));
+    row.value = { ...row.value, is_seen: 1 };
+    expect(mailStore.openMessage?.is_seen).toBe(1);
+    mailStore.selectMessage(null);
+    expect(mailStore.openMessage).toBeUndefined();
+  });
+
   it('writes the optimistic $seen patch and enqueues a setKeywords mutation; the worker drains it on its own', async () => {
     // Contract under test: the store's only job is to write the
     // optimistic patch and enqueue the pending_mutations row. The

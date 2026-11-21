@@ -118,11 +118,9 @@ watch(() => authStore.isOfflineSession, (cached) => {
   if (!cached) offlineSignInRequested.value = false;
 });
 
-function restoreOfflineConnection() {
-  if (authStore.appPasswordMode) {
+async function restoreOfflineConnection() {
+  if (!await authStore.reconnectCachedSession() && authStore.appPasswordMode && authStore.isOfflineSession) {
     offlineSignInRequested.value = true;
-  } else {
-    void authStore.reconnectCachedSession();
   }
 }
 
@@ -453,12 +451,6 @@ async function requestSpaceChange(next: string): Promise<boolean> {
   space.value = next;
   quickFilterQuery.value = '';
   return true;
-}
-
-async function openAttentionMail(messageId: number, folderId: number) {
-  await requestSpaceChange('mail');
-  if (mailStore.currentFolderId !== folderId) mailStore.selectFolder(folderId);
-  mailStore.selectMessage(messageId, folderId);
 }
 
 function toggleFolderList() {
@@ -914,7 +906,6 @@ function unwatchSystemTheme() {
       :owner-id="authStore.accountId"
       :address="authStore.username || ''"
       :search="quickFilterQuery"
-      @open-mail="openAttentionMail"
     />
 
     <ComposeManager />

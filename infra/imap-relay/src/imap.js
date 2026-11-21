@@ -92,9 +92,12 @@ function envelope(message) {
   };
 }
 
+async function selectableMailboxes(client) {
+  return (await client.list()).filter((entry) => !entry.flags.has('\\Noselect') && !entry.flags.has('\\NonExistent'));
+}
+
 export function listMailboxes(account) {
-  return withClient(account.imap, async (client) => (await client.list())
-    .filter((entry) => !entry.flags.has('\\Noselect') && !entry.flags.has('\\NonExistent'))
+  return withClient(account.imap, async (client) => (await selectableMailboxes(client))
     .map(({ path, name, specialUse }) => ({ path, name, specialUse: specialUse ?? null })));
 }
 
@@ -157,6 +160,13 @@ export function moveMessage(account, mailbox, uidValidity, uid, destination) {
       uidValidity: moved.uidValidity?.toString() ?? null,
     };
   });
+}
+
+export async function trashMessage(account, mailbox, uidValidity, uid) {
+  const trash = await withClient(account.imap, async (client) =>
+    (await selectableMailboxes(client)).find(({ flags }) => flags.has('\\Trash')));
+  if (!trash) throw new RelayError(422, 'trash_not_configured');
+  return moveMessage(account, mailbox, uidValidity, uid, trash.path);
 }
 
 export function watchSnapshot(account, previous) {

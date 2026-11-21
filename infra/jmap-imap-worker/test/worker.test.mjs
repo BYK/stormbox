@@ -59,6 +59,21 @@ test('paired same-origin API lists accounts without exposing credentials', async
   const list = await request('/api/imap/v1/accounts', { headers: { Cookie } });
   assert.deepEqual(await list.json(), { accounts: [{ id: 'alpha', email: 'alpha@example.test', name: 'alpha@example.test' }] });
   assert.equal((await request('/api/imap/v1/accounts/beta/messages', { headers: { Cookie } })).status, 404);
+  const messagePath = '/api/imap/v1/accounts/alpha/messages/44';
+  const patch = { method: 'PATCH', body: JSON.stringify({ flagged: true }) };
+  assert.equal((await request(`${messagePath}?uidValidity=7`, {
+    ...patch, headers: { Cookie, Origin: 'https://other.example.test' },
+  })).status, 401);
+  assert.equal((await request(`${messagePath}?uidValidity=7`, {
+    ...patch, headers: { Authorization: `Bearer ${accessToken}`, Origin: origin },
+  })).status, 401);
+  assert.equal((await request(`${messagePath}/trash?uidValidity=7`, {
+    method: 'POST', headers: { Cookie },
+  })).status, 401);
+  const headers = { Cookie, Origin: origin };
+  assert.equal((await request(`${messagePath}?uidValidity=7`, { ...patch, headers, body: '{"deleted":true}' })).status, 400);
+  assert.equal((await request(`${messagePath}?uidValidity=7`, { method: 'DELETE', headers })).status, 405);
+  assert.equal((await request(`${messagePath}/trash?uidValidity=0`, { method: 'POST', headers })).status, 400);
 });
 
 test('generic JMAP requires its bearer token and supports Core/echo', async () => {

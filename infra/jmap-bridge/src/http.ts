@@ -16,6 +16,8 @@
  */
 
 import type { Route } from './routes';
+import { allowsBrowserSession, BROWSER_SESSION_HEADER, BROWSER_SESSION_PATH,
+  handleBrowserSession, readBrowserSession } from './browser-session';
 
 /**
  * Headers Cloudflare injects on inbound requests; Stalwart must not
@@ -34,6 +36,7 @@ const HEADERS_TO_STRIP_BEFORE_UPSTREAM = [
   // SPA session cookies must not leak to the mail server; JMAP auth
   // is Authorization-only.
   'cookie',
+  BROWSER_SESSION_HEADER,
 ];
 
 /**
@@ -51,7 +54,7 @@ const PREFLIGHT_MAX_AGE_SECONDS = 3600;
  */
 const ALLOWED_REQUEST_HEADERS = 'Authorization, Content-Type, Accept';
 
-export async function handleHttpProxy(request: Request, route: Route): Promise<Response> {
+export async function handleHttpProxy(request: Request, route: Route, browserSessionKey?: string): Promise<Response> {
   if (request.headers.get('upgrade')?.toLowerCase() === 'websocket') {
     return new Response('WebSocket upgrades must be handled by the WS bridge', { status: 426 });
   }
@@ -66,7 +69,11 @@ export async function handleHttpProxy(request: Request, route: Route): Promise<R
   // Short-circuit preflights at the edge. Stalwart's CORS is exactly
   // what we are working around; we must NOT forward OPTIONS to it.
   if (request.method === 'OPTIONS' && origin !== null) {
-    return preflightResponse(origin, route);
+    return preflightResponse(origin, route, url.pathname);
+  }
+
+  if (url.pathname === BROWSER_SESSION_PATH) {
+    return handleBrowserSession(request, route, browserSessionKey, corsHeadersFor(origin, route));
   }
 
   if (!isJmapPath(url.pathname)) {
@@ -83,6 +90,17 @@ export async function handleHttpProxy(request: Request, route: Route): Promise<R
     upstreamHeaders.delete(name);
   }
 
+  const usesBrowserSession = request.headers.get(BROWSER_SESSION_HEADER) === '1';
+  if (usesBrowserSession) {
+    const auth = await readBrowserSession(request, route, browserSessionKey);
+    if (!auth) {
+      const headers = corsHeadersFor(origin, route);
+      headers.set('Cache-Control', 'no-store');
+      return new Response(null, { status: 401, headers });
+    }
+    upstreamHeaders.set('Authorization', auth);
+  }
+
   const upstreamResponse = await fetch(upstreamUrl.toString(), {
     method: request.method,
     headers: upstreamHeaders,
@@ -90,7 +108,7 @@ export async function handleHttpProxy(request: Request, route: Route): Promise<R
     redirect: 'manual',
   });
 
-  return rewriteResponse(upstreamResponse, url.pathname, route, origin);
+  return rewriteResponse(upstreamResponse, url.pathname, route, origin, usesBrowserSession);
 }
 
 function isJmapPath(pathname: string): boolean {
@@ -119,21 +137,20 @@ function corsHeadersFor(origin: string | null, route: Route): Headers {
     return headers;
   }
   headers.set('Access-Control-Allow-Origin', origin);
-  // Authorization is Bearer/Basic, not a cookie; no need to allow
-  // credentials. Keeping this `false` (the default) means responses
-  // are still readable to the SPA via the explicit Allow-Origin
-  // echo but cookies aren't sent.
+  if (allowsBrowserSession(route, origin)) headers.set('Access-Control-Allow-Credentials', 'true');
   return headers;
 }
 
-function preflightResponse(origin: string, route: Route): Response {
+function preflightResponse(origin: string, route: Route, pathname: string): Response {
   const headers = corsHeadersFor(origin, route);
-  if (!headers.has('Access-Control-Allow-Origin')) {
+  const browserSessionAllowed = allowsBrowserSession(route, origin);
+  const browserSessionEndpoint = pathname === BROWSER_SESSION_PATH;
+  if (!headers.has('Access-Control-Allow-Origin') || (browserSessionEndpoint && !browserSessionAllowed)) {
     // Unrecognised origin: no allow-* headers, browser will reject.
     return new Response(null, { status: 403, headers });
   }
-  headers.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
-  headers.set('Access-Control-Allow-Headers', ALLOWED_REQUEST_HEADERS);
+  headers.set('Access-Control-Allow-Methods', browserSessionEndpoint ? 'POST, DELETE, OPTIONS' : 'GET, HEAD, POST, OPTIONS');
+  headers.set('Access-Control-Allow-Headers', browserSessionAllowed ? `${ALLOWED_REQUEST_HEADERS}, ${BROWSER_SESSION_HEADER}` : ALLOWED_REQUEST_HEADERS);
   headers.set('Access-Control-Max-Age', String(PREFLIGHT_MAX_AGE_SECONDS));
   return new Response(null, { status: 204, headers });
 }
@@ -153,7 +170,7 @@ function replaceCorsHeaders(target: Headers, cors: Headers): void {
     }
   });
   for (const name of toDelete) target.delete(name);
-  for (const name of ['access-control-allow-origin', 'vary']) {
+  for (const name of ['access-control-allow-origin', 'access-control-allow-credentials', 'vary']) {
     const value = cors.get(name);
     if (value !== null) target.set(name, value);
   }
@@ -164,9 +181,12 @@ async function rewriteResponse(
   requestPath: string,
   route: Route,
   origin: string | null,
+  usesBrowserSession: boolean,
 ): Promise<Response> {
   const rewrittenHeaders = rewriteLocationHeader(upstream.headers, route);
   replaceCorsHeaders(rewrittenHeaders, corsHeadersFor(origin, route));
+  rewrittenHeaders.delete('Set-Cookie');
+  if (usesBrowserSession) rewrittenHeaders.set('Cache-Control', 'no-store');
 
   // Only the JMAP session document carries the URLs we have to
   // rewrite. Every other body is forwarded as a stream so uploads

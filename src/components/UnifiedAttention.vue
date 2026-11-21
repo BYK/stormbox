@@ -1,13 +1,16 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import { useOnline, useStorage } from '@vueuse/core';
 import AppButton from './AppButton.vue';
 import AttentionInbox from './AttentionInbox.vue';
+import AttentionMessageActions from './AttentionMessageActions.vue';
+import MessageView from './MessageView.vue';
 import { getRepositoryAsync } from '../composables/useRepository';
 import { TABLE_FAMILIES } from '../db/protocol';
 import type { AttentionCache } from '../db/attention';
 import type { Repository } from '../db/repository';
-import type { ImapMessageLocation } from '../sync/backends/imap/attention-relay';
+import { useMailStore } from '../stores/mail-store';
+import type { ImapAttentionAction, ImapMessageLocation } from '../sync/backends/imap/attention-relay';
 import { browserTriageMessageKey, createBrowserTriageRanker, type BrowserTriageProgress } from '../triage/browser-model';
 import { buildTriageBundles, markBundleDone, snoozeBundle, type BundleState, type TriageBundle, type TriageClassification, type TriageMessage } from '../triage/smart-sort';
 import { disableWebPush, enableWebPush, getWebPushPublicKey, isWebPushEnabled, onWebPushRefresh } from '../push/client';
@@ -19,8 +22,6 @@ const props = defineProps<{
   address: string;
   search?: string;
 }>();
-const emit = defineEmits<{ 'open-mail': [messageId: number, folderId: number] }>();
-
 const WINDOW_SIZE = 100;
 const REFRESH_INTERVAL = 60_000;
 const online = useOnline();
@@ -33,7 +34,15 @@ const token = ref('');
 const jmapFolder = shallowRef<FolderRow>();
 const jmapRows = shallowRef<MessageRow[]>([]);
 const cache = shallowRef<AttentionCache>({ paired: false, accounts: [], states: {} });
-const reading = shallowRef<{ message: TriageMessage; body?: string; error?: string }>();
+type Reading = { kind: 'jmap'; message: TriageMessage } |
+  { kind: 'imap'; message: TriageMessage; body?: string; error?: string };
+const mailStore = useMailStore();
+const reading = shallowRef<Reading>();
+const reader = ref<HTMLElement>();
+const list = ref<HTMLElement>();
+const maximized = ref(false);
+const pendingActions = ref(new Set<string>());
+let openingButton: HTMLElement | undefined;
 const pushRegistration = shallowRef<ServiceWorkerRegistration>();
 const pushKey = shallowRef<Uint8Array<ArrayBuffer>>();
 const pushEnabled = ref(false);
@@ -100,8 +109,18 @@ const imap = computed(() => cache.value.accounts.flatMap((account) => account.me
     directRecipient: row.to.some((recipient) => recipient.address.toLowerCase() === account.address.toLowerCase()),
     isFlagged: row.flagged,
   };
-  return { message, location };
+  return { message, location, seen: row.seen, flagged: row.flagged };
 })));
+const jmapRowsById = computed(() => new Map(jmapRows.value.map((row) => [row.id, row])));
+const messageStates = computed(() => new Map([
+  ...jmapRows.value.map((row) => [
+    browserTriageMessageKey({ accountId: `jmap:${row.account_id}`, id: row.id }),
+    { seen: Boolean(row.is_seen), flagged: Boolean(row.is_flagged) },
+  ] as const),
+  ...imap.value.map(({ message, seen, flagged }) => [
+    browserTriageMessageKey(message), { seen, flagged },
+  ] as const),
+]));
 const accountLabels = computed(() => Object.fromEntries([
   [`jmap:${props.ownerId}`, props.address],
   ...cache.value.accounts.map((account) => [`imap:${account.relay_id}`, account.address]),
@@ -276,25 +295,93 @@ async function saveState(bundle: TriageBundle, state: BundleState | null) {
   }
 }
 
-async function openMessage(message: TriageMessage) {
-  if (typeof message.id === 'number' && jmapFolder.value) {
-    emit('open-mail', message.id, jmapFolder.value.id);
+function releaseJmapReader(previous?: Reading) {
+  if (previous?.kind === 'jmap' && mailStore.selectedMessageId === previous.message.id) {
+    mailStore.selectMessage(null);
+  }
+}
+
+async function closeReader() {
+  const previous = reading.value;
+  reading.value = undefined;
+  maximized.value = false;
+  releaseJmapReader(previous);
+  await nextTick();
+  if (!active || reading.value) return;
+  if (openingButton?.isConnected) openingButton.focus({ preventScroll: true });
+  else list.value?.querySelector<HTMLElement>('.attention-inbox__filter[aria-pressed="true"]')
+    ?.focus({ preventScroll: true });
+  openingButton = undefined;
+}
+
+function findImapMessage(message: TriageMessage) {
+  return imap.value.find(({ message: candidate }) =>
+    candidate.id === message.id && candidate.accountId === message.accountId);
+}
+
+async function openMessage(message: TriageMessage, trigger: EventTarget | null) {
+  if (trigger instanceof HTMLElement) openingButton = trigger;
+  const messageId = message.id;
+  if (typeof messageId === 'number' && jmapFolder.value) {
+    reading.value = { kind: 'jmap', message };
+    mailStore.selectMessage(messageId, jmapFolder.value.id, () => jmapRowsById.value.get(messageId));
+    await nextTick();
+    reader.value?.focus({ preventScroll: true });
     return;
   }
-  const row = imap.value.find((entry) => entry.message.id === message.id && entry.message.accountId === message.accountId);
+  const row = findImapMessage(message);
   if (!row) return;
-  const pending = { message };
+  releaseJmapReader(reading.value);
+  const pending = { kind: 'imap', message } as const;
   reading.value = pending;
+  maximized.value = false;
+  void nextTick(() => reader.value?.focus({ preventScroll: true }));
   try {
     const body = await repo.readAttentionImapMessage(props.ownerId, row.location);
-    if (reading.value === pending) reading.value = { message, body };
+    if (reading.value === pending) reading.value = { ...pending, body };
   } catch (cause) {
     if (reading.value === pending) {
-      reading.value = { message, error: online.value && cause instanceof Error
+      reading.value = { ...pending, error: online.value && cause instanceof Error
         ? cause.message : 'This message body has not been downloaded for offline reading.' };
     }
   }
 }
+
+async function runMessageAction(message: TriageMessage, action: ImapAttentionAction) {
+  const key = browserTriageMessageKey(message);
+  if (pendingActions.value.has(key)) return;
+  pendingActions.value.add(key);
+  error.value = '';
+  try {
+    if (typeof message.id === 'number') {
+      const row = jmapRowsById.value.get(message.id);
+      if (!row || !jmapFolder.value) return;
+      const source = { sourceFolderId: jmapFolder.value.id, rows: [row] };
+      if (action.type === 'star') await mailStore.markManyFlagged([message.id], action.value, source);
+      else if (action.type === 'seen') await mailStore.markManySeen([message.id], action.value, source);
+      else await mailStore.destroyMessage(message.id, source);
+    } else {
+      const row = findImapMessage(message);
+      if (!row) return;
+      await repo.mutateAttentionImapMessage(props.ownerId, row.location, action);
+    }
+    await loadCache();
+  } catch (cause) {
+    report(cause);
+  } finally {
+    pendingActions.value.delete(key);
+  }
+}
+
+watch([() => mailStore.selectedMessageId, jmapRowsById, imap], () => {
+  const current = reading.value;
+  if (current?.kind === 'jmap'
+    && (mailStore.selectedMessageId !== current.message.id || !jmapRowsById.value.has(Number(current.message.id)))) {
+    void closeReader();
+  } else if (current?.kind === 'imap' && !findImapMessage(current.message)) {
+    void closeReader();
+  }
+});
 
 function onVisible() {
   if (document.visibilityState === 'visible') {
@@ -328,6 +415,7 @@ onMounted(async () => {
 });
 onBeforeUnmount(() => {
   active = false;
+  releaseJmapReader(reading.value);
   unsubscribe?.();
   removePushRefresh?.();
   ranker?.dispose();
@@ -339,66 +427,130 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="unified-attention" aria-label="Attention">
-    <section v-if="reading" class="unified-attention__reader" aria-label="Message">
-      <AppButton @click="reading = undefined">Back to Attention</AppButton>
-      <h2>{{ reading.message.subject || '(No subject)' }}</h2>
-      <p v-if="reading.message.sender">{{ reading.message.sender }}</p>
-      <p v-if="reading.error" role="alert">{{ reading.error }}</p>
-      <p v-else-if="reading.body === undefined" role="status">Loading message…</p>
-      <p v-else class="unified-attention__body">{{ reading.body || 'This message has no plain-text body.' }}</p>
-    </section>
-    <AttentionInbox
-      v-else
-      :bundles="bundles"
-      :account-labels="accountLabels"
-      :loading="loading"
-      :error="error"
-      @open="openMessage"
-      @done="(bundle) => saveState(bundle, markBundleDone(bundle))"
-      @snooze="(bundle, until) => saveState(bundle, snoozeBundle(bundle, until))"
-      @restore="(bundle) => saveState(bundle, null)"
-    >
-      <template #actions>
-        <form v-if="pairing" class="unified-attention__pairing" @submit.prevent="connectRelay">
-          <input v-model="token" type="password" aria-label="Mail relay pairing token" placeholder="Pairing token" autocomplete="off" />
-          <AppButton form-action="submit" :disabled="busy || !token.trim()">Connect</AppButton>
-          <AppButton @click="pairing = false; token = ''">Cancel</AppButton>
-        </form>
-        <AppButton v-else-if="!cache.paired" :disabled="loading || !online" @click="pairing = true">Connect IMAP accounts</AppButton>
-        <AppButton v-else :disabled="busy || !online" @click="disconnectRelay">Disconnect IMAP</AppButton>
-        <AppButton v-if="cache.paired && pushKey" :disabled="pushBusy || !online" @click="togglePush">
-          {{ pushEnabled ? 'Disable notifications' : 'Enable notifications' }}
-        </AppButton>
-        <AppButton :disabled="busy || loading || !online" @click="refresh">Refresh</AppButton>
-        <AppButton
-          variant="outline"
-          :title="localModelEnabled ? 'Use rules only' : 'Download multilingual E5 and rank on this device'"
-          :aria-pressed="localModelEnabled"
-          @click="localModelEnabled = !localModelEnabled"
-        >{{ localModelEnabled ? 'Turn off local model' : 'Use local model' }}</AppButton>
-        <span v-if="modelProgress" role="status" class="unified-attention__progress">
-          {{ modelProgress.phase === 'preparing' ? 'Preparing local model…' : 'Ranking mail locally…' }}
-        </span>
-        <span v-else-if="localModelEnabled && modelFailed" role="status" class="unified-attention__progress">
-          Local model unavailable. Showing rules-based rankings.
-        </span>
-      </template>
-    </AttentionInbox>
+  <section
+    class="unified-attention"
+    :class="{ 'unified-attention--reading': reading, 'unified-attention--maximized': maximized }"
+    aria-label="Attention"
+  >
+    <div ref="list" v-show="!maximized" class="unified-attention__list">
+      <AttentionInbox
+        :bundles="bundles"
+        :account-labels="accountLabels"
+        :loading="loading"
+        :error="error"
+        :open-message="reading?.message"
+        @open="openMessage"
+        @done="(bundle) => saveState(bundle, markBundleDone(bundle))"
+        @snooze="(bundle, until) => saveState(bundle, snoozeBundle(bundle, until))"
+        @restore="(bundle) => saveState(bundle, null)"
+      >
+        <template #message-actions="{ message }">
+          <AttentionMessageActions
+            :state="messageStates.get(browserTriageMessageKey(message))"
+            :disabled="pendingActions.has(browserTriageMessageKey(message)) || (typeof message.id === 'string' && !online)"
+            @action="runMessageAction(message, $event)"
+          />
+        </template>
+        <template #actions>
+          <form v-if="pairing" class="unified-attention__pairing" @submit.prevent="connectRelay">
+            <input v-model="token" type="password" aria-label="Mail relay pairing token" placeholder="Pairing token" autocomplete="off" />
+            <AppButton form-action="submit" :disabled="busy || !token.trim()">Connect</AppButton>
+            <AppButton @click="pairing = false; token = ''">Cancel</AppButton>
+          </form>
+          <AppButton v-else-if="!cache.paired" :disabled="loading || !online" @click="pairing = true">Connect IMAP accounts</AppButton>
+          <AppButton v-else :disabled="busy || !online" @click="disconnectRelay">Disconnect IMAP</AppButton>
+          <AppButton v-if="cache.paired && pushKey" :disabled="pushBusy || !online" @click="togglePush">
+            {{ pushEnabled ? 'Disable notifications' : 'Enable notifications' }}
+          </AppButton>
+          <AppButton :disabled="busy || loading || !online" @click="refresh">Refresh</AppButton>
+          <AppButton
+            variant="outline"
+            :title="localModelEnabled ? 'Use rules only' : 'Download multilingual E5 and rank on this device'"
+            :aria-pressed="localModelEnabled"
+            @click="localModelEnabled = !localModelEnabled"
+          >{{ localModelEnabled ? 'Turn off local model' : 'Use local model' }}</AppButton>
+          <span v-if="modelProgress" role="status" class="unified-attention__progress">
+            {{ modelProgress.phase === 'preparing' ? 'Preparing local model…' : 'Ranking mail locally…' }}
+          </span>
+          <span v-else-if="localModelEnabled && modelFailed" role="status" class="unified-attention__progress">
+            Local model unavailable. Showing rules-based rankings.
+          </span>
+        </template>
+      </AttentionInbox>
+    </div>
+    <div ref="reader" class="unified-attention__reader" tabindex="-1">
+      <MessageView
+        v-if="reading?.kind === 'jmap'"
+        back-label="Back to Attention"
+        :maximized="maximized"
+        @back="closeReader"
+        @toggle-maximized="maximized = !maximized"
+      />
+      <section v-else-if="reading" class="unified-attention__imap" aria-label="Message detail">
+        <AppButton @click="closeReader">Back to Attention</AppButton>
+        <h2>{{ reading.message.subject || '(No subject)' }}</h2>
+        <p v-if="reading.message.sender">{{ reading.message.sender }}</p>
+        <p v-if="reading.error" role="alert">{{ reading.error }}</p>
+        <p v-else-if="reading.body === undefined" role="status">Loading message…</p>
+        <p v-else class="unified-attention__body">{{ reading.body || 'This message has no plain-text body.' }}</p>
+      </section>
+      <p v-else class="unified-attention__empty">Select a message to read it.</p>
+    </div>
   </section>
 </template>
 
 <style scoped>
 .unified-attention {
-  display: flex;
-  flex-direction: column;
-  overflow: auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
+}
+.unified-attention:not(.unified-attention--maximized) {
+  grid-template-columns: minmax(330px, 2fr) minmax(0, 3fr);
+}
+.unified-attention__list,
+.unified-attention__reader {
+  min-width: 0;
+  min-height: 0;
 }
 .unified-attention__reader {
+  background: var(--panel);
+}
+.unified-attention__reader:focus {
+  outline: none;
+}
+.unified-attention:not(.unified-attention--maximized) .unified-attention__reader {
+  border-inline-start: 1px solid var(--border);
+}
+.unified-attention__empty {
+  display: grid;
+  height: 100%;
+  margin: 0;
+  place-items: center;
+  color: var(--muted);
+}
+.unified-attention__imap {
   width: min(100%, 760px);
+  height: 100%;
   margin-inline: auto;
   padding: 24px;
   box-sizing: border-box;
+  overflow: auto;
+}
+@media (max-width: 839px) {
+  .unified-attention:not(.unified-attention--maximized) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .unified-attention--reading .unified-attention__list {
+    display: none;
+  }
+  .unified-attention:not(.unified-attention--reading) .unified-attention__reader {
+    display: none;
+  }
+  .unified-attention:not(.unified-attention--maximized) .unified-attention__reader {
+    border-inline-start: 0;
+  }
 }
 .unified-attention__body {
   white-space: pre-wrap;

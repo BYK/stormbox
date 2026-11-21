@@ -11,6 +11,9 @@ import type { Oidc } from 'oidc-spa/core';
 import { computed, ref } from 'vue';
 
 import { initOidc, getOidc } from '../services/auth';
+import {
+  browserSessionEnabled, browserSessionState, clearBrowserSession, createBrowserSession, expireBrowserSession,
+} from '../services/browser-session';
 import { currentHref, reloadLocation, replaceLocation } from '../services/navigation';
 import {
   APP_PASSWORD_ONLY,
@@ -40,7 +43,7 @@ interface OidcTokenSnapshot {
   accessTokenExpirationTime: number;
   getServerDateNow: () => number;
 }
-type ConnectAuth = BasicAuth | BearerAuth;
+type ConnectAuth = BasicAuth | BearerAuth | { kind: 'browser-session' };
 
 // oidc-spa renews at 30 seconds remaining; run five seconds inside that window.
 const TOKEN_RENEWAL_WINDOW_MS = 25_000;
@@ -145,6 +148,7 @@ export const useAuthStore = defineStore('auth', () => {
   let tokenRenewalTimer: ReturnType<typeof setTimeout> | null = null;
   let tokenUpdateRetryTimer: ReturnType<typeof setTimeout> | null = null;
   let offlineSessionGeneration = 0;
+  let cachedReconnect: Promise<boolean> | null = null;
 
   const hasStorageQuota = computed(() =>
     quotaHardLimitBytes.value != null && quotaHardLimitBytes.value > 0,
@@ -213,6 +217,15 @@ export const useAuthStore = defineStore('auth', () => {
     }
     if (appPasswordMode.value) {
       setOidcRedirectPending(false);
+      if (browserSessionEnabled(JMAP_SERVER_URL)) {
+        const sessionState = browserSessionState();
+        if (sessionState === 'logout-pending') await clearBrowserSession();
+        if (sessionState === 'remembered') {
+          const connected = await _connect({ kind: 'browser-session' }, username.value);
+          if (connected || databaseUnavailable.value) return;
+          error.value = null;
+        }
+      }
       status.value = AUTH_STATE.OIDC_READY;
       return;
     }
@@ -238,11 +251,16 @@ export const useAuthStore = defineStore('auth', () => {
     await connectViaOidc();
   }
 
-  async function reconnectCachedSession(): Promise<void> {
-    if (!isOfflineSession.value || appPasswordMode.value || databaseUnavailable.value) return;
-    if (status.value !== AUTH_STATE.IDLE && status.value !== AUTH_STATE.FAILED) return;
+  async function reconnectCachedSession(): Promise<boolean> {
+    if (!isOfflineSession.value || databaseUnavailable.value) return isConnected.value;
+    if (cachedReconnect) return cachedReconnect;
+    if (appPasswordMode.value && (!browserSessionEnabled(JMAP_SERVER_URL) || browserSessionState() !== 'remembered')) return false;
+    if (status.value !== AUTH_STATE.IDLE && status.value !== AUTH_STATE.FAILED && status.value !== AUTH_STATE.OIDC_READY) return false;
     status.value = AUTH_STATE.IDLE;
-    await initialize();
+    cachedReconnect = initialize().then(() => isConnected.value).finally(() => {
+      cachedReconnect = null;
+    });
+    return cachedReconnect;
   }
 
   function reportOidcInitializationError(err: unknown): void {
@@ -262,14 +280,27 @@ export const useAuthStore = defineStore('auth', () => {
   async function connectWithPassword(
     { username: u, password }: { username: string; password: string },
   ): Promise<boolean> {
-    if (databaseUnavailable.value) return false;
-    if (!u || !password) {
+    if (databaseUnavailable.value || status.value === AUTH_STATE.CONNECTING) return false;
+    const loginName = u.trim();
+    if (!loginName || !password) {
       error.value = 'Username and password are required.';
       status.value = AUTH_STATE.FAILED;
       return false;
     }
     stopTokenSync();
-    return _connect({ kind: 'basic', username: u.trim(), password }, u.trim());
+    if (browserSessionEnabled(JMAP_SERVER_URL)) {
+      status.value = AUTH_STATE.CONNECTING;
+      error.value = null;
+      try {
+        await createBrowserSession(loginName, password);
+      } catch (err) {
+        status.value = AUTH_STATE.FAILED;
+        error.value = err instanceof Error ? err.message : 'Sign-in failed.';
+        return false;
+      }
+      return _connect({ kind: 'browser-session' }, loginName);
+    }
+    return _connect({ kind: 'basic', username: loginName, password }, loginName);
   }
 
   /**
@@ -561,8 +592,9 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       const repo = await getRepositoryAsync();
       if (databaseUnavailable.value) return false;
+      const sessionPath = auth.kind === 'browser-session' ? '/jmap/session' : '/.well-known/jmap';
       const result = await repo.startSyncAccount({
-        sessionUrl: `${JMAP_SERVER_URL.replace(/\/$/, '')}/.well-known/jmap`,
+        sessionUrl: `${JMAP_SERVER_URL.replace(/\/$/, '')}${sessionPath}`,
         serverOrigin: serverOrigin.value,
         auth,
         wsProxyUrl: JMAP_WS_PROXY_URL || null,
@@ -579,6 +611,7 @@ export const useAuthStore = defineStore('auth', () => {
       if (typeof repo.getAccount === 'function') {
         void repo.getAccount(result.accountId).then((row) => {
           if (row && generation === offlineSessionGeneration && accountId.value === row.id) {
+            if (auth.kind === 'browser-session' && !displayName) username.value = row.display_name ?? row.primary_email;
             writeCachedAccount(row);
           }
         }).catch((error) => console.warn('Could not remember the offline account', error));
@@ -587,7 +620,12 @@ export const useAuthStore = defineStore('auth', () => {
     } catch (err: any) {
       if (databaseUnavailable.value || reportDatabaseError(err)) return false;
       status.value = AUTH_STATE.FAILED;
-      error.value = err?.message ?? String(err);
+      if (auth.kind === 'browser-session' && err?.status === 401) {
+        expireBrowserSession();
+        error.value = 'The browser session expired. Sign in again with your app password.';
+      } else {
+        error.value = err?.message ?? String(err);
+      }
       return false;
     }
   }
@@ -616,6 +654,7 @@ export const useAuthStore = defineStore('auth', () => {
     offlineSessionGeneration += 1;
     writeCachedAccount(null);
     stopTokenSync();
+    const browserSessionLogout = browserSessionEnabled(JMAP_SERVER_URL) ? clearBrowserSession() : null;
     if (accountId.value != null) {
       try {
         const repo = await getRepositoryAsync();
@@ -626,6 +665,7 @@ export const useAuthStore = defineStore('auth', () => {
       }
     }
     $reset();
+    await browserSessionLogout;
     const oidc = getOidc();
     if (oidc?.isUserLoggedIn) {
       await oidc.logout({ redirectTo: 'home' });

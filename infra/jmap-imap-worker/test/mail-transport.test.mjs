@@ -72,16 +72,18 @@ const sample = [
   '',
 ].join('\r\n');
 
-function makeImapSocket({ mailboxSize = 1 } = {}) {
+function makeImapSocket({ mailboxSize = 1, trash = false, supportsMove = true } = {}) {
   const calls = [];
   let connections = 0;
+  let moved = false;
+  const flags = new Set(['\\Seen']);
   function connect(address, options) {
     connections += 1;
     assert.deepEqual(address, { hostname: endpoint.host, port: 993 });
     assert.equal(options.secureTransport, 'on');
     let current = 'INBOX';
     let authTag;
-    const capability = 'IMAP4rev1 AUTH=PLAIN UIDPLUS MOVE';
+    const capability = `IMAP4rev1 AUTH=PLAIN UIDPLUS${supportsMove ? ' MOVE' : ''}`;
     return scriptedSocket(`* OK [CAPABILITY ${capability}] fixture ready\r\n`, (line, write) => {
       calls.push(line);
       if (authTag) {
@@ -106,17 +108,29 @@ function makeImapSocket({ mailboxSize = 1 } = {}) {
         write('* LIST (\\HasNoChildren \\Archive) "/" "Archive"\r\n');
         write('* LIST (\\HasNoChildren) "/" "INBOX"\r\n');
         write('* LIST (\\Noselect) "/" "Parent"\r\n');
+        if (trash) write('* LIST (\\HasNoChildren \\Trash) "/" "Deleted items"\r\n');
         ok();
       } else if (/^LSUB /i.test(command)) {
         write('* LSUB (\\HasNoChildren) "/" "INBOX"\r\n');
         ok();
       } else if (/^(EXAMINE|SELECT) /i.test(command)) {
         current = /ARCHIVE/i.test(command) ? 'Archive' : 'INBOX';
-        write(`* ${current === 'INBOX' ? mailboxSize : 0} EXISTS\r\n`);
+        write(`* ${current === 'INBOX' && !moved ? mailboxSize : 0} EXISTS\r\n`);
         write('* OK [UIDVALIDITY 7] fixture UID validity\r\n');
         write('* OK [UIDNEXT 45] fixture next UID\r\n');
-        ok('OK [READ-ONLY] selected');
+        ok(`OK [${command.startsWith('SELECT') ? 'READ-WRITE' : 'READ-ONLY'}] selected`);
+      } else if (/^UID STORE 44 ([+-])FLAGS/i.test(command)) {
+        const [, sign, flag] = /^UID STORE 44 ([+-])FLAGS(?:\.SILENT)? \((\\\w+)\)/i.exec(command) ?? [];
+        if (sign === '+') flags.add(flag);
+        if (sign === '-') flags.delete(flag);
+        write(`* 1 FETCH (UID 44 FLAGS (${[...flags].join(' ')}))\r\n`);
+        ok();
+      } else if (/^UID MOVE 44 "Deleted items"$/i.test(command)) {
+        moved = true;
+        write('* 1 EXPUNGE\r\n');
+        ok('OK [COPYUID 8 44 45] moved');
       } else if (/^(UID )?FETCH /i.test(command)) {
+        if (moved) return ok();
         if (/BODY\.PEEK\[\]<0\./i.test(command)) {
           write(`* 1 FETCH (UID 44 BODY[]<0> {${encoder.encode(sample).byteLength}}\r\n${sample})\r\n`);
         } else {
@@ -124,7 +138,7 @@ function makeImapSocket({ mailboxSize = 1 } = {}) {
           const from = '(("Alice" NIL "alice" "example.test"))';
           const to = '((NIL NIL "me" "example.test"))';
           const envelope = `(${date} "A test message" ${from} NIL NIL ${to} NIL NIL "<first@example.test>" "<reply@example.test>")`;
-          write(`* 1 FETCH (UID 44 FLAGS (\\Seen) INTERNALDATE "20-Nov-2026 00:00:00 +0000" RFC822.SIZE ${encoder.encode(sample).byteLength} ENVELOPE ${envelope})\r\n`);
+          write(`* 1 FETCH (UID 44 FLAGS (${[...flags].join(' ')}) INTERNALDATE "20-Nov-2026 00:00:00 +0000" RFC822.SIZE ${encoder.encode(sample).byteLength} ENVELOPE ${envelope})\r\n`);
         }
         ok();
       } else {
@@ -162,6 +176,32 @@ test('rejects stale UIDVALIDITY before sending a UID command', async () => {
   const transport = createMailTransport(fixture.connect);
   await assert.rejects(transport.readMessage(account, 'INBOX', '6', 44), { code: 'mailbox_changed' });
   assert.equal(fixture.calls.some((line) => / FETCH /.test(line)), false);
+});
+
+test('updates flags and moves only to IMAP Trash, with a safe retry after a completed move', async () => {
+  const fixture = makeImapSocket({ trash: true });
+  const transport = createMailTransport(fixture.connect);
+  assert.deepEqual(await transport.patchMessage(account, 'INBOX', '7', 44, { flagged: true }), {
+    uid: 44, seen: true, flagged: true,
+  });
+  assert.deepEqual(await transport.patchMessage(account, 'INBOX', '7', 44, { seen: false }), {
+    uid: 44, seen: false, flagged: true,
+  });
+  assert.equal((await transport.trashMessage(account, 'INBOX', '7', 44)).status, 'moved');
+  assert.deepEqual(await transport.trashMessage(account, 'INBOX', '7', 44), { status: 'absent' });
+  assert.equal(fixture.calls.filter((line) => / UID MOVE /i.test(line)).length, 1);
+  assert.equal(fixture.calls.some((line) => /EXPUNGE|\\Deleted/i.test(line)), false);
+});
+
+test('requires a Trash role and UID MOVE support', async () => {
+  for (const [options, code] of [
+    [{ trash: false }, 'trash_not_configured'],
+    [{ trash: true, supportsMove: false }, 'move_not_supported'],
+  ]) {
+    const fixture = makeImapSocket(options);
+    await assert.rejects(createMailTransport(fixture.connect).trashMessage(account, 'INBOX', '7', 44), { code });
+    assert.equal(fixture.calls.some((line) => / (UID MOVE|UID COPY|UID STORE|EXPUNGE)/i.test(line)), false);
+  }
 });
 
 test('partial FETCH does not make missing UIDs eligible for reconciliation', async () => {

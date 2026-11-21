@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { MUTATION_TYPE } from '../../../src/constants/states';
 import { makeAttentionHandlers } from '../../../src/db/attention';
 import { bootTestEngine } from '../../../src/db/bootstrap-memory';
 import { DB_RPC } from '../../../src/db/protocol';
+import { processMutationRow } from '../../../src/sync/backends/jmap/outbox';
 
 let engine: Awaited<ReturnType<typeof bootTestEngine>>;
 
@@ -13,7 +15,8 @@ beforeEach(async () => {
 afterEach(async () => engine.close());
 
 function fakeRelay() {
-  const server = { online: true, uidValidity: '3', accountTwoOnline: true, lastToken: '' };
+  const server = { online: true, uidValidity: '3', accountTwoOnline: true, lastToken: '',
+    flags: { seen: true, flagged: false }, trashed: false };
   const fetcher = vi.fn(async (url: string, init: RequestInit) => {
     if (!server.online) throw new TypeError('Offline');
     if (url.endsWith('/session')) {
@@ -26,9 +29,21 @@ function fakeRelay() {
         { id: 'home', email: 'me@example.com', name: 'Home' },
       ] });
     }
-    if (url.includes('/messages/')) return Response.json({ text: `Body from ${url.split('/')[5]}` });
+    if (url.includes('/messages/')) {
+      if (init.method === 'PATCH') {
+        expect(init.credentials).toBe('same-origin');
+        Object.assign(server.flags, JSON.parse(String(init.body)));
+        return Response.json({ uid: 12, ...server.flags });
+      }
+      if (init.method === 'POST' && url.includes('/trash?')) {
+        server.trashed = true;
+        return Response.json({ status: 'moved' });
+      }
+      return Response.json({ text: `Body from ${url.split('/')[5]}` });
+    }
     if (url.includes('/home/') && !server.accountTwoOnline) return Response.json({}, { status: 502 });
-    return Response.json({ mailbox: 'INBOX', uidValidity: server.uidValidity, messages: [{ uid: 12, subject: url }] });
+    return Response.json({ mailbox: 'INBOX', uidValidity: server.uidValidity,
+      messages: server.trashed && url.includes('/work/') ? [] : [{ uid: 12, subject: url, ...server.flags }] });
   });
   const handlers = makeAttentionHandlers(engine, { touch: vi.fn() }, fetcher as unknown as typeof fetch);
   return { server, handlers };
@@ -77,5 +92,29 @@ describe('Attention cache', () => {
     expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).states).toEqual({ new: state });
     await handlers[DB_RPC.ATTENTION_SET_STATE]({ ownerId, bundleId: 'new', state: null, replacedIds: [] });
     expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).states).toEqual({});
+  });
+
+  it('applies an IMAP outbox change only to its paired account and updates its cached flags and Trash state', async () => {
+    const { server, handlers } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const cacheFor = async (relayId: string) =>
+      (await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts.find((account) => account.relay_id === relayId)?.messages;
+    const apply = (accountId: number, location: typeof workMessage, action: object) => processMutationRow({
+      transport: null, account: { id: accountId }, handlers,
+      row: { account_id: accountId, mutation_type: MUTATION_TYPE.ATTENTION_IMAP,
+        request_json: JSON.stringify({ location, action }) },
+    });
+
+    expect(await apply(2, workMessage, { type: 'star', value: true })).toMatchObject({ ok: false });
+    expect(await apply(ownerId, { ...workMessage, uidValidity: '4' }, { type: 'star', value: true })).toMatchObject({ ok: false });
+    expect(server.flags.flagged).toBe(false);
+    expect(await apply(ownerId, workMessage, { type: 'star', value: true })).toEqual({ ok: true });
+    expect(await cacheFor('work')).toMatchObject([{ uid: 12, seen: true, flagged: true }]);
+    expect(await cacheFor('home')).toMatchObject([{ uid: 12, seen: true, flagged: false }]);
+    expect(await apply(ownerId, workMessage, { type: 'seen', value: false })).toEqual({ ok: true });
+    expect(await cacheFor('work')).toMatchObject([{ uid: 12, seen: false, flagged: true }]);
+    expect(await apply(ownerId, workMessage, { type: 'trash' })).toEqual({ ok: true });
+    expect(await cacheFor('work')).toEqual([]);
+    expect(await cacheFor('home')).toHaveLength(1);
   });
 });

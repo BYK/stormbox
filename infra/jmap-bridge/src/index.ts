@@ -38,7 +38,7 @@ import { handleWebSocketUpgrade } from './ws';
 import { handleHttpProxy } from './http';
 
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env?: { BROWSER_SESSION_KEY?: string }): Promise<Response> {
     const url = new URL(request.url);
     const route = selectRoute(request);
     if (!route) {
@@ -51,8 +51,8 @@ export default {
       case 'jmap':
       case 'workers-dev':
         return isUpgrade
-          ? handleWebSocketUpgrade(request, route)
-          : handleHttpProxy(request, route);
+          ? handleWebSocketUpgrade(request, route, env?.BROWSER_SESSION_KEY)
+          : handleHttpProxy(request, route, env?.BROWSER_SESSION_KEY);
       default:
         return new Response('Unknown host', { status: 404 });
     }

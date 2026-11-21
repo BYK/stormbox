@@ -8,7 +8,8 @@
  */
 
 import type { AttentionCache } from './attention';
-import type { ImapMessageLocation } from '../sync/backends/imap/attention-relay';
+import { MUTATION_TYPE } from '../constants/states';
+import type { ImapAttentionAction, ImapMessageLocation } from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
 import type {
   AddressBookInventory,
@@ -319,6 +320,22 @@ export class Repository {
 
   readAttentionImapMessage(ownerId: number, location: ImapMessageLocation) {
     return this.call<string>(DB_RPC.ATTENTION_BODY, { ownerId, location });
+  }
+
+  async mutateAttentionImapMessage(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction) {
+    const { id } = await this.insertPendingMutation({
+      accountId: ownerId,
+      mutationType: MUTATION_TYPE.ATTENTION_IMAP,
+      requestJson: JSON.stringify({ location, action }),
+    });
+    const outcome = await this.runMutation(ownerId, id);
+    if (outcome.succeeded > 0) return;
+    if (outcome.failed > 0) {
+      const failure = await this.getPendingMutationError(id);
+      const error = JSON.parse(failure?.error_json ?? '{}');
+      throw new Error(error.message ?? 'Could not update this IMAP message.');
+    }
+    throw new Error('This change is queued until mail reconnects.');
   }
 
   setAttentionBundleState(ownerId: number, bundleId: string, state: BundleState | null, replacedIds: string[]) {

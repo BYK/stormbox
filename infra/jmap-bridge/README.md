@@ -76,12 +76,13 @@ grey-cloud DNS) stay completely untouched. The Worker owns CORS:
 | `Access-Control-Allow-Methods` (preflight) | `GET, HEAD, POST, OPTIONS` |
 | `Access-Control-Allow-Headers` (preflight) | `Authorization, Content-Type, Accept` |
 | `Access-Control-Max-Age` (preflight) | `3600` |
-| `Access-Control-Allow-Credentials` | not set — JMAP auth is `Authorization`, not cookies |
+| `Access-Control-Allow-Credentials` | `true` for `https://webmail.byk.im` on the BYK bridge |
 
 Allowlist per environment (defined in `routes.ts`):
 
 - **Stage**: `https://webmail.stage-thundermail.com`, `https://localhost:3000`, `http://localhost:3000`
 - **Prod**: `https://webmail.thundermail.com`, `https://alpha-app.thundermail.com` (strict, no dev origin)
+- **BYK**: `https://webmail.byk.im`. The app-password sign-in endpoint allows `POST` to issue a session cookie and `DELETE` to clear it. Credentialed JMAP requests send `X-Stormbox-Session: 1`, and WebSocket upgrades use the same cookie and exact origin.
 
 Changing the allowlist only takes effect after `npm run deploy:production`
 republishes the Worker.

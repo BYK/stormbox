@@ -66,8 +66,8 @@ import TagPickerPopover, { type PopoverAnchor } from './TagPickerPopover.vue';
 // even when scrollWidth would technically not overflow.
 const MIN_EMAIL_LAYOUT_WIDTH = 400;
 
-const props = withDefaults(defineProps<{ maximized?: boolean }>(), { maximized: false });
-const emit = defineEmits<{ toggleMaximized: [] }>();
+const props = withDefaults(defineProps<{ maximized?: boolean; backLabel?: string }>(), { maximized: false });
+const emit = defineEmits<{ toggleMaximized: []; back: [] }>();
 const messageViewEl = ref<HTMLElement | null>(null);
 const { height: messageViewHeight } = useElementSize(messageViewEl, undefined, { box: 'border-box' });
 const toolbarEl = ref<HTMLElement | null>(null);
@@ -801,6 +801,10 @@ async function destroy() {
 }
 
 function closeMessageView() {
+  if (props.backLabel) {
+    emit('back');
+    return;
+  }
   mailStore.selectMessage(null);
   mailStore.clearSelection();
 }
@@ -825,7 +829,12 @@ function closeMessageView() {
     </div>
     <article v-else class="message-view__article">
       <header ref="toolbarEl" class="message-view__header">
-        <AppIconButton class="message-view__action message-view__action--back" @click="closeMessageView" title="Back" aria-label="Back">
+        <AppIconButton
+          class="message-view__action message-view__action--back"
+          :title="backLabel ?? 'Back'"
+          :aria-label="backLabel ?? 'Back'"
+          @click="closeMessageView"
+        >
           <ArrowLeft class="message-view__toolbar-icon" :size="18" :stroke-width="1.65" />
         </AppIconButton>
         <!-- Contextual: only in the Junk folder. Labeled and set apart at

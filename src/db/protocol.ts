@@ -57,6 +57,7 @@ export const DB_RPC = Object.freeze({
   ATTENTION_DISCONNECT: 'attention.disconnect',
   ATTENTION_REFRESH: 'attention.refresh',
   ATTENTION_BODY: 'attention.body',
+  ATTENTION_APPLY_IMAP_ACTION: 'attention.applyImapAction',
   ATTENTION_SET_STATE: 'attention.setState',
 
   HEALTHCHECK: 'db.healthcheck',

@@ -1,4 +1,5 @@
-import { AttentionRelay, type ImapMessageLocation, type RelayMessage } from '../sync/backends/imap/attention-relay';
+import { MUTATION_TYPE } from '../constants/states';
+import { AttentionRelay, AttentionRelayError, type ImapAttentionAction, type ImapMessageLocation, type RelayMessage } from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
 import type { Engine } from './engine';
 import { DB_RPC, TABLE_FAMILIES } from './protocol';
@@ -26,7 +27,17 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
   fetcher: typeof globalThis.fetch = globalThis.fetch.bind(globalThis)) {
   const relay = new AttentionRelay(fetcher);
   const refreshing = new Map<number, Promise<string[]>>();
+  const relayOperations = new Map<number, Promise<unknown>>();
   const prefetching = new Set<number>();
+
+  function serializeRelayOperation<T>(ownerId: number, operation: () => Promise<T>): Promise<T> {
+    const previous = relayOperations.get(ownerId) ?? Promise.resolve();
+    const pending = previous.catch(() => {}).then(operation);
+    relayOperations.set(ownerId, pending);
+    return pending.finally(() => {
+      if (relayOperations.get(ownerId) === pending) relayOperations.delete(ownerId);
+    });
+  }
 
   async function isPaired(ownerId: number) {
     return Boolean(await engine.get(
@@ -126,10 +137,67 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
   function refreshOnce(ownerId: number) {
     let pending = refreshing.get(ownerId);
     if (!pending) {
-      pending = refresh(ownerId).finally(() => refreshing.delete(ownerId));
+      pending = serializeRelayOperation(ownerId, () => refresh(ownerId)).finally(() => refreshing.delete(ownerId));
       refreshing.set(ownerId, pending);
     }
     return pending;
+  }
+
+  function terminalImapAction(type: string, message: string) {
+    return { ok: false, error: { type, message, terminal: true } };
+  }
+
+  async function applyImapAction(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction) {
+    if (location?.mailbox !== 'INBOX' || typeof location.accountId !== 'string' || typeof location.uidValidity !== 'string'
+      || !Number.isSafeInteger(location.uid) || location.uid < 1 || location.uid > 0xffffffff
+      || !(action?.type === 'trash'
+        || ((action?.type === 'star' || action?.type === 'seen') && typeof action.value === 'boolean'))) {
+      return terminalImapAction('invalidArguments', 'The pending IMAP change is invalid.');
+    }
+    if (!await isPaired(ownerId)) {
+      return terminalImapAction('imapNotPaired', 'Connect the mail relay to update IMAP mail.');
+    }
+    const key = [ownerId, location.accountId, location.mailbox, location.uidValidity];
+    const snapshot = await engine.get(
+      `SELECT messages_json FROM attention_imap_accounts
+       WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ?`, key,
+    );
+    if (!snapshot) return terminalImapAction('imapMailboxChanged', 'This mailbox changed. Refresh Attention and reopen the message.');
+
+    let flags: Awaited<ReturnType<AttentionRelay['mutate']>>;
+    try {
+      flags = await relay.mutate(location, action);
+    } catch (error) {
+      if (error instanceof AttentionRelayError
+        && (error.status < 500 || ['move_not_supported', 'authentication_failed'].includes(error.code))) {
+        return terminalImapAction(error.code, error.message);
+      }
+      throw error;
+    }
+
+    const messages: RelayMessage[] = JSON.parse(String(snapshot.messages_json));
+    const next = flags
+      ? messages.map((message) => message.uid === location.uid ? { ...message, ...flags } : message)
+      : messages.filter((message) => message.uid !== location.uid);
+    await engine.transaction(async (tx) => {
+      await tx.run(
+        `UPDATE attention_imap_accounts SET messages_json = ?
+         WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ?`,
+        [JSON.stringify(next), ...key],
+      );
+      if (!flags) {
+        await tx.run(
+          `DELETE FROM attention_imap_bodies
+           WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ? AND uid = ?`,
+          [...key, location.uid],
+        );
+      }
+    });
+    broadcaster.touch(TABLE_FAMILIES.ATTENTION);
+    if (flags && action.type !== 'trash' && flags[action.type === 'star' ? 'flagged' : 'seen'] !== action.value) {
+      return terminalImapAction('imapFlagRejected', 'The IMAP server did not apply the requested flag.');
+    }
+    return { ok: true };
   }
 
   return {
@@ -168,16 +236,22 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
       broadcaster.touch(TABLE_FAMILIES.ATTENTION);
       return refreshOnce(ownerId);
     },
-    [DB_RPC.ATTENTION_DISCONNECT]: async ({ ownerId }) => {
+    [DB_RPC.ATTENTION_DISCONNECT]: async ({ ownerId }) => serializeRelayOperation(ownerId, async () => {
       await engine.transaction(async (tx) => {
         await tx.run('DELETE FROM attention_imap_pairing WHERE owner_account_id = ?', [ownerId]);
         await tx.run('DELETE FROM attention_imap_accounts WHERE owner_account_id = ?', [ownerId]);
+        await tx.run('DELETE FROM pending_mutations WHERE account_id = ? AND mutation_type = ? AND local_status != ?', [
+          ownerId, MUTATION_TYPE.ATTENTION_IMAP, 'in_flight',
+        ]);
       });
       broadcaster.touch(TABLE_FAMILIES.ATTENTION);
+      broadcaster.touch(TABLE_FAMILIES.MUTATIONS);
       await relay.disconnect();
-    },
+    }),
     [DB_RPC.ATTENTION_REFRESH]: async ({ ownerId }) => refreshOnce(ownerId),
     [DB_RPC.ATTENTION_BODY]: async ({ ownerId, location }) => readBody(ownerId, location),
+    [DB_RPC.ATTENTION_APPLY_IMAP_ACTION]: async ({ ownerId, location, action }) =>
+      serializeRelayOperation(ownerId, () => applyImapAction(ownerId, location, action)),
     [DB_RPC.ATTENTION_SET_STATE]: async ({ ownerId, bundleId, state, replacedIds }) => {
       await engine.transaction(async (tx) => {
         for (const id of new Set<string>([bundleId, ...replacedIds])) {

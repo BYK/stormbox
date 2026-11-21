@@ -173,6 +173,29 @@ describe('JmapTransport HTTP', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('uses a credentialed JMAP request only at the cookie session origin', async () => {
+    const sessionUrl = 'https://mail.example.com/jmap/session';
+    const fetchMock = makeFetch({
+      [sessionUrl]: () => jsonResponse({ ...SESSION, apiUrl: 'https://other.example.com/jmap' }),
+    });
+    const t = new JmapTransport({
+      sessionUrl,
+      getAuthHeader: async () => undefined,
+      useBrowserSession: true,
+      fetch: fetchMock,
+    });
+
+    await t.fetchSession();
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(sessionUrl, expect.objectContaining({
+      credentials: 'include',
+      redirect: 'error',
+      headers: { Accept: 'application/json', 'X-Stormbox-Session': '1' },
+    }));
+    await expect(t.request([JMAP_CAPS.MAIL], [['Email/get', {}, 'a']]))
+      .rejects.toThrow('Browser sign-in is only sent to the configured mail gateway.');
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it('forces a refetch when force=true', async () => {
     const fetchMock = makeFetch({
       'https://mail.example.com/.well-known/jmap': () => jsonResponse(SESSION),

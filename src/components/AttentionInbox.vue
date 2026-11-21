@@ -14,6 +14,7 @@ const props = withDefaults(defineProps<{
   accountLabels?: Readonly<Record<string, string>>;
   loading?: boolean;
   error?: string | null;
+  openMessage?: TriageMessage;
 }>(), {
   accountLabels: () => ({}),
   loading: false,
@@ -21,7 +22,7 @@ const props = withDefaults(defineProps<{
 });
 
 const emit = defineEmits<{
-  open: [message: TriageMessage];
+  open: [message: TriageMessage, trigger: EventTarget | null];
   done: [bundle: TriageBundle];
   snooze: [bundle: TriageBundle, until: number];
   restore: [bundle: TriageBundle];
@@ -63,6 +64,10 @@ const emptyMessage = computed(() => filters.find(({ key }) => key === selectedFi
 
 function subjectOf(message: TriageMessage): string {
   return message.subject?.trim() || '(no subject)';
+}
+
+function isOpen(message: TriageMessage): boolean {
+  return props.openMessage?.id === message.id && props.openMessage?.accountId === message.accountId;
 }
 
 function accountLabel(bundle: TriageBundle): string {
@@ -172,7 +177,8 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
             <button
               class="attention-inbox__preview"
               type="button"
-              @click="emit('open', bundle.leading.message)"
+              :aria-current="isOpen(bundle.leading.message) || undefined"
+              @click="emit('open', bundle.leading.message, $event.currentTarget)"
             >
               <span class="attention-inbox__subject">{{ subjectOf(bundle.leading.message) }}</span>
               <span class="attention-inbox__details">
@@ -195,6 +201,7 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
             </button>
 
             <div class="attention-inbox__actions">
+              <slot name="message-actions" :message="bundle.leading.message" />
               <button
                 v-if="bundle.messages.length > 1"
                 class="attention-inbox__expand"
@@ -258,8 +265,13 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
             class="attention-inbox__messages"
             aria-label="Messages in bundle"
           >
-            <li v-for="item in bundle.messages" :key="item.message.id">
-              <button class="attention-inbox__preview attention-inbox__message" type="button" @click="emit('open', item.message)">
+            <li v-for="item in bundle.messages" :key="item.message.id" class="attention-inbox__row">
+              <button
+                class="attention-inbox__preview attention-inbox__message"
+                type="button"
+                :aria-current="isOpen(item.message) || undefined"
+                @click="emit('open', item.message, $event.currentTarget)"
+              >
                 <span class="attention-inbox__subject">{{ subjectOf(item.message) }}</span>
                 <span class="attention-inbox__details">
                   <span v-if="senderOf(item.message)" class="attention-inbox__address">{{ senderOf(item.message) }}</span>
@@ -269,6 +281,9 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
                   </time>
                 </span>
               </button>
+              <div v-if="$slots['message-actions']" class="attention-inbox__actions">
+                <slot name="message-actions" :message="item.message" />
+              </div>
             </li>
           </ul>
         </li>
@@ -293,7 +308,7 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
-  justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
   min-height: 56px;
   padding: 8px 18px;
@@ -398,6 +413,10 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
   background: var(--rowHover);
 }
 
+.attention-inbox__preview[aria-current='true'] {
+  background: var(--rowActive);
+}
+
 .attention-inbox__filter:focus-visible,
 .attention-inbox__expand:focus-visible,
 .attention-inbox__snooze-trigger:focus-visible,
@@ -485,7 +504,7 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
   font-weight: 500;
 }
 
-@container (max-width: 420px) {
+@container (max-width: 460px) {
   .attention-inbox__row {
     align-items: start;
     gap: 2px;
@@ -494,6 +513,15 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
 
   .attention-inbox__actions {
     padding-top: 4px;
+  }
+
+  .attention-inbox__row:has(.attention-message-actions) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .attention-inbox__row:has(.attention-message-actions) > .attention-inbox__actions {
+    justify-content: end;
+    padding-top: 0;
   }
 
   .attention-inbox__details {

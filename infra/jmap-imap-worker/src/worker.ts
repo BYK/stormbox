@@ -1,8 +1,8 @@
 import { type Env, accessToken, mailAccounts } from './config';
-import { authorization, HttpError, json, matchesToken, readJson, sessionCookie } from './http';
+import { authorization, HttpError, json, matchesToken, pairedAuthorization, readJson, sessionCookie } from './http';
 import { jmap, session, type JmapStore } from './jmap';
 import {
-  listMailboxes, listMessages, MailTransportError, readMessage, readMessageSource, type MailAccount,
+  listMailboxes, listMessages, MailTransportError, patchMessage, readMessage, readMessageSource, trashMessage, type MailAccount,
 } from './mail-transport';
 import { handlePush } from './push';
 
@@ -46,6 +46,15 @@ function parsedSegments(path: string): string[] {
   }
 }
 
+function readFlagPatch(input: unknown): { seen?: boolean; flagged?: boolean } {
+  if (input == null || typeof input !== 'object') throw new HttpError(400, 'invalid_flags');
+  const entries = Object.entries(input);
+  if (!entries.length || entries.some(([key, value]) => !['seen', 'flagged'].includes(key) || typeof value !== 'boolean')) {
+    throw new HttpError(400, 'invalid_flags');
+  }
+  return Object.fromEntries(entries);
+}
+
 async function relay(request: Request, url: URL, env: Env): Promise<Response> {
   const parts = parsedSegments(url.pathname.slice(RELAY.length + 1));
   if (parts.length === 1 && parts[0] === 'health' && request.method === 'GET') {
@@ -61,21 +70,42 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
     if (!matchesToken(input?.accessToken, secret)) throw new HttpError(401, 'unauthorized');
     return json(null, 204, { 'Set-Cookie': sessionCookie(env, true) });
   }
-  if (!authorization(request, env, true)) throw new HttpError(401, 'unauthorized');
-  if (request.method !== 'GET') throw new HttpError(405, 'method_not_allowed');
+  const authorized = request.method === 'GET'
+    ? authorization(request, env, true)
+    : pairedAuthorization(request, env);
+  if (!authorized) throw new HttpError(401, 'unauthorized');
   const accounts = mailAccounts(env);
   const [resource, id, subresource, uid] = parts;
   if (resource !== 'accounts') throw new HttpError(404, 'not_found');
-  if (parts.length === 1) return json({ accounts: accounts.map(({ id, email, name }) => ({ id, email, name: name ?? email })) });
+  if (parts.length === 1 && request.method === 'GET') {
+    return json({ accounts: accounts.map(({ id, email, name }) => ({ id, email, name: name ?? email })) });
+  }
   const account = accounts.find((entry) => entry.id === id);
   if (!account) throw new HttpError(404, 'account_not_found');
-  if (parts.length === 3 && subresource === 'mailboxes') return json({ mailboxes: await listMailboxes(account) });
+  if (parts.length === 3 && subresource === 'mailboxes' && request.method === 'GET') {
+    return json({ mailboxes: await listMailboxes(account) });
+  }
   if (subresource !== 'messages') throw new HttpError(404, 'not_found');
   const mailbox = url.searchParams.get('mailbox') ?? 'INBOX';
   if (!mailbox || mailbox.length > 1024 || /[\0\r\n]/.test(mailbox)) throw new HttpError(400, 'invalid_mailbox');
-  if (parts.length === 3) return json(await listMessages(account, mailbox, number(url.searchParams.get('limit') ?? '50', 100)));
-  if (parts.length !== 4) throw new HttpError(404, 'not_found');
-  return json(await readMessage(account, mailbox, String(number(url.searchParams.get('uidValidity'), 0xffffffff)), number(uid, 0xffffffff)));
+  if (parts.length === 3 && request.method === 'GET') {
+    return json(await listMessages(account, mailbox, number(url.searchParams.get('limit') ?? '50', 100)));
+  }
+  if (parts.length !== 4 && !(parts.length === 5 && parts[4] === 'trash')) {
+    throw new HttpError(404, 'not_found');
+  }
+  const uidValidity = String(number(url.searchParams.get('uidValidity'), 0xffffffff));
+  const messageUid = number(uid, 0xffffffff);
+  if (parts.length === 4 && request.method === 'GET') {
+    return json(await readMessage(account, mailbox, uidValidity, messageUid));
+  }
+  if (parts.length === 4 && request.method === 'PATCH') {
+    return json(await patchMessage(account, mailbox, uidValidity, messageUid, readFlagPatch(await readJson(request, 4096))));
+  }
+  if (parts.length === 5 && request.method === 'POST') {
+    return json(await trashMessage(account, mailbox, uidValidity, messageUid));
+  }
+  throw new HttpError(405, 'method_not_allowed');
 }
 
 function eventSource(request: Request, accounts: readonly MailAccount[], env: Env): Response {
@@ -169,6 +199,9 @@ function errorResponse(error: unknown): Response {
       case 'mailbox_changed': return json({ error: error.code }, 409);
       case 'message_not_found': return json({ error: error.code }, 404);
       case 'message_too_large': return json({ error: error.code }, 413);
+      case 'same_mailbox':
+      case 'move_not_supported':
+      case 'trash_not_configured': return json({ error: error.code }, 422);
       default: return json({ error: error.code }, 502);
     }
   }

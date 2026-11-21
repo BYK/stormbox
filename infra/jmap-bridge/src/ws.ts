@@ -15,8 +15,9 @@
  */
 
 import type { Route } from './routes';
+import { readBrowserSession } from './browser-session';
 
-export async function handleWebSocketUpgrade(request: Request, route: Route): Promise<Response> {
+export async function handleWebSocketUpgrade(request: Request, route: Route, browserSessionKey?: string): Promise<Response> {
   if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
     return new Response(null, { status: 426 });
   }
@@ -54,7 +55,8 @@ export async function handleWebSocketUpgrade(request: Request, route: Route): Pr
   else if (bearer && basic) {
     return new Response('Pass either access_token OR basic, not both', { status: 400 });
   } else {
-    return new Response('Missing access_token or basic query parameter', { status: 401 });
+    authHeader = await readBrowserSession(request, route, browserSessionKey);
+    if (!authHeader) return new Response('Missing WebSocket credentials', { status: 401 });
   }
 
   const upstream = new URL(url.pathname + url.search, route.upstream);

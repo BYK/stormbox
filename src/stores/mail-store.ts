@@ -244,8 +244,14 @@ export const useMailStore = defineStore('mail', () => {
    * folder is recorded because several columns can be on screen: the
    * reading pane resolves the row from that folder's view and the
    * folder-specific actions (archive, junk, whitelist) act on it.
+   * Attention supplies its own live row because it reads a ranked
+   * inbox window independently of the Mail columns.
    */
-  const openMessageRef = ref<{ id: number | null; folderId: number | null }>({
+  const openMessageRef = ref<{
+    id: number | null;
+    folderId: number | null;
+    getRow?: () => CachedRow;
+  }>({
     id: null,
     folderId: null,
   });
@@ -451,6 +457,7 @@ export const useMailStore = defineStore('mail', () => {
   const openMessage = computed<CachedRow>(() => {
     const id = openMessageRef.value.id;
     if (id == null) return undefined;
+    if (openMessageRef.value.getRow) return openMessageRef.value.getRow();
     return findLoadedRow(id, openMessageRef.value.folderId ?? currentFolderId.value);
   });
   /** Folder the open message was opened from; the primary folder when unknown. */
@@ -1791,11 +1798,11 @@ export const useMailStore = defineStore('mail', () => {
    * guard against fast selection churn) and the cache vs network
    * decision.
    */
-  function selectMessage(messageId: number | null, folderId?: number | null) {
+  function selectMessage(messageId: number | null, folderId?: number | null, getRow?: () => CachedRow) {
     const owner = messageId == null
       ? null
       : (folderId ?? resolveFolderForMessage(messageId));
-    openMessageRef.value = { id: messageId, folderId: owner };
+    openMessageRef.value = { id: messageId, folderId: owner, getRow };
     // Plain navigation, row clicks, list commands, and delete-advance couple the
     // cursor to the preview. Shift+Arrow range extension is the one
     // path that moves the cursor without calling selectMessage.
@@ -1811,7 +1818,12 @@ export const useMailStore = defineStore('mail', () => {
     void bodyPrefetch.loadBodyForDisplay(messageId, token);
     void loadSelectedMessageAddresses(messageId);
 
-    if (!_isSeenInList(messageId, owner)) {
+    if (getRow) {
+      const row = getRow();
+      if (row && Number(row.is_seen) !== 1) {
+        void markManySeen([messageId], true, { sourceFolderId: owner, rows: [row] });
+      }
+    } else if (!_isSeenInList(messageId, owner)) {
       markRead(messageId).catch((err) => {
         console.warn('[mail-store] markRead failed', err);
       });
@@ -2708,6 +2720,7 @@ export const useMailStore = defineStore('mail', () => {
       }
     }
     if (!previewWasRemoved && !checkboxSelectionWasRemoved) return undefined;
+    if (openMessageRef.value.getRow) return null;
 
     let firstRemovedIndex = -1;
     for (let i = 0; i < rows.length; i += 1) {
