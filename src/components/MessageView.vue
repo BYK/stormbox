@@ -14,7 +14,10 @@ import {
   ArrowLeft,
   ChevronDown,
   Clock,
+  Mail,
+  MailOpen,
   Moon,
+  Star,
   Sun,
   Trash2,
 } from '@lucide/vue';
@@ -27,6 +30,7 @@ import { useAuthStore } from '../stores/auth-store';
 import { useComposeStore } from '../stores/compose-store';
 import { useMailStore } from '../stores/mail-store';
 import { useSettingsStore } from '../stores/settings-store';
+import type { ImapAttentionAction, RelayMessageBody } from '../sync/backends/imap/attention-relay';
 import {
   ALLOWED_URI_REGEXP,
   BODY_THEME_COLORS,
@@ -66,8 +70,27 @@ import TagPickerPopover, { type PopoverAnchor } from './TagPickerPopover.vue';
 // even when scrollWidth would technically not overflow.
 const MIN_EMAIL_LAYOUT_WIDTH = 400;
 
-const props = withDefaults(defineProps<{ maximized?: boolean; backLabel?: string }>(), { maximized: false });
-const emit = defineEmits<{ toggleMaximized: []; back: [] }>();
+const props = withDefaults(defineProps<{
+  maximized?: boolean;
+  backLabel?: string;
+  imap?: {
+    id: string;
+    subject: string;
+    from_text: string;
+    to_text: string;
+    ccText: string;
+    received_at: number;
+    keywords_json: string;
+    labels: string[];
+    seen: boolean;
+    flagged: boolean;
+    disabled: boolean;
+    body?: RelayMessageBody;
+    bodyError?: string;
+    actionError?: string;
+  };
+}>(), { maximized: false });
+const emit = defineEmits<{ toggleMaximized: []; back: []; imapAction: [action: ImapAttentionAction] }>();
 const messageViewEl = ref<HTMLElement | null>(null);
 const { height: messageViewHeight } = useElementSize(messageViewEl, undefined, { box: 'border-box' });
 const toolbarEl = ref<HTMLElement | null>(null);
@@ -88,7 +111,7 @@ watch(() => props.maximized, async (maximized) => {
 let sizeChange = 0;
 let fitIframe: (() => void) | null = null;
 async function toggleMaximized() {
-  const messageId = mailStore.selectedMessageId;
+  const messageId = viewMessageId.value;
   const bodyEl = bodyScrollEl.value;
   const scrollRange = bodyEl ? bodyEl.scrollHeight - bodyEl.clientHeight : 0;
   const progress = scrollRange > 0 && bodyEl ? bodyEl.scrollTop / scrollRange : 0;
@@ -109,7 +132,7 @@ async function toggleMaximized() {
   fitIframe?.();
   await nextTick();
   window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-    if (change === sizeChange && messageId === mailStore.selectedMessageId && bodyEl?.isConnected) {
+    if (change === sizeChange && messageId === viewMessageId.value && bodyEl?.isConnected) {
       if (anchor?.isConnected && frame?.isConnected) {
         bodyEl.scrollTop += frame.getBoundingClientRect().top + anchor.getBoundingClientRect().top
           - bodyEl.getBoundingClientRect().top - anchorOffset;
@@ -162,7 +185,13 @@ const iframeBackground = computed(() => {
     : BODY_THEME_COLORS[scheme].background;
 });
 
-const body = computed(() => mailStore.messageBody);
+const isImap = computed(() => props.imap != null);
+const imapBody = computed(() => props.imap?.body);
+const body = computed(() => {
+  if (!isImap.value) return mailStore.messageBody;
+  const source = imapBody.value;
+  return source ? { text: source.text, html: source.html ?? '', attachments: [] } : null;
+});
 // null while the body is still loading; a (possibly empty) object once the
 // load completes. Used to show the loading placeholder only while loading,
 // not for a message that has genuinely no body content.
@@ -183,8 +212,10 @@ const textHtml = computed(() => {
 });
 // The open message is resolved by the store from the folder it was
 // opened in, so a message read from any list column shows here.
-const message = computed(() => mailStore.openMessage ?? null);
-const selectedMessageId = computed(() => mailStore.selectedMessageId);
+const message = computed(() => props.imap ? null : mailStore.openMessage ?? null);
+const viewMessage = computed(() => props.imap ?? message.value);
+const selectedMessageId = computed(() => props.imap ? null : mailStore.selectedMessageId);
+const viewMessageId = computed(() => props.imap?.id ?? selectedMessageId.value);
 const compactHeader = useMediaQuery('(max-width: 639px)');
 const headerExpanded = ref(false);
 const metadataExpanded = computed(() => !compactHeader.value || headerExpanded.value);
@@ -198,10 +229,10 @@ watch(compactHeader, (compact) => {
   }
 });
 const senderText = computed(() => metadataExpanded.value
-  ? message.value?.from_text || '(no sender)'
-  : shortFrom(message.value?.from_text));
+  ? viewMessage.value?.from_text || '(no sender)'
+  : shortFrom(viewMessage.value?.from_text));
 const headerDetailsLabel = computed(() => headerExpanded.value ? 'Hide message details' : 'Show message details');
-watch(selectedMessageId, () => {
+watch(viewMessageId, () => {
   headerExpanded.value = false;
   if (metadataEl.value) metadataEl.value.scrollTop = 0;
 });
@@ -218,7 +249,11 @@ const messageAccountId = computed(() => message.value?.account_id ?? null);
 // single-column layout has no row hover, so this is where a phone user
 // tags a single message.
 const { definitions: tagDefinitions, tagsFor } = useMessageTags();
-const messageTags = computed(() => tagsFor(message.value));
+const messageTags = computed(() => [
+  ...tagsFor(viewMessage.value),
+  ...(props.imap?.labels ?? []).map((label) => ({ keyword: `label:${label}`, name: label, color: null, defined: true })),
+]);
+const seenLabel = computed(() => props.imap?.seen ? 'Mark as unread' : 'Mark as read');
 const messageTagTargets = computed(() => (message.value ? [message.value] : []));
 const canTagMessage = computed(() => message.value != null && !isScheduledMessage(message.value));
 
@@ -301,8 +336,8 @@ function addressText(kind: 'cc' | 'bcc') {
       .map((row) => ({ ...(row.name ? { name: row.name } : {}), email: row.email })),
   );
 }
-const ccText = computed(() => addressText('cc'));
-const bccText = computed(() => addressText('bcc'));
+const ccText = computed(() => props.imap?.ccText ?? addressText('cc'));
+const bccText = computed(() => props.imap ? '' : addressText('bcc'));
 
 let resizeObserver = null;
 let iframeMeasurementCleanup = null;
@@ -408,7 +443,7 @@ watch([body, bodyColorScheme], ([next, colorScheme]) => {
   void renderHtmlBody(next, colorScheme);
 }, { immediate: true });
 
-watch(() => mailStore.selectedMessageId, () => {
+watch(viewMessageId, () => {
   forceLightBody.value = false;
 });
 
@@ -531,7 +566,7 @@ function onIframeLoad() {
 
   const onIframeKeyDown = (event: KeyboardEvent) => {
     onReadingKeyDown(event);
-    invokeThunderbirdShortcut(event);
+    if (!props.imap) invokeThunderbirdShortcut(event);
   };
   doc.addEventListener('keydown', onIframeKeyDown, true);
 
@@ -787,6 +822,10 @@ async function cancelScheduledSend() {
 }
 
 async function destroy() {
+  if (props.imap) {
+    emit('imapAction', { type: 'trash' });
+    return;
+  }
   if (!message.value) return;
   try {
     await mailStore.destroyMessage(message.value.id, messageSource.value);
@@ -824,7 +863,7 @@ function closeMessageView() {
     tabindex="-1"
     @keydown="onReadingKeyDown"
   >
-    <div v-if="!message" class="message-view__empty">
+    <div v-if="!viewMessage" class="message-view__empty">
       <p>Select a message to read it.</p>
     </div>
     <article v-else class="message-view__article">
@@ -841,7 +880,7 @@ function closeMessageView() {
              the leading edge so it reads as a folder-specific action,
              not one of the always-present icon buttons. -->
         <button
-          v-if="canWhitelistInJunk"
+          v-if="!imap && canWhitelistInJunk"
           class="message-view__action message-view__action--whitelist"
           type="button"
           :disabled="whitelisting"
@@ -855,22 +894,43 @@ function closeMessageView() {
              only Back and the view-mode toggle, and the banner below
              owns Cancel Send. -->
         <template v-if="!isPendingScheduled">
-          <AppIconButton v-if="!isInArchiveFolder" class="message-view__action" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
+          <AppIconButton v-if="!imap && !isInArchiveFolder" class="message-view__action" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="archiveIcon" />
           </AppIconButton>
-          <AppIconButton v-if="!isInJunkFolder" class="message-view__action" @click="junk" title="Junk" aria-label="Mark as junk">
+          <AppIconButton v-if="!imap && !isInJunkFolder" class="message-view__action" @click="junk" title="Junk" aria-label="Mark as junk">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="junkIcon" />
           </AppIconButton>
-          <AppIconButton class="message-view__action" danger @click="destroy" :title="actionTitle('Delete', 'delete')" aria-label="Delete">
+          <template v-if="imap">
+            <AppIconButton
+              class="message-view__action"
+              aria-label="Star"
+              :title="imap.flagged ? 'Unstar' : 'Star'"
+              :aria-pressed="imap.flagged"
+              :disabled="imap.disabled"
+              @click="emit('imapAction', { type: 'star', value: !imap.flagged })"
+            >
+              <Star :size="17" :stroke-width="1.75" :fill="imap.flagged ? '#facc15' : 'none'" />
+            </AppIconButton>
+            <AppIconButton
+              class="message-view__action"
+              :aria-label="seenLabel"
+              :title="seenLabel"
+              :disabled="imap.disabled"
+              @click="emit('imapAction', { type: 'seen', value: !imap.seen })"
+            >
+              <component :is="imap.seen ? Mail : MailOpen" :size="17" :stroke-width="1.75" />
+            </AppIconButton>
+          </template>
+          <AppIconButton class="message-view__action" danger :disabled="imap?.disabled" @click="destroy" :title="imap ? 'Move to Trash' : actionTitle('Delete', 'delete')" aria-label="Delete">
             <Trash2 class="message-view__toolbar-icon" :size="18" :stroke-width="1.65" />
           </AppIconButton>
-          <AppIconButton class="message-view__action" @click="reply" :title="actionTitle('Reply', 'reply')" aria-label="Reply">
+          <AppIconButton v-if="!imap" class="message-view__action" @click="reply" :title="actionTitle('Reply', 'reply')" aria-label="Reply">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="replyIcon" />
           </AppIconButton>
-          <AppIconButton class="message-view__action" @click="replyAll" :title="actionTitle('Reply All', 'replyAll')" aria-label="Reply All">
+          <AppIconButton v-if="!imap" class="message-view__action" @click="replyAll" :title="actionTitle('Reply All', 'replyAll')" aria-label="Reply All">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="replyAllIcon" />
           </AppIconButton>
-          <AppIconButton class="message-view__action" @click="forward" :title="actionTitle('Forward', 'forward')" aria-label="Forward">
+          <AppIconButton v-if="!imap" class="message-view__action" @click="forward" :title="actionTitle('Forward', 'forward')" aria-label="Forward">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="forwardIcon" />
           </AppIconButton>
           <!-- The message's tag stack (MK-6.5); opens the tag menu. -->
@@ -955,9 +1015,9 @@ function closeMessageView() {
             <dt>From</dt>
             <dd>{{ senderText }}</dd>
           </div>
-          <div v-if="message.to_text" v-show="metadataExpanded" class="message-view__metadata-row">
+          <div v-if="viewMessage.to_text" v-show="metadataExpanded" class="message-view__metadata-row">
             <dt>To</dt>
-            <dd>{{ message.to_text }}</dd>
+            <dd>{{ viewMessage.to_text }}</dd>
           </div>
           <div v-if="ccText" v-show="metadataExpanded" class="message-view__metadata-row">
             <dt>Cc</dt>
@@ -969,12 +1029,12 @@ function closeMessageView() {
           </div>
           <div class="message-view__metadata-row message-view__title">
             <dt>Subject</dt>
-            <dd><h2>{{ message.subject || '(no subject)' }}</h2></dd>
+            <dd><h2>{{ viewMessage.subject || '(no subject)' }}</h2></dd>
           </div>
           <div v-show="metadataExpanded" class="message-view__metadata-row">
             <dt>{{ hasScheduledBanner ? 'Send at' : 'Date' }}</dt>
             <dd class="message-view__date">
-              {{ fmtDate(hasScheduledBanner ? (message.sent_at ?? message.received_at) : message.received_at) }}
+              {{ fmtDate(hasScheduledBanner ? (message?.sent_at ?? viewMessage.received_at) : viewMessage.received_at) }}
             </dd>
           </div>
           <div
@@ -996,6 +1056,7 @@ function closeMessageView() {
         </dl>
       </section>
       <div ref="bodyScrollEl" class="message-view__body" tabindex="0" aria-label="Message body">
+        <p v-if="imap?.actionError" class="message-view__placeholder" role="alert">{{ imap.actionError }}</p>
         <div
           v-if="iframeSrcDoc"
           ref="htmlShellRef"
@@ -1015,11 +1076,13 @@ function closeMessageView() {
           />
         </div>
         <div v-else-if="textHtml" class="message-view__text" v-html="textHtml" />
+        <p v-else-if="imap?.bodyError" class="message-view__placeholder" role="alert">{{ imap.bodyError }}</p>
         <p v-else-if="!bodyLoaded" class="message-view__placeholder">
           {{ authStore.isOfflineSession && message?.body_fetched_at == null
             ? 'Reconnect to download this message.'
             : 'Loading message…' }}
         </p>
+        <p v-else-if="imap" class="message-view__placeholder">This message has no body.</p>
         <MessageAttachmentPreviews
           :rows="attachmentRows"
           @preview="previewAttachment"

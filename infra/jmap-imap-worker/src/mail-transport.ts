@@ -50,6 +50,8 @@ export interface ImapMessage {
   from: MailAddress[];
   to: MailAddress[];
   cc: MailAddress[];
+  keywords: string[];
+  labels: string[];
   receivedAt: string;
   size: number;
   seen: boolean;
@@ -93,6 +95,7 @@ const MAX_WINDOW_SIZE = 500;
 const MESSAGE_QUERY: FetchQueryObject = {
   envelope: true,
   flags: true,
+  labels: true,
   internalDate: true,
   size: true,
   bodyStructure: true,
@@ -120,6 +123,8 @@ function envelope(message: FetchMessageObject): ImapMessage {
     from: addresses(fields?.from),
     to: addresses(fields?.to),
     cc: addresses(fields?.cc),
+    keywords: [...(message.flags ?? [])].filter((flag) => !flag.startsWith('\\')),
+    labels: [...(message.labels ?? [])].filter((label) => !label.startsWith('\\')),
     receivedAt: new Date(Number.isNaN(receivedAtMs) ? 0 : receivedAtMs).toISOString(),
     size: message.size ?? 0,
     seen: message.flags?.has('\\Seen') ?? false,

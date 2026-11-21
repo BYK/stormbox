@@ -8,6 +8,7 @@ import UnifiedAttention from '../../../src/components/UnifiedAttention.vue';
 import { __resetRepositoryForTests, __setRepositoryForTests } from '../../../src/composables/useRepository';
 import { useAuthStore } from '../../../src/stores/auth-store';
 import { useMailStore } from '../../../src/stores/mail-store';
+import type { RelayMessageBody } from '../../../src/sync/backends/imap/attention-relay';
 import type { FolderRow } from '../../../src/types';
 
 vi.mock('../../../src/services/auth', () => ({ initOidc: vi.fn(), getOidc: vi.fn() }));
@@ -105,6 +106,90 @@ it('opens the regular JMAP reader in Attention and keeps the filter and focus on
   } finally {
     wrapper.unmount();
     stop();
+    __resetRepositoryForTests();
+  }
+});
+
+it('keeps the shared reader mounted while loading IMAP HTML and sends its toolbar actions to the relay account', async () => {
+  const row = {
+    uid: 17, subject: 'Newsletter issue', receivedAt: '2026-11-21T20:00:00Z', seen: true, flagged: false,
+    from: [{ name: 'Newsletter', address: 'updates@example.org' }],
+    to: [{ name: '', address: 'my-gmail@example.org' }],
+    cc: [{ name: 'Subscriber', address: 'subscriber@example.net' }],
+    labels: ['Read later'], keywords: ['localtriage-category-newsletter'],
+  };
+  let messages = [row];
+  let receiveBody!: (body: RelayMessageBody) => void;
+  const download = new Promise<RelayMessageBody>((resolve) => { receiveBody = resolve; });
+  const readAttentionImapMessage = vi.fn(async (_owner, _location, cachedOnly) => cachedOnly
+    ? { text: 'Previously downloaded text', html: null } : download);
+  const mutateAttentionImapMessage = vi.fn(async (_owner, _location, action) => {
+    if (action.type === 'star') row.flagged = action.value;
+    if (action.type === 'seen') row.seen = action.value;
+    if (action.type === 'trash') messages = [];
+  });
+  __setRepositoryForTests({
+    subscribe: () => () => {},
+    getAttentionCache: async () => ({ paired: true, accounts: [{
+      relay_id: 'personal-gmail', address: 'my-gmail@example.org', name: 'Gmail',
+      mailbox: 'INBOX', uid_validity: '3', messages,
+    }], states: {} }),
+    folderByRole: async () => undefined,
+    refreshAttentionRelay: async () => [],
+    readAttentionImapMessage,
+    mutateAttentionImapMessage,
+  });
+  const wrapper = mount(UnifiedAttention, {
+    attachTo: document.body,
+    props: { ownerId: 1, address: 'owner@example.org' },
+    global: { plugins: [createPinia()] },
+  });
+
+  try {
+    await flushPromises();
+    const open = wrapper.get('.msg-list__open');
+    await open.trigger('click');
+    await flushPromises();
+    const reader = wrapper.get('.message-view');
+    const header = reader.get('[aria-label="Message header"]');
+    const back = reader.get('[aria-label="Back to Attention"]');
+    expect(header.text()).toContain('Newsletter <updates@example.org>');
+    expect(header.text()).toContain('my-gmail@example.org');
+    expect(header.text()).toContain('Subscriber <subscriber@example.net>');
+    expect(header.text()).toContain('Read later');
+    expect(header.text()).toContain('localtriage-category-newsletter');
+    expect(reader.text()).toContain('Previously downloaded text');
+    expect(reader.find('iframe').exists()).toBe(false);
+    const location = { accountId: 'personal-gmail', mailbox: 'INBOX', uidValidity: '3', uid: 17 };
+    expect(readAttentionImapMessage).toHaveBeenNthCalledWith(1, 1, location, true);
+    expect(readAttentionImapMessage).toHaveBeenNthCalledWith(2, 1, location);
+
+    receiveBody({ text: '', html: '<p><strong>Formatted newsletter</strong></p>' });
+    await flushPromises();
+    expect(reader.get('iframe').attributes('srcdoc')).toContain('<strong>Formatted newsletter</strong>');
+    expect(reader.get('[aria-label="Message header"]').element).toBe(header.element);
+    expect(reader.get('[aria-label="Back to Attention"]').element).toBe(back.element);
+    await back.trigger('click');
+    expect(document.activeElement).toBe(open.element);
+    await open.trigger('click');
+    await flushPromises();
+
+    const reopened = wrapper.get('.message-view');
+    const star = reopened.get('[aria-label="Star"]');
+    await star.trigger('click');
+    await flushPromises();
+    expect(mutateAttentionImapMessage).toHaveBeenLastCalledWith(1, location, { type: 'star', value: true });
+    expect(star.attributes('aria-pressed')).toBe('true');
+    await reopened.get('[aria-label="Mark as unread"]').trigger('click');
+    await flushPromises();
+    expect(mutateAttentionImapMessage).toHaveBeenLastCalledWith(1, location, { type: 'seen', value: false });
+    expect(reopened.find('[aria-label="Mark as read"]').exists()).toBe(true);
+    await reopened.get('[aria-label="Delete"]').trigger('click');
+    await flushPromises();
+    expect(mutateAttentionImapMessage).toHaveBeenLastCalledWith(1, location, { type: 'trash' });
+    expect(wrapper.find('.message-view').exists()).toBe(false);
+  } finally {
+    wrapper.unmount();
     __resetRepositoryForTests();
   }
 });

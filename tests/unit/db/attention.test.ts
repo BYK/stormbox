@@ -40,7 +40,8 @@ function fakeRelay() {
         server.trashed = true;
         return Response.json({ status: 'moved' });
       }
-      return Response.json({ text: `Body from ${url.split('/')[5]}` });
+      const text = `Body from ${url.split('/')[5]}`;
+      return Response.json({ text, html: `<p>${text}</p>` });
     }
     if (url.includes('/home/') && !server.accountTwoOnline) return Response.json({}, { status: 502 });
     return Response.json({ mailbox: 'INBOX', uidValidity: server.uidValidity,
@@ -75,14 +76,32 @@ describe('Attention cache', () => {
     const cached = await handlers[DB_RPC.ATTENTION_GET]({ ownerId });
     expect(cached.accounts.map((account) => account.relay_id)).toEqual(['home', 'work']);
     expect(await handlers[DB_RPC.ATTENTION_GET]({ ownerId: 2 })).toEqual({ paired: false, accounts: [], states: {} });
-    expect(await handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: workMessage })).toBe('Body from work');
+    const body = { text: 'Body from work', html: '<p>Body from work</p>' };
+    expect(await handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: workMessage })).toEqual(body);
     const withBody = await handlers[DB_RPC.ATTENTION_GET]({ ownerId });
     expect(withBody.accounts.find((account) => account.relay_id === 'work').messages[0].preview).toBe('Body from work');
     server.online = false;
-    expect(await handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: workMessage })).toBe('Body from work');
+    expect(await handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: workMessage, cachedOnly: true })).toEqual(body);
     await expect(handlers[DB_RPC.ATTENTION_REFRESH]({ ownerId })).rejects.toThrow('Offline');
     expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts.map((account) => account.relay_id))
       .toEqual(cached.accounts.map((account) => account.relay_id));
+  });
+
+  it('retains a legacy plaintext body offline and fills in its HTML when it reconnects', async () => {
+    const { server, handlers } = fakeRelay();
+    const args = { ownerId, location: workMessage };
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    await handlers[DB_RPC.ATTENTION_BODY](args);
+    await engine.run(`UPDATE attention_imap_bodies SET body_text = 'Previously saved', body_html = NULL WHERE relay_id = 'work'`);
+
+    const cached = { text: 'Previously saved', html: null };
+    server.online = false;
+    expect(await handlers[DB_RPC.ATTENTION_BODY]({ ...args, cachedOnly: true })).toEqual(cached);
+    expect(await handlers[DB_RPC.ATTENTION_BODY](args)).toEqual(cached);
+    server.online = true;
+    const upgraded = { text: 'Body from work', html: '<p>Body from work</p>' };
+    expect(await handlers[DB_RPC.ATTENTION_BODY](args)).toEqual(upgraded);
+    expect(await handlers[DB_RPC.ATTENTION_BODY]({ ...args, cachedOnly: true })).toEqual(upgraded);
   });
 
   it('keeps accounts with transient failures and discards bodies when UIDVALIDITY changes', async () => {

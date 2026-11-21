@@ -1,7 +1,7 @@
 import { MUTATION_TYPE } from '../constants/states';
 import {
   AttentionRelay, AttentionRelayError, type ImapAttentionAction, type ImapMessageLocation,
-  type RelayAccountInput, type RelayMessage,
+  type RelayAccountInput, type RelayMessage, type RelayMessageBody,
 } from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
 import type { Engine } from './engine';
@@ -24,6 +24,7 @@ export interface AttentionCache {
 
 const PREFETCH_COUNT = 5;
 const BODY_CACHE_LIMIT = 100;
+const BODY_CACHE_BYTES = 64 * 1024 * 1024;
 const BODY_CHARACTERS = 512_000;
 
 export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (table: string) => void },
@@ -54,14 +55,17 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     }
   }
 
-  async function readBody(ownerId: number, location: ImapMessageLocation): Promise<string> {
+  async function readBody(ownerId: number, location: ImapMessageLocation, cachedOnly = false): Promise<RelayMessageBody | null> {
     const { accountId, mailbox, uidValidity, uid } = location;
     const key = [ownerId, accountId, mailbox, uidValidity, uid];
-    const cached = await engine.get(
-      `SELECT body_text FROM attention_imap_bodies WHERE owner_account_id = ?
+    const record = await engine.get(
+      `SELECT body_text, body_html FROM attention_imap_bodies WHERE owner_account_id = ?
        AND relay_id = ? AND mailbox = ? AND uid_validity = ? AND uid = ?`, key,
     );
-    if (cached) return String(cached.body_text);
+    const cached = record ? {
+      text: String(record.body_text), html: record.body_html == null ? null : String(record.body_html),
+    } : null;
+    if (cachedOnly || cached?.html != null) return cached;
     const snapshot = await engine.get(
       `SELECT 1 FROM attention_imap_accounts WHERE owner_account_id = ?
        AND relay_id = ? AND mailbox = ? AND uid_validity = ?`, key.slice(0, 4),
@@ -69,20 +73,34 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     if (!snapshot || !await isPaired(ownerId)) {
       throw new Error('Refresh Attention before opening this message.');
     }
-    const body = (await relay.body(location)).slice(0, BODY_CHARACTERS);
+    let body: RelayMessageBody;
+    try {
+      const downloaded = await relay.body(location);
+      body = { text: downloaded.text.slice(0, BODY_CHARACTERS), html: downloaded.html ?? '' };
+    } catch (cause) {
+      if (cached) return cached;
+      throw cause;
+    }
     await engine.transaction(async (tx) => {
       await tx.run(
-        `INSERT OR IGNORE INTO attention_imap_bodies
-           (owner_account_id, relay_id, mailbox, uid_validity, uid, body_text, cached_at)
-         SELECT ?, relay_id, mailbox, uid_validity, ?, ?, ? FROM attention_imap_accounts
-         WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ?`,
-        [ownerId, uid, body, Date.now(), ...key.slice(0, 4)],
+        `INSERT INTO attention_imap_bodies
+           (owner_account_id, relay_id, mailbox, uid_validity, uid, body_text, body_html, cached_at)
+         SELECT ?, relay_id, mailbox, uid_validity, ?, ?, ?, ? FROM attention_imap_accounts
+         WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ?
+         ON CONFLICT (owner_account_id, relay_id, mailbox, uid_validity, uid) DO UPDATE SET
+           body_text = excluded.body_text, body_html = excluded.body_html, cached_at = excluded.cached_at
+         WHERE attention_imap_bodies.body_html IS NULL`,
+        [ownerId, uid, body.text, body.html, Date.now(), ...key.slice(0, 4)],
       );
       await tx.run(
-        `DELETE FROM attention_imap_bodies WHERE owner_account_id = ? AND relay_id = ? AND rowid IN (
-           SELECT rowid FROM attention_imap_bodies WHERE owner_account_id = ? AND relay_id = ?
-           ORDER BY cached_at DESC, rowid DESC LIMIT -1 OFFSET ?
-         )`, [ownerId, accountId, ownerId, accountId, BODY_CACHE_LIMIT],
+        `DELETE FROM attention_imap_bodies WHERE rowid IN (
+           SELECT rowid FROM (
+             SELECT rowid, ROW_NUMBER() OVER newest AS position,
+                    SUM(octet_length(body_text) + COALESCE(octet_length(body_html), 0)) OVER newest AS total_bytes
+             FROM attention_imap_bodies WHERE owner_account_id = ? AND relay_id = ?
+             WINDOW newest AS (ORDER BY cached_at DESC, rowid DESC)
+           ) WHERE position > ? OR total_bytes > ?
+         )`, [ownerId, accountId, BODY_CACHE_LIMIT, BODY_CACHE_BYTES],
       );
     });
     broadcaster.touch(TABLE_FAMILIES.ATTENTION);
@@ -280,7 +298,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
         );
         broadcaster.touch(TABLE_FAMILIES.ATTENTION);
       }),
-    [DB_RPC.ATTENTION_BODY]: async ({ ownerId, location }) => readBody(ownerId, location),
+    [DB_RPC.ATTENTION_BODY]: async ({ ownerId, location, cachedOnly = false }) => readBody(ownerId, location, cachedOnly),
     [DB_RPC.ATTENTION_APPLY_IMAP_ACTION]: async ({ ownerId, location, action }) =>
       serializeRelayOperation(ownerId, () => applyImapAction(ownerId, location, action)),
     [DB_RPC.ATTENTION_SET_STATE]: async ({ ownerId, bundleId, state, replacedIds }) => {

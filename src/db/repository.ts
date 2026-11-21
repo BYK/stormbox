@@ -9,7 +9,7 @@
 
 import type { AttentionCache } from './attention';
 import { MUTATION_TYPE } from '../constants/states';
-import type { ImapAttentionAction, ImapMessageLocation, RelayAccount, RelayAccountInput, RelayAccountSettings } from '../sync/backends/imap/attention-relay';
+import type { ImapAttentionAction, ImapMessageLocation, RelayAccount, RelayAccountInput, RelayAccountSettings, RelayMessageBody } from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
 import type {
   AddressBookInventory,
@@ -334,8 +334,8 @@ export class Repository {
     return this.call<void>(DB_RPC.ATTENTION_REMOVE_RELAY_ACCOUNT, { ownerId, id });
   }
 
-  readAttentionImapMessage(ownerId: number, location: ImapMessageLocation) {
-    return this.call<string>(DB_RPC.ATTENTION_BODY, { ownerId, location });
+  readAttentionImapMessage(ownerId: number, location: ImapMessageLocation, cachedOnly = false) {
+    return this.call<RelayMessageBody | null>(DB_RPC.ATTENTION_BODY, { ownerId, location, cachedOnly });
   }
 
   async mutateAttentionImapMessage(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction) {

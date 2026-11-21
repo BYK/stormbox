@@ -72,7 +72,7 @@ const sample = [
   '',
 ].join('\r\n');
 
-function makeImapSocket({ mailboxSize = 1, trash = false, supportsMove = true, oauth = false } = {}) {
+function makeImapSocket({ mailboxSize = 1, trash = false, supportsMove = true, oauth = false, gmail = false } = {}) {
   const calls = [];
   let connections = 0;
   let moved = false;
@@ -83,7 +83,7 @@ function makeImapSocket({ mailboxSize = 1, trash = false, supportsMove = true, o
     assert.equal(options.secureTransport, 'on');
     let current = 'INBOX';
     let authTag;
-    const capability = `IMAP4rev1 AUTH=${oauth ? 'XOAUTH2' : 'PLAIN'} UIDPLUS${supportsMove ? ' MOVE' : ''}`;
+    const capability = `IMAP4rev1 AUTH=${oauth ? 'XOAUTH2' : 'PLAIN'} UIDPLUS${supportsMove ? ' MOVE' : ''}${gmail ? ' X-GM-EXT-1' : ''}`;
     return scriptedSocket(`* OK [CAPABILITY ${capability}] fixture ready\r\n`, (line, write) => {
       calls.push(line);
       if (authTag) {
@@ -138,7 +138,8 @@ function makeImapSocket({ mailboxSize = 1, trash = false, supportsMove = true, o
           const from = '(("Alice" NIL "alice" "example.test"))';
           const to = '((NIL NIL "me" "example.test"))';
           const envelope = `(${date} "A test message" ${from} NIL NIL ${to} NIL NIL "<first@example.test>" "<reply@example.test>")`;
-          write(`* 1 FETCH (UID 44 FLAGS (${[...flags].join(' ')}) INTERNALDATE "20-Nov-2026 00:00:00 +0000" RFC822.SIZE ${encoder.encode(sample).byteLength} ENVELOPE ${envelope})\r\n`);
+          const labels = /X-GM-LABELS/.test(command) ? ' X-GM-LABELS ("\\\\Inbox" "Read later")' : '';
+          write(`* 1 FETCH (UID 44 FLAGS (${[...flags].join(' ')} localtriage-category-newsletter) INTERNALDATE "20-Nov-2026 00:00:00 +0000" RFC822.SIZE ${encoder.encode(sample).byteLength} ENVELOPE ${envelope}${labels})\r\n`);
         }
         ok();
       } else {
@@ -169,6 +170,15 @@ test('lists and reads multiple IMAP windows over one TLS connection', async () =
   const body = await transport.readMessage(account, 'INBOX', '7', 44);
   assert.match(body.text, /Hi from IMAP!/);
   assert.equal(new TextDecoder().decode(await transport.readMessageSource(account, 'INBOX', '7', 44)), sample);
+});
+
+test('reads custom Gmail labels and IMAP keywords from the message list', async () => {
+  const fixture = makeImapSocket({ gmail: true });
+  const transport = createMailTransport(fixture.connect);
+  const { messages } = await transport.listMessages(account, 'INBOX', 10);
+
+  assert.deepEqual(messages[0].labels, ['Read later']);
+  assert.deepEqual(messages[0].keywords, ['localtriage-category-newsletter']);
 });
 
 test('rejects stale UIDVALIDITY before sending a UID command', async () => {

@@ -47,6 +47,9 @@ export interface RelayMessage {
   preview?: string;
   from: MailAddress[];
   to: MailAddress[];
+  cc?: MailAddress[];
+  keywords?: string[];
+  labels?: string[];
   receivedAt: string;
   seen: boolean;
   flagged: boolean;
@@ -56,6 +59,11 @@ export interface RelayWindow {
   mailbox: string;
   uidValidity: string;
   messages: RelayMessage[];
+}
+
+export interface RelayMessageBody {
+  text: string;
+  html: string | null;
 }
 
 export interface ImapMessageLocation {
@@ -152,9 +160,9 @@ export class AttentionRelay {
     return this.json(`/accounts/${encodeURIComponent(accountId)}/messages?mailbox=INBOX&limit=50`);
   }
 
-  async body(location: ImapMessageLocation): Promise<string> {
-    const body = await this.json<{ text: string }>(messagePath(location));
-    return body.text;
+  async body(location: ImapMessageLocation): Promise<RelayMessageBody> {
+    const body = await this.json<{ text: string; html?: string }>(messagePath(location));
+    return { text: body.text, html: body.html ?? '' };
   }
 
   async mutate(location: ImapMessageLocation, action: ImapAttentionAction): Promise<Pick<RelayMessage, 'seen' | 'flagged'> | null> {
