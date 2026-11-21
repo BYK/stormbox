@@ -178,6 +178,13 @@ test('rejects stale UIDVALIDITY before sending a UID command', async () => {
   assert.equal(fixture.calls.some((line) => / FETCH /.test(line)), false);
 });
 
+test('verifies credentials by opening Inbox read-only without fetching or changing mail', async () => {
+  const fixture = makeImapSocket();
+  await createMailTransport(fixture.connect).verifyImapAccount(account);
+  assert.equal(fixture.calls.some((line) => / EXAMINE INBOX$/i.test(line)), true);
+  assert.equal(fixture.calls.some((line) => / (FETCH|UID (FETCH|STORE)|SELECT) /i.test(line)), false);
+});
+
 test('updates flags and moves only to IMAP Trash, with a safe retry after a completed move', async () => {
   const fixture = makeImapSocket({ trash: true });
   const transport = createMailTransport(fixture.connect);

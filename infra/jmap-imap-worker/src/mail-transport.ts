@@ -209,6 +209,10 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     return withClient(account.imap, readFolders);
   }
 
+  async function verifyImapAccount(account: MailAccount): Promise<void> {
+    await withMailbox(account, 'INBOX', { readOnly: true }, async () => {});
+  }
+
   function readWindow(client: ImapFlow, mailbox: string, limit: number): Promise<ImapWindow> {
     const count = Number.isSafeInteger(limit) ? Math.min(MAX_WINDOW_SIZE, Math.max(1, limit)) : 50;
     return withSelectedMailbox(client, mailbox, { readOnly: true }, async (selected) => {
@@ -363,9 +367,9 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     }
   }
 
-  return { listMailboxes, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, moveMessage, trashMessage, submitMessage };
+  return { listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, moveMessage, trashMessage, submitMessage };
 }
 
 export const {
-  listMailboxes, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, moveMessage, trashMessage, submitMessage,
+  listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, moveMessage, trashMessage, submitMessage,
 } = createMailTransport();

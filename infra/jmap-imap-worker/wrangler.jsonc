@@ -20,6 +20,10 @@
       {
         "name": "PUSH_SUBSCRIPTIONS",
         "class_name": "PushSubscriptions"
+      },
+      {
+        "name": "MANAGED_ACCOUNTS",
+        "class_name": "ManagedAccounts"
       }
     ]
   },
@@ -34,6 +38,12 @@
       "tag": "push-v1",
       "new_sqlite_classes": [
         "PushSubscriptions"
+      ]
+    },
+    {
+      "tag": "managed-accounts-v1",
+      "new_sqlite_classes": [
+        "ManagedAccounts"
       ]
     }
   ]

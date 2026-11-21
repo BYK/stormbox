@@ -34,6 +34,7 @@ test('Attention reads JMAP and IMAP and retains triage state and a downloaded bo
     await page.getByRole('button', { name: 'Connect IMAP accounts' }).click();
     await page.getByLabel('Mail relay pairing token').fill(pairToken);
     await page.getByRole('button', { name: 'Connect', exact: true }).click();
+    await page.getByRole('button', { name: 'Close IMAP accounts' }).click();
 
     const jmapRow = page.locator('.attention-inbox__bundle').filter({ hasText: jmapSubject });
     const imapRow = page.locator('.attention-inbox__bundle').filter({ hasText: imapSubject });
@@ -115,6 +116,7 @@ test('Attention applies IMAP star, read state and Trash to the row, local cache 
     await page.getByRole('button', { name: 'Connect IMAP accounts' }).click();
     await page.getByLabel('Mail relay pairing token').fill(pairToken);
     await page.getByRole('button', { name: 'Connect', exact: true }).click();
+    await page.getByRole('button', { name: 'Close IMAP accounts' }).click();
     const row = page.locator('.attention-inbox__bundle').filter({ hasText: subject });
     const actions = row.getByRole('group', { name: 'Message actions' }).first();
     const star = actions.getByRole('button', { name: 'Star', exact: true });

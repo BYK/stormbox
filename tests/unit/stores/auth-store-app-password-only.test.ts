@@ -58,7 +58,10 @@ describe('auth-store app-password-only mode', () => {
     await authStore.initialize();
     expect(fetchMock).not.toHaveBeenCalled();
     expect(await authStore.connectWithPassword({ username: 'test', password: 'test-app-password' })).toBe(true);
-    expect(fetchMock).toHaveBeenCalledExactlyOnceWith('https://jmap.byk.im/jmap/browser-session', expect.objectContaining({
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/imap/v1/session', expect.objectContaining({
+      method: 'DELETE', credentials: 'same-origin',
+    }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, 'https://jmap.byk.im/jmap/browser-session', expect.objectContaining({
       method: 'POST', credentials: 'include',
       headers: { Authorization: `Basic ${btoa('test:test-app-password')}` },
     }));
@@ -69,7 +72,7 @@ describe('auth-store app-password-only mode', () => {
     await reopened.initialize();
     expect(reopened.isConnected).toBe(true);
     expect(reopened.accountId).toBe(42);
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(startSyncAccount).toHaveBeenCalledTimes(2);
     for (const call of startSyncAccount.mock.calls) {
       expect(call[0]).toEqual(expect.objectContaining({
@@ -91,12 +94,15 @@ describe('auth-store app-password-only mode', () => {
     expect(await authStore.connectWithPassword({ username: 'test', password: 'test-app-password' })).toBe(true);
     online.mockReturnValue(false);
     await authStore.logout();
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
 
     online.mockReturnValue(true);
     setActivePinia(createPinia());
     const reopened = useAuthStore();
     await reopened.initialize();
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/imap/v1/session', expect.objectContaining({
+      method: 'DELETE', credentials: 'same-origin',
+    }));
     expect(fetchMock).toHaveBeenLastCalledWith('https://jmap.byk.im/jmap/browser-session', expect.objectContaining({
       method: 'DELETE', credentials: 'include',
     }));

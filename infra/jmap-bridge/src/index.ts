@@ -30,15 +30,16 @@
  *     bearing HTTP requests never land in Cloudflare Logs.
  *   - No caching. Streaming passthrough except for the small session
  *     document, which is parsed only to rewrite URLs back at us.
- *   - No credentials of its own. Auth is whatever the client sent.
+ *   - Upstream authentication comes from the caller's Thundermail session.
  */
 
 import { classifyHost, selectRoute } from './routes';
 import { handleWebSocketUpgrade } from './ws';
 import { handleHttpProxy } from './http';
+import type { RelaySessionConfig } from './relay-session';
 
 export default {
-  async fetch(request: Request, env?: { BROWSER_SESSION_KEY?: string }): Promise<Response> {
+  async fetch(request: Request, env?: RelaySessionConfig & { BROWSER_SESSION_KEY?: string }): Promise<Response> {
     const url = new URL(request.url);
     const route = selectRoute(request);
     if (!route) {
@@ -52,7 +53,7 @@ export default {
       case 'workers-dev':
         return isUpgrade
           ? handleWebSocketUpgrade(request, route, env?.BROWSER_SESSION_KEY)
-          : handleHttpProxy(request, route, env?.BROWSER_SESSION_KEY);
+          : handleHttpProxy(request, route, env?.BROWSER_SESSION_KEY, env);
       default:
         return new Response('Unknown host', { status: 404 });
     }

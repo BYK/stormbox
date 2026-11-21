@@ -1,12 +1,16 @@
-import { type Env, accessToken, mailAccounts } from './config';
-import { authorization, HttpError, json, matchesToken, pairedAuthorization, readJson, sessionCookie } from './http';
+import { type Env, accessToken, mailAccounts, MAX_IMAP_ACCOUNTS } from './config';
+import { authorization, consumeSessionAssertion, HttpError, json, matchesToken, pairedAuthorization, readJson, sessionCookie } from './http';
 import { jmap, session, type JmapStore } from './jmap';
 import {
   listMailboxes, listMessages, MailTransportError, patchMessage, readMessage, readMessageSource, trashMessage, type MailAccount,
 } from './mail-transport';
-import { handlePush } from './push';
+import {
+  getManagedAccount, listManagedAccounts, listManagedIds, managedAccountInput, registerManagedAccount, removeManagedAccount,
+} from './managed-accounts';
+import { handlePush, hasPushSubscribers } from './push';
 
 export { AccountState } from './account';
+export { ManagedAccounts } from './managed-accounts';
 export { PushSubscriptions } from './push';
 
 const RELAY = '/api/imap/v1';
@@ -55,19 +59,27 @@ function readFlagPatch(input: unknown): { seen?: boolean; flagged?: boolean } {
   return Object.fromEntries(entries);
 }
 
+function managedAuthorized(request: Request, url: URL, env: Env): boolean {
+  const origin = request.headers.get('Origin');
+  return url.origin === env.PUBLIC_ORIGIN && (!origin || origin === env.PUBLIC_ORIGIN) && pairedAuthorization(request, env);
+}
+
 async function relay(request: Request, url: URL, env: Env): Promise<Response> {
   const parts = parsedSegments(url.pathname.slice(RELAY.length + 1));
   if (parts.length === 1 && parts[0] === 'health' && request.method === 'GET') {
     return json({ status: 'ok', service: 'stormbox-jmap-imap' });
   }
   const secret = accessToken(env);
-  if (!secret) throw new HttpError(503, 'gateway_not_configured');
+  if (!secret && !env.RELAY_SESSION_KEY) throw new HttpError(503, 'gateway_not_configured');
   if (parts.length === 1 && parts[0] === 'session') {
     if (request.headers.get('Origin') !== env.PUBLIC_ORIGIN) throw new HttpError(403, 'invalid_origin');
     if (request.method === 'DELETE') return json(null, 204, { 'Set-Cookie': sessionCookie(env, false) });
     if (request.method !== 'POST') throw new HttpError(405, 'method_not_allowed');
     const input = await readJson(request, 4096);
-    if (!matchesToken(input?.accessToken, secret)) throw new HttpError(401, 'unauthorized');
+    const paired = env.RELAY_SESSION_KEY
+      ? url.origin === env.PUBLIC_ORIGIN && await consumeSessionAssertion(input?.assertion, env)
+      : matchesToken(input?.accessToken, secret);
+    if (!paired) throw new HttpError(401, 'unauthorized');
     return json(null, 204, { 'Set-Cookie': sessionCookie(env, true) });
   }
   const authorized = request.method === 'GET'
@@ -77,10 +89,33 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
   const accounts = mailAccounts(env);
   const [resource, id, subresource, uid] = parts;
   if (resource !== 'accounts') throw new HttpError(404, 'not_found');
+  const managed = managedAuthorized(request, url, env);
   if (parts.length === 1 && request.method === 'GET') {
-    return json({ accounts: accounts.map(({ id, email, name }) => ({ id, email, name: name ?? email })) });
+    const configured = accounts.map(({ id, email, name }) => ({ id, email, name: name ?? email }));
+    return json({ accounts: [...configured, ...(managed ? await listManagedAccounts(env) : [])] });
   }
-  const account = accounts.find((entry) => entry.id === id);
+  if (parts.length === 1 && request.method === 'POST') {
+    if (!managed) throw new HttpError(401, 'unauthorized');
+    const input = managedAccountInput(await readJson(request, 4096));
+    if (accounts.some(({ email }) => email.toLowerCase() === input.email.toLowerCase())) {
+      throw new HttpError(409, 'account_exists');
+    }
+    const account = await registerManagedAccount(env, input, MAX_IMAP_ACCOUNTS - accounts.length);
+    if (await hasPushSubscribers(env).catch(() => false)) {
+      await env.MAILBOXES.getByName(account.id).watch(60).catch(() => {});
+    }
+    return json(account);
+  }
+  if (!id) throw new HttpError(405, 'method_not_allowed');
+  const configured = accounts.find((entry) => entry.id === id);
+  if (parts.length === 2 && request.method === 'DELETE') {
+    if (!managed) throw new HttpError(401, 'unauthorized');
+    if (configured) throw new HttpError(409, 'account_not_managed');
+    if (!await removeManagedAccount(env, id)) throw new HttpError(404, 'account_not_found');
+    await env.MAILBOXES.getByName(id).forgetManagedMailbox().catch(() => {});
+    return json(null, 204);
+  }
+  const account = configured ?? (managed ? await getManagedAccount(env, id) : undefined);
   if (!account) throw new HttpError(404, 'account_not_found');
   if (parts.length === 3 && subresource === 'mailboxes' && request.method === 'GET') {
     return json({ mailboxes: await listMailboxes(account) });
@@ -214,10 +249,14 @@ export default {
     try {
       if (url.pathname.startsWith(`${RELAY}/`)) return await relay(request, url, env);
       if (url.pathname.startsWith('/api/push/')) {
-        const paired = authorization(request, env, true);
+        const paired = env.RELAY_SESSION_KEY
+          ? managedAuthorized(request, url, env)
+          : authorization(request, env, true);
         const response = await handlePush(request, env, paired);
         if (paired && response.ok && request.method === 'POST') {
-          await Promise.all(mailAccounts(env).map((account) => accountObject(env, account).watch(60)));
+          const configuredIds = mailAccounts(env).map(({ id }) => id);
+          const managedIds = managedAuthorized(request, url, env) ? await listManagedIds(env) : [];
+          await Promise.all([...configuredIds, ...managedIds].map((id) => env.MAILBOXES.getByName(id).watch(60)));
         }
         return response;
       }

@@ -1,9 +1,27 @@
+import { JMAP_SERVER_URL } from '../../../defines';
+import { browserRelayAssertion, browserSessionEnabled } from '../../../services/browser-session';
+
 const API_ROOT = '/api/imap/v1';
 
 export interface RelayAccount {
   id: string;
   email: string;
   name: string;
+  managed?: boolean;
+  host?: string;
+  port?: number;
+  mode?: 'tls' | 'starttls';
+  user?: string;
+}
+
+export interface RelayAccountInput {
+  email: string;
+  password: string;
+  name?: string;
+  host?: string;
+  port?: number;
+  mode?: 'tls' | 'starttls';
+  user?: string;
 }
 
 interface MailAddress {
@@ -55,13 +73,28 @@ function messagePath(location: ImapMessageLocation, suffix = '') {
 }
 
 export class AttentionRelay {
+  private browserPairing?: Promise<void>;
+
   constructor(private readonly fetcher: typeof globalThis.fetch) {}
 
-  async pair(accessToken: string) {
+  async pair(accessToken?: string) {
+    if (accessToken === undefined) {
+      if (!browserSessionEnabled(JMAP_SERVER_URL)) throw new Error('Enter the mail relay pairing token.');
+      this.browserPairing ??= this.pairBrowser().finally(() => { this.browserPairing = undefined; });
+      return this.browserPairing;
+    }
+    await this.startSession({ accessToken });
+  }
+
+  private async pairBrowser() {
+    await this.startSession({ assertion: await browserRelayAssertion(this.fetcher) });
+  }
+
+  private async startSession(proof: { accessToken: string } | { assertion: string }) {
     await this.request('/session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ accessToken }),
+      body: JSON.stringify(proof),
     });
   }
 
@@ -71,6 +104,19 @@ export class AttentionRelay {
 
   async accounts(): Promise<RelayAccount[]> {
     return (await this.json<{ accounts: RelayAccount[] }>('/accounts')).accounts;
+  }
+
+  async saveAccount(account: RelayAccountInput): Promise<RelayAccount> {
+    const response = await this.request('/accounts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(account),
+    });
+    return response.json();
+  }
+
+  async removeAccount(id: string): Promise<void> {
+    await this.request(`/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' });
   }
 
   inbox(accountId: string): Promise<RelayWindow> {
@@ -109,12 +155,17 @@ export class AttentionRelay {
   }
 
   private async request(path: string, init: RequestInit = {}) {
-    const response = await this.fetcher(`${API_ROOT}${path}`, {
+    const send = () => this.fetcher(`${API_ROOT}${path}`, {
       ...init,
       credentials: 'same-origin',
       redirect: 'error',
       signal: AbortSignal.timeout(30_000),
     });
+    let response = await send();
+    if (response.status === 401 && path !== '/session' && browserSessionEnabled(JMAP_SERVER_URL)) {
+      await this.pair();
+      response = await send();
+    }
     if (response.ok) return response;
     const { error: code } = await response.json().catch(() => ({})) ?? {};
     const messages: Record<string, string> = {
@@ -123,6 +174,16 @@ export class AttentionRelay {
       same_mailbox: 'This message is already in Trash.',
       message_not_found: 'This message is no longer in this mailbox.',
       authentication_failed: 'The IMAP server rejected the relay credentials.',
+      invalid_account: 'Check the email address, app password, and IMAP settings.',
+      account_exists: 'An account already uses this email address.',
+      account_limit: 'The relay has reached its account limit.',
+      account_not_managed: 'This account is configured by the relay operator.',
+      account_management_unavailable: 'The relay has not enabled account management.',
+      invalid_imap_host: 'Enter the full public hostname of your IMAP server.',
+      invalid_imap_port: 'Use TLS on port 993 or STARTTLS on port 143.',
+      account_identity_changed: 'Remove this account before connecting it to a different IMAP server or username.',
+      account_changed: 'The account changed while you were editing it. Reopen account management and try again.',
+      mail_unavailable: 'The relay could not connect to the IMAP server. Check the hostname and TLS settings.',
     };
     const message = (Object.hasOwn(messages, code) ? messages[code] : undefined)
       ?? (response.status === 401 ? 'Connect the mail relay to access IMAP mail.'

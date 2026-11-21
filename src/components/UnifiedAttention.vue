@@ -3,13 +3,16 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch 
 import { useOnline, useStorage } from '@vueuse/core';
 import AppButton from './AppButton.vue';
 import AttentionInbox from './AttentionInbox.vue';
+import ImapAccountsDialog from './ImapAccountsDialog.vue';
 import MessageView from './MessageView.vue';
 import { useMessageTags } from '../composables/useMessageTags';
 import { getRepositoryAsync } from '../composables/useRepository';
 import { TABLE_FAMILIES } from '../db/protocol';
+import { JMAP_SERVER_URL } from '../defines';
 import type { AttentionCache } from '../db/attention';
 import type { Repository } from '../db/repository';
 import { useMailStore } from '../stores/mail-store';
+import { browserSessionEnabled } from '../services/browser-session';
 import type { ImapAttentionAction, ImapMessageLocation } from '../sync/backends/imap/attention-relay';
 import { browserTriageMessageKey, createBrowserTriageRanker, type BrowserTriageProgress } from '../triage/browser-model';
 import { buildTriageBundles, markBundleDone, snoozeBundle, type BundleState, type TriageBundle, type TriageClassification, type TriageMessage } from '../triage/smart-sort';
@@ -31,8 +34,7 @@ const clock = ref(Date.now());
 const loading = ref(true);
 const busy = ref(false);
 const error = ref('');
-const pairing = ref(false);
-const token = ref('');
+const manageImap = ref(false);
 const jmapFolder = shallowRef<FolderRow>();
 const jmapRows = shallowRef<MessageRow[]>([]);
 const cache = shallowRef<AttentionCache>({ paired: false, accounts: [], states: {} });
@@ -262,21 +264,19 @@ async function togglePush() {
   }
 }
 
-async function connectRelay() {
-  const accessToken = token.value.trim();
-  if (!accessToken || busy.value) return;
-  busy.value = true;
-  token.value = '';
-  error.value = '';
+function relayPaired(failedAccounts: string[]) {
+  showFailedAccounts(failedAccounts);
+  void loadCache().catch(report);
+  void prepareWebPush();
+}
+
+async function refreshAfterAccountChange() {
   try {
-    showFailedAccounts(await repo.pairAttentionRelay(props.ownerId, accessToken));
-    pairing.value = false;
-    void prepareWebPush();
+    error.value = '';
+    showFailedAccounts(await repo.refreshAttentionRelay(props.ownerId));
+    await loadCache();
   } catch (cause) {
     report(cause);
-  } finally {
-    busy.value = false;
-    await loadCache().catch(report);
   }
 }
 
@@ -289,8 +289,6 @@ async function disconnectRelay() {
     }
     pushEnabled.value = false;
     await repo.disconnectAttentionRelay(props.ownerId);
-  } catch (cause) {
-    report(cause);
   } finally {
     busy.value = false;
     await loadCache().catch(report);
@@ -464,13 +462,9 @@ onBeforeUnmount(() => {
         @restore="(bundle) => saveState(bundle, null)"
       >
         <template #actions>
-          <form v-if="pairing" class="unified-attention__pairing" @submit.prevent="connectRelay">
-            <input v-model="token" type="password" aria-label="Mail relay pairing token" placeholder="Pairing token" autocomplete="off" />
-            <AppButton form-action="submit" :disabled="busy || !token.trim()">Connect</AppButton>
-            <AppButton @click="pairing = false; token = ''">Cancel</AppButton>
-          </form>
-          <AppButton v-else-if="!cache.paired" :disabled="loading || !online" @click="pairing = true">Connect IMAP accounts</AppButton>
-          <AppButton v-else :disabled="busy || !online" @click="disconnectRelay">Disconnect IMAP</AppButton>
+          <AppButton :disabled="loading || !online" @click="manageImap = true">
+            {{ cache.paired ? 'Manage IMAP accounts' : 'Connect IMAP accounts' }}
+          </AppButton>
           <AppButton v-if="cache.paired && pushKey" :disabled="pushBusy || !online" @click="togglePush">
             {{ pushEnabled ? 'Disable notifications' : 'Enable notifications' }}
           </AppButton>
@@ -490,6 +484,16 @@ onBeforeUnmount(() => {
         </template>
       </AttentionInbox>
     </div>
+    <ImapAccountsDialog
+      v-if="manageImap"
+      :owner-id="ownerId"
+      :paired="cache.paired"
+      :automatic="browserSessionEnabled(JMAP_SERVER_URL)"
+      :disconnect="disconnectRelay"
+      @paired="relayPaired"
+      @account-change="refreshAfterAccountChange"
+      @close="manageImap = false"
+    />
     <div ref="reader" class="unified-attention__reader" tabindex="-1">
       <MessageView
         v-if="reading?.kind === 'jmap'"
@@ -569,22 +573,8 @@ onBeforeUnmount(() => {
   overflow-wrap: anywhere;
   line-height: 1.55;
 }
-.unified-attention__pairing {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-}
 .unified-attention__progress {
   color: var(--muted);
   font-size: .8rem;
-}
-.unified-attention__pairing input {
-  max-width: 100%;
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--panel);
-  color: var(--text);
 }
 </style>

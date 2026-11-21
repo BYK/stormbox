@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto';
 import {
   afterEach, beforeEach, describe, expect, it, vi,
 } from 'vitest';
@@ -186,6 +187,32 @@ describe('BYK JMAP browser sessions', () => {
     expect(response.status).toBe(401);
     expect(response.headers.get('Set-Cookie')).toBeNull();
     expect((await worker.fetch(signInRequest())).status).toBe(503);
+  });
+
+  it('issues a short-lived relay proof only to the owner with a currently valid session', async () => {
+    const owner = { ...env, RELAY_OWNER_EMAIL: 'test@example.net', RELAY_SESSION_KEY: btoa('b'.repeat(32)) };
+    const cookie = (await worker.fetch(signInRequest(), owner)).headers.get('Set-Cookie')!.split(';')[0];
+    const proofRequest = (from = origin, value = cookie) => new Request(`${bridge}/jmap/relay-session`, {
+      method: 'POST', headers: { Origin: from, Cookie: value },
+    });
+    upstream.mockClear();
+    expect((await worker.fetch(proofRequest(origin, ''), owner)).status).toBe(401);
+    expect((await worker.fetch(proofRequest('https://other.byk.im'), owner)).status).toBe(403);
+    expect((await worker.fetch(proofRequest(), { ...owner, RELAY_OWNER_EMAIL: 'another@example.net' })).status).toBe(403);
+    expect(upstream).not.toHaveBeenCalled();
+
+    const response = await worker.fetch(proofRequest(), owner);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    const { assertion } = await response.json();
+    const [version, expiry, nonce, digest] = assertion.split('.');
+    expect(version).toBe('v1');
+    expect(Number(expiry) - Date.now()).toBeLessThanOrEqual(45_000);
+    expect(Number(expiry)).toBeGreaterThan(Date.now());
+    expect(digest).toBe(createHmac('sha256', 'b'.repeat(32))
+      .update(`stormbox-imap-relay:v1.${expiry}.${nonce}`).digest('hex'));
+    upstream.mockReturnValueOnce(new Response(null, { status: 401 }));
+    expect((await worker.fetch(proofRequest(), owner)).status).toBe(401);
   });
 
   it('rejects tampered and expired sessions and expires the cookie at logout', async () => {

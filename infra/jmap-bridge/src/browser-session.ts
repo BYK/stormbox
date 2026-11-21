@@ -88,27 +88,8 @@ export async function handleBrowserSession(
   const key = await importKey(secret);
   if (!key) return new Response(null, { status: 503, headers });
 
-  // The upstream may return a public session without an authenticated account.
-  // Require an actual mail account before minting a cookie.
-  try {
-    const upstream = await fetch(new URL('/jmap/session', route.upstream), {
-      headers: { Authorization: authorization, Accept: 'application/json' },
-      redirect: 'manual',
-    });
-    if (!upstream.ok) {
-      return new Response(null, { status: upstream.status >= 500 ? 502 : 401, headers });
-    }
-    const session = await upstream.json() as {
-      primaryAccounts?: Record<string, string>;
-      accounts?: Record<string, unknown>;
-    };
-    const accountId = session.primaryAccounts?.['urn:ietf:params:jmap:mail'];
-    if (!accountId || !session.accounts || !Object.hasOwn(session.accounts, accountId)) {
-      return new Response(null, { status: 401, headers });
-    }
-  } catch {
-    return new Response(null, { status: 502, headers });
-  }
+  const upstreamStatus = await validatePrimaryMailSession(route, authorization);
+  if (upstreamStatus !== 200) return new Response(null, { status: upstreamStatus, headers });
 
   const iv = crypto.getRandomValues(new Uint8Array(NONCE_BYTES));
   const payload = ENCODER.encode(JSON.stringify({ exp: Date.now() + MAX_AGE_SECONDS * 1000, authorization }));
@@ -118,4 +99,29 @@ export async function handleBrowserSession(
   combined.set(encrypted, iv.length);
   headers.set('Set-Cookie', `${COOKIE_NAME}=${encodeCookie(combined)}; ${COOKIE_ATTRIBUTES}; Max-Age=${MAX_AGE_SECONDS}`);
   return new Response(null, { status: 204, headers });
+}
+
+export async function validatePrimaryMailSession(route: Route, authorization: string): Promise<200 | 401 | 502> {
+  // The upstream may return a public session without an authenticated account.
+  // Require an actual mail account before authorizing a browser session.
+  try {
+    const upstream = await fetch(new URL('/jmap/session', route.upstream), {
+      headers: { Authorization: authorization, Accept: 'application/json' },
+      redirect: 'manual',
+    });
+    if (!upstream.ok) {
+      return upstream.status >= 500 ? 502 : 401;
+    }
+    const session = await upstream.json() as {
+      primaryAccounts?: Record<string, string>;
+      accounts?: Record<string, unknown>;
+    };
+    const accountId = session.primaryAccounts?.['urn:ietf:params:jmap:mail'];
+    if (!accountId || !session.accounts || !Object.hasOwn(session.accounts, accountId)) {
+      return 401;
+    }
+  } catch {
+    return 502;
+  }
+  return 200;
 }

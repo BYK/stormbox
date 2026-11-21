@@ -1,5 +1,8 @@
 import { MUTATION_TYPE } from '../constants/states';
-import { AttentionRelay, AttentionRelayError, type ImapAttentionAction, type ImapMessageLocation, type RelayMessage } from '../sync/backends/imap/attention-relay';
+import {
+  AttentionRelay, AttentionRelayError, type ImapAttentionAction, type ImapMessageLocation,
+  type RelayAccountInput, type RelayMessage,
+} from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
 import type { Engine } from './engine';
 import { DB_RPC, TABLE_FAMILIES } from './protocol';
@@ -43,6 +46,12 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     return Boolean(await engine.get(
       'SELECT 1 FROM attention_imap_pairing WHERE owner_account_id = ?', [ownerId],
     ));
+  }
+
+  async function requirePairing(ownerId: number) {
+    if (!await isPaired(ownerId)) {
+      throw new AttentionRelayError(401, 'unauthorized', 'Pair this browser to manage IMAP accounts.');
+    }
   }
 
   async function readBody(ownerId: number, location: ImapMessageLocation): Promise<string> {
@@ -249,6 +258,24 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
       await relay.disconnect();
     }),
     [DB_RPC.ATTENTION_REFRESH]: async ({ ownerId }) => refreshOnce(ownerId),
+    [DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS]: async ({ ownerId }) => {
+      await requirePairing(ownerId);
+      return relay.accounts();
+    },
+    [DB_RPC.ATTENTION_SAVE_RELAY_ACCOUNT]: async ({ ownerId, account }: { ownerId: number; account: RelayAccountInput }) =>
+      serializeRelayOperation(ownerId, async () => {
+        await requirePairing(ownerId);
+        return relay.saveAccount(account);
+      }),
+    [DB_RPC.ATTENTION_REMOVE_RELAY_ACCOUNT]: async ({ ownerId, id }: { ownerId: number; id: string }) =>
+      serializeRelayOperation(ownerId, async () => {
+        await requirePairing(ownerId);
+        await relay.removeAccount(id);
+        await engine.run(
+          'DELETE FROM attention_imap_accounts WHERE owner_account_id = ? AND relay_id = ?', [ownerId, id],
+        );
+        broadcaster.touch(TABLE_FAMILIES.ATTENTION);
+      }),
     [DB_RPC.ATTENTION_BODY]: async ({ ownerId, location }) => readBody(ownerId, location),
     [DB_RPC.ATTENTION_APPLY_IMAP_ACTION]: async ({ ownerId, location, action }) =>
       serializeRelayOperation(ownerId, () => applyImapAction(ownerId, location, action)),

@@ -18,6 +18,7 @@
 import type { Route } from './routes';
 import { allowsBrowserSession, BROWSER_SESSION_HEADER, BROWSER_SESSION_PATH,
   handleBrowserSession, readBrowserSession } from './browser-session';
+import { handleRelaySession, RELAY_SESSION_PATH, type RelaySessionConfig } from './relay-session';
 
 /**
  * Headers Cloudflare injects on inbound requests; Stalwart must not
@@ -54,7 +55,9 @@ const PREFLIGHT_MAX_AGE_SECONDS = 3600;
  */
 const ALLOWED_REQUEST_HEADERS = 'Authorization, Content-Type, Accept';
 
-export async function handleHttpProxy(request: Request, route: Route, browserSessionKey?: string): Promise<Response> {
+export async function handleHttpProxy(
+  request: Request, route: Route, browserSessionKey?: string, relaySession?: RelaySessionConfig,
+): Promise<Response> {
   if (request.headers.get('upgrade')?.toLowerCase() === 'websocket') {
     return new Response('WebSocket upgrades must be handled by the WS bridge', { status: 426 });
   }
@@ -74,6 +77,9 @@ export async function handleHttpProxy(request: Request, route: Route, browserSes
 
   if (url.pathname === BROWSER_SESSION_PATH) {
     return handleBrowserSession(request, route, browserSessionKey, corsHeadersFor(origin, route));
+  }
+  if (url.pathname === RELAY_SESSION_PATH) {
+    return handleRelaySession(request, route, browserSessionKey, relaySession, corsHeadersFor(origin, route));
   }
 
   if (!isJmapPath(url.pathname)) {

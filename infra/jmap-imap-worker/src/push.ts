@@ -4,6 +4,7 @@ import { HttpError, json, readJson } from './http';
 
 export interface PushEnv {
   PUSH_SUBSCRIPTIONS?: DurableObjectNamespace<PushSubscriptions>;
+  RELAY_SESSION_KEY?: string;
   WEB_PUSH_VAPID_PUBLIC_KEY?: string;
   WEB_PUSH_VAPID_PRIVATE_KEY?: string;
   WEB_PUSH_VAPID_SUBJECT?: string;
@@ -48,6 +49,10 @@ function vapid(env: PushEnv) {
   return { publicKey, privateKey, subject };
 }
 
+function subscriptionRegistry(env: PushEnv) {
+  return env.PUSH_SUBSCRIPTIONS?.getByName(env.RELAY_SESSION_KEY ? 'stormbox-owner' : 'stormbox');
+}
+
 function endpointFrom(value: unknown) {
   if (typeof value !== 'string' || value.length > 4096) throw new HttpError(400, 'Invalid push endpoint.');
   let endpoint: URL;
@@ -82,7 +87,7 @@ export async function handlePush(request: Request, env: PushEnv, paired: boolean
     const body: Partial<Subscription> = await readJson(request, MAX_BODY);
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, 'Invalid JSON.');
     const endpoint = endpointFrom(body.endpoint);
-    const subscriptions = env.PUSH_SUBSCRIPTIONS.getByName('stormbox');
+    const subscriptions = subscriptionRegistry(env)!;
     if (status) return json({ enabled: await subscriptions.has(endpoint) });
     if (request.method === 'DELETE') {
       await subscriptions.remove(endpoint);
@@ -107,11 +112,16 @@ export async function notifyArrival(env: PushEnv, account: string, event: string
   if (!env.PUSH_SUBSCRIPTIONS || !vapid(env)) return true;
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(account) || !/^[A-Za-z0-9_:-]{1,128}$/.test(event)) return false;
   try {
-    await env.PUSH_SUBSCRIPTIONS.getByName('stormbox').enqueue(account, event);
+    await subscriptionRegistry(env)!.enqueue(account, event);
     return true;
   } catch {
     return false;
   }
+}
+
+export async function hasPushSubscribers(env: PushEnv): Promise<boolean> {
+  if (!env.PUSH_SUBSCRIPTIONS || !vapid(env)) return false;
+  return subscriptionRegistry(env)!.hasAny();
 }
 
 function subscriptionValue(recipient: PendingRecipient): Subscription {
@@ -159,6 +169,10 @@ export class PushSubscriptions extends DurableObject<PushEnv> {
 
   has(endpoint: string): boolean {
     return this.sql.exec('SELECT 1 FROM push_subscriptions WHERE endpoint = ?', endpoint).toArray().length > 0;
+  }
+
+  hasAny(): boolean {
+    return this.sql.exec('SELECT 1 FROM push_subscriptions LIMIT 1').toArray().length > 0;
   }
 
   add(subscription: Subscription): boolean {

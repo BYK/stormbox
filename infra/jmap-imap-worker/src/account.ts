@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { mailAccounts, type Env } from './config';
 import { listMailboxWindows, listMessages, type ImapMessage, type MailAccount } from './mail-transport';
+import { getManagedAccount } from './managed-accounts';
 import { notifyArrival } from './push';
 
 export interface Address {
@@ -220,6 +221,7 @@ export class AccountState extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   private syncing?: Promise<AccountSnapshot>;
   private refreshedAt = 0;
+  private forgotten = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -430,7 +432,8 @@ export class AccountState extends DurableObject<Env> {
       SELECT event_id FROM gateway_push_outbox ORDER BY created_at,event_id LIMIT 10
     `).toArray();
     for (const { event_id: eventId } of jobs) {
-      if (await notifyArrival(this.env, accountId, eventId)) {
+      if (this.forgotten) return;
+      if (await notifyArrival(this.env, accountId, eventId) && !this.forgotten) {
         this.sql.exec('DELETE FROM gateway_push_outbox WHERE event_id = ?', eventId);
       }
     }
@@ -508,6 +511,7 @@ export class AccountState extends DurableObject<Env> {
   }
 
   async watch(intervalSeconds: number | null): Promise<void> {
+    if (this.forgotten) return;
     if (intervalSeconds === null) {
       this.setState('poll_interval_seconds', 0);
       await this.ctx.storage.deleteAlarm();
@@ -517,7 +521,14 @@ export class AccountState extends DurableObject<Env> {
     this.setState('poll_interval_seconds', interval);
     const next = Date.now() + interval * 1000;
     const existing = await this.ctx.storage.getAlarm();
-    if (existing === null || existing > next) await this.ctx.storage.setAlarm(next);
+    if (!this.forgotten && (existing === null || existing > next)) await this.ctx.storage.setAlarm(next);
+  }
+
+  async forgetManagedMailbox(): Promise<void> {
+    if (!this.ctx.id.name?.startsWith('managed_')) return;
+    this.forgotten = true;
+    await this.ctx.storage.deleteAll();
+    await this.ctx.storage.deleteAlarm();
   }
 
   private async pollInbox(account: MailAccount): Promise<void> {
@@ -525,6 +536,7 @@ export class AccountState extends DurableObject<Env> {
     const generation = this.beginSync();
     const path = previous ? String(previous.path) : 'INBOX';
     const window = await listMessages(account, path, PER_FOLDER_WINDOW);
+    if (this.forgotten) return;
     this.reconcile([{
       path, name: previous ? String(previous.name) : 'Inbox', role: 'inbox',
       delimiter: previous?.delimiter == null ? null : String(previous.delimiter),
@@ -535,18 +547,29 @@ export class AccountState extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    if (this.forgotten) return;
     const interval = this.getState('poll_interval_seconds');
     if (interval === 0) return;
-    const account = mailAccounts(this.env).find(({ id }) => id === this.ctx.id.name);
-    if (!account) return;
+    const id = this.ctx.id.name;
+    if (!id) return;
+    const managed = id.startsWith('managed_');
+    let account: MailAccount | undefined;
     try {
+      account = mailAccounts(this.env).find((entry) => entry.id === id) ?? (managed ? await getManagedAccount(this.env, id) : undefined);
+      if (this.forgotten) return;
+      if (!account) {
+        if (managed) await this.forgetManagedMailbox();
+        return;
+      }
       const running = this.syncing;
       if (running) await running;
       else await this.pollInbox(account);
     } finally {
       // A disconnect can cancel polling while the refresh awaits IMAP.
-      const current = this.getState('poll_interval_seconds');
-      if (current !== 0) await this.ctx.storage.setAlarm(Date.now() + current * 1000);
+      if (!this.forgotten && (account || managed)) {
+        const current = this.getState('poll_interval_seconds');
+        if (current !== 0) await this.ctx.storage.setAlarm(Date.now() + current * 1000);
+      }
     }
   }
 }

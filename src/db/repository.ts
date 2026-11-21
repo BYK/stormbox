@@ -9,7 +9,7 @@
 
 import type { AttentionCache } from './attention';
 import { MUTATION_TYPE } from '../constants/states';
-import type { ImapAttentionAction, ImapMessageLocation } from '../sync/backends/imap/attention-relay';
+import type { ImapAttentionAction, ImapMessageLocation, RelayAccount, RelayAccountInput } from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
 import type {
   AddressBookInventory,
@@ -306,7 +306,7 @@ export class Repository {
     return this.call<AttentionCache>(DB_RPC.ATTENTION_GET, { ownerId });
   }
 
-  pairAttentionRelay(ownerId: number, accessToken: string) {
+  pairAttentionRelay(ownerId: number, accessToken?: string) {
     return this.call<string[]>(DB_RPC.ATTENTION_PAIR, { ownerId, accessToken });
   }
 
@@ -316,6 +316,18 @@ export class Repository {
 
   refreshAttentionRelay(ownerId: number) {
     return this.call<string[]>(DB_RPC.ATTENTION_REFRESH, { ownerId });
+  }
+
+  listAttentionRelayAccounts(ownerId: number) {
+    return this.call<RelayAccount[]>(DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS, { ownerId });
+  }
+
+  saveAttentionRelayAccount(ownerId: number, account: RelayAccountInput) {
+    return this.call<RelayAccount>(DB_RPC.ATTENTION_SAVE_RELAY_ACCOUNT, { ownerId, account });
+  }
+
+  removeAttentionRelayAccount(ownerId: number, id: string) {
+    return this.call<void>(DB_RPC.ATTENTION_REMOVE_RELAY_ACCOUNT, { ownerId, id });
   }
 
   readAttentionImapMessage(ownerId: number, location: ImapMessageLocation) {

@@ -62,6 +62,14 @@ in a host-only, HttpOnly cookie valid for 30 days. The only browser origin
 permitted to use the cookie is `https://webmail.byk.im`. Signing out deletes
 the cookie and clears the account used to reopen offline mail.
 
+Set `RELAY_OWNER_EMAIL` on the bridge to the Thundermail sign-in address
+allowed to use the IMAP relay. Set the same random, base64-encoded 32-byte
+`RELAY_SESSION_KEY` on both Workers. The bridge revalidates the owner's
+session and issues a short-lived, single-use assertion that the relay
+exchanges for its browser cookie. The browser can then add IMAP accounts
+directly in Attention. See the [relay deployment guide](../infra/jmap-imap-worker/DEPLOYMENT.md)
+for the separate account encryption key.
+
 The token needs account-level Cloudflare Pages edit and Workers Scripts
 edit access, plus Zone read, DNS edit, and Workers Routes edit access
 for `byk.im`. Restrict the token to this account and zone. The
