@@ -118,6 +118,19 @@ export const OIDC_ISSUER =
 export const OIDC_CLIENT_ID =
   import.meta.env.VITE_OIDC_CLIENT_ID || "thunderbird-stormbox-test";
 
+export function appPasswordOnlyFromEnv(value: string | undefined): boolean {
+  return value === "1" || value?.toLowerCase() === "true";
+}
+
+/**
+ * Custom deployments whose origin is not registered with Thundermail's
+ * OIDC client can use app-password authentication without offering a
+ * redirect flow that cannot complete.
+ */
+export const APP_PASSWORD_ONLY = appPasswordOnlyFromEnv(
+  import.meta.env.VITE_APP_PASSWORD_ONLY,
+);
+
 /**
  * The hosted mail servers use their jmap.* WebSocket auth bridges.
  * Local and custom servers default to /jmap/ws on the server origin.

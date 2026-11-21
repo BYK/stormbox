@@ -140,6 +140,9 @@ VITE_JMAP_SERVER_URL=https://your-jmap-server.com
 VITE_SENDER_AVATAR_PROXY_URL=https://your-avatar-proxy.com
 ```
 
+Set `VITE_APP_PASSWORD_ONLY=1` when the deployment origin uses app passwords.
+See the [BYK Cloudflare deployment](docs/byk-cloudflare-deployment.md) for an example.
+
 ## Common Commands
 
 ```bash

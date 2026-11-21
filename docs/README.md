@@ -7,6 +7,9 @@ This directory is the human entry point for project documentation.
 [Architecture overview and index](architecture/README.md) summarizes the
 system and links to the focused design documents.
 
+- [BYK Cloudflare deployment](byk-cloudflare-deployment.md): personal Pages
+  and JMAP bridge configuration.
+
 ## Spec-Driven Development
 
 Stormbox uses GitHub Spec Kit for shared, IDE-agnostic specs.

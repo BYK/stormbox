@@ -12,7 +12,13 @@ import { computed, ref } from 'vue';
 
 import { initOidc, getOidc } from '../services/auth';
 import { currentHref, reloadLocation, replaceLocation } from '../services/navigation';
-import { JMAP_SERVER_URL, JMAP_WS_PROXY_URL, STAFF_APP_URL, jmapAccountOriginForServer } from '../defines';
+import {
+  APP_PASSWORD_ONLY,
+  JMAP_SERVER_URL,
+  JMAP_WS_PROXY_URL,
+  STAFF_APP_URL,
+  jmapAccountOriginForServer,
+} from '../defines';
 import { AUTH_STATE } from '../constants/states';
 import type { AuthState } from '../constants/states';
 import { isStaffEmail } from '../constants/staff';
@@ -44,6 +50,7 @@ const OIDC_REDIRECT_PENDING_KEY = 'stormbox.oidcRedirectPending';
 const OIDC_SIGN_IN_INCOMPLETE = 'Sign-in did not complete. Try again to return to sign in.';
 
 function appPasswordRequested(): boolean {
+  if (APP_PASSWORD_ONLY) return true;
   if (new URLSearchParams(globalThis.location?.search ?? '').has('app-password')) return true;
   try {
     return globalThis.localStorage?.getItem('stormbox.appPassword') === '1';

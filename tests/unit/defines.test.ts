@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   accountsUrlForHostname,
+  appPasswordOnlyFromEnv,
   appointmentUrlForHostname,
   defaultJmapServerUrl,
   defaultJmapWsProxyUrl,
@@ -12,6 +13,16 @@ import {
   senderAvatarProxyUrlForHostname,
   staffAppUrlForHostname,
 } from '../../src/defines';
+
+describe('appPasswordOnlyFromEnv', () => {
+  it('accepts explicit true values only', () => {
+    expect(appPasswordOnlyFromEnv('1')).toBe(true);
+    expect(appPasswordOnlyFromEnv('true')).toBe(true);
+    expect(appPasswordOnlyFromEnv('TRUE')).toBe(true);
+    expect(appPasswordOnlyFromEnv('0')).toBe(false);
+    expect(appPasswordOnlyFromEnv(undefined)).toBe(false);
+  });
+});
 
 describe('isProdWebmailHostname', () => {
   it('treats the prod and alpha webmail hosts as production', () => {

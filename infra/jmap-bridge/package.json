@@ -5,6 +5,7 @@
   "description": "Cloudflare Worker that fronts Stormbox JMAP HTTP and WebSocket auth on jmap.*.",
   "scripts": {
     "deploy": "wrangler deploy",
+    "deploy:byk": "wrangler deploy --config wrangler.byk.toml",
     "deploy:production": "wrangler deploy --env production",
     "tail": "wrangler tail",
     "types": "wrangler types"
