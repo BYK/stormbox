@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import { onClickOutside } from '@vueuse/core';
-import { CircleUserRound, LogOut, Settings } from '@lucide/vue';
+import { CircleUserRound, ListFilter, LogOut, Settings } from '@lucide/vue';
 
 import { useAuthStore } from '../stores/auth-store';
 import { ACCOUNTS_URL, SUPPORT_URL } from '../defines';
@@ -9,7 +9,10 @@ import { senderAvatarStyle, senderInitials } from '../utils/sender-avatar';
 import supportIcon from '../assets/icons/tb-support.svg?raw';
 
 const authStore = useAuthStore();
-const emit = defineEmits<{ openSettings: [] }>();
+const emit = defineEmits<{
+  openSettings: [];
+  showMailRules: [];
+}>();
 
 const detailsEl = ref<HTMLDetailsElement | null>(null);
 
@@ -28,13 +31,21 @@ function onLogout() {
   if (detailsEl.value) detailsEl.value.open = false;
   authStore.logout();
 }
-
-function onSettings() {
+function closeMenuAndRestoreFocus() {
   if (detailsEl.value) {
     detailsEl.value.open = false;
     detailsEl.value.querySelector('summary')?.focus({ preventScroll: true });
   }
+}
+
+function onSettings() {
+  closeMenuAndRestoreFocus();
   emit('openSettings');
+}
+
+function onShowMailRules() {
+  closeMenuAndRestoreFocus();
+  emit('showMailRules');
 }
 </script>
 
@@ -52,6 +63,10 @@ function onSettings() {
         </span>
         <span class="account-menu__email">{{ identityLabel }}</span>
       </div>
+      <button class="account-menu__item" type="button" role="menuitem" @click="onShowMailRules">
+        <ListFilter :size="16" :stroke-width="1.75" aria-hidden="true" />
+        <span>Mail Rules</span>
+      </button>
       <button class="account-menu__item" type="button" role="menuitem" @click="onSettings">
         <Settings :size="16" :stroke-width="1.75" aria-hidden="true" />
         <span>Settings</span>
