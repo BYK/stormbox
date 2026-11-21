@@ -1,13 +1,17 @@
 <script setup lang="ts">
 import { Check, ChevronDown, Clock, RotateCcw } from '@lucide/vue';
+import { useElementSize } from '@vueuse/core';
 import { computed, nextTick, ref, useId } from 'vue';
 
+import { provideSenderAvatars } from '../composables/useSenderAvatars';
+import type { ImapAttentionAction } from '../sync/backends/imap/attention-relay';
+import { browserTriageMessageKey } from '../triage/browser-model';
 import type { TriageBundle, TriageMessage } from '../triage/smart-sort';
 import { closeContainingDropdown } from '../utils/dropdown';
-import { fmtDate } from '../utils/message-row-presentation';
-import { shortFrom } from '../utils/sender-avatar';
+import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, type MessageRowLike } from '../utils/message-row-presentation';
+import type { MessageTagDefinition } from '../utils/message-tags';
 import AppDropdown from './AppDropdown.vue';
-import AppIconButton from './AppIconButton.vue';
+import MessageListRow from './MessageListRow.vue';
 
 const props = withDefaults(defineProps<{
   bundles: readonly TriageBundle[];
@@ -15,6 +19,9 @@ const props = withDefaults(defineProps<{
   loading?: boolean;
   error?: string | null;
   openMessage?: TriageMessage;
+  rows?: ReadonlyMap<string, MessageRowLike & { id: number | string }>;
+  disabledActions?: ReadonlySet<string>;
+  tagDefinitions?: ReadonlyArray<MessageTagDefinition>;
 }>(), {
   accountLabels: () => ({}),
   loading: false,
@@ -23,6 +30,7 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   open: [message: TriageMessage, trigger: EventTarget | null];
+  'message-action': [message: TriageMessage, action: ImapAttentionAction];
   done: [bundle: TriageBundle];
   snooze: [bundle: TriageBundle, until: number];
   restore: [bundle: TriageBundle];
@@ -38,7 +46,12 @@ type Filter = typeof filters[number]['key'];
 const selectedFilter = ref<Filter>('attention');
 const headingId = useId();
 const filterBar = ref<HTMLElement | null>(null);
+const listEl = ref<HTMLElement | null>(null);
+const { width } = useElementSize(listEl);
+const cardLayout = computed(() => width.value > 0 && width.value < CARD_LAYOUT_WIDTH);
+const rowHeight = computed(() => cardLayout.value ? CARD_ROW_HEIGHT : ROW_HEIGHT);
 const expandedBundles = ref(new Set<string>());
+provideSenderAvatars();
 
 const bundlesByFilter = computed(() => {
   const groups: Record<Filter, TriageBundle[]> = { attention: [], updates: [], handled: [] };
@@ -62,20 +75,33 @@ const bundlesByFilter = computed(() => {
 const visibleBundles = computed(() => bundlesByFilter.value[selectedFilter.value]);
 const emptyMessage = computed(() => filters.find(({ key }) => key === selectedFilter.value)?.empty);
 
-function subjectOf(message: TriageMessage): string {
-  return message.subject?.trim() || '(no subject)';
+function rowFor(message: TriageMessage): MessageRowLike & { id: number | string } {
+  return props.rows?.get(browserTriageMessageKey(message)) ?? {
+    id: message.id,
+    from_text: message.sender,
+    subject: message.subject,
+    preview: message.preview,
+    received_at: message.receivedAt,
+    is_flagged: Number(message.isFlagged ?? false),
+  };
 }
 
 function isOpen(message: TriageMessage): boolean {
   return props.openMessage?.id === message.id && props.openMessage?.accountId === message.accountId;
 }
 
-function accountLabel(bundle: TriageBundle): string {
-  return props.accountLabels[String(bundle.accountId)] || '';
+function inlineActions(message: TriageMessage) {
+  return { disabled: props.disabledActions?.has(browserTriageMessageKey(message)) ?? false };
 }
 
-function senderOf(message: TriageMessage): string {
-  return message.sender ? shortFrom(message.sender) : '';
+function bundleContext(bundle: TriageBundle): string {
+  const status = bundle.status === 'snoozed' ? snoozeLabel(bundle.snoozedUntil)
+    : bundle.status === 'done' ? 'Done' : bundle.reason;
+  return [
+    props.accountLabels[String(bundle.accountId)],
+    bundle.status === 'action' ? bundle.priority : '',
+    status,
+  ].filter(Boolean).join(' · ');
 }
 
 function detailId(bundle: TriageBundle): string {
@@ -134,7 +160,7 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
 </script>
 
 <template>
-  <section class="attention-inbox" :aria-labelledby="headingId">
+  <section ref="listEl" class="attention-inbox" :class="{ 'msg-list--card': cardLayout }" :aria-labelledby="headingId">
     <header class="attention-inbox__header">
       <h2 :id="headingId">Smart Inbox</h2>
       <slot name="actions" />
@@ -167,126 +193,110 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
       <p v-else-if="visibleBundles.length === 0" class="attention-inbox__status">
         {{ emptyMessage }}
       </p>
-      <ul v-else class="attention-inbox__bundles">
-        <li
+      <ul v-else class="attention-inbox__bundles msg-list__items">
+        <MessageListRow
           v-for="bundle in visibleBundles"
           :key="bundle.id"
           class="attention-inbox__bundle"
+          :message="rowFor(bundle.leading.message)"
+          :size="rowHeight"
+          :dom-id-prefix="`${detailId(bundle)}-leader-`"
+          :focused="isOpen(bundle.leading.message)"
+          :selectable="false"
+          :draggable="false"
+          :inline-actions="inlineActions(bundle.leading.message)"
+          :context="bundleContext(bundle)"
+          :tag-definitions="tagDefinitions"
+          @row-click="(_event, trigger) => emit('open', bundle.leading.message, trigger)"
+          @star="(value) => emit('message-action', bundle.leading.message, { type: 'star', value })"
+          @seen="(value) => emit('message-action', bundle.leading.message, { type: 'seen', value })"
+          @delete="emit('message-action', bundle.leading.message, { type: 'trash' })"
         >
-          <div class="attention-inbox__row">
+          <template #actions>
             <button
-              class="attention-inbox__preview"
+              v-if="bundle.messages.length > 1"
+              class="msg-list__action attention-inbox__expand"
               type="button"
-              :aria-current="isOpen(bundle.leading.message) || undefined"
-              @click="emit('open', bundle.leading.message, $event.currentTarget)"
+              :aria-expanded="expandedBundles.has(bundle.id)"
+              :aria-controls="detailId(bundle)"
+              :aria-label="`${expandedBundles.has(bundle.id) ? 'Hide' : 'Show'} ${bundle.messages.length} messages`"
+              @click="toggleBundle(bundle)"
             >
-              <span class="attention-inbox__subject">{{ subjectOf(bundle.leading.message) }}</span>
-              <span class="attention-inbox__details">
-                <span v-if="bundle.status === 'action'" class="attention-inbox__priority">
-                  {{ bundle.priority }}
-                </span>
-                <span v-if="bundle.status === 'snoozed'">{{ snoozeLabel(bundle.snoozedUntil) }}</span>
-                <span v-else-if="bundle.status === 'done'">Done</span>
-                <span v-else class="attention-inbox__reason">{{ bundle.reason }}</span>
-                <span v-if="senderOf(bundle.leading.message)" class="attention-inbox__address">
-                  {{ senderOf(bundle.leading.message) }}
-                </span>
-                <span v-if="accountLabel(bundle)" class="attention-inbox__address">
-                  {{ accountLabel(bundle) }}
-                </span>
-                <time v-if="dateTime(bundle.latestAt)" :datetime="dateTime(bundle.latestAt)">
-                  {{ fmtDate(bundle.latestAt) }}
-                </time>
-              </span>
+              {{ bundle.messages.length }}
+              <ChevronDown :size="14" aria-hidden="true" />
             </button>
-
-            <div class="attention-inbox__actions">
-              <slot name="message-actions" :message="bundle.leading.message" />
+            <template v-if="bundle.status === 'done' || bundle.status === 'snoozed'">
               <button
-                v-if="bundle.messages.length > 1"
-                class="attention-inbox__expand"
                 type="button"
-                :aria-expanded="expandedBundles.has(bundle.id)"
-                :aria-controls="detailId(bundle)"
-                :aria-label="`${expandedBundles.has(bundle.id) ? 'Hide' : 'Show'} ${bundle.messages.length} messages`"
-                @click="toggleBundle(bundle)"
+                class="msg-list__action"
+                :aria-label="bundle.status === 'snoozed' ? 'Cancel snooze' : 'Restore bundle'"
+                :title="bundle.status === 'snoozed' ? 'Cancel snooze' : 'Restore bundle'"
+                @click="restore(bundle, $event)"
               >
-                {{ bundle.messages.length }}
-                <ChevronDown :size="14" aria-hidden="true" />
+                <RotateCcw :size="17" :stroke-width="1.75" aria-hidden="true" />
               </button>
-              <template v-if="bundle.status === 'done' || bundle.status === 'snoozed'">
-                <AppIconButton
-                  :aria-label="bundle.status === 'snoozed' ? 'Cancel snooze' : 'Restore bundle'"
-                  :title="bundle.status === 'snoozed' ? 'Cancel snooze' : 'Restore bundle'"
-                  @click="restore(bundle, $event)"
+            </template>
+            <template v-else>
+              <AppDropdown class="attention-inbox__snooze">
+                <summary
+                  class="app-dropdown__summary msg-list__action attention-inbox__snooze-trigger"
+                  aria-label="Snooze bundle"
+                  title="Snooze"
                 >
-                  <RotateCcw :size="16" aria-hidden="true" />
-                </AppIconButton>
-              </template>
-              <template v-else>
-                <AppDropdown class="attention-inbox__snooze">
-                  <summary
-                    class="app-dropdown__summary attention-inbox__snooze-trigger"
-                    aria-label="Snooze bundle"
-                    title="Snooze"
+                  <Clock :size="17" :stroke-width="1.75" aria-hidden="true" />
+                </summary>
+                <div class="app-dropdown__menu attention-inbox__snooze-menu" role="group" aria-label="Snooze until">
+                  <button
+                    class="app-dropdown__item"
+                    type="button"
+                    @click="snooze(bundle, Date.now() + 60 * 60 * 1000, $event)"
                   >
-                    <Clock :size="16" aria-hidden="true" />
-                  </summary>
-                  <div class="app-dropdown__menu attention-inbox__snooze-menu" role="group" aria-label="Snooze until">
-                    <button
-                      class="app-dropdown__item"
-                      type="button"
-                      @click="snooze(bundle, Date.now() + 60 * 60 * 1000, $event)"
-                    >
-                      <Clock :size="15" aria-hidden="true" />
-                      In one hour
-                    </button>
-                    <button
-                      class="app-dropdown__item"
-                      type="button"
-                      @click="snooze(bundle, tomorrowMorning(), $event)"
-                    >
-                      <Clock :size="15" aria-hidden="true" />
-                      Tomorrow at 9 AM
-                    </button>
-                  </div>
-                </AppDropdown>
-                <AppIconButton aria-label="Mark bundle done" title="Done" @click="complete(bundle, $event)">
-                  <Check :size="17" aria-hidden="true" />
-                </AppIconButton>
-              </template>
-            </div>
-          </div>
-
-          <ul
-            v-if="bundle.messages.length > 1"
-            v-show="expandedBundles.has(bundle.id)"
-            :id="detailId(bundle)"
-            class="attention-inbox__messages"
-            aria-label="Messages in bundle"
-          >
-            <li v-for="item in bundle.messages" :key="item.message.id" class="attention-inbox__row">
-              <button
-                class="attention-inbox__preview attention-inbox__message"
-                type="button"
-                :aria-current="isOpen(item.message) || undefined"
-                @click="emit('open', item.message, $event.currentTarget)"
-              >
-                <span class="attention-inbox__subject">{{ subjectOf(item.message) }}</span>
-                <span class="attention-inbox__details">
-                  <span v-if="senderOf(item.message)" class="attention-inbox__address">{{ senderOf(item.message) }}</span>
-                  <span class="attention-inbox__reason">{{ item.classification.reason }}</span>
-                  <time v-if="dateTime(item.message.receivedAt)" :datetime="dateTime(item.message.receivedAt)">
-                    {{ fmtDate(item.message.receivedAt) }}
-                  </time>
-                </span>
+                    <Clock :size="15" aria-hidden="true" />
+                    In one hour
+                  </button>
+                  <button
+                    class="app-dropdown__item"
+                    type="button"
+                    @click="snooze(bundle, tomorrowMorning(), $event)"
+                  >
+                    <Clock :size="15" aria-hidden="true" />
+                    Tomorrow at 9 AM
+                  </button>
+                </div>
+              </AppDropdown>
+              <button class="msg-list__action" type="button" aria-label="Mark bundle done" title="Done" @click="complete(bundle, $event)">
+                <Check :size="17" :stroke-width="1.75" aria-hidden="true" />
               </button>
-              <div v-if="$slots['message-actions']" class="attention-inbox__actions">
-                <slot name="message-actions" :message="item.message" />
-              </div>
-            </li>
-          </ul>
-        </li>
+            </template>
+          </template>
+          <template #after-row>
+            <ul
+              v-if="bundle.messages.length > 1"
+              v-show="expandedBundles.has(bundle.id)"
+              :id="detailId(bundle)"
+              class="attention-inbox__messages msg-list__items"
+              aria-label="Messages in bundle"
+            >
+              <MessageListRow
+                v-for="item in bundle.messages"
+                :key="item.message.id"
+                :message="rowFor(item.message)"
+                :size="rowHeight"
+                :dom-id-prefix="`${detailId(bundle)}-member-`"
+                :focused="isOpen(item.message)"
+                :selectable="false"
+                :draggable="false"
+                :inline-actions="inlineActions(item.message)"
+                :context="item.classification.reason"
+                :tag-definitions="tagDefinitions"
+                @row-click="(_event, trigger) => emit('open', item.message, trigger)"
+                @star="(value) => emit('message-action', item.message, { type: 'star', value })"
+                @seen="(value) => emit('message-action', item.message, { type: 'seen', value })"
+                @delete="emit('message-action', item.message, { type: 'trash' })"
+              />
+            </ul>
+          </template>
+        </MessageListRow>
       </ul>
     </div>
   </section>
@@ -328,10 +338,7 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
   border-bottom: 1px solid var(--border);
 }
 
-.attention-inbox__filter,
-.attention-inbox__expand,
-.attention-inbox__snooze-trigger,
-.attention-inbox__preview {
+.attention-inbox__filter {
   border: 0;
   background: transparent;
   color: inherit;
@@ -383,98 +390,17 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
   list-style: none;
 }
 
-.attention-inbox__bundle {
-  border-bottom: 1px solid var(--border);
-}
-
-.attention-inbox__row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 6px;
-  min-height: 61px;
-  padding: 4px 10px;
-}
-
-.attention-inbox__preview {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-  width: 100%;
-  padding: 8px;
-  border-radius: 6px;
-  text-align: left;
-}
-
-.attention-inbox__filter:hover,
-.attention-inbox__expand:hover,
-.attention-inbox__snooze-trigger:hover,
-.attention-inbox__preview:hover {
+.attention-inbox__filter:hover {
   background: var(--rowHover);
 }
 
-.attention-inbox__preview[aria-current='true'] {
-  background: var(--rowActive);
-}
-
-.attention-inbox__filter:focus-visible,
-.attention-inbox__expand:focus-visible,
-.attention-inbox__snooze-trigger:focus-visible,
-.attention-inbox__preview:focus-visible {
+.attention-inbox__filter:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
-.attention-inbox__subject {
-  overflow: hidden;
-  font-size: 14px;
-  font-weight: 650;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.attention-inbox__details {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 2px 9px;
-  min-width: 0;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.attention-inbox__reason,
-.attention-inbox__address {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.attention-inbox__reason {
-  color: var(--text);
-}
-
-.attention-inbox__priority {
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-}
-
-.attention-inbox__actions {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.attention-inbox__expand,
-.attention-inbox__snooze-trigger {
-  display: inline-flex;
-  min-height: 34px;
-  min-width: 34px;
-  align-items: center;
-  justify-content: center;
-  gap: 3px;
-  padding: 0 5px;
-  border-radius: 8px;
-  color: var(--muted);
+.attention-inbox__expand {
+  grid-auto-flow: column;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
@@ -491,55 +417,17 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
   right: 0;
   left: auto;
   background: var(--panel);
+  pointer-events: auto;
 }
 
 .attention-inbox__messages {
-  margin: 0 18px 9px 27px;
-  padding-left: 8px;
-  border-left: 1px solid var(--control-border);
-}
-
-.attention-inbox__message .attention-inbox__subject {
-  font-size: 13px;
-  font-weight: 500;
-}
-
-@container (max-width: 460px) {
-  .attention-inbox__row {
-    align-items: start;
-    gap: 2px;
-    padding-inline: 6px;
-  }
-
-  .attention-inbox__actions {
-    padding-top: 4px;
-  }
-
-  .attention-inbox__row:has(.attention-message-actions) {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .attention-inbox__row:has(.attention-message-actions) > .attention-inbox__actions {
-    justify-content: end;
-    padding-top: 0;
-  }
-
-  .attention-inbox__details {
-    gap: 2px 6px;
-  }
+  margin-inline-start: 27px;
+  border-inline-start: 1px solid var(--control-border);
 }
 
 @media (pointer: coarse) {
-  .attention-inbox__filter,
-  .attention-inbox__expand,
-  .attention-inbox__snooze-trigger {
+  .attention-inbox__filter {
     min-height: 40px;
-  }
-
-  .attention-inbox__actions :deep(.app-icon-button) {
-    width: 40px;
-    height: 40px;
-    flex-basis: 40px;
   }
 }
 </style>

@@ -41,9 +41,10 @@ test('Attention reads JMAP and IMAP and retains triage state and a downloaded bo
     await expect(imapRow).toContainText(relayEmail);
     await expect(page.locator('.attention-inbox__bundle').filter({ hasText: 'Please review the Relay Beta draft' }))
       .toContainText('relay-beta@example.org');
-    await imapRow.locator('.attention-inbox__preview').click();
+    await imapRow.locator('.msg-list__open').click();
     await expect(page.getByText(imapText)).toBeVisible();
     await page.getByRole('button', { name: 'Back to Attention' }).click();
+    await jmapRow.locator('.msg-list__open').hover();
     await jmapRow.getByRole('button', { name: 'Mark bundle done' }).click();
     await expect(jmapRow).toHaveCount(0);
 
@@ -62,7 +63,7 @@ test('Attention reads JMAP and IMAP and retains triage state and a downloaded bo
     await page.getByRole('button', { name: /^Done/ }).click();
     await expect(jmapRow).toBeVisible();
     await page.getByRole('button', { name: /^Needs attention/ }).click();
-    await imapRow.locator('.attention-inbox__preview').click();
+    await imapRow.locator('.msg-list__open').click();
     await expect(page.getByText(imapText)).toBeVisible();
   } finally {
     await context.setOffline(false);
@@ -118,6 +119,7 @@ test('Attention applies IMAP star, read state and Trash to the row, local cache 
     const actions = row.getByRole('group', { name: 'Message actions' }).first();
     const star = actions.getByRole('button', { name: 'Star', exact: true });
 
+    await row.locator('.msg-list__open').hover();
     await star.click();
     await expect(star).toHaveAttribute('aria-pressed', 'true');
     await expect.poll(cachedMessage).toMatchObject({ flagged: true });

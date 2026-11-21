@@ -49,7 +49,7 @@ it('opens the regular JMAP reader in Attention and keeps the filter and focus on
     const filters = wrapper.get('[aria-label="Smart Inbox filters"]');
     const updates = filters.findAll('button')[1];
     await updates.trigger('click');
-    const preview = wrapper.get('.attention-inbox__preview');
+    const preview = wrapper.get('.msg-list__open');
     await preview.trigger('click');
     await flushPromises();
     const reader = wrapper.get('[aria-label="Message detail"]');

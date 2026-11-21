@@ -3,8 +3,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch 
 import { useOnline, useStorage } from '@vueuse/core';
 import AppButton from './AppButton.vue';
 import AttentionInbox from './AttentionInbox.vue';
-import AttentionMessageActions from './AttentionMessageActions.vue';
 import MessageView from './MessageView.vue';
+import { useMessageTags } from '../composables/useMessageTags';
 import { getRepositoryAsync } from '../composables/useRepository';
 import { TABLE_FAMILIES } from '../db/protocol';
 import type { AttentionCache } from '../db/attention';
@@ -16,6 +16,8 @@ import { buildTriageBundles, markBundleDone, snoozeBundle, type BundleState, typ
 import { disableWebPush, enableWebPush, getWebPushPublicKey, isWebPushEnabled, onWebPushRefresh } from '../push/client';
 import type { MessageRow, FolderRow } from '../types';
 import { parseAddressList } from '../utils/address-list';
+import { formatAddressList } from '../utils/address-parse';
+import type { MessageRowLike } from '../utils/message-row-presentation';
 
 const props = defineProps<{
   ownerId: number;
@@ -37,6 +39,7 @@ const cache = shallowRef<AttentionCache>({ paired: false, accounts: [], states: 
 type Reading = { kind: 'jmap'; message: TriageMessage } |
   { kind: 'imap'; message: TriageMessage; body?: string; error?: string };
 const mailStore = useMailStore();
+const { definitions: tagDefinitions } = useMessageTags();
 const reading = shallowRef<Reading>();
 const reader = ref<HTMLElement>();
 const list = ref<HTMLElement>();
@@ -109,17 +112,29 @@ const imap = computed(() => cache.value.accounts.flatMap((account) => account.me
     directRecipient: row.to.some((recipient) => recipient.address.toLowerCase() === account.address.toLowerCase()),
     isFlagged: row.flagged,
   };
-  return { message, location, seen: row.seen, flagged: row.flagged };
+  const presentation: MessageRowLike & { id: string } = {
+    id,
+    subject: row.subject,
+    preview: row.preview,
+    from_text: formatAddressList(row.from.map(({ name, address }) => ({ name, email: address }))),
+    received_at: message.receivedAt,
+    is_seen: Number(row.seen),
+    is_flagged: Number(row.flagged),
+  };
+  return { message, location, presentation };
 })));
 const jmapRowsById = computed(() => new Map(jmapRows.value.map((row) => [row.id, row])));
-const messageStates = computed(() => new Map([
+const rows = computed(() => new Map<string, MessageRowLike & { id: number | string }>([
   ...jmapRows.value.map((row) => [
-    browserTriageMessageKey({ accountId: `jmap:${row.account_id}`, id: row.id }),
-    { seen: Boolean(row.is_seen), flagged: Boolean(row.is_flagged) },
+    browserTriageMessageKey({ accountId: `jmap:${row.account_id}`, id: row.id }), row,
   ] as const),
-  ...imap.value.map(({ message, seen, flagged }) => [
-    browserTriageMessageKey(message), { seen, flagged },
+  ...imap.value.map(({ message, presentation }) => [
+    browserTriageMessageKey(message), presentation,
   ] as const),
+]));
+const disabledActions = computed(() => new Set([
+  ...pendingActions.value,
+  ...(!online.value ? imap.value.map(({ message }) => browserTriageMessageKey(message)) : []),
 ]));
 const accountLabels = computed(() => Object.fromEntries([
   [`jmap:${props.ownerId}`, props.address],
@@ -439,18 +454,15 @@ onBeforeUnmount(() => {
         :loading="loading"
         :error="error"
         :open-message="reading?.message"
+        :rows="rows"
+        :disabled-actions="disabledActions"
+        :tag-definitions="tagDefinitions"
         @open="openMessage"
+        @message-action="runMessageAction"
         @done="(bundle) => saveState(bundle, markBundleDone(bundle))"
         @snooze="(bundle, until) => saveState(bundle, snoozeBundle(bundle, until))"
         @restore="(bundle) => saveState(bundle, null)"
       >
-        <template #message-actions="{ message }">
-          <AttentionMessageActions
-            :state="messageStates.get(browserTriageMessageKey(message))"
-            :disabled="pendingActions.has(browserTriageMessageKey(message)) || (typeof message.id === 'string' && !online)"
-            @action="runMessageAction(message, $event)"
-          />
-        </template>
         <template #actions>
           <form v-if="pairing" class="unified-attention__pairing" @submit.prevent="connectRelay">
             <input v-model="token" type="password" aria-label="Mail relay pairing token" placeholder="Pairing token" autocomplete="off" />

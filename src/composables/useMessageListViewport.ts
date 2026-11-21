@@ -6,10 +6,7 @@ import { useVirtualizer } from '@tanstack/vue-virtual';
 
 import { useMailStore } from '../stores/mail-store';
 import type { CachedRow } from '../stores/mail-store-types';
-
-const CARD_LAYOUT_WIDTH = 480;
-const ROW_HEIGHT = 64;
-const CARD_ROW_HEIGHT = 96;
+import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT } from '../utils/message-row-presentation';
 
 /**
  * Throttle for the scroll-driven fetch: a 100ms leading-edge guard so a

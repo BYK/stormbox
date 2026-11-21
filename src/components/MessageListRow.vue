@@ -1,13 +1,13 @@
 <script setup lang="ts">
 /**
- * One positioned message-list row. Owns the row's markup and styling so
+ * One message-list row. Owns the row's markup and styling so
  * every list surface renders the same row;
  * selection, focus and drag state come in as props and every interaction
  * is emitted back to the owner.
  */
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import {
-  Paperclip, Star, Trash2,
+  Mail, MailOpen, Paperclip, Star, Trash2,
 } from '@lucide/vue';
 
 import archiveIcon from '../assets/icons/tb-folder-archive.svg?raw';
@@ -25,9 +25,9 @@ import { isScheduledMessage } from '../utils/scheduled-message';
 import MessageTagStack from './MessageTagStack.vue';
 
 const props = withDefaults(defineProps<{
-  message: MessageRowLike & { id: number };
-  index: number;
-  start: number;
+  message: MessageRowLike & { id: number | string };
+  index?: number;
+  start?: number;
   size: number;
   focused?: boolean;
   cursor?: boolean;
@@ -53,6 +53,9 @@ const props = withDefaults(defineProps<{
    * (set or not) and never tag, archive or delete.
    */
   hoverActions?: boolean;
+  /** Show star, read state and delete for a list with independent row controls. */
+  inlineActions?: { disabled: boolean };
+  context?: string;
   /** False where archiving is a no-op (the Archive folder): the overlay drops its Archive button. */
   archiveAction?: boolean;
   /** False in a tag view, whose rows live in many folders: the overlay drops Delete. */
@@ -84,11 +87,12 @@ const props = withDefaults(defineProps<{
 });
 
 const emit = defineEmits<{
-  (e: 'row-click', event: MouseEvent): void;
+  (e: 'row-click', event: MouseEvent, trigger: HTMLButtonElement | null): void;
   (e: 'checkbox-click', event: MouseEvent): void;
   (e: 'dragstart', event: DragEvent): void;
   (e: 'dragend', event: DragEvent): void;
-  (e: 'star'): void;
+  (e: 'star', flagged: boolean): void;
+  (e: 'seen', seen: boolean): void;
   /** Open the tag menu for this row, anchored to the button that raised it. */
   (e: 'tag', event: MouseEvent): void;
   /** A chip was clicked: the owner filters the list to that tag. */
@@ -98,6 +102,9 @@ const emit = defineEmits<{
 
 const { senderAvatar, onAvatarError } = useSenderAvatars();
 
+const openButton = ref<HTMLButtonElement | null>(null);
+const inFlow = computed(() => props.start === undefined);
+const controlTabIndex = computed(() => inFlow.value ? undefined : -1);
 const isUnread = computed(() => Number(props.message.is_seen) === 0);
 const isFlagged = computed(() => Number(props.message.is_flagged) === 1);
 const tags = computed(() => resolveMessageTags(props.message.keywords_json, props.tagDefinitions));
@@ -108,6 +115,10 @@ const correspondent = computed(() => rowCorrespondent(props.message, props.shows
 const avatar = computed(() => senderAvatar(correspondent.value));
 const label = computed(() => correspondentLabel(props.message, props.showsRecipients));
 const dateText = computed(() => fmtDate(rowTimestamp(props.message, props.sort)));
+const secondaryActionLabel = computed(() => props.inlineActions
+  ? (isUnread.value ? 'Mark as read' : 'Mark as unread')
+  : 'Archive');
+const preview = computed(() => [props.context, props.message.preview].filter(Boolean).join(' · '));
 const rowLabel = computed(() => [
   label.value,
   props.message.subject || '(no subject)',
@@ -121,12 +132,12 @@ const rowLabel = computed(() => [
 
 <template>
   <li
-    :id="`${domIdPrefix}${message.id}`"
+    :id="`${domIdPrefix}${encodeURIComponent(message.id)}`"
     :data-index="index"
-    role="row"
-    :aria-rowindex="index + 1"
-    :aria-label="rowLabel"
-    :aria-selected="selected"
+    :role="inFlow ? undefined : 'row'"
+    :aria-rowindex="index === undefined ? undefined : index + 1"
+    :aria-label="inFlow ? undefined : rowLabel"
+    :aria-selected="inFlow ? undefined : selected"
     :class="{
       'is-focused': focused,
       'is-cursor': cursor,
@@ -135,7 +146,7 @@ const rowLabel = computed(() => [
       'is-unread': isUnread,
       'is-unselectable': !selectable,
     }"
-    :style="{
+    :style="inFlow ? { minHeight: size + 'px' } : {
       position: 'absolute',
       top: '0px',
       left: '0px',
@@ -146,26 +157,34 @@ const rowLabel = computed(() => [
   >
     <div
       class="msg-list__item"
-      :class="{ 'msg-list__item--hover-actions': hoverActions, 'has-tag-menu': tagMenuOpen }"
-      role="gridcell"
+      :class="{
+        'msg-list__item--hover-actions': hoverActions,
+        'msg-list__item--inline-actions': inlineActions,
+        'msg-list__item--in-flow': inFlow,
+        'has-tag-menu': tagMenuOpen,
+      }"
+      :role="inFlow ? undefined : 'gridcell'"
       :draggable="draggable && !isScheduledMessage(message)"
-      @click="emit('row-click', $event)"
+      @click="emit('row-click', $event, openButton)"
       @dragstart="emit('dragstart', $event)"
       @dragend="emit('dragend', $event)"
     >
       <button
+        ref="openButton"
         type="button"
         class="msg-list__open"
         data-message-control
-        tabindex="-1"
+        :tabindex="controlTabIndex"
+        :aria-current="inFlow && focused ? true : undefined"
         :aria-label="`Open message: ${message.subject || '(no subject)'}, ${label}`"
+        :title="context ? preview : undefined"
       />
       <div class="msg-list__state">
         <label v-if="selectable" class="msg-list__check" draggable="false" @click.stop>
           <input
             type="checkbox"
             data-message-control
-            tabindex="-1"
+            :tabindex="controlTabIndex"
             :aria-label="`Select message: ${message.subject || '(no subject)'}, ${label}`"
             :checked="selected"
             @click="emit('checkbox-click', $event)"
@@ -210,8 +229,10 @@ const rowLabel = computed(() => [
           </span>
           <span class="msg-list__date">{{ dateText }}</span>
           <div
-            v-if="hoverActions"
+            v-if="hoverActions || inlineActions"
             class="msg-list__actions"
+            :role="inlineActions ? 'group' : undefined"
+            :aria-label="inlineActions ? 'Message actions' : undefined"
             draggable="false"
             @click.stop
           >
@@ -219,10 +240,11 @@ const rowLabel = computed(() => [
                  rest while the row carries tags and on hover otherwise;
                  clicking opens the tag menu. -->
             <button
+              v-if="hoverActions"
               type="button"
               class="msg-list__action msg-list__action--tag"
               :class="{ 'is-tagged': tags.length > 0 }"
-              tabindex="-1"
+              :tabindex="controlTabIndex"
               data-message-control
               :title="tagStackLabel"
               :aria-label="tagStackLabel"
@@ -237,46 +259,52 @@ const rowLabel = computed(() => [
               type="button"
               class="msg-list__action msg-list__action--star"
               :class="{ 'msg-list__action--starred': isFlagged }"
-              tabindex="-1"
+              :tabindex="controlTabIndex"
               data-message-control
               :title="isFlagged ? 'Unstar' : 'Star'"
-              :aria-label="isFlagged ? 'Unstar' : 'Star'"
+              :aria-label="isFlagged && !inlineActions ? 'Unstar' : 'Star'"
               :aria-pressed="isFlagged"
-              @click="emit('star')"
+              :disabled="inlineActions?.disabled"
+              @click="emit('star', !isFlagged)"
             >
               <Star :size="17" :stroke-width="1.75" :fill="isFlagged ? '#facc15' : 'none'" />
             </button>
             <button
-              v-if="archiveAction"
+              v-if="inlineActions || archiveAction"
               type="button"
               class="msg-list__action"
-              tabindex="-1"
+              :tabindex="controlTabIndex"
               data-message-control
-              title="Archive"
-              aria-label="Archive"
-              @click="emit('archive')"
+              :title="secondaryActionLabel"
+              :aria-label="secondaryActionLabel"
+              :disabled="inlineActions?.disabled"
+              @click="inlineActions ? emit('seen', isUnread) : emit('archive')"
             >
-              <span class="msg-list__action-icon--folder" aria-hidden="true" v-html="archiveIcon" />
+              <component v-if="inlineActions" :is="isUnread ? MailOpen : Mail" :size="17" :stroke-width="1.75" aria-hidden="true" />
+              <span v-else class="msg-list__action-icon--folder" aria-hidden="true" v-html="archiveIcon" />
             </button>
             <button
               v-if="deleteAction"
               type="button"
               class="msg-list__action msg-list__action--danger"
-              tabindex="-1"
+              :tabindex="controlTabIndex"
               data-message-control
-              title="Delete"
+              :title="inlineActions ? 'Move to Trash' : 'Delete'"
               aria-label="Delete"
+              :disabled="inlineActions?.disabled"
               @click="emit('delete')"
             >
               <Trash2 :size="18" :stroke-width="1.65" />
             </button>
+            <slot name="actions" />
           </div>
         </div>
-        <p v-if="message.preview" class="msg-list__preview">
-          {{ message.preview }}
+        <p v-if="preview" class="msg-list__preview">
+          {{ preview }}
         </p>
       </div>
     </div>
+    <slot name="after-row" />
   </li>
 </template>
 
@@ -286,18 +314,18 @@ const rowLabel = computed(() => [
  * checkbox itself; we tint the row very softly so the user can scan
  * a column of selected rows without it competing with the "what
  * am I reading" highlight. */
-.msg-list__items li.is-focused .msg-list__item { background: var(--rowActive); }
-.msg-list__items li.is-selected .msg-list__item {
+.msg-list__items li.is-focused > .msg-list__item { background: var(--rowActive); }
+.msg-list__items li.is-selected > .msg-list__item {
   background: color-mix(in srgb, var(--accent) 6%, var(--panel));
 }
-.msg-list__items li.is-selected.is-focused .msg-list__item {
+.msg-list__items li.is-selected.is-focused > .msg-list__item {
   background: var(--rowActive);
 }
-.msg-list__items li.is-dragging .msg-list__item {
+.msg-list__items li.is-dragging > .msg-list__item {
   opacity: 0.55;
 }
-.msg-list__items li.is-unread .msg-list__from,
-.msg-list__items li.is-unread .msg-list__subject {
+.msg-list__items li.is-unread > .msg-list__item .msg-list__from,
+.msg-list__items li.is-unread > .msg-list__item .msg-list__subject {
   font-weight: 600;
   color: var(--text);
 }
@@ -328,6 +356,9 @@ const rowLabel = computed(() => [
 .msg-list__item:hover,
 .msg-list__item:focus-within,
 .msg-list__item.has-tag-menu { background: var(--rowHover); }
+.msg-list__item--in-flow {
+  min-height: inherit;
+}
 .msg-list__scroller:focus-visible .is-cursor .msg-list__item {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -359,7 +390,7 @@ const rowLabel = computed(() => [
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
-.msg-list__action:focus-visible,
+:where(.msg-list__actions) :deep(.msg-list__action:focus-visible),
 .msg-list__check input:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -395,7 +426,7 @@ const rowLabel = computed(() => [
   gap: 2px;
   pointer-events: none;
 }
-.msg-list__action {
+:where(.msg-list__actions) :deep(.msg-list__action) {
   position: relative;
   display: inline-grid;
   place-items: center;
@@ -453,7 +484,7 @@ const rowLabel = computed(() => [
     display: none;
   }
 }
-.msg-list__action:hover:where(:not(:disabled)) {
+:where(.msg-list__actions) :deep(.msg-list__action:hover:where(:not(:disabled))) {
   background: var(--control-hover-bg);
   color: var(--text);
 }
@@ -461,9 +492,47 @@ const rowLabel = computed(() => [
 .msg-list__action--starred:hover {
   color: var(--folder-icon-color);
 }
-.msg-list__action--danger:hover:where(:not(:disabled)) {
+:where(.msg-list__actions) :deep(.msg-list__action--danger:hover:where(:not(:disabled))) {
   background: var(--error-bg);
   color: var(--error-fg);
+}
+:where(.msg-list__actions) :deep(.msg-list__action:disabled) {
+  opacity: 0.35;
+  cursor: default;
+}
+.msg-list__item--inline-actions .msg-list__actions {
+  position: static;
+  transform: none;
+  grid-column: 1 / -1;
+  justify-self: end;
+  justify-content: end;
+  flex-wrap: wrap;
+}
+.msg-list__item--inline-actions .msg-list__actions :deep(.msg-list__action) {
+  display: inline-grid;
+  visibility: visible;
+}
+@media (min-width: 640px) and (hover: hover) {
+  @container (min-width: 480px) {
+    .msg-list__item--inline-actions .msg-list__summary {
+      position: relative;
+    }
+    .msg-list__item--inline-actions .msg-list__actions {
+      position: absolute;
+      transform: translateY(-50%);
+      opacity: 0;
+    }
+    .msg-list__item--inline-actions:not(:hover, :focus-within, :has(details[open])) .msg-list__actions :deep(.msg-list__action) {
+      pointer-events: none;
+    }
+    .msg-list__item--inline-actions :is(.msg-list__content, .msg-list__summary, .msg-list__actions) {
+      background: inherit;
+    }
+    .msg-list__item--inline-actions:is(:hover, :focus-within, :has(details[open])) .msg-list__actions {
+      opacity: 1;
+      z-index: 1;
+    }
+  }
 }
 .msg-list__action-icon--folder {
   display: block;
@@ -519,15 +588,15 @@ const rowLabel = computed(() => [
   pointer-events: none;
 }
 .msg-list__item:hover .msg-list__check,
-.msg-list__items li.is-selected .msg-list__check {
+.msg-list__items li.is-selected > .msg-list__item .msg-list__check {
   opacity: 1;
 }
 .msg-list__item:hover .msg-list__unread-dot,
-.msg-list__items li.is-selected .msg-list__unread-dot {
+.msg-list__items li.is-selected > .msg-list__item .msg-list__unread-dot {
   opacity: 0;
 }
 /* Without a checkbox there is nothing for the dot to make room for. */
-.msg-list__items li.is-unselectable .msg-list__item:hover .msg-list__unread-dot {
+.msg-list__items li.is-unselectable > .msg-list__item .msg-list__unread-dot {
   opacity: 1;
 }
 .msg-list__avatar {
@@ -646,10 +715,10 @@ const rowLabel = computed(() => [
 .msg-list--card .msg-list__actions {
   top: 9px;
 }
-.msg-list--card .msg-list__action:focus-visible {
+.msg-list--card :where(.msg-list__actions) :deep(.msg-list__action:focus-visible) {
   outline: none;
 }
-.msg-list--card .msg-list__action:focus-visible::after {
+.msg-list--card :where(.msg-list__actions) :deep(.msg-list__action:focus-visible)::after {
   content: '';
   position: absolute;
   inset: 4px 0;

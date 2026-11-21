@@ -7,8 +7,12 @@
 import type { JmapViewSort } from '../constants/states';
 import { shortFrom } from './sender-avatar';
 
+export const CARD_LAYOUT_WIDTH = 480;
+export const ROW_HEIGHT = 64;
+export const CARD_ROW_HEIGHT = 96;
+
 export interface MessageRowLike {
-  id?: number | null;
+  id?: number | string | null;
   from_text?: string | null;
   to_text?: string | null;
   subject?: string | null;

@@ -28,8 +28,9 @@ test('Attention keeps the current filter while reading and applies quick actions
     await loginViaOidc(page);
     await page.getByRole('button', { name: 'Attention', exact: true }).click();
     const row = page.locator('.attention-inbox__bundle').filter({ hasText: subject });
-    const trigger = row.locator('.attention-inbox__preview');
+    const trigger = row.locator('.msg-list__open');
     const handled = page.getByRole('button', { name: /^Done & snoozed/ });
+    await trigger.hover();
     await row.getByRole('button', { name: 'Mark bundle done' }).click();
     await handled.click();
     await trigger.click();
