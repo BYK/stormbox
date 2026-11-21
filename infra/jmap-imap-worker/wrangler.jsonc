@@ -1,0 +1,40 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "stormbox-jmap-imap",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-11-20",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": {
+    "enabled": false
+  },
+  "vars": {
+    "PUBLIC_ORIGIN": "https://webmail.byk.im"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MAILBOXES",
+        "class_name": "AccountState"
+      },
+      {
+        "name": "PUSH_SUBSCRIPTIONS",
+        "class_name": "PushSubscriptions"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "mailboxes-v1",
+      "new_sqlite_classes": [
+        "AccountState"
+      ]
+    },
+    {
+      "tag": "push-v1",
+      "new_sqlite_classes": [
+        "PushSubscriptions"
+      ]
+    }
+  ]
+}

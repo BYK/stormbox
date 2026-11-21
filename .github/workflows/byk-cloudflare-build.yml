@@ -28,6 +28,7 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             infra/jmap-bridge/package-lock.json
+            infra/jmap-imap-worker/package-lock.json
 
       - name: Install application dependencies
         env:
@@ -61,6 +62,16 @@ jobs:
           --dry-run
           --outdir ../../worker-dist
 
+      - name: Install gateway dependencies
+        run: npm ci --prefix infra/jmap-imap-worker
+
+      - name: Verify gateway
+        working-directory: infra/jmap-imap-worker
+        run: |
+          npm run typecheck
+          npm test
+          npm run build
+
       - name: Upload deployment artifacts
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -68,5 +79,6 @@ jobs:
           path: |
             dist/
             worker-dist/
+            infra/jmap-imap-worker/dist/
           if-no-files-found: error
           retention-days: 7
