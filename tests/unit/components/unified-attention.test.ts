@@ -7,6 +7,7 @@ import { watch } from 'vue';
 import UnifiedAttention from '../../../src/components/UnifiedAttention.vue';
 import { __resetRepositoryForTests, __setRepositoryForTests } from '../../../src/composables/useRepository';
 import { useAuthStore } from '../../../src/stores/auth-store';
+import { useComposeStore } from '../../../src/stores/compose-store';
 import { useMailStore } from '../../../src/stores/mail-store';
 import type { RelayMessageBody } from '../../../src/sync/backends/imap/attention-relay';
 import type { FolderRow } from '../../../src/types';
@@ -116,7 +117,8 @@ it('keeps the shared reader mounted while loading IMAP HTML and sends its toolba
     from: [{ name: 'Newsletter', address: 'updates@example.org' }],
     to: [{ name: '', address: 'my-gmail@example.org' }],
     cc: [{ name: 'Subscriber', address: 'subscriber@example.net' }],
-    labels: ['Read later'], keywords: ['localtriage-category-newsletter'],
+    replyTo: [{ name: '', address: 'replies@example.org' }],
+    labels: ['Read later'], keywords: ['localtriage-category-newsletter'], gmailLabels: true,
   };
   let messages = [row];
   let receiveBody!: (body: RelayMessageBody) => void;
@@ -126,23 +128,27 @@ it('keeps the shared reader mounted while loading IMAP HTML and sends its toolba
   const mutateAttentionImapMessage = vi.fn(async (_owner, _location, action) => {
     if (action.type === 'star') row.flagged = action.value;
     if (action.type === 'seen') row.seen = action.value;
+    if (action.type === 'tags') row.labels = row.labels.filter((label) => !action.tags.removeLabels?.includes(label));
     if (action.type === 'trash') messages = [];
   });
   __setRepositoryForTests({
     subscribe: () => () => {},
     getAttentionCache: async () => ({ paired: true, accounts: [{
       relay_id: 'personal-gmail', address: 'my-gmail@example.org', name: 'Gmail',
-      mailbox: 'INBOX', uid_validity: '3', messages,
+      mailbox: 'INBOX', uid_validity: '3', can_send: true, messages,
     }], states: {} }),
     folderByRole: async () => undefined,
     refreshAttentionRelay: async () => [],
     readAttentionImapMessage,
     mutateAttentionImapMessage,
   });
+  const pinia = createPinia();
+  const compose = useComposeStore(pinia);
+  const prepare = vi.spyOn(compose, 'prepareImapResponse');
   const wrapper = mount(UnifiedAttention, {
     attachTo: document.body,
     props: { ownerId: 1, address: 'owner@example.org' },
-    global: { plugins: [createPinia()] },
+    global: { plugins: [pinia], stubs: { Teleport: true } },
   });
 
   try {
@@ -169,6 +175,28 @@ it('keeps the shared reader mounted while loading IMAP HTML and sends its toolba
     expect(reader.get('iframe').attributes('srcdoc')).toContain('<strong>Formatted newsletter</strong>');
     expect(reader.get('[aria-label="Message header"]').element).toBe(header.element);
     expect(reader.get('[aria-label="Back to Attention"]').element).toBe(back.element);
+    expect(reader.get('[aria-label="Archive"]').attributes('disabled')).toBeUndefined();
+    expect(reader.get('[aria-label="Mark as junk"]').attributes('disabled')).toBeUndefined();
+    await reader.get('[aria-label="Reply All"]').trigger('click');
+    expect(prepare).toHaveBeenLastCalledWith('reply-all', {
+      id: 'personal-gmail', email: 'my-gmail@example.org', name: 'Gmail',
+    }, expect.objectContaining({ addresses: expect.arrayContaining([
+      expect.objectContaining({ kind: 'replyTo', email: 'replies@example.org' }),
+      expect.objectContaining({ kind: 'cc', email: 'subscriber@example.net' }),
+    ]) }), expect.objectContaining({ html: expect.stringContaining('Formatted newsletter') }));
+    await reader.get('[aria-label="Forward"]').trigger('click');
+    expect(prepare.mock.lastCall?.[0]).toBe('forward');
+
+    await reader.get('[data-tag-picker-trigger]').trigger('click');
+    await flushPromises();
+    const tag = wrapper.findAll('[role="menuitemcheckbox"]').find((item) => item.text().trim() === 'Read later');
+    expect(tag?.attributes('aria-checked')).toBe('true');
+    await tag!.trigger('click');
+    await flushPromises();
+    expect(mutateAttentionImapMessage).toHaveBeenLastCalledWith(1, location, {
+      type: 'tags', tags: { removeLabels: ['Read later'] },
+    });
+    expect(header.text()).not.toContain('Read later');
     await back.trigger('click');
     expect(document.activeElement).toBe(open.element);
     await open.trigger('click');

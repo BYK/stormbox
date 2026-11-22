@@ -71,6 +71,7 @@ const PICKABLE_IMAGE_ACCEPT = [...PICKABLE_IMAGE_TYPES].join(',');
 const props = withDefaults(
   defineProps<{
     accessibleLabel?: string;
+    allowFiles?: boolean;
     ariaDescribedby?: string;
     ariaInvalid?: boolean;
     contentKey?: string | number;
@@ -79,6 +80,7 @@ const props = withDefaults(
   }>(),
   {
     accessibleLabel: 'Rich text editor',
+    allowFiles: true,
     ariaDescribedby: undefined,
     ariaInvalid: false,
     contentKey: 'default',
@@ -890,7 +892,7 @@ function handleNativePaste(event: ClipboardEvent): void {
   if (text) {
     runEditorCommand((editor) => editor.insertPlainText(text, true));
   }
-  void classifyAndInsertPastedFiles(files);
+  if (props.allowFiles) void classifyAndInsertPastedFiles(files);
 }
 
 const LONE_URL_PATTERN = /^https?:\/\/\S+$/i;
@@ -901,7 +903,7 @@ function handleScriptedPaste(event: Event): void {
   const detail = scriptedPasteDetail(event);
   if (!detail || !squire) return;
   rememberSelection();
-  if (detail.files && detail.files.length > 0) {
+  if (props.allowFiles && detail.files && detail.files.length > 0) {
     void classifyAndInsertPastedFiles(detail.files);
     return;
   }
@@ -1249,6 +1251,7 @@ defineExpose({
 <template>
   <div class="rich-text-editor">
     <input
+      v-if="allowFiles"
       ref="imageInputEl"
       hidden
       type="file"
@@ -1400,6 +1403,7 @@ defineExpose({
         data-tour="image-tools"
       >
         <button
+          v-if="allowFiles"
           type="button"
           class="toolbar-button"
           aria-label="Insert image"
@@ -1573,6 +1577,7 @@ defineExpose({
             aria-label="Insert"
           >
             <button
+              v-if="allowFiles"
               type="button"
               class="app-dropdown__item toolbar-menu-button"
               role="menuitem"

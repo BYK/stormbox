@@ -1002,6 +1002,27 @@ describe('OutboxRunner crash recovery', () => {
 });
 
 describe('OutboxRunner runMutation', () => {
+  it('keeps a partial IMAP send receipt when a background drain finishes before the caller attaches', async () => {
+    const processRow = vi.fn().mockResolvedValueOnce({ ok: true, result: { rejected: 2 } })
+      .mockResolvedValueOnce({ ok: true, result: {} });
+    const runner = new OutboxRunner({
+      accountId, handlers, processRow,
+    });
+    const { id } = await handlers[DB_RPC.PENDING_MUTATION_INSERT]({
+      accountId, mutationType: MUTATION_TYPE.ATTENTION_IMAP_SEND, requestJson: '{}',
+    });
+    await runner.drain();
+    expect(await loadRow(id)).toBeNull();
+    expect(await runner.runMutation(id)).toEqual({ attempted: 0, succeeded: 1, failed: 0, result: { rejected: 2 } });
+    const next = await handlers[DB_RPC.PENDING_MUTATION_INSERT]({
+      accountId, mutationType: MUTATION_TYPE.ATTENTION_IMAP_SEND, requestJson: '{}',
+    });
+    expect(next.id).toBe(id);
+    await runner.drain();
+    expect(await runner.runMutation(next.id)).toEqual({ attempted: 0, succeeded: 1, failed: 0 });
+    await runner.stop();
+  });
+
   it('resolves with success once the targeted row terminates', async () => {
     const localMsg = await seedMessage('e-1');
     const runner = new OutboxRunner({

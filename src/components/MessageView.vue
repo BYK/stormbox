@@ -69,6 +69,7 @@ import TagPickerPopover, { type PopoverAnchor } from './TagPickerPopover.vue';
 // content as if it has at least this width and apply CSS zoom to fit,
 // even when scrollWidth would technically not overflow.
 const MIN_EMAIL_LAYOUT_WIDTH = 400;
+const GMAIL_SYSTEM_LABEL = /^(?:inbox|spam|trash|unread|starred|important|sent|drafts?|all mail|category_\w+|\[gmail\]|\[googlemail\])$/i;
 
 const props = withDefaults(defineProps<{
   maximized?: boolean;
@@ -82,6 +83,9 @@ const props = withDefaults(defineProps<{
     received_at: number;
     keywords_json: string;
     labels: string[];
+    knownLabels: string[];
+    gmailLabels: boolean;
+    canSend: boolean;
     seen: boolean;
     flagged: boolean;
     disabled: boolean;
@@ -90,7 +94,12 @@ const props = withDefaults(defineProps<{
     actionError?: string;
   };
 }>(), { maximized: false });
-const emit = defineEmits<{ toggleMaximized: []; back: []; imapAction: [action: ImapAttentionAction] }>();
+const emit = defineEmits<{
+  toggleMaximized: [];
+  back: [];
+  imapAction: [action: ImapAttentionAction];
+  imapCompose: [kind: 'reply' | 'reply-all' | 'forward'];
+}>();
 const messageViewEl = ref<HTMLElement | null>(null);
 const { height: messageViewHeight } = useElementSize(messageViewEl, undefined, { box: 'border-box' });
 const toolbarEl = ref<HTMLElement | null>(null);
@@ -150,7 +159,7 @@ const settingsStore = useSettingsStore();
 const shortcutScheme = computed(() => settingsStore.get('shortcutScheme'));
 /** Toolbar title with the key the active scheme binds, e.g. `Reply (R)`. */
 function actionTitle(label: string, action: ShortcutAction): string {
-  return props.maximized ? label : titleWithShortcut(label, action, shortcutScheme.value);
+  return props.maximized || props.imap ? label : titleWithShortcut(label, action, shortcutScheme.value);
 }
 
 function onReadingKeyDown(event: KeyboardEvent) {
@@ -249,13 +258,27 @@ const messageAccountId = computed(() => message.value?.account_id ?? null);
 // single-column layout has no row hover, so this is where a phone user
 // tags a single message.
 const { definitions: tagDefinitions, tagsFor } = useMessageTags();
+const gmailTags = computed(() => {
+  if (!props.imap?.gmailLabels) return [];
+  const colors = new Map(tagDefinitions.value.filter(({ name }) => !GMAIL_SYSTEM_LABEL.test(name))
+    .map((tag) => [tag.name, tag.color]));
+  const applied = new Set(props.imap.labels);
+  return [...new Set([...colors.keys(), ...props.imap.knownLabels, ...applied])].map((label) => ({
+    keyword: `gmail label:${label}`, name: label, color: colors.get(label) ?? null, applied: applied.has(label),
+  }));
+});
+const keywordTags = computed(() => tagsFor(viewMessage.value));
 const messageTags = computed(() => [
-  ...tagsFor(viewMessage.value),
-  ...(props.imap?.labels ?? []).map((label) => ({ keyword: `label:${label}`, name: label, color: null, defined: true })),
+  ...keywordTags.value,
+  ...gmailTags.value.filter((tag) => tag.applied).map((tag) => ({ ...tag, defined: true })),
 ]);
 const seenLabel = computed(() => props.imap?.seen ? 'Mark as unread' : 'Mark as read');
-const messageTagTargets = computed(() => (message.value ? [message.value] : []));
-const canTagMessage = computed(() => message.value != null && !isScheduledMessage(message.value));
+const messageTagTargets = computed(() => (viewMessage.value ? [viewMessage.value] : []));
+const canTagMessage = computed(() => !!props.imap || (message.value != null && !isScheduledMessage(message.value)));
+const pickerDefinitions = computed(() => props.imap?.gmailLabels
+  ? tagDefinitions.value.filter((definition) => keywordTags.value.some(({ keyword }) => keyword === definition.keyword))
+  : tagDefinitions.value);
+const imapCanRespond = computed(() => props.imap?.canSend && bodyLoaded.value && !props.imap.bodyError);
 
 // The toolbar's tag stack opens the menu as a popover: the header sits in
 // an overflow-hidden article, which would clip an inline dropdown.
@@ -280,9 +303,17 @@ function closeTagMenu() {
   tagMenuAnchor.value = null;
 }
 // A different message (or none) closes the menu with the row it was for.
-watch(() => message.value?.id, closeTagMenu);
+watch(viewMessageId, closeTagMenu);
 
 async function setMessageTag(keyword: string, on: boolean) {
+  if (props.imap) {
+    if (props.imap.disabled) return;
+    const label = gmailTags.value.find((tag) => tag.keyword === keyword);
+    emit('imapAction', { type: 'tags', tags: label
+      ? { [on ? 'addLabels' : 'removeLabels']: [label.name] }
+      : { [on ? 'add' : 'remove']: [keyword] } });
+    return;
+  }
   if (!message.value) return;
   await mailStore.setTagsMany(
     [message.value.id],
@@ -292,6 +323,11 @@ async function setMessageTag(keyword: string, on: boolean) {
 }
 
 async function clearMessageTags() {
+  if (props.imap) {
+    if (props.imap.disabled) return;
+    emit('imapAction', { type: 'tags', tags: { remove: keywordTags.value.map(({ keyword }) => keyword), removeLabels: props.imap.labels } });
+    return;
+  }
   if (!message.value) return;
   await mailStore.clearTagsMany([message.value.id], { ...messageSource.value, rows: [message.value] });
 }
@@ -710,21 +746,25 @@ async function quoteBody() {
 }
 
 async function reply() {
+  if (props.imap) return emit('imapCompose', 'reply');
   if (!message.value) return;
   await composeStore.prepareReplyFromMessage(message.value, await quoteBody());
 }
 
 async function replyAll() {
+  if (props.imap) return emit('imapCompose', 'reply-all');
   if (!message.value) return;
   await composeStore.prepareReplyAll(message.value, await quoteBody());
 }
 
 async function forward() {
+  if (props.imap) return emit('imapCompose', 'forward');
   if (!message.value) return;
   composeStore.prepareForward(message.value, await quoteBody());
 }
 
 async function archive() {
+  if (props.imap) return emit('imapAction', { type: 'archive' });
   if (!message.value) return;
   try {
     await mailStore.archiveMessages([message.value.id], messageSource.value);
@@ -758,6 +798,7 @@ async function whitelistSender() {
 }
 
 async function junk() {
+  if (props.imap) return emit('imapAction', { type: 'junk' });
   if (!message.value) return;
   try {
     await mailStore.junkMessages([message.value.id], messageSource.value);
@@ -894,10 +935,10 @@ function closeMessageView() {
              only Back and the view-mode toggle, and the banner below
              owns Cancel Send. -->
         <template v-if="!isPendingScheduled">
-          <AppIconButton v-if="!imap && !isInArchiveFolder" class="message-view__action" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
+          <AppIconButton v-if="imap || !isInArchiveFolder" class="message-view__action" :disabled="imap?.disabled" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="archiveIcon" />
           </AppIconButton>
-          <AppIconButton v-if="!imap && !isInJunkFolder" class="message-view__action" @click="junk" title="Junk" aria-label="Mark as junk">
+          <AppIconButton v-if="imap || !isInJunkFolder" class="message-view__action" :disabled="imap?.disabled" @click="junk" title="Junk" aria-label="Mark as junk">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="junkIcon" />
           </AppIconButton>
           <template v-if="imap">
@@ -924,13 +965,13 @@ function closeMessageView() {
           <AppIconButton class="message-view__action" danger :disabled="imap?.disabled" @click="destroy" :title="imap ? 'Move to Trash' : actionTitle('Delete', 'delete')" aria-label="Delete">
             <Trash2 class="message-view__toolbar-icon" :size="18" :stroke-width="1.65" />
           </AppIconButton>
-          <AppIconButton v-if="!imap" class="message-view__action" @click="reply" :title="actionTitle('Reply', 'reply')" aria-label="Reply">
+          <AppIconButton class="message-view__action" :disabled="!!imap && !imapCanRespond" @click="reply" :title="actionTitle('Reply', 'reply')" aria-label="Reply">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="replyIcon" />
           </AppIconButton>
-          <AppIconButton v-if="!imap" class="message-view__action" @click="replyAll" :title="actionTitle('Reply All', 'replyAll')" aria-label="Reply All">
+          <AppIconButton class="message-view__action" :disabled="!!imap && !imapCanRespond" @click="replyAll" :title="actionTitle('Reply All', 'replyAll')" aria-label="Reply All">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="replyAllIcon" />
           </AppIconButton>
-          <AppIconButton v-if="!imap" class="message-view__action" @click="forward" :title="actionTitle('Forward', 'forward')" aria-label="Forward">
+          <AppIconButton class="message-view__action" :disabled="!!imap && !imapCanRespond" @click="forward" :title="actionTitle('Forward', 'forward')" aria-label="Forward">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="forwardIcon" />
           </AppIconButton>
           <!-- The message's tag stack (MK-6.5); opens the tag menu. -->
@@ -942,6 +983,7 @@ function closeMessageView() {
             :aria-label="tagStackLabel"
             aria-haspopup="dialog"
             :aria-expanded="tagMenuAnchor !== null"
+            :disabled="imap?.disabled && tagMenuAnchor === null"
             data-tag-picker-trigger
             @click="toggleTagMenu"
           >
@@ -951,7 +993,9 @@ function closeMessageView() {
         <TagPickerPopover
           :anchor="tagMenuAnchor"
           :targets="messageTagTargets"
-          :definitions="tagDefinitions"
+          :definitions="pickerDefinitions"
+          :additional-tags="gmailTags"
+          :busy="imap?.disabled"
           :trigger="tagMenuTrigger"
           label="Tags"
           @close="closeTagMenu"

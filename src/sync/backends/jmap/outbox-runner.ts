@@ -65,6 +65,7 @@ const DEFAULT_NOTIFY_DELAY_MS = 10;
 const DEFAULT_BACKOFF_BASE_MS = 1_000;
 const DEFAULT_BACKOFF_CAP_MS = 60_000;
 const DRAIN_BATCH_SIZE = 50;
+const RECENT_IMAP_SEND_LIMIT = 32;
 
 export type ProcessRowContext = {
   /** Forwards a row's progress reports to every runMutation caller awaiting it. */
@@ -100,6 +101,7 @@ export class OutboxRunner {
   _awaiters: Map<number, Array<{ resolve: (v: any) => void; mutationType: string }>>;
   _progressListeners: Map<number, Set<(progress: MutationProgress) => void>>;
   _tallyListeners: Set<(id: number, outcome: any) => void>;
+  private readonly recentImapSendResults = new Map<number, { rejected: number }>();
 
   _onForegroundChange: ((delta: number) => void) | null;
 
@@ -333,7 +335,8 @@ export class OutboxRunner {
     const row = await this._loadRow(mutationId);
     if (!row) {
       // Already deleted = already succeeded by a prior pass.
-      return { attempted: 0, succeeded: 1, failed: 0 };
+      const result = this.recentImapSendResults.get(mutationId);
+      return { attempted: 0, succeeded: 1, failed: 0, ...(result ? { result } : {}) };
     }
     if (row.local_status === 'conflicted') {
       return { attempted: 0, succeeded: 0, failed: 1 };
@@ -382,7 +385,7 @@ export class OutboxRunner {
     // of waiting forever for a notification that already happened.
     const current = await this._loadRow(mutationId);
     if (!current) {
-      this._resolveAwaiters(mutationId, { ok: true });
+      this._resolveAwaiters(mutationId, { ok: true, result: this.recentImapSendResults.get(mutationId) });
     } else if (current.local_status === 'conflicted') {
       let error;
       try {
@@ -486,6 +489,7 @@ export class OutboxRunner {
     }
     this._awaiters.clear();
     this._progressListeners.clear();
+    this.recentImapSendResults.clear();
     this._targetLocks.clear();
   }
 
@@ -643,6 +647,7 @@ export class OutboxRunner {
         await this._settleUnclaimedRow(row.id);
         return;
       }
+      this.recentImapSendResults.delete(activeRow.id);
       try {
         result = await this._processRow(activeRow, {
           onProgress: (progress) => this._emitProgress(activeRow.id, progress),
@@ -675,6 +680,13 @@ export class OutboxRunner {
       this._signalForeground(-1);
     }
     if (result?.ok) {
+      if (activeRow.mutation_type === MUTATION_TYPE.ATTENTION_IMAP_SEND && result.result?.rejected > 0) {
+        this.recentImapSendResults.set(activeRow.id, { rejected: result.result.rejected });
+        if (this.recentImapSendResults.size > RECENT_IMAP_SEND_LIMIT) {
+          const oldest = this.recentImapSendResults.keys().next().value;
+          if (oldest !== undefined) this.recentImapSendResults.delete(oldest);
+        }
+      }
       await this._deleteRow(activeRow.id);
       this._resolveAwaiters(activeRow.id, { ok: true, result: result.result });
       this._fireTally(activeRow.id, { ok: true, result: result.result });
@@ -794,7 +806,7 @@ export class OutboxRunner {
   async _settleUnclaimedRow(mutationId) {
     const current = await this._loadRow(mutationId);
     if (!current) {
-      this._resolveAwaiters(mutationId, { ok: true });
+      this._resolveAwaiters(mutationId, { ok: true, result: this.recentImapSendResults.get(mutationId) });
       return;
     }
     if (current.local_status !== 'conflicted') return;

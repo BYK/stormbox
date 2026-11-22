@@ -277,6 +277,10 @@ export async function processMutationRow({
       return handlers[DB_RPC.ATTENTION_APPLY_IMAP_ACTION]({
         ownerId: row.account_id, location: request?.location, action: request?.action,
       });
+    case MUTATION_TYPES.ATTENTION_IMAP_SEND:
+      return handlers[DB_RPC.ATTENTION_APPLY_IMAP_SEND]({
+        ownerId: row.account_id, accountId: request?.accountId, draft: request?.draft, cancelled: request?.cancelled === 1,
+      });
     default:
       return {
         ok: false,

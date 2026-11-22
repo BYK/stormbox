@@ -62,6 +62,8 @@ export const DB_RPC = Object.freeze({
   ATTENTION_REMOVE_RELAY_ACCOUNT: 'attention.removeRelayAccount',
   ATTENTION_BODY: 'attention.body',
   ATTENTION_APPLY_IMAP_ACTION: 'attention.applyImapAction',
+  ATTENTION_ENSURE_IMAP_SEND: 'attention.ensureImapSend',
+  ATTENTION_APPLY_IMAP_SEND: 'attention.applyImapSend',
   ATTENTION_SET_STATE: 'attention.setState',
 
   HEALTHCHECK: 'db.healthcheck',

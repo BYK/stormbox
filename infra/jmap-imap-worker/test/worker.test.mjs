@@ -136,6 +136,38 @@ test('generic JMAP requires its bearer token and supports Core/echo', async () =
   assert.deepEqual((await res.json()).methodResponses, [['Core/echo', { health: true }, 'a']]);
 });
 
+test('accepts submission requests only from the paired application origin', async () => {
+  const send = `${api}/accounts/alpha/send`;
+  const Cookie = (await pairBrowser()).headers.get('set-cookie').split(';')[0];
+  const init = { method: 'POST', body: '{}' };
+  assert.equal((await request(send, { ...init, headers: { Origin: origin, Authorization: `Bearer ${accessToken}` } })).status, 401);
+  assert.equal((await request(send, { ...init, headers: { Origin: 'https://other.example.test', Cookie } })).status, 401);
+  const unavailable = await request(send, { ...init, headers: { Origin: origin, Cookie } });
+  assert.equal(unavailable.status, 422);
+  assert.deepEqual(await unavailable.json(), { error: 'smtp_not_configured' });
+});
+
+test('requires pairing and rejects malformed tag patches before contacting a mail server', async () => {
+  const message = `${api}/accounts/alpha/messages/44`;
+  const paired = await pairBrowser();
+  const headers = { Cookie: paired.headers.get('set-cookie').split(';')[0], Origin: origin };
+  for (const operation of ['archive', 'junk']) {
+    assert.equal((await request(`${message}/${operation}?uidValidity=7`, { method: 'POST', headers: { Origin: origin } })).status, 401);
+    assert.equal((await request(`${message}/${operation}?uidValidity=0`, { method: 'POST', headers })).status, 400);
+  }
+  for (const payload of [
+    { tags: {} }, { tags: { add: ['foo bar'] } }, { tags: { add: ['\\Deleted'] } },
+    { tags: { add: ['$Junk'] } }, { tags: { add: ['valid'], remove: ['VALID'] } },
+    { tags: { removeLabels: ['\\Inbox'] } }, { tags: { addLabels: ['Inbox'] } },
+    { tags: { addLabels: ['[Gmail]/Trash'] } }, { tags: { addLabels: ['injected\r\ncommand'] } },
+    { tags: { add: ['valid'] }, seen: false },
+  ]) {
+    const response = await request(`${message}?uidValidity=7`, { method: 'PATCH', headers, body: JSON.stringify(payload) });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: 'invalid_tags' });
+  }
+});
+
 test('requires paired account setup and validates public host and TLS options before network access', async () => {
   const path = `${api}/accounts`;
   const payload = { email: 'me@gmail.com', password: 'fict itio uspa sswd' };

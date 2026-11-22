@@ -56,10 +56,11 @@ import {
   parseAddressList,
   type ParsedAddress,
 } from '../utils/address-parse';
-import { buildReplyAudience, buildThreadHeaders } from '../utils/reply';
+import { buildReplyAudience, buildThreadHeaders, type MessageAddress } from '../utils/reply';
 import { addressKey } from '../utils/address-key';
 import { sanitizeAttachmentFilename } from '../utils/attachment-presentation';
 import { isInlineImageType } from '../utils/message-html';
+import { extractDataUriImages } from '../utils/inline-images';
 import { makeMessageId, makeOperationId } from '../utils/message-id';
 import { randomToken } from '../utils/random-token';
 import {
@@ -68,7 +69,7 @@ import {
 } from '../utils/schedule-time';
 import { editSafeDraftHtml } from '../utils/compose-html';
 import { textSignatureToHtml } from '../utils/identity-fields';
-import { sanitizeRichTextHtml } from '../utils/rich-text';
+import { sanitizeRichTextContent, sanitizeRichTextHtml } from '../utils/rich-text';
 import {
   IDENTITY_SIGNATURE_ORIGIN,
   insertBeforeQuotedContent,
@@ -188,6 +189,7 @@ export type ComposeOpenOrigin =
 
 export type ComposeOpenOptions = {
   preferredIdentityEmails?: string[];
+  imapAccount?: ImapComposeAccount;
 } & (
   | { origin: typeof COMPOSE_OPEN_ORIGIN.NEW }
   | { origin: typeof COMPOSE_OPEN_ORIGIN.REPLY }
@@ -195,6 +197,29 @@ export type ComposeOpenOptions = {
   | { origin: typeof COMPOSE_OPEN_ORIGIN.FORWARD }
   | { origin: typeof COMPOSE_OPEN_ORIGIN.SERVER_DRAFT }
 );
+
+interface ImapComposeAccount {
+  id: string;
+  email: string;
+  name: string;
+  ownerId: number;
+}
+
+type QuoteSource = Pick<MessageRow, 'from_text' | 'subject' | 'received_at'>;
+type QuoteContent = { html?: string | null; text?: string | null };
+type ImapResponseKind = 'reply' | 'reply-all' | 'forward';
+
+function quoteDraft(message: QuoteSource, body: QuoteContent) {
+  const { html, text } = body;
+  const quote = { from: message.from_text, date: message.received_at, subject: message.subject, html, text };
+  return { htmlBody: buildQuotedHtml(quote), textBody: buildQuotedText(quote) };
+}
+
+function imapThreadHeaders(message: Parameters<typeof buildThreadHeaders>[0]) {
+  const { inReplyTo, references } = buildThreadHeaders(message);
+  const usable = (id: string) => id.length <= 512 && /^[^\s<>@]+@[^\s<>@]+$/.test(id) && !/\p{Cc}/u.test(id);
+  return { inReplyTo: inReplyTo.filter(usable), references: references.filter(usable).slice(-200) };
+}
 
 export interface AutomaticBccOrigin {
   slot: number;
@@ -247,6 +272,8 @@ export interface ComposeSession {
   revision: number;
   confirmedRevision: ConfirmedDraftRevision | null;
   sourceMessageId: number | null;
+  imapAccount: ImapComposeAccount | null;
+  pendingImapSend: { requestId: string; payloadJson: string } | null;
   unresolvedFrom: ParsedAddress | null;
   automaticFromSelection: boolean;
   preferredIdentityEmails: string[];
@@ -590,7 +617,7 @@ export const useComposeStore = defineStore('compose', () => {
   });
 
   const fromIdentity = computed<IdentityRow | null>(() =>
-    identities.value[draft.value.fromIdx] ?? identities.value[0] ?? null,
+    activeSession.value?.imapAccount ? null : identities.value[draft.value.fromIdx] ?? identities.value[0] ?? null,
   );
 
   /** Recipients across all three fields; any of them can carry a send. */
@@ -622,10 +649,18 @@ export const useComposeStore = defineStore('compose', () => {
   });
   const {
     isAttachmentBusy,
-    addAttachments,
     cancelAttachment,
     removeAttachment,
   } = attachmentController;
+
+  function addAttachments(
+    files: readonly File[] | FileList,
+    source: Exclude<ComposeAttachmentSource, 'draft'> = 'picker',
+    sessionId: string | null = activeSessionId.value,
+  ): Promise<boolean> {
+    if (sessionById(sessionId)?.imapAccount) return Promise.resolve(false);
+    return attachmentController.addAttachments(files, source, sessionId);
+  }
   const AUTOSAVE_DEBOUNCE_MS = 2_000;
   const AUTOSAVE_MAX_DELAY_MS = 30_000;
 
@@ -907,7 +942,7 @@ export const useComposeStore = defineStore('compose', () => {
     session: ComposeSession | null,
     list: readonly IdentityRow[] = identities.value,
   ): IdentityRow | null {
-    if (!session) return null;
+    if (!session || session.imapAccount) return null;
     if (session.unresolvedFrom) return null;
     return list[session.draft.fromIdx] ?? list[0] ?? null;
   }
@@ -1245,6 +1280,7 @@ export const useComposeStore = defineStore('compose', () => {
     });
     return JSON.stringify({
       identity: session.unresolvedFrom?.email
+        ?? session.imapAccount?.email
         ?? identity?.remote_id
         ?? identity?.email
         ?? session.draft.fromIdx,
@@ -1428,6 +1464,7 @@ export const useComposeStore = defineStore('compose', () => {
       .map((session) => session.id));
     identities.value = refreshed;
     for (const session of sessions.value) {
+      if (session.imapAccount) continue;
       // fromIdx addressed previousIdentities until the swap above, so a From
       // chosen while the read was in flight is carried across, not reverted.
       const previousIdentity = identityForSession(session, previousIdentities);
@@ -1469,8 +1506,8 @@ export const useComposeStore = defineStore('compose', () => {
 
     const initialAttachments = [...(prefill.attachments ?? [])];
     const nextDraft = cloneDraft(prefill);
-    const automaticFromSelection =
-      !Object.prototype.hasOwnProperty.call(prefill, 'fromIdx');
+    const automaticFromSelection = !options.imapAccount
+      && !Object.prototype.hasOwnProperty.call(prefill, 'fromIdx');
     const preferredIdentityEmails = options.preferredIdentityEmails ?? [];
     if (automaticFromSelection) {
       nextDraft.fromIdx = preferredIdentityEmails.length > 0
@@ -1509,6 +1546,8 @@ export const useComposeStore = defineStore('compose', () => {
       revision: 0,
       confirmedRevision: null,
       sourceMessageId: null,
+      imapAccount: options.imapAccount ? { ...options.imapAccount } : null,
+      pendingImapSend: null,
       unresolvedFrom: null,
       automaticFromSelection,
       preferredIdentityEmails: [...preferredIdentityEmails],
@@ -1540,7 +1579,7 @@ export const useComposeStore = defineStore('compose', () => {
     sessions.value.push(session);
     activeSessionId.value = id;
     clearNotice();
-    refreshIdentitiesFromServer();
+    if (!session.imapAccount) refreshIdentitiesFromServer();
     return id;
   }
 
@@ -1611,7 +1650,7 @@ export const useComposeStore = defineStore('compose', () => {
     sessionId: string | null = activeSessionId.value,
   ): void {
     const session = sessionById(sessionId);
-    if (!session) return;
+    if (!session || session.imapAccount) return;
     const parsed = typeof value === 'number' ? value : Number(value);
     const maxIdx = identities.value.length - 1;
     const nextIdx = Number.isFinite(parsed)
@@ -1744,7 +1783,7 @@ export const useComposeStore = defineStore('compose', () => {
 
   function scheduleAutosave(sessionId: string): void {
     const session = sessionById(sessionId);
-    if (!session) return;
+    if (!session || session.imapAccount) return;
     const runtime = runtimeFor(sessionId);
     if (runtime.blocked || runtime.held || session.status === COMPOSE_STATE.SENDING || session.isDiscarding) return;
     if (hasPendingRecipientText(session)) {
@@ -2094,7 +2133,7 @@ export const useComposeStore = defineStore('compose', () => {
     { explicit = false, forAttachment = false } = {},
   ): Promise<boolean> {
     const session = sessionById(sessionId);
-    if (!session) return false;
+    if (!session || session.imapAccount) return false;
     const runtime = runtimeFor(session.id);
     if (session.status === COMPOSE_STATE.SENDING || session.isDiscarding) {
       return false;
@@ -2424,19 +2463,7 @@ export const useComposeStore = defineStore('compose', () => {
       inReplyTo,
       references,
       subject: makeReplySubject(message.subject),
-      htmlBody: buildQuotedHtml({
-        from: message.from_text,
-        date: message.received_at,
-        subject: message.subject,
-        html: body.html,
-        text: body.text,
-      }),
-      textBody: buildQuotedText({
-        from: message.from_text,
-        date: message.received_at,
-        subject: message.subject,
-        text: body.text,
-      }),
+      ...quoteDraft(message, body),
     }, {
       origin: all ? COMPOSE_OPEN_ORIGIN.REPLY_ALL : COMPOSE_OPEN_ORIGIN.REPLY,
       preferredIdentityEmails,
@@ -2458,25 +2485,40 @@ export const useComposeStore = defineStore('compose', () => {
   }
 
   function prepareForward(
-    message: Pick<MessageRow, 'from_text' | 'subject' | 'received_at'>,
-    body: { html?: string | null; text?: string | null } = {},
+    message: QuoteSource,
+    body: QuoteContent = {},
   ): void {
     open({
       subject: makeForwardSubject(message.subject),
-      htmlBody: buildQuotedHtml({
-        from: message.from_text,
-        date: message.received_at,
-        subject: message.subject,
-        html: body.html,
-        text: body.text,
-      }),
-      textBody: buildQuotedText({
-        from: message.from_text,
-        date: message.received_at,
-        subject: message.subject,
-        text: body.text,
-      }),
+      ...quoteDraft(message, body),
     }, { origin: COMPOSE_OPEN_ORIGIN.FORWARD });
+  }
+
+  function prepareImapResponse(
+    kind: ImapResponseKind,
+    account: Omit<ImapComposeAccount, 'ownerId'>,
+    message: QuoteSource & Parameters<typeof buildThreadHeaders>[0] & {
+      addresses: readonly MessageAddress[];
+    },
+    body: QuoteContent = {},
+  ): void {
+    const ownerId = authStore.accountId;
+    if (ownerId == null) return;
+    const html = body.html ? editSafeDraftHtml(body.html) : '';
+    const text = body.text || (html ? sanitizeRichTextContent(html).text : '');
+    const quote = quoteDraft(message, { html, text });
+    const prefill = kind === 'forward'
+      ? { subject: makeForwardSubject(message.subject) }
+      : {
+          ...buildReplyAudience({
+            addresses: message.addresses,
+            ownedEmails: [account.email],
+            all: kind === 'reply-all',
+          }),
+          ...imapThreadHeaders(message),
+          subject: makeReplySubject(message.subject),
+        };
+    open({ ...quote, ...prefill }, { origin: kind, imapAccount: { ...account, ownerId } });
   }
 
   async function editableDraftHtml(
@@ -2768,6 +2810,73 @@ export const useComposeStore = defineStore('compose', () => {
     }
   }
 
+  function validateSendRecipients(session: ComposeSession): string | null {
+    commitPendingRecipientText(session);
+    // An unreadable recipient must stay visible and block send (CS-2.4).
+    if (hasInvalidRecipientPills(session)) return INVALID_RECIPIENT_MESSAGE;
+    return userRecipientCount(session) === 0 ? 'Add at least one recipient.' : null;
+  }
+
+  async function performImapSend(
+    session: ComposeSession,
+    account: ImapComposeAccount,
+    scheduledAt: string | null,
+  ): Promise<boolean> {
+    if (!repo || authStore.accountId !== account.ownerId || authStore.isOfflineSession
+        || globalThis.navigator?.onLine === false) {
+      return failSend('Reconnect to send from this account.', session.id);
+    }
+    if (scheduledAt) return failSend('Scheduled sending is not supported by this account.', session.id);
+    const recipientError = validateSendRecipients(session);
+    if (recipientError) return failSend(recipientError, session.id);
+    const { to, cc, bcc, subject, textBody, inReplyTo, references } = session.draft;
+    const htmlBody = stripInternalProvenanceHtml(session.draft.htmlBody);
+    if (session.attachments.length > 0 || extractDataUriImages(htmlBody).images.length > 0) {
+      return failSend('Remove attached files and inline images before sending from this account.', session.id);
+    }
+    const payload = { to, cc, bcc, subject, textBody, htmlBody, inReplyTo, references };
+    const payloadJson = JSON.stringify(payload);
+    const previous = session.pendingImapSend;
+    if (previous && previous.payloadJson !== payloadJson) {
+      return failSend('A previous send could still be in progress. Check your Sent folder before sending a revised message.', session.id);
+    }
+    const requestId = previous?.requestId ?? randomToken();
+    session.pendingImapSend = { requestId, payloadJson };
+    const generation = session.generation;
+    const stillCurrent = () => sessionById(session.id)?.generation === generation;
+    session.status = COMPOSE_STATE.SENDING;
+    session.error = null;
+    hide(session);
+    try {
+      const result = await repo.sendAttentionImapMessage(
+        account.ownerId, account.id, { ...JSON.parse(payloadJson), requestId },
+      );
+      if (stillCurrent()) {
+        session.status = COMPOSE_STATE.SENT;
+        close(session.id);
+        if (result.rejected === 1) setNotice('Message sent. One recipient was rejected.');
+        else if (result.rejected) setNotice(`Message sent. ${result.rejected} recipients were rejected.`);
+        else setNotice('Message sent.');
+      }
+      return true;
+    } catch (error) {
+      if (!stillCurrent()) return false;
+      const code = typeof error === 'object' && error != null && 'code' in error ? error.code : '';
+      const knownRejection = [
+        'submission_rejected', 'invalid_submission', 'smtp_not_configured',
+        'smtp_authentication_failed', 'smtp_unavailable', 'message_too_large', 'request_too_large',
+        'google_reconnect_required', 'unauthorized', 'account_not_found',
+      ].some((rejection) => rejection === code);
+      if (knownRejection && !previous) session.pendingImapSend = null;
+      return failSend(
+        (knownRejection || code === 'submission_pending') && error instanceof Error
+          ? error.message
+          : 'Could not confirm this send. Check your Sent folder before trying again.',
+        session.id,
+      );
+    }
+  }
+
   /**
    * Send now, or — with `scheduledAt` — hand the server a Send Later
    * submission. Scheduling is the same durable SEND mutation with one
@@ -2803,6 +2912,7 @@ export const useComposeStore = defineStore('compose', () => {
     if (runtimeFor(session.id).blocked && session.saveError) {
       return failSend('Resolve the draft save failure before sending.', session.id);
     }
+    if (session.imapAccount) return performImapSend(session, session.imapAccount, scheduledAt);
     if (!repo || authStore.accountId == null) return failSend('Not connected.', session.id);
     const queueOffline = authStore.isOfflineSession || globalThis.navigator?.onLine === false;
     if (queueOffline && scheduledAt) {
@@ -2810,20 +2920,9 @@ export const useComposeStore = defineStore('compose', () => {
     }
     const identity = identityForSession(session);
     if (!identity) return failSend('No identities are configured.', session.id);
-    commitPendingRecipientText(session);
+    const recipientError = validateSendRecipients(session);
+    if (recipientError) return failSend(recipientError, session.id);
     const sessionDraft = session.draft;
-    // Report what could not be read before anything else: a fragment left
-    // in a recipient field is a recipient the user believes they added, and
-    // sending without it delivers to a smaller audience than they asked
-    // for (CS-2.4).
-    const rejected = RECIPIENT_FIELDS.flatMap((field) => session.rejectedRecipients[field]);
-    if (rejected.length > 0) {
-      return failSend(INVALID_RECIPIENT_MESSAGE, session.id);
-    }
-    // Any of the three carries the message, so requiring To would refuse a
-    // send the user has every right to make (CS-2.2).
-    const sessionRecipientCount = userRecipientCount(session);
-    if (sessionRecipientCount === 0) return failSend('Add at least one recipient.', session.id);
 
     const folders = mailStore.folders as FolderRow[];
     const findByRole = (role: MailboxRole) => folders.find((f) => f.role === role);
@@ -3062,7 +3161,7 @@ export const useComposeStore = defineStore('compose', () => {
     if (schedulingSessions.has(session.id)) return false;
     schedulingSessions.add(session.id);
     try {
-      if (!canScheduleSend.value) {
+      if (session.imapAccount || !canScheduleSend.value) {
         return failSend(
           'Scheduled sending is not supported by this account.',
           session.id,
@@ -3146,6 +3245,7 @@ export const useComposeStore = defineStore('compose', () => {
     prepareReplyFromMessage,
     prepareReplyAll,
     prepareForward,
+    prepareImapResponse,
     prepareDraftFromMessage,
     send,
     scheduleSend,

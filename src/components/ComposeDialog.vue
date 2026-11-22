@@ -192,7 +192,7 @@ const richTextEditorEl = ref<{
 
 function saveClosePrompt(): void {
   const current = session.value;
-  if (!current || current.isSaving) return;
+  if (!current || current.imapAccount || current.isSaving) return;
   void composeStore.saveAndClose(current.id);
 }
 
@@ -577,17 +577,17 @@ function pickFromIdentity(idx: number, event: Event) {
   composeStore.selectFromIndex(idx, session.value?.id ?? null);
 }
 
-function identityLabel(id: IdentityRow | null): string {
+function identityLabel(id: Pick<IdentityRow, 'name' | 'email'> | null): string {
   if (!id) return '';
   return id.name ? `${id.name} <${id.email}>` : id.email;
 }
 
 /** The message list's sender circle, so one address is one color everywhere. */
-function identityAvatarStyle(id: IdentityRow): Record<string, string> {
+function identityAvatarStyle(id: Pick<IdentityRow, 'email'>): Record<string, string> {
   return senderAvatarStyle(id.email);
 }
 
-function identityInitials(id: IdentityRow): string {
+function identityInitials(id: Pick<IdentityRow, 'name' | 'email'>): string {
   return senderInitials(id.name?.trim() || id.email);
 }
 </script>
@@ -664,6 +664,7 @@ function identityInitials(id: IdentityRow): string {
                 <span>Discard</span>
               </button>
               <button
+                v-if="!session.imapAccount"
                 type="button"
                 class="app-dropdown__item"
                 role="menuitem"
@@ -684,10 +685,24 @@ function identityInitials(id: IdentityRow): string {
       <div class="compose-dialog__body" :inert="isSending">
       <div class="row">
         <label :id="fromLabelId">From</label>
+        <div
+          v-if="session.imapAccount"
+          class="from-picker__summary"
+          data-compose-from
+          role="group"
+          :aria-labelledby="fromLabelId"
+        >
+          <span
+            class="from-picker__avatar"
+            aria-hidden="true"
+            :style="identityAvatarStyle(session.imapAccount)"
+          >{{ identityInitials(session.imapAccount) }}</span>
+          <span class="from-picker__summary-text">{{ identityLabel(session.imapAccount) }}</span>
+        </div>
         <!-- An identity is a person with an address, so its rows wear the
              same avatar-and-two-lines dress the suggestion list and the
              message list use: one look for one kind of thing. -->
-        <AppDropdown class="from-picker" data-compose-from>
+        <AppDropdown v-else class="from-picker" data-compose-from>
           <summary
             class="app-dropdown__summary from-picker__summary"
             :aria-labelledby="fromLabelId"
@@ -784,6 +799,7 @@ function identityInitials(id: IdentityRow): string {
 
       <RichTextEditor
         ref="richTextEditorEl"
+        :allow-files="!session.imapAccount"
         :content-key="session.id"
         :initial-html="session.editorHtmlBody"
         accessible-label="Message body"
@@ -860,6 +876,7 @@ function identityInitials(id: IdentityRow): string {
 
       <footer>
         <input
+          v-if="!session.imapAccount"
           ref="attachmentInputEl"
           type="file"
           multiple
@@ -867,6 +884,7 @@ function identityInitials(id: IdentityRow): string {
           @change="pickAttachments"
         />
         <AppButton
+          v-if="!session.imapAccount"
           variant="outline"
           :disabled="scheduleBusy || session.isDiscarding"
           aria-label="Attach files"
@@ -878,7 +896,7 @@ function identityInitials(id: IdentityRow): string {
           </template>
           Attach
         </AppButton>
-        <div class="compose-send-split">
+        <div :class="{ 'compose-send-split': !session.imapAccount }">
           <AppButton
             class="compose-send"
             :disabled="sendDisabled"
@@ -894,6 +912,7 @@ function identityInitials(id: IdentityRow): string {
             {{ sendButtonText }}
           </AppButton>
           <AppDropdown
+            v-if="!session.imapAccount"
             class="compose-schedule-menu"
             :disabled="scheduleSegmentDisabled"
             @toggle="onScheduleMenuToggle"
@@ -967,7 +986,7 @@ function identityInitials(id: IdentityRow): string {
               </button>
             </div>
           </AppDropdown>
-          <span :id="scheduleDescriptionId" class="compose-schedule-menu__description">
+          <span v-if="!session.imapAccount" :id="scheduleDescriptionId" class="compose-schedule-menu__description">
             {{ scheduleAvailabilityMessage }}
           </span>
         </div>
@@ -1030,9 +1049,11 @@ function identityInitials(id: IdentityRow): string {
         >
           <h3
             id="compose-close-title"
-          >Save this draft?</h3>
+          >{{ session.imapAccount ? 'Discard this draft?' : 'Save this draft?' }}</h3>
           <p id="compose-close-description">
-            {{ unfinishedAttachmentCount > 0
+            {{ session.imapAccount
+              ? 'Close this compose window and discard your changes.'
+              : unfinishedAttachmentCount > 0
               ? 'Some attachments have not finished uploading. Keep this window open to finish '
                 + 'or retry them, or close without saving those attachments.'
               : 'Save your latest changes before closing this compose window.' }}
@@ -1045,8 +1066,9 @@ function identityInitials(id: IdentityRow): string {
             <AppButton
               variant="outline"
               @click="composeStore.closeWithoutSaving(session.id)"
-            >Don't Save</AppButton>
+            >{{ session.imapAccount ? 'Discard' : "Don't Save" }}</AppButton>
             <AppButton
+              v-if="!session.imapAccount"
               :disabled="session.isSaving"
               @click="composeStore.saveAndClose(session.id)"
             >Save draft</AppButton>

@@ -233,7 +233,40 @@ export class ManagedAccounts extends DurableObject<Env> {
         state TEXT PRIMARY KEY, browser_hash TEXT NOT NULL, verifier TEXT NOT NULL, client_id TEXT NOT NULL,
         account_id TEXT, revision TEXT, expires_at INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS relay_submissions (
+        account_key TEXT NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, rejected INTEGER,
+        PRIMARY KEY (account_key, request_id)
+      );
     `);
+  }
+
+  claimSubmission(accountKey: string, requestId: string, fingerprint: string):
+    { state: 'claimed' | 'pending' | 'conflict' } | { state: 'submitted'; rejected: number } {
+    return this.ctx.storage.transactionSync(() => {
+      const existing = this.sql.exec<{ fingerprint: string; rejected: number | null }>(
+        'SELECT fingerprint, rejected FROM relay_submissions WHERE account_key = ? AND request_id = ?', accountKey, requestId,
+      ).toArray()[0];
+      if (existing) {
+        if (existing.fingerprint !== fingerprint) return { state: 'conflict' };
+        if (existing.rejected === null) return { state: 'pending' };
+        return { state: 'submitted', rejected: existing.rejected };
+      }
+      this.sql.exec('INSERT INTO relay_submissions (account_key, request_id, fingerprint) VALUES (?, ?, ?)',
+        accountKey, requestId, fingerprint);
+      return { state: 'claimed' };
+    });
+  }
+
+  finishSubmission(accountKey: string, requestId: string, fingerprint: string, rejected: number): boolean {
+    return this.sql.exec(`UPDATE relay_submissions SET rejected = ?
+      WHERE account_key = ? AND request_id = ? AND fingerprint = ? AND rejected IS NULL`,
+    rejected, accountKey, requestId, fingerprint).rowsWritten === 1;
+  }
+
+  releaseSubmission(accountKey: string, requestId: string, fingerprint: string): void {
+    this.sql.exec(`DELETE FROM relay_submissions
+      WHERE account_key = ? AND request_id = ? AND fingerprint = ? AND rejected IS NULL`,
+    accountKey, requestId, fingerprint);
   }
 
   list(): RecordRow[] {

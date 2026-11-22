@@ -314,6 +314,87 @@ describe('compose-store reply and forward prefills', () => {
   });
 });
 
+describe('compose-store IMAP responses', () => {
+  const account = { id: 'gmail-home', email: 'my-gmail@example.net', name: 'Gmail' };
+  const parent = () => ({
+    ...sourceMessage({ references_json: '["<first@example.net>"]' }),
+    addresses: [
+      { kind: 'from', position: 0, name: 'Alice', email: 'alice@example.com' },
+      { kind: 'replyTo', position: 0, name: 'Team', email: 'team@example.com' },
+      { kind: 'to', position: 0, name: '', email: account.email },
+      { kind: 'cc', position: 0, name: 'Bob', email: 'bob@example.com' },
+      { kind: 'bcc', position: 0, name: '', email: 'hidden@example.com' },
+    ],
+  });
+
+  it('uses the account of the message for reply-all and never stores a JMAP draft', async () => {
+    const { composeStore, repo } = await storeWithParentAddresses();
+    const sendAttentionImapMessage = vi.fn(async () => ({ rejected: 1 }));
+    const insertPendingMutation = vi.fn();
+    Object.assign(repo, { sendAttentionImapMessage, insertPendingMutation });
+    composeStore.prepareImapResponse('reply-all', account, parent(), {
+      html: '<p>Original message</p><script>alert(1)</script>',
+      text: 'Original message',
+    });
+
+    expect(composeStore.activeSession?.imapAccount?.email).toBe(account.email);
+    expect(composeStore.fromIdentity).toBeNull();
+    expect(composeStore.draft.to).toEqual([{ name: 'Team', email: 'team@example.com' }]);
+    expect(composeStore.draft.cc).toEqual([{ name: 'Bob', email: 'bob@example.com' }]);
+    expect(composeStore.draft.bcc).toEqual([]);
+    expect(composeStore.draft.references).toEqual(['first@example.net', 'parent@example.com']);
+    expect(composeStore.draft.htmlBody).toContain('Original message');
+    expect(composeStore.draft.htmlBody).not.toContain('<script');
+    expect(await composeStore.saveDraft()).toBe(false);
+    expect(insertPendingMutation).not.toHaveBeenCalled();
+    expect(sendAttentionImapMessage).not.toHaveBeenCalled();
+
+    expect(await composeStore.send()).toBe(true);
+    expect(sendAttentionImapMessage).toHaveBeenCalledWith(1, account.id, expect.objectContaining({
+      subject: 'Re: Project update',
+      to: [{ name: 'Team', email: 'team@example.com' }],
+      cc: [{ name: 'Bob', email: 'bob@example.com' }],
+      bcc: [],
+      inReplyTo: ['parent@example.com'],
+      references: ['first@example.net', 'parent@example.com'],
+    }));
+    expect(insertPendingMutation).not.toHaveBeenCalled();
+    expect(composeStore.notice).toBe('Message sent. One recipient was rejected.');
+    expect(composeStore.isOpen).toBe(false);
+  });
+
+  it('keeps the same request when retrying a response whose delivery was uncertain', async () => {
+    const { composeStore, repo } = await storeWithParentAddresses();
+    const sendAttentionImapMessage = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('No SMTP confirmation'), { code: 'submission_unknown' }))
+      .mockResolvedValueOnce({});
+    Object.assign(repo, { sendAttentionImapMessage });
+    composeStore.prepareImapResponse('reply', account, parent(), { text: 'Original message' });
+
+    expect(await composeStore.send()).toBe(false);
+    expect(composeStore.error).toContain('Check your Sent folder');
+    const originalSubject = composeStore.draft.subject;
+    composeStore.draft.subject = 'Some edits';
+    expect(await composeStore.send()).toBe(false);
+    expect(sendAttentionImapMessage).toHaveBeenCalledTimes(1);
+    composeStore.draft.subject = originalSubject;
+    expect(await composeStore.send()).toBe(true);
+    expect(sendAttentionImapMessage.mock.calls[1]).toEqual(sendAttentionImapMessage.mock.calls[0]);
+  });
+
+  it('opens an unaddressed forward and leaves the connected account locked', async () => {
+    const { composeStore } = await storeWithParentAddresses();
+    composeStore.prepareImapResponse('forward', account, parent(), { text: 'Original message' });
+    composeStore.selectFromIndex(1);
+    expect(composeStore.draft.subject).toBe('Fwd: Project update');
+    expect(composeStore.draft.to).toEqual([]);
+    expect(composeStore.draft.cc).toEqual([]);
+    expect(composeStore.draft.inReplyTo).toEqual([]);
+    expect(composeStore.draft.references).toEqual([]);
+    expect(composeStore.activeSession?.imapAccount?.id).toBe(account.id);
+  });
+});
+
 describe('compose-store recipient fields', () => {
   it('takes the addresses from committed recipients', () => {
     const composeStore = useComposeStore();

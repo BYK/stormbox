@@ -30,6 +30,8 @@ const props = withDefaults(defineProps<{
   anchor: PopoverAnchor | null;
   targets: ReadonlyArray<MessageRowLike | null | undefined>;
   definitions: ReadonlyArray<MessageTagDefinition>;
+  additionalTags?: ReadonlyArray<{ keyword: string; name: string; color: string | null; applied: boolean }>;
+  busy?: boolean;
   label?: string;
   /** Element that opened the popover; a pointer down on it does not dismiss. */
   trigger?: HTMLElement | null;
@@ -165,7 +167,7 @@ watch(() => props.anchor, (anchor, previous) => {
 });
 
 // Rows come and go as tags are toggled; re-place the popover to fit.
-watch(() => [props.targets, props.definitions], () => {
+watch(() => [props.targets, props.definitions, props.additionalTags], () => {
   if (props.anchor) void nextTick(measure);
 });
 
@@ -188,6 +190,8 @@ onBeforeUnmount(unlisten);
         ref="panelEl"
         :targets="targets"
         :definitions="definitions"
+        :additional-tags="additionalTags"
+        :busy="busy"
         :label="label"
         @toggle="(keyword, on) => emit('toggle', keyword, on)"
         @clear="emit('clear')"

@@ -9,7 +9,7 @@
 
 import type { AttentionCache } from './attention';
 import { MUTATION_TYPE } from '../constants/states';
-import type { ImapAttentionAction, ImapMessageLocation, RelayAccount, RelayAccountInput, RelayAccountSettings, RelayMessageBody } from '../sync/backends/imap/attention-relay';
+import type { AttentionImapDraft, AttentionImapSendResult, ImapAttentionAction, ImapMessageLocation, RelayAccount, RelayAccountInput, RelayAccountSettings, RelayMessageBody } from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
 import type {
   AddressBookInventory,
@@ -352,6 +352,20 @@ export class Repository {
       throw new Error(error.message ?? 'Could not update this IMAP message.');
     }
     throw new Error('This change is queued until mail reconnects.');
+  }
+
+  async sendAttentionImapMessage(ownerId: number, accountId: string, draft: AttentionImapDraft): Promise<AttentionImapSendResult> {
+    const id = await this.call<number>(DB_RPC.ATTENTION_ENSURE_IMAP_SEND, { ownerId, accountId, draft });
+    const outcome = await this.runMutation(ownerId, id);
+    if (outcome.succeeded > 0) return outcome.result ?? {};
+    if (outcome.failed > 0) {
+      const failure = await this.getPendingMutationError(id);
+      const error = JSON.parse(failure?.error_json ?? '{}');
+      throw Object.assign(new Error(error.message ?? 'Could not confirm the send.'), {
+        code: error.type ?? 'submission_unknown',
+      });
+    }
+    throw Object.assign(new Error('This send is queued until mail reconnects.'), { code: 'submission_pending' });
   }
 
   setAttentionBundleState(ownerId: number, bundleId: string, state: BundleState | null, replacedIds: string[]) {

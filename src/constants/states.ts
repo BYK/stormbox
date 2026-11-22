@@ -197,6 +197,7 @@ export const MUTATION_TYPE = Object.freeze({
   PUSH_CONTACTS_TRASH: 'pushContactsTrash',
   SET_SIEVE_RULES: 'setSieveRules',
   ATTENTION_IMAP: 'attentionImap',
+  ATTENTION_IMAP_SEND: 'attentionImapSend',
 } as const);
 export type MutationType = (typeof MUTATION_TYPE)[keyof typeof MUTATION_TYPE];
 

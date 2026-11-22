@@ -298,6 +298,32 @@ describe('ComposeDialog rich text integration', () => {
   });
 });
 
+it('locks the From address and offers immediate Send for an IMAP response', async () => {
+  const composeStore = useComposeStore();
+  useAuthStore().accountId = 1;
+  composeStore.identities = [{ id: 1, name: 'Thundermail', email: 'thunder@example.com' } as any];
+  composeStore.prepareImapResponse(
+    'forward',
+    { id: 'gmail-home', name: 'Gmail', email: 'home@gmail.com' },
+    { from_text: 'sender@example.com', subject: 'Newsletter', received_at: null, addresses: [] },
+    { html: '<p>Original newsletter</p>' },
+  );
+  const wrapper = mount(ComposeDialog, {
+    attachTo: document.body,
+    global: { stubs: { teleport: true } },
+  });
+  mountedWrappers.push(wrapper);
+  await nextTick();
+
+  expect(wrapper.get('[data-compose-from]').text()).toContain('Gmail <home@gmail.com>');
+  expect(wrapper.find('[data-compose-from] summary').exists()).toBe(false);
+  expect(wrapper.find('[aria-label="Attach files"]').exists()).toBe(false);
+  expect(wrapper.find('[aria-label="Insert image"]').exists()).toBe(false);
+  expect(wrapper.find('[aria-label="Schedule send"]').exists()).toBe(false);
+  expect(wrapper.find('.compose-send').text()).toBe('Send');
+  expect(wrapper.findAll('[role="menuitem"]').some((item) => item.text() === 'Save Draft')).toBe(false);
+});
+
 describe('ComposeDialog recipient fields', () => {
   const rowLabels = (wrapper: any) => wrapper.findAll('.row label').map((l: any) => l.text());
   const toggleLabels = (wrapper: any) => wrapper

@@ -86,6 +86,7 @@ function getHandlers() {
     });
     const publicRepoHandlers = { ...repoHandlers };
     delete publicRepoHandlers[DB_RPC.ATTENTION_APPLY_IMAP_ACTION];
+    delete publicRepoHandlers[DB_RPC.ATTENTION_APPLY_IMAP_SEND];
     return lifecycle.requestHandlers({ ...publicRepoHandlers, ...syncHandlers }, {
       stopSync: () => stopSync(),
       closeStorage: () => engine.close(),

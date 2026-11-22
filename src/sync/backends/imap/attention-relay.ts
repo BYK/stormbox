@@ -1,5 +1,6 @@
 import { JMAP_SERVER_URL } from '../../../defines';
 import { browserRelayAssertion, browserSessionEnabled } from '../../../services/browser-session';
+import type { ParsedAddress } from '../../../utils/address-parse';
 
 const API_ROOT = '/api/imap/v1';
 
@@ -48,8 +49,10 @@ export interface RelayMessage {
   from: MailAddress[];
   to: MailAddress[];
   cc?: MailAddress[];
+  replyTo?: MailAddress[];
   keywords?: string[];
   labels?: string[];
+  gmailLabels?: boolean;
   receivedAt: string;
   seen: boolean;
   flagged: boolean;
@@ -58,6 +61,7 @@ export interface RelayMessage {
 export interface RelayWindow {
   mailbox: string;
   uidValidity: string;
+  canSend?: boolean;
   messages: RelayMessage[];
 }
 
@@ -76,7 +80,33 @@ export interface ImapMessageLocation {
 export type ImapAttentionAction =
   | { type: 'star'; value: boolean }
   | { type: 'seen'; value: boolean }
-  | { type: 'trash' };
+  | { type: 'trash' }
+  | { type: 'archive' }
+  | { type: 'junk' }
+  | { type: 'tags'; tags: ImapTagPatch };
+
+export interface ImapTagPatch {
+  add?: string[];
+  remove?: string[];
+  addLabels?: string[];
+  removeLabels?: string[];
+}
+
+export interface AttentionImapDraft {
+  requestId: string;
+  to: ParsedAddress[];
+  cc: ParsedAddress[];
+  bcc: ParsedAddress[];
+  subject: string;
+  textBody: string;
+  htmlBody: string;
+  inReplyTo: string[];
+  references: string[];
+}
+
+export interface AttentionImapSendResult {
+  rejected?: number;
+}
 
 export class AttentionRelayError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) {
@@ -165,38 +195,56 @@ export class AttentionRelay {
     return { text: body.text, html: body.html ?? '' };
   }
 
-  async mutate(location: ImapMessageLocation, action: ImapAttentionAction): Promise<Pick<RelayMessage, 'seen' | 'flagged'> | null> {
-    if (action.type === 'trash') {
-      const response = await this.request(messagePath(location, '/trash'), { method: 'POST' });
+  async mutate(location: ImapMessageLocation, action: ImapAttentionAction): Promise<
+    (Pick<RelayMessage, 'seen' | 'flagged' | 'keywords' | 'labels'> & { tagsApplied?: boolean }) | null
+  > {
+    if (action.type === 'trash' || action.type === 'archive' || action.type === 'junk') {
+      const response = await this.request(messagePath(location, `/${action.type}`), { method: 'POST' });
       const result = await response.json();
       if (result?.status !== 'moved' && result?.status !== 'absent') {
         throw new Error('The mail relay did not confirm that the message left the inbox.');
       }
       return null;
     }
-    const field = action.type === 'star' ? 'flagged' : 'seen';
+    const patch = action.type === 'tags' ? { tags: action.tags } : {
+      [action.type === 'star' ? 'flagged' : 'seen']: action.value,
+    };
     const response = await this.request(messagePath(location), {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ [field]: action.value }),
+      body: JSON.stringify(patch),
     });
     const result = await response.json();
     if (result?.uid !== location.uid || typeof result.seen !== 'boolean' || typeof result.flagged !== 'boolean') {
       throw new Error('The mail relay did not return updated message flags.');
     }
-    return { seen: result.seen, flagged: result.flagged };
+    const flags = { seen: result.seen, flagged: result.flagged };
+    if (action.type !== 'tags') return flags;
+    if (!Array.isArray(result.keywords) || !Array.isArray(result.labels) || typeof result.tagsApplied !== 'boolean') {
+      throw new Error('The mail relay did not return the updated tags.');
+    }
+    return { ...flags, keywords: result.keywords, labels: result.labels, tagsApplied: result.tagsApplied };
+  }
+
+  async submit(accountId: string, draft: AttentionImapDraft): Promise<AttentionImapSendResult> {
+    const response = await this.request(`/accounts/${encodeURIComponent(accountId)}/send`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draft),
+    }, 40_000);
+    const result = await response.json();
+    if (result.status !== 'submitted') throw new Error('The mail relay did not confirm submission.');
+    return Number.isSafeInteger(result.rejected) && result.rejected > 0 ? { rejected: result.rejected } : {};
   }
 
   private async json<T>(path: string): Promise<T> {
     return (await this.request(path)).json();
   }
 
-  private async request(path: string, init: RequestInit = {}) {
+  private async request(path: string, init: RequestInit = {}, timeout = 30_000) {
     const send = () => this.fetcher(`${API_ROOT}${path}`, {
       ...init,
       credentials: 'same-origin',
       redirect: 'error',
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(timeout),
     });
     let response = await send();
     if (response.status === 401 && path !== '/session' && browserSessionEnabled(JMAP_SERVER_URL)) {
@@ -207,8 +255,16 @@ export class AttentionRelay {
     const { error: code } = await response.json().catch(() => ({})) ?? {};
     const messages: Record<string, string> = {
       trash_not_configured: 'This account does not have an IMAP Trash folder.',
-      move_not_supported: 'This mail server does not support moving messages to Trash.',
-      same_mailbox: 'This message is already in Trash.',
+      archive_not_configured: 'This account does not have an IMAP Archive folder.',
+      archive_requires_inbox: 'Open the message from Inbox to archive it.',
+      archive_rejected: 'The mail server did not confirm that the message left Inbox.',
+      junk_not_configured: 'This account does not have an IMAP Junk folder.',
+      move_not_supported: 'This mail server does not support moving messages.',
+      same_mailbox: 'This message is already in the destination folder.',
+      labels_not_supported: 'This mail server does not support Gmail labels.',
+      tags_not_supported: 'This mailbox does not support changing tags.',
+      tag_update_rejected: 'The mail server rejected the tag change.',
+      invalid_tags: 'The mail server cannot use one of these tag names.',
       message_not_found: 'This message is no longer in this mailbox.',
       authentication_failed: 'The IMAP server rejected the relay credentials.',
       invalid_account: 'Check the email address, app password, and IMAP settings.',
@@ -223,6 +279,15 @@ export class AttentionRelay {
       mail_unavailable: 'The relay could not connect to the IMAP server. Check the hostname and TLS settings.',
       google_oauth_unavailable: 'Google sign-in has not been configured for this mail relay.',
       google_reconnect_required: 'Reconnect this Google account in Manage IMAP accounts.',
+      smtp_not_configured: 'This account does not have a sending server.',
+      smtp_authentication_failed: 'The sending server rejected this account’s credentials.',
+      smtp_unavailable: 'The sending server is unavailable. Try again when it reconnects.',
+      invalid_submission: 'Check the message and its recipients before sending.',
+      message_too_large: 'This message is too large to send.',
+      request_too_large: 'This message is too large to send.',
+      submission_conflict: 'An earlier send used this request. Check the account’s Sent folder before sending again.',
+      submission_rejected: 'The sending server rejected the message.',
+      submission_unknown: 'The relay could not confirm delivery. Check the account’s Sent folder before sending again.',
     };
     const message = (Object.hasOwn(messages, code) ? messages[code] : undefined)
       ?? (response.status === 401 ? 'Connect the mail relay to access IMAP mail.'

@@ -1,10 +1,12 @@
 import { type Env, accessToken, mailAccounts, MAX_IMAP_ACCOUNTS } from './config';
+import { canSubmitAttentionMessage, submitAttentionMessage } from './attention-submission';
 import { GOOGLE_CALLBACK_PATH, GOOGLE_START_PATH, googleOAuthConfiguration } from './google-auth';
 import { cancelGoogleLink, finishGoogleLink, startGoogleLink } from './google-link';
 import { authorization, consumeSessionAssertion, HttpError, json, matchesToken, pairedAuthorization, readJson, sessionCookie } from './http';
 import { jmap, session, type JmapStore } from './jmap';
 import {
-  listMailboxes, listMessages, MailTransportError, patchMessage, readMessage, readMessageSource, trashMessage, type MailAccount,
+  listMailboxes, listMessages, MailTransportError, MOVE_ROLES, moveToRole, patchMessage, patchMessageTags,
+  readMessage, readMessageSource, type ImapTagPatch, type MailAccount, type MoveAction,
 } from './mail-transport';
 import {
   getManagedAccount, listManagedAccounts, listManagedIds, managedAccountInput, registerManagedAccount, removeManagedAccount,
@@ -59,6 +61,37 @@ function readFlagPatch(input: unknown): { seen?: boolean; flagged?: boolean } {
     throw new HttpError(400, 'invalid_flags');
   }
   return Object.fromEntries(entries);
+}
+
+function isTagKeyword(value: unknown): value is string {
+  return typeof value === 'string' && /^[\x21-\x7e]{1,255}$/.test(value) && !/[(){\]%*"\\]/.test(value)
+    && !/^\$(?:seen|flagged|junk|notjunk|draft|answered|forwarded|deleted|recent|phishing|notphishing)$/i.test(value);
+}
+
+function isCustomLabel(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 255 && value.trim().length > 0
+    && !/^\\|^inbox$|^\[(?:gmail|googlemail)\](?:\/|$)/i.test(value) && !/[\p{Cc}\p{Cs}]/u.test(value);
+}
+
+function readTagPatch(input: unknown): ImapTagPatch {
+  const patch: ImapTagPatch = { add: [], remove: [], addLabels: [], removeLabels: [] };
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new HttpError(400, 'invalid_tags');
+  for (const [operation, values] of Object.entries(input)) {
+    const labels = operation === 'addLabels' || operation === 'removeLabels';
+    if ((!labels && operation !== 'add' && operation !== 'remove') || !Array.isArray(values)
+      || values.length > 64 || !values.every(labels ? isCustomLabel : isTagKeyword)) {
+      throw new HttpError(400, 'invalid_tags');
+    }
+    patch[operation] = [...new Set(values)];
+  }
+  const removedKeywords = new Set(patch.remove.map((keyword) => keyword.toLowerCase()));
+  const removedLabels = new Set(patch.removeLabels);
+  if ((!patch.add.length && !patch.remove.length && !patch.addLabels.length && !patch.removeLabels.length)
+    || patch.add.some((keyword) => removedKeywords.has(keyword.toLowerCase()))
+    || patch.addLabels.some((label) => removedLabels.has(label))) {
+    throw new HttpError(400, 'invalid_tags');
+  }
+  return patch;
 }
 
 function managedAuthorized(request: Request, url: URL, env: Env): boolean {
@@ -135,6 +168,10 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
   }
   const account = configured ?? (managed ? await getManagedAccount(env, id) : undefined);
   if (!account) throw new HttpError(404, 'account_not_found');
+  if (parts.length === 3 && subresource === 'send' && request.method === 'POST') {
+    if (!managed) throw new HttpError(401, 'unauthorized');
+    return submitAttentionMessage(request, account, env);
+  }
   if (parts.length === 3 && subresource === 'mailboxes' && request.method === 'GET') {
     return json({ mailboxes: await listMailboxes(account) });
   }
@@ -142,9 +179,11 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
   const mailbox = url.searchParams.get('mailbox') ?? 'INBOX';
   if (!mailbox || mailbox.length > 1024 || /[\0\r\n]/.test(mailbox)) throw new HttpError(400, 'invalid_mailbox');
   if (parts.length === 3 && request.method === 'GET') {
-    return json(await listMessages(account, mailbox, number(url.searchParams.get('limit') ?? '50', 100)));
+    const window = await listMessages(account, mailbox, number(url.searchParams.get('limit') ?? '50', 100));
+    return json({ ...window, canSend: Boolean(env.MANAGED_ACCOUNTS) && managed && canSubmitAttentionMessage(account) });
   }
-  if (parts.length !== 4 && !(parts.length === 5 && parts[4] === 'trash')) {
+  const action = parts.length === 5 && Object.hasOwn(MOVE_ROLES, parts[4]) ? parts[4] as MoveAction : null;
+  if (parts.length !== 4 && !action) {
     throw new HttpError(404, 'not_found');
   }
   const uidValidity = String(number(url.searchParams.get('uidValidity'), 0xffffffff));
@@ -153,10 +192,15 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
     return json(await readMessage(account, mailbox, uidValidity, messageUid));
   }
   if (parts.length === 4 && request.method === 'PATCH') {
-    return json(await patchMessage(account, mailbox, uidValidity, messageUid, readFlagPatch(await readJson(request, 4096))));
+    const input = await readJson(request, 65_536);
+    if (input && typeof input === 'object' && Object.hasOwn(input, 'tags')) {
+      if (Object.keys(input).length !== 1) throw new HttpError(400, 'invalid_tags');
+      return json(await patchMessageTags(account, mailbox, uidValidity, messageUid, readTagPatch(input.tags)));
+    }
+    return json(await patchMessage(account, mailbox, uidValidity, messageUid, readFlagPatch(input)));
   }
-  if (parts.length === 5 && request.method === 'POST') {
-    return json(await trashMessage(account, mailbox, uidValidity, messageUid));
+  if (action && request.method === 'POST') {
+    return json(await moveToRole(account, mailbox, uidValidity, messageUid, action));
   }
   throw new HttpError(405, 'method_not_allowed');
 }
@@ -254,6 +298,11 @@ function errorResponse(error: unknown): Response {
       case 'message_too_large': return json({ error: error.code }, 413);
       case 'same_mailbox':
       case 'move_not_supported':
+      case 'archive_not_configured':
+      case 'archive_requires_inbox':
+      case 'archive_rejected':
+      case 'junk_not_configured':
+      case 'labels_not_supported':
       case 'trash_not_configured': return json({ error: error.code }, 422);
       default: return json({ error: error.code }, 502);
     }

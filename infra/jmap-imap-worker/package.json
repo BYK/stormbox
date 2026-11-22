@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@portable/mail": "0.1.0",
     "@portable/smtp": "0.1.0",
     "imapflow": "2.9.1",
     "postal-mime": "^4.0.8",

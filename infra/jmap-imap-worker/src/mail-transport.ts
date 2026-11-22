@@ -26,7 +26,7 @@ export interface MailAccount {
   email: string;
   name?: string;
   imap: ImapConnection;
-  smtp?: MailConnection;
+  smtp?: ImapConnection;
 }
 
 export interface ImapFolder {
@@ -50,8 +50,10 @@ export interface ImapMessage {
   from: MailAddress[];
   to: MailAddress[];
   cc: MailAddress[];
+  replyTo: MailAddress[];
   keywords: string[];
   labels: string[];
+  gmailLabels: boolean;
   receivedAt: string;
   size: number;
   seen: boolean;
@@ -75,8 +77,21 @@ export interface ImapMessageBody extends ImapMessage {
   html: string;
 }
 
+export interface ImapTagPatch {
+  add: string[];
+  remove: string[];
+  addLabels: string[];
+  removeLabels: string[];
+}
+
+export const MOVE_ROLES = {
+  archive: '\\Archive', junk: '\\Junk', trash: '\\Trash',
+} as const;
+export type MoveAction = keyof typeof MOVE_ROLES;
+
 export type MailTransportErrorCode = 'authentication_failed' | 'invalid_message' | 'mailbox_changed'
   | 'mail_unavailable' | 'message_not_found' | 'message_too_large' | 'move_not_supported'
+  | 'archive_not_configured' | 'archive_requires_inbox' | 'archive_rejected' | 'junk_not_configured' | 'labels_not_supported'
   | 'same_mailbox' | 'trash_not_configured' | 'smtp_not_configured' | 'submission_rejected' | 'submission_unknown';
 
 export class MailTransportError extends Error {
@@ -111,6 +126,13 @@ function hasAttachment(part: FetchMessageObject['bodyStructure']): boolean {
     || part.dispositionParameters?.filename || part.childNodes?.some(hasAttachment)));
 }
 
+function messageTagState(message: FetchMessageObject) {
+  return {
+    keywords: [...(message.flags ?? [])].filter((flag) => !flag.startsWith('\\')),
+    labels: [...(message.labels ?? [])].filter((label) => !label.startsWith('\\')),
+  };
+}
+
 function envelope(message: FetchMessageObject): ImapMessage {
   const fields = message.envelope;
   const receivedAtMs = new Date(message.internalDate || fields?.date || 0).getTime();
@@ -123,8 +145,9 @@ function envelope(message: FetchMessageObject): ImapMessage {
     from: addresses(fields?.from),
     to: addresses(fields?.to),
     cc: addresses(fields?.cc),
-    keywords: [...(message.flags ?? [])].filter((flag) => !flag.startsWith('\\')),
-    labels: [...(message.labels ?? [])].filter((label) => !label.startsWith('\\')),
+    replyTo: addresses(fields?.replyTo),
+    ...messageTagState(message),
+    gmailLabels: message.labels != null,
     receivedAt: new Date(Number.isNaN(receivedAtMs) ? 0 : receivedAtMs).toISOString(),
     size: message.size ?? 0,
     seen: message.flags?.has('\\Seen') ?? false,
@@ -309,6 +332,51 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     });
   }
 
+  function patchMessageTags(account: MailAccount, mailbox: string, uidValidity: string, uid: number, patch: ImapTagPatch) {
+    return withMailbox(account, mailbox, { readOnly: false, uidValidity }, async (client) => {
+      const updateLabels = patch.addLabels.length > 0 || patch.removeLabels.length > 0;
+      if (updateLabels && !client.capabilities.has('X-GM-EXT-1')) {
+        throw new MailTransportError('labels_not_supported');
+      }
+      const query = { flags: true, labels: true };
+      const byUid = { uid: true };
+      const before = await client.fetchOne(uid, query, byUid);
+      if (!before) throw new MailTransportError('message_not_found');
+      const current = messageTagState(before);
+      const keywords = new Set(current.keywords.map((keyword) => keyword.toLowerCase()));
+      const labels = new Set(current.labels);
+      const add = patch.add.filter((keyword) => !keywords.has(keyword.toLowerCase()));
+      const remove = patch.remove.filter((keyword) => keywords.has(keyword.toLowerCase()));
+      const addLabels = patch.addLabels.filter((label) => !labels.has(label));
+      const removeLabels = patch.removeLabels.filter((label) => labels.has(label));
+      if (addLabels.length) {
+        const existing = new Set((await client.list()).map(({ path }) => path));
+        for (const label of addLabels) {
+          // The final FETCH confirms the outcome even if another client created the label first.
+          if (!existing.has(label)) await client.mailboxCreate(label).catch(() => {});
+        }
+      }
+      if (add.length) await client.messageFlagsAdd(uid, add, byUid);
+      if (remove.length) await client.messageFlagsRemove(uid, remove, byUid);
+      const gmailLabels = { ...byUid, useLabels: true };
+      if (addLabels.length) await client.messageFlagsAdd(uid, addLabels, gmailLabels);
+      if (removeLabels.length) await client.messageFlagsRemove(uid, removeLabels, gmailLabels);
+      const updated = await client.fetchOne(uid, query, byUid);
+      if (!updated) throw new MailTransportError('message_not_found');
+      const state = messageTagState(updated);
+      const newKeywords = new Set(state.keywords.map((keyword) => keyword.toLowerCase()));
+      const newLabels = new Set(state.labels);
+      const tagsApplied = patch.add.every((keyword) => newKeywords.has(keyword.toLowerCase()))
+        && patch.remove.every((keyword) => !newKeywords.has(keyword.toLowerCase()))
+        && patch.addLabels.every((label) => newLabels.has(label))
+        && patch.removeLabels.every((label) => !newLabels.has(label));
+      return {
+        uid, ...state, tagsApplied,
+        seen: updated.flags?.has('\\Seen') ?? false, flagged: updated.flags?.has('\\Flagged') ?? false,
+      };
+    });
+  }
+
   async function moveSelectedMessage(client: ImapFlow, mailbox: string, uid: number, destination: string) {
     if (mailbox === destination) throw new MailTransportError('same_mailbox');
     if (!client.capabilities.has('MOVE')) throw new MailTransportError('move_not_supported');
@@ -330,12 +398,32 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
   }
 
   function trashMessage(account: MailAccount, mailbox: string, uidValidity: string, uid: number) {
+    return moveToRole(account, mailbox, uidValidity, uid, 'trash');
+  }
+
+  function moveToRole(account: MailAccount, mailbox: string, uidValidity: string, uid: number, action: MoveAction) {
     return withClient(account.imap, async (client) => {
-      const trash = (await client.list()).find(({ flags }) =>
-        flags.has('\\Trash') && !flags.has('\\Noselect') && !flags.has('\\NonExistent'));
-      if (!trash) throw new MailTransportError('trash_not_configured');
+      if (action === 'archive' && client.capabilities.has('X-GM-EXT-1')) {
+        if (mailbox.toUpperCase() !== 'INBOX') throw new MailTransportError('archive_requires_inbox');
+        return withSelectedMailbox(client, mailbox, { readOnly: false, uidValidity }, async () => {
+          const byUid = { uid: true };
+          if (!await client.fetchOne(uid, byUid, byUid)) return { status: 'absent' as const };
+          // Gmail archive removes Inbox membership while retaining All Mail and every other label.
+          if (!await client.messageFlagsRemove(uid, ['\\Inbox'], { ...byUid, useLabels: true })) {
+            throw new MailTransportError('archive_rejected');
+          }
+          const updated = await client.fetchOne(uid, { labels: true }, byUid);
+          if (updated && (!updated.labels || [...updated.labels].some((label) => label.toLowerCase() === '\\inbox'))) {
+            throw new MailTransportError('archive_rejected');
+          }
+          return { status: 'moved' as const };
+        });
+      }
+      const destination = (await client.list()).find(({ flags }) =>
+        flags.has(MOVE_ROLES[action]) && !flags.has('\\Noselect') && !flags.has('\\NonExistent'));
+      if (!destination) throw new MailTransportError(`${action}_not_configured`);
       return withSelectedMailbox(client, mailbox, { readOnly: false, uidValidity }, () =>
-        moveSelectedMessage(client, mailbox, uid, trash.path));
+        moveSelectedMessage(client, mailbox, uid, destination.path));
     });
   }
 
@@ -353,7 +441,7 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
         host: smtp.host,
         port: smtp.port ?? (useStartTls ? 587 : 465),
         secure: useStartTls ? 'starttls' : 'on',
-        auth: { user: smtp.user, pass: smtp.password },
+        auth: 'accessToken' in smtp ? { user: smtp.user, accessToken: smtp.accessToken } : { user: smtp.user, pass: smtp.password },
         signal,
       });
     } catch (error) {
@@ -372,13 +460,13 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
       // A connection loss after DATA can hide a successful server acknowledgement.
       throw new MailTransportError('submission_unknown');
     } finally {
-      await client.close({ signal });
+      await client.close({ signal }).catch(() => {});
     }
   }
 
-  return { listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, moveMessage, trashMessage, submitMessage };
+  return { listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, patchMessageTags, moveMessage, moveToRole, trashMessage, submitMessage };
 }
 
 export const {
-  listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, moveMessage, trashMessage, submitMessage,
+  listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, patchMessageTags, moveMessage, moveToRole, trashMessage, submitMessage,
 } = createMailTransport();

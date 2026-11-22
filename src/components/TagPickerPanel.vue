@@ -26,6 +26,8 @@ import {
 const props = withDefaults(defineProps<{
   targets: ReadonlyArray<MessageRowLike | null | undefined>;
   definitions: ReadonlyArray<MessageTagDefinition>;
+  additionalTags?: ReadonlyArray<{ keyword: string; name: string; color: string | null; applied: boolean }>;
+  busy?: boolean;
   label?: string;
 }>(), {
   label: 'Tags',
@@ -61,7 +63,7 @@ interface PickerRow {
 /** Every target parsed once; presences for all rows come from this. */
 const presenceIndex = computed(() => tagPresenceIndex(props.targets, props.definitions));
 
-const definedRows = computed<PickerRow[]>(() => props.definitions.map((definition, index) => {
+const definedRows = computed<PickerRow[]>(() => [...props.definitions.map((definition, index): PickerRow => {
   const keyword = normalizeKeyword(definition.keyword);
   return {
     keyword,
@@ -70,7 +72,9 @@ const definedRows = computed<PickerRow[]>(() => props.definitions.map((definitio
     presence: presenceIndex.value.presence(keyword),
     digit: index < 9 ? index + 1 : null,
   };
-}));
+}), ...(props.additionalTags ?? []).map((tag): PickerRow => ({
+  ...tag, presence: tag.applied ? 'all' : 'none', digit: null,
+}))]);
 
 /** Keywords on the targets that no definition names, in first-seen order. */
 const otherRows = computed<PickerRow[]>(() => {
@@ -87,12 +91,12 @@ const otherRows = computed<PickerRow[]>(() => {
 });
 
 /** Offered while any target carries a tag. */
-const showsClear = computed(() => presenceIndex.value.keywords.length > 0);
+const showsClear = computed(() => presenceIndex.value.keywords.length > 0 || props.additionalTags?.some((tag) => tag.applied));
 
 const isEmpty = computed(() => definedRows.value.length === 0 && otherRows.value.length === 0);
 
 function toggle(row: PickerRow) {
-  emit('toggle', row.keyword, row.presence !== 'all');
+  if (!props.busy) emit('toggle', row.keyword, row.presence !== 'all');
 }
 
 /**
@@ -113,11 +117,11 @@ function onKeydown(event: KeyboardEvent) {
     event.stopPropagation();
     const digit = Number(event.key);
     if (digit === 0) {
-      if (showsClear.value) emit('clear');
+      if (showsClear.value && !props.busy) emit('clear');
       return;
     }
     const row = definedRows.value[digit - 1];
-    if (row) toggle(row);
+    if (row?.digit === digit) toggle(row);
     return;
   }
   onMenuKeydown(event);
@@ -145,8 +149,9 @@ defineExpose({ focusFirst });
         role="menuitem"
         tabindex="-1"
         aria-keyshortcuts="0"
+        :aria-disabled="busy || undefined"
         data-tag-picker-clear
-        @click="emit('clear')"
+        @click="!busy && emit('clear')"
       >
         <span class="tag-picker__check" aria-hidden="true">
           <X :size="14" :stroke-width="2" />
@@ -166,6 +171,7 @@ defineExpose({ focusFirst });
         tabindex="-1"
         :aria-checked="row.presence === 'all' ? 'true' : row.presence === 'some' ? 'mixed' : 'false'"
         :aria-keyshortcuts="row.digit !== null ? String(row.digit) : undefined"
+        :aria-disabled="busy || undefined"
         :data-tag-keyword="row.keyword"
         :style="row.color ? { '--tag-color': row.color } : undefined"
         @click="toggle(row)"
@@ -191,6 +197,7 @@ defineExpose({ focusFirst });
           role="menuitemcheckbox"
           tabindex="-1"
           :aria-checked="row.presence === 'all' ? 'true' : row.presence === 'some' ? 'mixed' : 'false'"
+          :aria-disabled="busy || undefined"
           :data-tag-keyword="row.keyword"
           :title="`${row.keyword} has no tag definition`"
           @click="toggle(row)"

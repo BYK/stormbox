@@ -11,6 +11,7 @@ import { TABLE_FAMILIES } from '../db/protocol';
 import { JMAP_SERVER_URL } from '../defines';
 import type { AttentionCache } from '../db/attention';
 import type { Repository } from '../db/repository';
+import { useComposeStore } from '../stores/compose-store';
 import { useMailStore } from '../stores/mail-store';
 import { browserSessionEnabled } from '../services/browser-session';
 import { GOOGLE_IMAP_RESULTS, type GoogleImapResult, type ImapAttentionAction, type ImapMessageLocation, type RelayMessage, type RelayMessageBody } from '../sync/backends/imap/attention-relay';
@@ -42,6 +43,7 @@ const cache = shallowRef<AttentionCache>({ paired: false, accounts: [], states: 
 type ImapReading = { kind: 'imap'; message: TriageMessage; body?: RelayMessageBody; bodyError?: string; actionError?: string };
 type Reading = { kind: 'jmap'; message: TriageMessage } | ImapReading;
 const mailStore = useMailStore();
+const composeStore = useComposeStore();
 const { definitions: tagDefinitions } = useMessageTags();
 const reading = shallowRef<Reading>();
 const reader = ref<HTMLElement>();
@@ -130,7 +132,7 @@ const imap = computed(() => cache.value.accounts.flatMap((account) => account.me
     is_seen: Number(row.seen),
     is_flagged: Number(row.flagged),
   };
-  return { message, location, presentation, row };
+  return { message, location, presentation, row, account };
 })));
 const jmapRowsById = computed(() => new Map(jmapRows.value.map((row) => [row.id, row])));
 const rows = computed(() => new Map<string, MessageRowLike & { id: number | string }>([
@@ -151,9 +153,13 @@ const imapReader = computed(() => {
   const entry = findImapMessage(current.message);
   if (!entry) return undefined;
   const id = browserTriageMessageKey(current.message);
+  const labels = entry.row.labels ?? [];
   return {
     ...entry.presentation, id,
-    ccText: formatRelayAddresses(entry.row.cc), labels: entry.row.labels ?? [],
+    ccText: formatRelayAddresses(entry.row.cc), labels,
+    knownLabels: [...new Set(entry.account.messages.flatMap((row) => row.labels ?? []))],
+    gmailLabels: entry.row.gmailLabels ?? labels.length > 0,
+    canSend: entry.account.can_send === true,
     seen: entry.row.seen, flagged: entry.row.flagged, disabled: disabledActions.value.has(id),
     body: current.body, bodyError: current.bodyError, actionError: current.actionError,
   };
@@ -352,6 +358,24 @@ function findImapMessage(message: TriageMessage) {
     candidate.id === message.id && candidate.accountId === message.accountId);
 }
 
+function composeImapResponse(kind: 'reply' | 'reply-all' | 'forward') {
+  const current = reading.value;
+  if (current?.kind !== 'imap' || !current.body) return;
+  const entry = findImapMessage(current.message);
+  if (!entry?.account.can_send) return;
+  const { account, row, presentation } = entry;
+  const addressLists = { from: row.from, replyTo: row.replyTo, to: row.to, cc: row.cc };
+  const addresses = Object.entries(addressLists).flatMap(([kind, list]) => (list ?? [])
+    .map(({ name, address }, position) => ({ kind, position, name, email: address })));
+  composeStore.prepareImapResponse(kind, { id: account.relay_id, email: account.address, name: account.name }, {
+    ...presentation,
+    addresses,
+    rfc822_message_id: row.messageId,
+    references_json: JSON.stringify(row.references ?? []),
+    in_reply_to_json: JSON.stringify(row.inReplyTo ? [row.inReplyTo] : []),
+  }, current.body);
+}
+
 async function openMessage(message: TriageMessage, trigger: EventTarget | null) {
   if (trigger instanceof HTMLElement) openingButton = trigger;
   const messageId = message.id;
@@ -398,7 +422,7 @@ async function runMessageAction(message: TriageMessage, action: ImapAttentionAct
       const source = { sourceFolderId: jmapFolder.value.id, rows: [row] };
       if (action.type === 'star') await mailStore.markManyFlagged([message.id], action.value, source);
       else if (action.type === 'seen') await mailStore.markManySeen([message.id], action.value, source);
-      else await mailStore.destroyMessage(message.id, source);
+      else if (action.type === 'trash') await mailStore.destroyMessage(message.id, source);
     } else {
       const row = findImapMessage(message);
       if (!row) return;
@@ -542,6 +566,7 @@ onBeforeUnmount(() => {
         @back="closeReader"
         @toggle-maximized="maximized = !maximized"
         @imap-action="(action) => reading?.kind === 'imap' && runMessageAction(reading.message, action)"
+        @imap-compose="composeImapResponse"
       />
       <p v-else class="unified-attention__empty">Select a message to read it.</p>
     </div>

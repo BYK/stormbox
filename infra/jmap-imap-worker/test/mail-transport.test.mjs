@@ -72,11 +72,16 @@ const sample = [
   '',
 ].join('\r\n');
 
-function makeImapSocket({ mailboxSize = 1, trash = false, supportsMove = true, oauth = false, gmail = false } = {}) {
+function makeImapSocket({
+  mailboxSize = 1, trash = false, junk = false, archive = true, supportsMove = true, oauth = false, gmail = false,
+  keywordsAllowed = true, rejectLabelUpdate = false,
+} = {}) {
   const calls = [];
   let connections = 0;
   let moved = false;
-  const flags = new Set(['\\Seen']);
+  const flags = new Set(['\\Seen', 'localtriage-category-newsletter']);
+  const labels = new Set(['\\Inbox', 'Read later']);
+  const customLabels = new Set(['Read later']);
   function connect(address, options) {
     connections += 1;
     assert.deepEqual(address, { hostname: endpoint.host, port: 993 });
@@ -105,7 +110,12 @@ function makeImapSocket({ mailboxSize = 1, trash = false, supportsMove = true, o
         write('* LIST (\\Noselect) "/" ""\r\n');
         ok();
       } else if (/^LIST /i.test(command)) {
-        write('* LIST (\\HasNoChildren \\Archive) "/" "Archive"\r\n');
+        if (archive) write('* LIST (\\HasNoChildren \\Archive) "/" "Archive"\r\n');
+        if (junk) write('* LIST (\\HasNoChildren \\Junk) "/" "Spam folder"\r\n');
+        if (gmail) {
+          write('* LIST (\\HasNoChildren \\All) "/" "[Gmail]/All Mail"\r\n');
+          for (const label of customLabels) write(`* LIST (\\HasNoChildren) "/" ${JSON.stringify(label)}\r\n`);
+        }
         write('* LIST (\\HasNoChildren) "/" "INBOX"\r\n');
         write('* LIST (\\Noselect) "/" "Parent"\r\n');
         if (trash) write('* LIST (\\HasNoChildren \\Trash) "/" "Deleted items"\r\n');
@@ -118,14 +128,38 @@ function makeImapSocket({ mailboxSize = 1, trash = false, supportsMove = true, o
         write(`* ${current === 'INBOX' && !moved ? mailboxSize : 0} EXISTS\r\n`);
         write('* OK [UIDVALIDITY 7] fixture UID validity\r\n');
         write('* OK [UIDNEXT 45] fixture next UID\r\n');
+        if (!keywordsAllowed) write('* OK [PERMANENTFLAGS (\\Seen \\Flagged)] fixture flags\r\n');
         ok(`OK [${command.startsWith('SELECT') ? 'READ-WRITE' : 'READ-ONLY'}] selected`);
       } else if (/^UID STORE 44 ([+-])FLAGS/i.test(command)) {
-        const [, sign, flag] = /^UID STORE 44 ([+-])FLAGS(?:\.SILENT)? \((\\\w+)\)/i.exec(command) ?? [];
-        if (sign === '+') flags.add(flag);
-        if (sign === '-') flags.delete(flag);
+        const [, sign, values] = /^UID STORE 44 ([+-])FLAGS(?:\.SILENT)? \((.*)\)/i.exec(command);
+        for (const flag of values.split(' ')) {
+          if (sign === '+') flags.add(flag);
+          else flags.delete([...flags].find((value) => value.toLowerCase() === flag.toLowerCase()));
+        }
         write(`* 1 FETCH (UID 44 FLAGS (${[...flags].join(' ')}))\r\n`);
         ok();
-      } else if (/^UID MOVE 44 "Deleted items"$/i.test(command)) {
+      } else if (/^CREATE /i.test(command)) {
+        const label = command.slice('CREATE '.length);
+        customLabels.add(label.startsWith('"') ? JSON.parse(label) : label);
+        ok();
+      } else if (/^UID STORE 44 ([+-])X-GM-LABELS/i.test(command)) {
+        const [, sign, values] = /^UID STORE 44 ([+-])X-GM-LABELS \((.*)\)/i.exec(command);
+        const parts = values.match(/"(?:[^"\\]|\\.)*"|[^ ]+/g) ?? [];
+        for (const part of parts) {
+          const label = part.startsWith('"') ? JSON.parse(part) : part;
+          if (sign === '+') {
+            if (!customLabels.has(label) || rejectLabelUpdate) return ok('NO label refused');
+            labels.add(label);
+          } else {
+            labels.delete(label);
+          }
+        }
+        if (!labels.has('\\Inbox')) {
+          moved = true;
+          write('* 1 EXPUNGE\r\n');
+        }
+        ok();
+      } else if (/^UID MOVE 44 (?:"Deleted items"|"?Archive"?|"Spam folder")$/i.test(command)) {
         moved = true;
         write('* 1 EXPUNGE\r\n');
         ok('OK [COPYUID 8 44 45] moved');
@@ -138,8 +172,8 @@ function makeImapSocket({ mailboxSize = 1, trash = false, supportsMove = true, o
           const from = '(("Alice" NIL "alice" "example.test"))';
           const to = '((NIL NIL "me" "example.test"))';
           const envelope = `(${date} "A test message" ${from} NIL NIL ${to} NIL NIL "<first@example.test>" "<reply@example.test>")`;
-          const labels = /X-GM-LABELS/.test(command) ? ' X-GM-LABELS ("\\\\Inbox" "Read later")' : '';
-          write(`* 1 FETCH (UID 44 FLAGS (${[...flags].join(' ')} localtriage-category-newsletter) INTERNALDATE "20-Nov-2026 00:00:00 +0000" RFC822.SIZE ${encoder.encode(sample).byteLength} ENVELOPE ${envelope}${labels})\r\n`);
+          const gmailLabels = /X-GM-LABELS/.test(command) ? ` X-GM-LABELS (${[...labels].map((label) => JSON.stringify(label)).join(' ')})` : '';
+          write(`* 1 FETCH (UID 44 FLAGS (${[...flags].join(' ')}) INTERNALDATE "20-Nov-2026 00:00:00 +0000" RFC822.SIZE ${encoder.encode(sample).byteLength} ENVELOPE ${envelope}${gmailLabels})\r\n`);
         }
         ok();
       } else {
@@ -179,6 +213,60 @@ test('reads custom Gmail labels and IMAP keywords from the message list', async 
 
   assert.deepEqual(messages[0].labels, ['Read later']);
   assert.deepEqual(messages[0].keywords, ['localtriage-category-newsletter']);
+  assert.equal(messages[0].gmailLabels, true);
+});
+
+test('archives Gmail by removing only Inbox membership and safely confirms a retry', async () => {
+  const fixture = makeImapSocket({ gmail: true, archive: false, supportsMove: false });
+  const transport = createMailTransport(fixture.connect);
+  assert.deepEqual(await transport.moveToRole(account, 'INBOX', '7', 44, 'archive'), { status: 'moved' });
+  assert.deepEqual(await transport.moveToRole(account, 'INBOX', '7', 44, 'archive'), { status: 'absent' });
+  assert.equal(fixture.calls.filter((line) => / UID STORE 44 -X-GM-LABELS \(\\Inbox\)$/.test(line)).length, 1);
+  assert.equal(fixture.calls.some((line) => / UID MOVE | UID COPY |\\Deleted|EXPUNGE/.test(line)), false);
+});
+
+test('moves standard IMAP mail only to a selectable archive or junk role', async () => {
+  for (const [role, destination] of [['archive', 'Archive'], ['junk', 'Spam folder']]) {
+    const fixture = makeImapSocket({ archive: true, junk: true });
+    const transport = createMailTransport(fixture.connect);
+    assert.equal((await transport.moveToRole(account, 'INBOX', '7', 44, role)).destination, destination);
+    await assert.rejects(createMailTransport(makeImapSocket({ archive: false }).connect)
+      .moveToRole(account, 'INBOX', '7', 44, role), { code: `${role}_not_configured` });
+  }
+});
+
+test('adds and removes Gmail labels and IMAP keywords without replacing other flags', async () => {
+  const fixture = makeImapSocket({ gmail: true });
+  const transport = createMailTransport(fixture.connect);
+  const patch = {
+    add: ['stormbox-work'], remove: ['LOCALTRIAGE-CATEGORY-NEWSLETTER'],
+    addLabels: ['Customer follow-up'], removeLabels: ['Read later'],
+  };
+  const expected = { uid: 44, seen: true, flagged: false, tagsApplied: true,
+    labels: ['Customer follow-up'], keywords: ['stormbox-work'] };
+  assert.deepEqual(await transport.patchMessageTags(account, 'INBOX', '7', 44, patch), expected);
+  assert.deepEqual(await transport.patchMessageTags(account, 'INBOX', '7', 44, patch), expected);
+  assert.equal(fixture.calls.filter((line) => / CREATE "Customer follow-up"$/.test(line)).length, 1);
+  assert.equal(fixture.calls.filter((line) => / UID STORE /.test(line)).length, 4);
+});
+
+test('returns the confirmed tag state when the server rejects part of a patch', async () => {
+  const fixture = makeImapSocket({ gmail: true, keywordsAllowed: false, rejectLabelUpdate: true });
+  const transport = createMailTransport(fixture.connect);
+  assert.deepEqual(await transport.patchMessageTags(account, 'INBOX', '7', 44, {
+    add: ['stormbox-work'], remove: [], addLabels: ['Work'], removeLabels: ['Read later'],
+  }), { uid: 44, seen: true, flagged: false, tagsApplied: false,
+    labels: [], keywords: ['localtriage-category-newsletter'] });
+});
+
+test('requires the matching UIDVALIDITY before creating labels or updating a message', async () => {
+  const fixture = makeImapSocket({ gmail: true });
+  const transport = createMailTransport(fixture.connect);
+  await assert.rejects(transport.patchMessageTags(account, 'INBOX', '6', 44, {
+    add: [], remove: [], addLabels: ['New label'], removeLabels: [],
+  }), { code: 'mailbox_changed' });
+  await assert.rejects(transport.moveToRole(account, 'INBOX', '6', 44, 'archive'), { code: 'mailbox_changed' });
+  assert.equal(fixture.calls.some((line) => / (CREATE|UID STORE|UID MOVE) /i.test(line)), false);
 });
 
 test('rejects stale UIDVALIDITY before sending a UID command', async () => {

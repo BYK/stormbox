@@ -3,7 +3,7 @@ import { MUTATION_TYPE } from '../../../src/constants/states';
 import { makeAttentionHandlers } from '../../../src/db/attention';
 import { bootTestEngine } from '../../../src/db/bootstrap-memory';
 import { DB_RPC } from '../../../src/db/protocol';
-import { AttentionRelay } from '../../../src/sync/backends/imap/attention-relay';
+import { AttentionRelay, type AttentionImapDraft } from '../../../src/sync/backends/imap/attention-relay';
 import { processMutationRow } from '../../../src/sync/backends/jmap/outbox';
 
 let engine: Awaited<ReturnType<typeof bootTestEngine>>;
@@ -17,7 +17,8 @@ afterEach(async () => engine.close());
 
 function fakeRelay() {
   const server = { online: true, uidValidity: '3', accountTwoOnline: true, lastToken: '',
-    flags: { seen: true, flagged: false }, trashed: false };
+    flags: { seen: true, flagged: false }, trashed: false, archived: false, labels: ['Read later'],
+    sends: [] as { url: string; draft: AttentionImapDraft }[] };
   const fetcher = vi.fn(async (url: string, init: RequestInit) => {
     if (!server.online) throw new TypeError('Offline');
     if (url.endsWith('/session')) {
@@ -30,22 +31,36 @@ function fakeRelay() {
         { id: 'home', email: 'me@example.com', name: 'Home' },
       ] });
     }
+    if (url.endsWith('/send')) {
+      server.sends.push({ url, draft: JSON.parse(String(init.body)) });
+      return Response.json({ status: 'submitted', rejected: 1 });
+    }
     if (url.includes('/messages/')) {
       if (init.method === 'PATCH') {
         expect(init.credentials).toBe('same-origin');
-        Object.assign(server.flags, JSON.parse(String(init.body)));
+        const patch = JSON.parse(String(init.body));
+        if (patch.tags) {
+          server.labels = server.labels.filter((label) => !patch.tags.removeLabels?.includes(label));
+          return Response.json({ uid: 12, ...server.flags, keywords: [], labels: server.labels, tagsApplied: true });
+        }
+        Object.assign(server.flags, patch);
         return Response.json({ uid: 12, ...server.flags });
       }
       if (init.method === 'POST' && url.includes('/trash?')) {
         server.trashed = true;
         return Response.json({ status: 'moved' });
       }
+      if (init.method === 'POST' && url.includes('/archive?')) {
+        server.archived = true;
+        return Response.json({ status: 'moved' });
+      }
       const text = `Body from ${url.split('/')[5]}`;
       return Response.json({ text, html: `<p>${text}</p>` });
     }
     if (url.includes('/home/') && !server.accountTwoOnline) return Response.json({}, { status: 502 });
-    return Response.json({ mailbox: 'INBOX', uidValidity: server.uidValidity,
-      messages: server.trashed && url.includes('/work/') ? [] : [{ uid: 12, subject: url, ...server.flags }] });
+    const work = url.includes('/work/');
+    return Response.json({ mailbox: 'INBOX', uidValidity: server.uidValidity, canSend: work,
+      messages: work && (server.trashed || server.archived) ? [] : [{ uid: 12, subject: url, ...server.flags, labels: server.labels }] });
   });
   const handlers = makeAttentionHandlers(engine, { touch: vi.fn() }, fetcher as unknown as typeof fetch);
   return { server, handlers };
@@ -150,5 +165,50 @@ describe('Attention cache', () => {
     expect(await apply(ownerId, workMessage, { type: 'trash' })).toEqual({ ok: true });
     expect(await cacheFor('work')).toEqual([]);
     expect(await cacheFor('home')).toHaveLength(1);
+  });
+
+  it('writes Gmail labels and archives through the outbox, then reconciles the corresponding cached row', async () => {
+    const { server, handlers } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const apply = (action: object) => processMutationRow({
+      transport: null, account: { id: ownerId }, handlers,
+      row: { account_id: ownerId, mutation_type: MUTATION_TYPE.ATTENTION_IMAP,
+        request_json: JSON.stringify({ location: workMessage, action }) },
+    });
+    const cached = async (accountId: string) => (await handlers[DB_RPC.ATTENTION_GET]({ ownerId }))
+      .accounts.find((account) => account.relay_id === accountId)?.messages;
+
+    expect(await apply({ type: 'tags', tags: { removeLabels: ['Read later'] } })).toEqual({ ok: true });
+    expect(server.labels).toEqual([]);
+    expect(await cached('work')).toMatchObject([{ uid: 12, labels: [] }]);
+    expect(await cached('home')).toMatchObject([{ uid: 12, labels: ['Read later'] }]);
+    expect(await apply({ type: 'archive' })).toEqual({ ok: true });
+    expect(server.archived).toBe(true);
+    expect(server.trashed).toBe(false);
+    expect(await cached('work')).toEqual([]);
+    expect(await cached('home')).toHaveLength(1);
+  });
+
+  it('deduplicates a pending account-scoped send and submits it to the relay with the stable request ID', async () => {
+    const { server, handlers } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const draft = {
+      requestId: crypto.randomUUID(), to: [{ email: 'recipient@example.net' }], cc: [], bcc: [],
+      subject: 'Re: News', textBody: 'Thanks', htmlBody: '<p>Thanks</p>',
+      inReplyTo: ['thread@example.net'], references: ['thread@example.net'],
+    };
+    const payload = { ownerId, accountId: 'work', draft };
+    const ids = await Promise.all([handlers[DB_RPC.ATTENTION_ENSURE_IMAP_SEND](payload),
+      handlers[DB_RPC.ATTENTION_ENSURE_IMAP_SEND](payload)]);
+    expect(ids[0]).toBe(ids[1]);
+    const apply = (accountId: string, owner = ownerId) => processMutationRow({
+      transport: null, account: { id: owner }, handlers,
+      row: { account_id: owner, mutation_type: MUTATION_TYPE.ATTENTION_IMAP_SEND,
+        request_json: JSON.stringify({ accountId, draft }) },
+    });
+    expect(await apply('work', 2)).toMatchObject({ ok: false, error: { type: 'unauthorized' } });
+    expect(await apply('home')).toMatchObject({ ok: false, error: { type: 'smtp_not_configured' } });
+    expect(await apply('work')).toEqual({ ok: true, result: { rejected: 1 } });
+    expect(server.sends).toEqual([{ url: '/api/imap/v1/accounts/work/send', draft }]);
   });
 });

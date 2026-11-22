@@ -1,6 +1,6 @@
 import { MUTATION_TYPE } from '../constants/states';
 import {
-  AttentionRelay, AttentionRelayError, type ImapAttentionAction, type ImapMessageLocation,
+  AttentionRelay, AttentionRelayError, type AttentionImapDraft, type ImapAttentionAction, type ImapMessageLocation,
   type RelayAccountInput, type RelayMessage, type RelayMessageBody,
 } from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
@@ -13,6 +13,7 @@ export interface CachedImapAccount {
   name: string;
   mailbox: string | null;
   uid_validity: string | null;
+  can_send?: boolean;
   messages: RelayMessage[];
 }
 
@@ -126,15 +127,15 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
           failed.push(account.email);
           continue;
         }
-        const { mailbox, uidValidity, messages } = result.value;
+        const { mailbox, uidValidity, messages, canSend } = result.value;
         await tx.run(
           `INSERT INTO attention_imap_accounts
-           (owner_account_id, relay_id, address, name, mailbox, uid_validity, messages_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+           (owner_account_id, relay_id, address, name, mailbox, uid_validity, messages_json, can_send)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (owner_account_id, relay_id) DO UPDATE SET
              address = excluded.address, name = excluded.name, mailbox = excluded.mailbox,
-             uid_validity = excluded.uid_validity, messages_json = excluded.messages_json`,
-          [ownerId, account.id, account.email, account.name || account.email, mailbox, uidValidity, JSON.stringify(messages)],
+             uid_validity = excluded.uid_validity, messages_json = excluded.messages_json, can_send = excluded.can_send`,
+          [ownerId, account.id, account.email, account.name || account.email, mailbox, uidValidity, JSON.stringify(messages), Number(canSend === true)],
         );
         await tx.run(
           `DELETE FROM attention_imap_bodies WHERE owner_account_id = ? AND relay_id = ?
@@ -177,7 +178,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
   async function applyImapAction(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction) {
     if (location?.mailbox !== 'INBOX' || typeof location.accountId !== 'string' || typeof location.uidValidity !== 'string'
       || !Number.isSafeInteger(location.uid) || location.uid < 1 || location.uid > 0xffffffff
-      || !(action?.type === 'trash'
+      || !(action?.type === 'trash' || action?.type === 'archive' || action?.type === 'junk' || action?.type === 'tags'
         || ((action?.type === 'star' || action?.type === 'seen') && typeof action.value === 'boolean'))) {
       return terminalImapAction('invalidArguments', 'The pending IMAP change is invalid.');
     }
@@ -203,8 +204,11 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     }
 
     const messages: RelayMessage[] = JSON.parse(String(snapshot.messages_json));
-    const next = flags
-      ? messages.map((message) => message.uid === location.uid ? { ...message, ...flags } : message)
+    const tagUpdate = flags?.tagsApplied;
+    const confirmed = flags && { seen: flags.seen, flagged: flags.flagged,
+      ...(flags.keywords ? { keywords: flags.keywords } : {}), ...(flags.labels ? { labels: flags.labels } : {}) };
+    const next = confirmed
+      ? messages.map((message) => message.uid === location.uid ? { ...message, ...confirmed } : message)
       : messages.filter((message) => message.uid !== location.uid);
     await engine.transaction(async (tx) => {
       await tx.run(
@@ -221,10 +225,50 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
       }
     });
     broadcaster.touch(TABLE_FAMILIES.ATTENTION);
-    if (flags && action.type !== 'trash' && flags[action.type === 'star' ? 'flagged' : 'seen'] !== action.value) {
+    if (tagUpdate === false) return terminalImapAction('tag_update_rejected', 'The mail server rejected the tag change.');
+    if (flags && (action.type === 'star' || action.type === 'seen') && flags[action.type === 'star' ? 'flagged' : 'seen'] !== action.value) {
       return terminalImapAction('imapFlagRejected', 'The IMAP server did not apply the requested flag.');
     }
     return { ok: true };
+  }
+
+  async function ensureImapSend(ownerId: number, accountId: string, draft: AttentionImapDraft): Promise<number> {
+    const requestJson = JSON.stringify({ accountId, draft });
+    return engine.transaction(async (tx) => {
+      const active = await tx.get(
+        `SELECT id, json_remove(request_json, '$.cancelled') AS request_json FROM pending_mutations
+         WHERE account_id = ? AND mutation_type = ? AND local_status IN ('pending', 'retry', 'in_flight')
+           AND json_extract(request_json, '$.accountId') = ? AND json_extract(request_json, '$.draft.requestId') = ?`,
+        [ownerId, MUTATION_TYPE.ATTENTION_IMAP_SEND, accountId, draft.requestId],
+      );
+      if (active) {
+        if (active.request_json !== requestJson) throw new Error('An earlier send used this request.');
+        return Number(active.id);
+      }
+      const now = Date.now();
+      const result = await tx.run(
+        `INSERT INTO pending_mutations (account_id, mutation_type, local_status, request_json, created_at, updated_at)
+         VALUES (?, ?, 'pending', ?, ?, ?)`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP_SEND, requestJson, now, now],
+      );
+      return Number(result.lastInsertRowid);
+    });
+  }
+
+  async function applyImapSend(ownerId: number, accountId: string, draft: AttentionImapDraft, cancelled: boolean) {
+    if (cancelled) return terminalImapAction('unauthorized', 'The mail relay disconnected before this message was sent.');
+    if (!draft?.requestId || !await isPaired(ownerId)) {
+      return terminalImapAction('unauthorized', 'Connect the mail relay to send IMAP mail.');
+    }
+    const account = await engine.get(
+      'SELECT can_send FROM attention_imap_accounts WHERE owner_account_id = ? AND relay_id = ?', [ownerId, accountId],
+    );
+    if (!account?.can_send) return terminalImapAction('smtp_not_configured', 'This account does not have a sending server.');
+    try {
+      return { ok: true, result: await relay.submit(accountId, draft) };
+    } catch (cause) {
+      if (cause instanceof AttentionRelayError) return terminalImapAction(cause.code, cause.message);
+      return terminalImapAction('submission_unknown', 'The relay could not confirm delivery. Check the account’s Sent folder before sending again.');
+    }
   }
 
   return {
@@ -248,7 +292,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
         paired,
         accounts: accounts.map((row) => ({
           relay_id: String(row.relay_id), address: String(row.address), name: String(row.name),
-          mailbox: String(row.mailbox), uid_validity: String(row.uid_validity),
+          mailbox: String(row.mailbox), uid_validity: String(row.uid_validity), can_send: Boolean(row.can_send),
           messages: (JSON.parse(String(row.messages_json)) as RelayMessage[]).map((message) => {
             const preview = byMessage.get(JSON.stringify([row.relay_id, message.uid]));
             return preview ? { ...message, preview } : message;
@@ -270,6 +314,9 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
         await tx.run('DELETE FROM pending_mutations WHERE account_id = ? AND mutation_type = ? AND local_status != ?', [
           ownerId, MUTATION_TYPE.ATTENTION_IMAP, 'in_flight',
         ]);
+        await tx.run(`UPDATE pending_mutations SET request_json = json_set(request_json, '$.cancelled', 1), updated_at = ?
+          WHERE account_id = ? AND mutation_type = ? AND local_status IN ('pending', 'retry')`,
+        [Date.now(), ownerId, MUTATION_TYPE.ATTENTION_IMAP_SEND]);
       });
       broadcaster.touch(TABLE_FAMILIES.ATTENTION);
       broadcaster.touch(TABLE_FAMILIES.MUTATIONS);
@@ -301,6 +348,12 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     [DB_RPC.ATTENTION_BODY]: async ({ ownerId, location, cachedOnly = false }) => readBody(ownerId, location, cachedOnly),
     [DB_RPC.ATTENTION_APPLY_IMAP_ACTION]: async ({ ownerId, location, action }) =>
       serializeRelayOperation(ownerId, () => applyImapAction(ownerId, location, action)),
+    [DB_RPC.ATTENTION_ENSURE_IMAP_SEND]: async ({ ownerId, accountId, draft }) => {
+      const id = await ensureImapSend(ownerId, accountId, draft);
+      broadcaster.touch(TABLE_FAMILIES.MUTATIONS);
+      return id;
+    },
+    [DB_RPC.ATTENTION_APPLY_IMAP_SEND]: async ({ ownerId, accountId, draft, cancelled }) => applyImapSend(ownerId, accountId, draft, cancelled),
     [DB_RPC.ATTENTION_SET_STATE]: async ({ ownerId, bundleId, state, replacedIds }) => {
       await engine.transaction(async (tx) => {
         for (const id of new Set<string>([bundleId, ...replacedIds])) {
