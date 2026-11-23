@@ -22,6 +22,7 @@ export interface RelayAccountSettings {
 }
 
 export const GOOGLE_IMAP_RESULTS = ['connected', 'cancelled', 'blocked', 'account_mismatch', 'failed'] as const;
+export const GOOGLE_IMAP_RETURN_SPACE = 'stormbox.google-imap-return-space';
 export type GoogleImapResult = typeof GOOGLE_IMAP_RESULTS[number];
 
 export interface RelayAccountInput {
@@ -56,12 +57,23 @@ export interface RelayMessage {
   receivedAt: string;
   seen: boolean;
   flagged: boolean;
+  hasAttachments?: boolean;
+}
+
+export interface RelayFolder {
+  path: string;
+  name: string;
+  specialUse: string | null;
+  delimiter: string | null;
 }
 
 export interface RelayWindow {
   mailbox: string;
   uidValidity: string;
   canSend?: boolean;
+  total?: number;
+  complete?: boolean;
+  minUid?: number | null;
   messages: RelayMessage[];
 }
 
@@ -187,7 +199,22 @@ export class AttentionRelay {
   }
 
   inbox(accountId: string): Promise<RelayWindow> {
-    return this.json(`/accounts/${encodeURIComponent(accountId)}/messages?mailbox=INBOX&limit=50`);
+    return this.folder(accountId, 'INBOX');
+  }
+
+  async folders(accountId: string): Promise<RelayFolder[]> {
+    const { mailboxes } = await this.json<{ mailboxes: RelayFolder[] }>(`/accounts/${encodeURIComponent(accountId)}/mailboxes`);
+    if (!Array.isArray(mailboxes)) throw new Error('The mail relay did not return a folder list.');
+    return mailboxes;
+  }
+
+  async folder(accountId: string, mailbox: string, limit = 50): Promise<RelayWindow> {
+    const query = new URLSearchParams({ mailbox, limit: String(limit) });
+    const window = await this.json<RelayWindow>(`/accounts/${encodeURIComponent(accountId)}/messages?${query}`);
+    if (window.complete === false && window.minUid === null) {
+      throw new AttentionRelayError(503, 'incomplete_window', 'The folder changed during sync. Try refreshing again.');
+    }
+    return window;
   }
 
   async body(location: ImapMessageLocation): Promise<RelayMessageBody> {

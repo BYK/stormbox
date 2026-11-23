@@ -35,6 +35,8 @@ export interface UseThunderbirdShortcutsOptions {
   enabled: Ref<boolean>;
   /** Focuses the app-level Quick Filter field. */
   focusQuickFilter?: () => void;
+  composeNew?: () => void;
+  imapFolderActive?: Ref<boolean>;
 }
 
 export type MessageListNavigationCommand =
@@ -146,6 +148,8 @@ export function useThunderbirdShortcuts({
   space,
   enabled,
   focusQuickFilter,
+  composeNew,
+  imapFolderActive,
 }: UseThunderbirdShortcutsOptions) {
   const mailStore = useMailStore();
   const composeStore = useComposeStore();
@@ -229,6 +233,7 @@ export function useThunderbirdShortcuts({
     if (space.value !== 'mail') return;
     if (editable) return;
     if (!resolved) return;
+    if (imapFolderActive?.value && resolved.action !== 'compose') return;
     // Keys pressed on an open tag menu's items belong to the menu (its
     // find field is editable and already excluded; its items are not).
     if (
@@ -242,7 +247,8 @@ export function useThunderbirdShortcuts({
     switch (action) {
       case 'compose':
         event.preventDefault();
-        composeStore.open();
+        if (composeNew) composeNew();
+        else composeStore.open();
         return;
 
       // Tags (MK-4.2): a digit toggles the nth defined tag, `0` clears

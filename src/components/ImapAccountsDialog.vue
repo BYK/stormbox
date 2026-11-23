@@ -6,7 +6,7 @@ import { useOnline } from '@vueuse/core';
 import { useModalFocus } from '../composables/useModalFocus';
 import { getRepositoryAsync } from '../composables/useRepository';
 import { replaceLocation } from '../services/navigation';
-import type { GoogleImapResult, RelayAccount, RelayAccountInput } from '../sync/backends/imap/attention-relay';
+import { GOOGLE_IMAP_RETURN_SPACE, type GoogleImapResult, type RelayAccount, type RelayAccountInput } from '../sync/backends/imap/attention-relay';
 import AppButton from './AppButton.vue';
 import AppIconButton from './AppIconButton.vue';
 
@@ -15,6 +15,7 @@ const props = defineProps<{
   paired: boolean;
   automatic: boolean;
   googleResult?: GoogleImapResult;
+  returnToMail?: boolean;
   disconnect: () => Promise<void>;
 }>();
 const emit = defineEmits<{
@@ -127,6 +128,8 @@ async function connectGoogle(account?: RelayAccount) {
   await run(async () => {
     const repo = await getRepositoryAsync();
     const url = await repo.startAttentionGoogleOAuth(props.ownerId, account?.id);
+    if (props.returnToMail) window.sessionStorage.setItem(GOOGLE_IMAP_RETURN_SPACE, 'mail');
+    else window.sessionStorage.removeItem(GOOGLE_IMAP_RETURN_SPACE);
     replaceLocation(url);
   });
 }
@@ -191,7 +194,7 @@ async function remove() {
     await repo.removeAttentionRelayAccount(props.ownerId, account.id);
     accounts.value = accounts.value.filter(({ id }) => id !== account.id);
     showList();
-    notice.value = `${account.email} was removed from Attention.`;
+    notice.value = `${account.email} was disconnected.`;
     emit('account-change');
   });
 }
@@ -294,7 +297,7 @@ async function disconnectBrowser() {
         </form>
 
         <template v-else-if="screen === 'remove' && removing">
-          <p>Remove {{ removing.email }} from Attention? You can reconnect it later.</p>
+          <p>Disconnect {{ removing.email }}? You can reconnect it later.</p>
           <footer class="imap-accounts__footer">
             <AppButton variant="outline" :disabled="busy" @click="showList">Cancel</AppButton>
             <AppButton :disabled="busy || !online" @click="remove">Remove account</AppButton>

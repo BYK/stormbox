@@ -399,13 +399,6 @@ function applyMessageAction(message: TriageMessage, action: ImapAttentionAction,
   transform: rotate(180deg);
 }
 
-@media (hover: hover) and (pointer: fine) {
-  .attention-inbox__bundles :deep(.msg-list__item:not(:hover, :focus-within) .attention-row-menu:not([open])) {
-    opacity: 0;
-    pointer-events: none;
-  }
-}
-
 .attention-inbox__messages {
   margin-inline-start: 27px;
   border-inline-start: 1px solid var(--control-border);

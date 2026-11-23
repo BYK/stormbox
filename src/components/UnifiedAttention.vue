@@ -1,28 +1,27 @@
 <script setup lang="ts">
 import { AtSign, Bell, BellOff, RefreshCw, Sparkles } from '@lucide/vue';
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowReactive, shallowRef, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import { useOnline, useStorage } from '@vueuse/core';
 import AppIconButton from './AppIconButton.vue';
 import AttentionActionMenu from './AttentionActionMenu.vue';
 import AttentionInbox from './AttentionInbox.vue';
 import ImapAccountsDialog from './ImapAccountsDialog.vue';
 import MessageView from './MessageView.vue';
+import { imapEntry, useImapReader } from '../composables/useImapReader';
 import { useMessageTags } from '../composables/useMessageTags';
 import { getRepositoryAsync } from '../composables/useRepository';
 import { TABLE_FAMILIES } from '../db/protocol';
 import { JMAP_SERVER_URL } from '../defines';
 import type { AttentionCache } from '../db/attention';
 import type { Repository } from '../db/repository';
-import { useComposeStore } from '../stores/compose-store';
 import { useMailStore } from '../stores/mail-store';
 import { browserSessionEnabled } from '../services/browser-session';
-import { GOOGLE_IMAP_RESULTS, type GoogleImapResult, type ImapAttentionAction, type ImapMessageLocation, type RelayMessage, type RelayMessageBody } from '../sync/backends/imap/attention-relay';
+import { GOOGLE_IMAP_RESULTS, type GoogleImapResult, type ImapAttentionAction } from '../sync/backends/imap/attention-relay';
 import { browserTriageMessageKey, createBrowserTriageRanker, type BrowserTriageProgress } from '../triage/browser-model';
 import { buildTriageBundles, markBundleDone, snoozeBundle, type BundleState, type TriageBundle, type TriageClassification, type TriageMessage } from '../triage/smart-sort';
 import { disableWebPush, enableWebPush, getWebPushPublicKey, isWebPushEnabled, onWebPushRefresh } from '../push/client';
 import type { MessageRow, FolderRow } from '../types';
 import { parseAddressList } from '../utils/address-list';
-import { formatAddressList } from '../utils/address-parse';
 import { closeContainingDropdown } from '../utils/dropdown';
 import type { MessageRowLike } from '../utils/message-row-presentation';
 
@@ -43,10 +42,8 @@ const googleImapResult = ref<GoogleImapResult>();
 const jmapFolder = shallowRef<FolderRow>();
 const jmapRows = shallowRef<MessageRow[]>([]);
 const cache = shallowRef<AttentionCache>({ paired: false, accounts: [], states: {} });
-type ImapReading = { kind: 'imap'; message: TriageMessage; body?: RelayMessageBody; bodyError?: string; actionError?: string };
-type Reading = { kind: 'jmap'; message: TriageMessage } | ImapReading;
+type Reading = { kind: 'jmap' | 'imap'; message: TriageMessage };
 const mailStore = useMailStore();
-const composeStore = useComposeStore();
 const { definitions: tagDefinitions } = useMessageTags();
 const reading = shallowRef<Reading>();
 const reader = ref<HTMLElement>();
@@ -101,42 +98,30 @@ function parseHeaderList(value: string | null): string[] {
   }
 }
 
-function formatRelayAddresses(list: RelayMessage['from'] = []): string {
-  return formatAddressList(list.map(({ name, address }) => ({ name, email: address })));
-}
-
-const imap = computed(() => cache.value.accounts.flatMap((account) => account.messages.map((row) => {
-  const id = JSON.stringify([account.mailbox, account.uid_validity, row.uid]);
-  const location: ImapMessageLocation = {
-    accountId: account.relay_id, mailbox: account.mailbox,
-    uidValidity: account.uid_validity, uid: row.uid,
-  };
-  const message: TriageMessage = {
-    id,
-    accountId: `imap:${account.relay_id}`,
-    receivedAt: Date.parse(row.receivedAt) || 0,
-    subject: row.subject,
-    preview: row.preview,
-    messageId: row.messageId,
-    references: row.references,
-    inReplyTo: row.inReplyTo,
-    sender: row.from[0]?.address,
-    directRecipient: row.to.some((recipient) => recipient.address.toLowerCase() === account.address.toLowerCase()),
-    isFlagged: row.flagged,
-  };
-  const presentation = {
-    id,
-    subject: row.subject,
-    preview: row.preview,
-    from_text: formatRelayAddresses(row.from),
-    to_text: formatRelayAddresses(row.to),
-    keywords_json: JSON.stringify(Object.fromEntries((row.keywords ?? []).map((keyword) => [keyword, true]))),
-    received_at: message.receivedAt,
-    is_seen: Number(row.seen),
-    is_flagged: Number(row.flagged),
-  };
-  return { message, location, presentation, row, account };
-})));
+const imap = computed(() => cache.value.accounts.flatMap((account) => {
+  const { mailbox, uid_validity: uidValidity } = account;
+  if (!mailbox || !uidValidity) return [];
+  return account.messages.map((row) => {
+    const entry = imapEntry(account, mailbox, uidValidity, row);
+    const message: TriageMessage = {
+      id: JSON.stringify([mailbox, uidValidity, row.uid]),
+      accountId: `imap:${account.relay_id}`,
+      receivedAt: entry.presentation.received_at,
+      subject: row.subject,
+      preview: row.preview,
+      messageId: row.messageId,
+      references: row.references,
+      inReplyTo: row.inReplyTo,
+      sender: row.from[0]?.address,
+      directRecipient: row.to.some((recipient) => recipient.address.toLowerCase() === account.address.toLowerCase()),
+      isFlagged: row.flagged,
+    };
+    return { ...entry, message };
+  });
+}));
+const imapById = computed(() => new Map(imap.value.map((entry) => [entry.id, entry])));
+const imapReading = useImapReader(() => props.ownerId, () => repo, (id) => imapById.value.get(id), report);
+const imapReader = imapReading.view;
 const jmapRowsById = computed(() => new Map(jmapRows.value.map((row) => [row.id, row])));
 const rows = computed(() => new Map<string, MessageRowLike & { id: number | string }>([
   ...jmapRows.value.map((row) => [
@@ -148,25 +133,8 @@ const rows = computed(() => new Map<string, MessageRowLike & { id: number | stri
 ]));
 const disabledActions = computed(() => new Set([
   ...pendingActions.value,
-  ...(!online.value ? imap.value.map(({ message }) => browserTriageMessageKey(message)) : []),
+  ...imap.value.filter(({ id }) => imapReading.disabled(id)).map(({ message }) => browserTriageMessageKey(message)),
 ]));
-const imapReader = computed(() => {
-  const current = reading.value;
-  if (current?.kind !== 'imap') return undefined;
-  const entry = findImapMessage(current.message);
-  if (!entry) return undefined;
-  const id = browserTriageMessageKey(current.message);
-  const labels = entry.row.labels ?? [];
-  return {
-    ...entry.presentation, id,
-    ccText: formatRelayAddresses(entry.row.cc), labels,
-    knownLabels: [...new Set(entry.account.messages.flatMap((row) => row.labels ?? []))],
-    gmailLabels: entry.row.gmailLabels ?? labels.length > 0,
-    canSend: entry.account.can_send === true,
-    seen: entry.row.seen, flagged: entry.row.flagged, disabled: disabledActions.value.has(id),
-    body: current.body, bodyError: current.bodyError, actionError: current.actionError,
-  };
-});
 const accountLabels = computed(() => Object.fromEntries([
   [`jmap:${props.ownerId}`, props.address],
   ...cache.value.accounts.map((account) => [`imap:${account.relay_id}`, account.address]),
@@ -348,6 +316,7 @@ function releaseJmapReader(previous?: Reading) {
 async function closeReader() {
   const previous = reading.value;
   reading.value = undefined;
+  imapReading.close();
   maximized.value = false;
   releaseJmapReader(previous);
   await nextTick();
@@ -363,28 +332,11 @@ function findImapMessage(message: TriageMessage) {
     candidate.id === message.id && candidate.accountId === message.accountId);
 }
 
-function composeImapResponse(kind: 'reply' | 'reply-all' | 'forward') {
-  const current = reading.value;
-  if (current?.kind !== 'imap' || !current.body) return;
-  const entry = findImapMessage(current.message);
-  if (!entry?.account.can_send) return;
-  const { account, row, presentation } = entry;
-  const addressLists = { from: row.from, replyTo: row.replyTo, to: row.to, cc: row.cc };
-  const addresses = Object.entries(addressLists).flatMap(([kind, list]) => (list ?? [])
-    .map(({ name, address }, position) => ({ kind, position, name, email: address })));
-  composeStore.prepareImapResponse(kind, { id: account.relay_id, email: account.address, name: account.name }, {
-    ...presentation,
-    addresses,
-    rfc822_message_id: row.messageId,
-    references_json: JSON.stringify(row.references ?? []),
-    in_reply_to_json: JSON.stringify(row.inReplyTo ? [row.inReplyTo] : []),
-  }, current.body);
-}
-
 async function openMessage(message: TriageMessage, trigger: EventTarget | null) {
   if (trigger instanceof HTMLElement) openingButton = trigger;
   const messageId = message.id;
   if (typeof messageId === 'number' && jmapFolder.value) {
+    imapReading.close();
     reading.value = { kind: 'jmap', message };
     mailStore.selectMessage(messageId, jmapFolder.value.id, () => jmapRowsById.value.get(messageId));
     await nextTick();
@@ -394,52 +346,33 @@ async function openMessage(message: TriageMessage, trigger: EventTarget | null) 
   const row = findImapMessage(message);
   if (!row) return;
   releaseJmapReader(reading.value);
-  const pending = shallowReactive<ImapReading>({ kind: 'imap', message });
-  reading.value = pending;
+  reading.value = { kind: 'imap', message };
   void nextTick(() => reader.value?.focus({ preventScroll: true }));
-  try {
-    const cached = await repo.readAttentionImapMessage(props.ownerId, row.location, true);
-    if (reading.value !== pending) return;
-    pending.body = cached ?? undefined;
-    if (cached?.html != null || (cached && !online.value)) return;
-    if (!online.value) throw new Error('This message body has not been downloaded for offline reading.');
-    pending.body = await repo.readAttentionImapMessage(props.ownerId, row.location) ?? undefined;
-  } catch (cause) {
-    if (reading.value === pending) {
-      pending.bodyError = online.value && cause instanceof Error
-        ? cause.message : 'This message body has not been downloaded for offline reading.';
-    }
-  }
+  await imapReading.open(row);
 }
 
 async function runMessageAction(message: TriageMessage, action: ImapAttentionAction) {
+  error.value = '';
+  if (typeof message.id !== 'number') {
+    const entry = findImapMessage(message);
+    if (!entry) return;
+    await imapReading.runAction(entry, action);
+    await loadCache().catch(report);
+    return;
+  }
   const key = browserTriageMessageKey(message);
   if (pendingActions.value.has(key)) return;
   pendingActions.value.add(key);
-  error.value = '';
-  const current = reading.value;
-  const imapReading = current?.kind === 'imap' && browserTriageMessageKey(current.message) === key ? current : null;
-  if (imapReading) imapReading.actionError = undefined;
   try {
-    if (typeof message.id === 'number') {
-      const row = jmapRowsById.value.get(message.id);
-      if (!row || !jmapFolder.value) return;
-      const source = { sourceFolderId: jmapFolder.value.id, rows: [row] };
-      if (action.type === 'star') await mailStore.markManyFlagged([message.id], action.value, source);
-      else if (action.type === 'seen') await mailStore.markManySeen([message.id], action.value, source);
-      else if (action.type === 'trash') await mailStore.destroyMessage(message.id, source);
-    } else {
-      const row = findImapMessage(message);
-      if (!row) return;
-      await repo.mutateAttentionImapMessage(props.ownerId, row.location, action);
-    }
+    const row = jmapRowsById.value.get(message.id);
+    if (!row || !jmapFolder.value) return;
+    const source = { sourceFolderId: jmapFolder.value.id, rows: [row] };
+    if (action.type === 'star') await mailStore.markManyFlagged([message.id], action.value, source);
+    else if (action.type === 'seen') await mailStore.markManySeen([message.id], action.value, source);
+    else if (action.type === 'trash') await mailStore.destroyMessage(message.id, source);
     await loadCache();
   } catch (cause) {
-    if (imapReading && reading.value === imapReading) {
-      imapReading.actionError = cause instanceof Error ? cause.message : 'Could not update this message.';
-    } else {
-      report(cause);
-    }
+    report(cause);
   } finally {
     pendingActions.value.delete(key);
   }
@@ -468,6 +401,7 @@ onMounted(async () => {
     if (!active) return;
     removePushRefresh = onWebPushRefresh(() => { void refresh(); });
     unsubscribe = repo.subscribe((tables) => {
+      if (online.value && tables.includes(TABLE_FAMILIES.IMAP_MUTATIONS)) void refreshAfterAccountChange();
       if ([TABLE_FAMILIES.MESSAGES, TABLE_FAMILIES.FOLDERS, TABLE_FAMILIES.ATTENTION].some((table) => tables.includes(table))) {
         void loadCache().catch(report);
       }
@@ -595,7 +529,7 @@ onBeforeUnmount(() => {
         @back="closeReader"
         @toggle-maximized="maximized = !maximized"
         @imap-action="(action) => reading?.kind === 'imap' && runMessageAction(reading.message, action)"
-        @imap-compose="composeImapResponse"
+        @imap-compose="imapReading.composeResponse"
       />
       <p v-else class="unified-attention__empty">Select a message to read it.</p>
     </div>

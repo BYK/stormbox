@@ -1,7 +1,7 @@
 import { MUTATION_TYPE } from '../constants/states';
 import {
   AttentionRelay, AttentionRelayError, type AttentionImapDraft, type ImapAttentionAction, type ImapMessageLocation,
-  type RelayAccountInput, type RelayMessage, type RelayMessageBody,
+  type RelayAccount, type RelayAccountInput, type RelayFolder, type RelayMessage, type RelayMessageBody, type RelayWindow,
 } from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
 import type { Engine } from './engine';
@@ -14,7 +14,18 @@ export interface CachedImapAccount {
   mailbox: string | null;
   uid_validity: string | null;
   can_send?: boolean;
+  last_synced_at?: number | null;
+  sync_error?: string | null;
+  total_messages?: number | null;
+  folders?: RelayFolder[];
   messages: RelayMessage[];
+}
+
+export interface CachedImapFolder {
+  uidValidity: string;
+  messages: RelayMessage[];
+  total: number | null;
+  syncedAt: number;
 }
 
 export interface AttentionCache {
@@ -56,6 +67,10 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     }
   }
 
+  function folderTable(mailbox: string) {
+    return mailbox === 'INBOX' ? 'attention_imap_accounts' : 'imap_folder_windows';
+  }
+
   async function readBody(ownerId: number, location: ImapMessageLocation, cachedOnly = false): Promise<RelayMessageBody | null> {
     const { accountId, mailbox, uidValidity, uid } = location;
     const key = [ownerId, accountId, mailbox, uidValidity, uid];
@@ -68,11 +83,11 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     } : null;
     if (cachedOnly || cached?.html != null) return cached;
     const snapshot = await engine.get(
-      `SELECT 1 FROM attention_imap_accounts WHERE owner_account_id = ?
+      `SELECT 1 FROM ${folderTable(mailbox)} WHERE owner_account_id = ?
        AND relay_id = ? AND mailbox = ? AND uid_validity = ?`, key.slice(0, 4),
     );
     if (!snapshot || !await isPaired(ownerId)) {
-      throw new Error('Refresh Attention before opening this message.');
+      throw new Error('Refresh this folder before opening the message.');
     }
     let body: RelayMessageBody;
     try {
@@ -86,7 +101,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
       await tx.run(
         `INSERT INTO attention_imap_bodies
            (owner_account_id, relay_id, mailbox, uid_validity, uid, body_text, body_html, cached_at)
-         SELECT ?, relay_id, mailbox, uid_validity, ?, ?, ?, ? FROM attention_imap_accounts
+         SELECT ?, relay_id, mailbox, uid_validity, ?, ?, ?, ? FROM ${folderTable(mailbox)}
          WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ?
          ON CONFLICT (owner_account_id, relay_id, mailbox, uid_validity, uid) DO UPDATE SET
            body_text = excluded.body_text, body_html = excluded.body_html, cached_at = excluded.cached_at
@@ -111,44 +126,62 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
   async function refresh(ownerId: number): Promise<string[]> {
     if (!await isPaired(ownerId)) return [];
     const accounts = await relay.accounts();
-    const windows = await Promise.allSettled(accounts.map((account) => relay.inbox(account.id)));
-    const failed: string[] = [];
     await engine.transaction(async (tx) => {
-      if (!await tx.get('SELECT 1 FROM attention_imap_pairing WHERE owner_account_id = ?', [ownerId])) return;
       const retained = new Set(accounts.map((account) => account.id));
       for (const row of await tx.all('SELECT relay_id FROM attention_imap_accounts WHERE owner_account_id = ?', [ownerId])) {
         if (!retained.has(String(row.relay_id))) {
           await tx.run('DELETE FROM attention_imap_accounts WHERE owner_account_id = ? AND relay_id = ?', [ownerId, row.relay_id]);
         }
       }
-      for (const [index, account] of accounts.entries()) {
-        const result = windows[index];
-        if (result.status === 'rejected') {
-          failed.push(account.email);
-          continue;
-        }
-        const { mailbox, uidValidity, messages, canSend } = result.value;
+      for (const account of accounts) {
         await tx.run(
-          `INSERT INTO attention_imap_accounts
-           (owner_account_id, relay_id, address, name, mailbox, uid_validity, messages_json, can_send)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (owner_account_id, relay_id) DO UPDATE SET
-             address = excluded.address, name = excluded.name, mailbox = excluded.mailbox,
-             uid_validity = excluded.uid_validity, messages_json = excluded.messages_json, can_send = excluded.can_send`,
-          [ownerId, account.id, account.email, account.name || account.email, mailbox, uidValidity, JSON.stringify(messages), Number(canSend === true)],
-        );
-        await tx.run(
-          `DELETE FROM attention_imap_bodies WHERE owner_account_id = ? AND relay_id = ?
-           AND (mailbox IS NOT ? OR uid_validity IS NOT ?)`, [ownerId, account.id, mailbox, uidValidity],
+          `INSERT INTO attention_imap_accounts (owner_account_id, relay_id, address, name)
+           VALUES (?, ?, ?, ?) ON CONFLICT (owner_account_id, relay_id) DO UPDATE SET
+             address = excluded.address, name = excluded.name`,
+          [ownerId, account.id, account.email, account.name || account.email],
         );
       }
     });
     broadcaster.touch(TABLE_FAMILIES.ATTENTION);
+
+    const windows = await Promise.allSettled(accounts.map((account) => refreshInbox(ownerId, account)));
     if (!prefetching.has(ownerId)) {
       prefetching.add(ownerId);
       void prefetch(ownerId, accounts, windows).finally(() => prefetching.delete(ownerId));
     }
-    return failed;
+    return accounts.filter((_account, index) => windows[index].status === 'rejected').map(({ email }) => email);
+  }
+
+  async function refreshInbox(ownerId: number, account: RelayAccount) {
+    const identity = [ownerId, account.id];
+    let window: RelayWindow;
+    try {
+      window = await relay.inbox(account.id);
+    } catch (cause) {
+      const message = cause instanceof AttentionRelayError
+        ? cause.message : 'Could not reach the IMAP relay. Try refreshing again.';
+      await engine.run(
+        'UPDATE attention_imap_accounts SET sync_error = ? WHERE owner_account_id = ? AND relay_id = ?',
+        [message, ...identity],
+      );
+      broadcaster.touch(TABLE_FAMILIES.ATTENTION);
+      throw cause;
+    }
+    const { mailbox, uidValidity, messages, canSend, total } = window;
+    await engine.transaction(async (tx) => {
+      await tx.run(
+        `UPDATE attention_imap_accounts SET mailbox = ?, uid_validity = ?, messages_json = ?, can_send = ?,
+           last_synced_at = ?, total_messages = ?, sync_error = NULL
+         WHERE owner_account_id = ? AND relay_id = ?`,
+        [mailbox, uidValidity, JSON.stringify(messages), Number(canSend === true), Date.now(), total ?? null, ...identity],
+      );
+      await tx.run(
+        `DELETE FROM attention_imap_bodies WHERE owner_account_id = ? AND relay_id = ?
+         AND mailbox = ? AND uid_validity IS NOT ?`, [...identity, mailbox, uidValidity],
+      );
+    });
+    broadcaster.touch(TABLE_FAMILIES.ATTENTION);
+    return window;
   }
 
   async function prefetch(ownerId: number, accounts: Awaited<ReturnType<AttentionRelay['accounts']>>,
@@ -171,12 +204,48 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     return pending;
   }
 
+  async function listFolders(ownerId: number, accountId: string) {
+    await requirePairing(ownerId);
+    const folders = await relay.folders(accountId);
+    await engine.run(`UPDATE attention_imap_accounts SET folders_json = ?
+      WHERE owner_account_id = ? AND relay_id = ?`, [JSON.stringify(folders), ownerId, accountId]);
+    broadcaster.touch(TABLE_FAMILIES.ATTENTION);
+  }
+
+  async function getFolder(ownerId: number, accountId: string, mailbox: string): Promise<CachedImapFolder | null> {
+    const account = await engine.get(`SELECT messages_json, uid_validity, total_messages, cached_at FROM imap_folder_windows
+      WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ?`, [ownerId, accountId, mailbox]);
+    return account ? {
+      uidValidity: String(account.uid_validity), messages: JSON.parse(String(account.messages_json)),
+      total: account.total_messages == null ? null : Number(account.total_messages), syncedAt: Number(account.cached_at),
+    } : null;
+  }
+
+  async function refreshFolder(ownerId: number, accountId: string, mailbox: string) {
+    await requirePairing(ownerId);
+    const { uidValidity, messages, total }: RelayWindow = await relay.folder(accountId, mailbox, 100);
+    await engine.transaction(async (tx) => {
+      await tx.run(`INSERT INTO imap_folder_windows
+        (owner_account_id, relay_id, mailbox, uid_validity, messages_json, total_messages, cached_at)
+        SELECT owner_account_id, relay_id, ?, ?, ?, ?, ? FROM attention_imap_accounts
+        WHERE owner_account_id = ? AND relay_id = ?
+        ON CONFLICT (owner_account_id, relay_id, mailbox) DO UPDATE SET
+          uid_validity = excluded.uid_validity, messages_json = excluded.messages_json,
+          total_messages = excluded.total_messages, cached_at = excluded.cached_at`,
+      [mailbox, uidValidity, JSON.stringify(messages), total ?? null, Date.now(), ownerId, accountId]);
+      await tx.run(`DELETE FROM attention_imap_bodies WHERE owner_account_id = ? AND relay_id = ?
+        AND mailbox = ? AND uid_validity IS NOT ?`, [ownerId, accountId, mailbox, uidValidity]);
+    });
+    broadcaster.touch(TABLE_FAMILIES.ATTENTION);
+    return getFolder(ownerId, accountId, mailbox);
+  }
+
   function terminalImapAction(type: string, message: string) {
     return { ok: false, error: { type, message, terminal: true } };
   }
 
   async function applyImapAction(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction) {
-    if (location?.mailbox !== 'INBOX' || typeof location.accountId !== 'string' || typeof location.uidValidity !== 'string'
+    if (typeof location?.mailbox !== 'string' || !location.mailbox || typeof location.accountId !== 'string' || typeof location.uidValidity !== 'string'
       || !Number.isSafeInteger(location.uid) || location.uid < 1 || location.uid > 0xffffffff
       || !(action?.type === 'trash' || action?.type === 'archive' || action?.type === 'junk' || action?.type === 'tags'
         || ((action?.type === 'star' || action?.type === 'seen') && typeof action.value === 'boolean'))) {
@@ -187,10 +256,14 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     }
     const key = [ownerId, location.accountId, location.mailbox, location.uidValidity];
     const snapshot = await engine.get(
-      `SELECT messages_json FROM attention_imap_accounts
+      `SELECT messages_json FROM ${folderTable(location.mailbox)}
        WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ?`, key,
     );
-    if (!snapshot) return terminalImapAction('imapMailboxChanged', 'This mailbox changed. Refresh Attention and reopen the message.');
+    if (!snapshot) return terminalImapAction('imapMailboxChanged', 'This mailbox changed. Refresh this folder and reopen the message.');
+    const messages: RelayMessage[] = JSON.parse(String(snapshot.messages_json));
+    if (!messages.some(({ uid }) => uid === location.uid)) {
+      return terminalImapAction('imapMessageAbsent', 'This message is no longer in this folder.');
+    }
 
     let flags: Awaited<ReturnType<AttentionRelay['mutate']>>;
     try {
@@ -203,7 +276,6 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
       throw error;
     }
 
-    const messages: RelayMessage[] = JSON.parse(String(snapshot.messages_json));
     const tagUpdate = flags?.tagsApplied;
     const confirmed = flags && { seen: flags.seen, flagged: flags.flagged,
       ...(flags.keywords ? { keywords: flags.keywords } : {}), ...(flags.labels ? { labels: flags.labels } : {}) };
@@ -212,9 +284,9 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
       : messages.filter((message) => message.uid !== location.uid);
     await engine.transaction(async (tx) => {
       await tx.run(
-        `UPDATE attention_imap_accounts SET messages_json = ?
+        `UPDATE ${folderTable(location.mailbox)} SET messages_json = ?, total_messages = total_messages - ?
          WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ?`,
-        [JSON.stringify(next), ...key],
+        [JSON.stringify(next), flags ? 0 : 1, ...key],
       );
       if (!flags) {
         await tx.run(
@@ -225,6 +297,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
       }
     });
     broadcaster.touch(TABLE_FAMILIES.ATTENTION);
+    broadcaster.touch(TABLE_FAMILIES.IMAP_MUTATIONS);
     if (tagUpdate === false) return terminalImapAction('tag_update_rejected', 'The mail server rejected the tag change.');
     if (flags && (action.type === 'star' || action.type === 'seen') && flags[action.type === 'star' ? 'flagged' : 'seen'] !== action.value) {
       return terminalImapAction('imapFlagRejected', 'The IMAP server did not apply the requested flag.');
@@ -292,7 +365,12 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
         paired,
         accounts: accounts.map((row) => ({
           relay_id: String(row.relay_id), address: String(row.address), name: String(row.name),
-          mailbox: String(row.mailbox), uid_validity: String(row.uid_validity), can_send: Boolean(row.can_send),
+          mailbox: row.mailbox == null ? null : String(row.mailbox),
+          uid_validity: row.uid_validity == null ? null : String(row.uid_validity), can_send: Boolean(row.can_send),
+          last_synced_at: row.last_synced_at == null ? null : Number(row.last_synced_at),
+          sync_error: row.sync_error == null ? null : String(row.sync_error),
+          total_messages: row.total_messages == null ? null : Number(row.total_messages),
+          folders: JSON.parse(String(row.folders_json)),
           messages: (JSON.parse(String(row.messages_json)) as RelayMessage[]).map((message) => {
             const preview = byMessage.get(JSON.stringify([row.relay_id, message.uid]));
             return preview ? { ...message, preview } : message;
@@ -323,6 +401,11 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
       await relay.disconnect();
     }),
     [DB_RPC.ATTENTION_REFRESH]: async ({ ownerId }) => refreshOnce(ownerId),
+    [DB_RPC.IMAP_FOLDER_LIST_REFRESH]: async ({ ownerId, accountId }) =>
+      serializeRelayOperation(ownerId, () => listFolders(ownerId, accountId)),
+    [DB_RPC.IMAP_FOLDER_GET]: async ({ ownerId, accountId, mailbox, refresh: online = false }) => online
+      ? serializeRelayOperation(ownerId, () => refreshFolder(ownerId, accountId, mailbox))
+      : getFolder(ownerId, accountId, mailbox),
     [DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS]: async ({ ownerId }) => {
       await requirePairing(ownerId);
       return relay.accountSettings();

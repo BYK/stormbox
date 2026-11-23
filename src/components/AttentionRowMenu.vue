@@ -8,11 +8,12 @@ import { closeContainingDropdown } from '../utils/dropdown';
 import type { MessageRowLike } from '../utils/message-row-presentation';
 import AttentionActionMenu from './AttentionActionMenu.vue';
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   row: MessageRowLike;
   bundle?: TriageBundle;
   disabled?: boolean;
-}>();
+  canTrash?: boolean;
+}>(), { canTrash: true });
 const emit = defineEmits<{
   action: [action: ImapAttentionAction, event: MouseEvent];
   done: [bundle: TriageBundle, event: MouseEvent];
@@ -92,6 +93,7 @@ function snoozeUntilTomorrow(): number {
       </template>
     </template>
     <button
+      v-if="canTrash"
       class="app-dropdown__item"
       type="button"
       :disabled="disabled"
@@ -102,3 +104,12 @@ function snoozeUntilTomorrow(): number {
     </button>
   </AttentionActionMenu>
 </template>
+
+<style scoped>
+@media (hover: hover) and (pointer: fine) {
+  :global(.msg-list__item:not(:hover, :focus-within) .attention-row-menu:not([open])) {
+    opacity: 0;
+    pointer-events: none;
+  }
+}
+</style>

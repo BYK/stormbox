@@ -37,6 +37,8 @@ import { shortcutAria, shortcutHint } from './constants/shortcuts';
 
 import AppSpaces from './components/AppSpaces.vue';
 import UnifiedAttention from './components/UnifiedAttention.vue';
+import ImapMail from './components/ImapMail.vue';
+import { GOOGLE_IMAP_RETURN_SPACE } from './sync/backends/imap/attention-relay';
 import { onWebPushOpenAttention } from './push/client';
 import LoginGate from './components/LoginGate.vue';
 import PlannedMaintenanceNotice from './components/PlannedMaintenanceNotice.vue';
@@ -80,7 +82,22 @@ interface ContactsViewHandle {
   requestLeave: () => Promise<boolean>;
 }
 
-const space = ref<AppSpace>(new URLSearchParams(window.location.search).get('view') === 'attention' ? 'attention' : 'mail');
+const initialQuery = new URLSearchParams(window.location.search);
+const googleReturningToMail = initialQuery.has('google_imap')
+  && window.sessionStorage.getItem(GOOGLE_IMAP_RETURN_SPACE) === 'mail';
+const space = ref<AppSpace>(initialQuery.get('view') === 'attention' && !googleReturningToMail ? 'attention' : 'mail');
+const imapMail = ref<InstanceType<typeof ImapMail>>();
+const imapFolderNav = ref<HTMLElement | null>(null);
+const imapFolderSelected = ref(false);
+const imapDetailVisible = ref(false);
+
+function selectImapFolder(selected: boolean) {
+  imapFolderSelected.value = selected;
+  if (!selected) return;
+  mailStore.selectMessage(null);
+  mailStore.clearSelection();
+  if (singleColumnLayout.value) folderListHidden.value = true;
+}
 const contactsViewEl = ref<ContactsViewHandle | null>(null);
 // ContactsView teleports its address-book rail into this shell element so the
 // rail shares the folder list's slot, width, toggle, and drawer (CT-1.3).
@@ -219,7 +236,7 @@ const shortcutsEnabled = computed(() =>
 const showFeatureBeacons = computed(() =>
   !showWelcomeModal.value && !showSettingsDialog.value && !showTagManager.value && !showMailRules.value);
 const windowWidth = ref(typeof window === 'undefined' ? COMPACT_READING_WIDTH : window.innerWidth);
-const wantsMessageDetailView = computed(() => mailStore.selectedMessageId != null);
+const wantsMessageDetailView = computed(() => !imapFolderSelected.value && mailStore.selectedMessageId != null);
 // Multi-select never opens the message view: the bulk actions live in
 // the message list header, so a checkbox selection hides the reading
 // pane entirely (and works the same in single-column layouts).
@@ -291,6 +308,8 @@ useThunderbirdShortcuts({
   space,
   enabled: computed(() => space.value !== 'attention' && shortcutsEnabled.value),
   focusQuickFilter: focusQuickFilterInput,
+  composeNew: startCompose,
+  imapFolderActive: imapFolderSelected,
 });
 
 let appMounted = false;
@@ -349,7 +368,7 @@ watch(space, () => {
   clampColumnWidths();
 });
 
-watch(contactsDetailVisible, () => {
+watch([contactsDetailVisible, imapDetailVisible], () => {
   applyResponsiveLayout();
   clampColumnWidths();
 });
@@ -383,7 +402,8 @@ watch(
 );
 
 function startCompose() {
-  composeStore.open();
+  if (imapFolderSelected.value) imapMail.value?.startCompose();
+  else composeStore.open();
 }
 
 function setQuickFilterQuery(event: Event) {
@@ -552,7 +572,7 @@ function onWindowResize() {
 // identity, or address-book pane in Contacts. Both collapse the sidebar in
 // the compact layout (R-10.2, CT-1.3).
 function detailPaneVisible() {
-  return space.value === 'contacts' ? contactsDetailVisible.value : showMessageView.value;
+  return space.value === 'contacts' ? contactsDetailVisible.value : showMessageView.value || imapDetailVisible.value;
 }
 
 function applyResponsiveLayout() {
@@ -833,7 +853,7 @@ function unwatchSystemTheme() {
     >
       <aside v-if="space === 'mail'" class="sidebar">
         <header class="sidebar__header">
-          <AppButton class="sidebar__compose" @click="startCompose">
+          <AppButton class="sidebar__compose" :disabled="imapFolderSelected && !imapMail?.canCompose" @click="startCompose">
             <template #iconLeft>
               <Plus :size="16" :stroke-width="2" />
             </template>
@@ -845,7 +865,9 @@ function unwatchSystemTheme() {
           <span class="sidebar__account-name">{{ accountLabel }}</span>
         </div>
 
-        <FolderTree />
+        <FolderTree :external-folder-selected="imapFolderSelected" @pick-primary="imapMail?.clearFolder()">
+          <template #connected-accounts><div ref="imapFolderNav" /></template>
+        </FolderTree>
 
         <footer class="sidebar__footer">
           <StorageUsageBar />
@@ -879,15 +901,26 @@ function unwatchSystemTheme() {
     />
 
     <template v-if="space === 'mail'">
+      <ImapMail
+        v-if="authStore.accountId != null && imapFolderNav"
+        :key="authStore.accountId"
+        ref="imapMail"
+        :owner-id="authStore.accountId"
+        :folder-target="imapFolderNav"
+        :search="quickFilterQuery"
+        @folder-selected="selectImapFolder"
+        @detail-visible="imapDetailVisible = $event"
+        @maximized="messageViewMaximized = $event"
+      />
       <MessageColumns
-        v-if="displayedMessageList"
+        v-if="displayedMessageList && !imapFolderSelected"
         :inert="messageViewMaximized"
         :aria-hidden="messageViewMaximized"
         :quick-filter-query="quickFilterQuery"
         :reading-pane-visible="displayedMessageView"
       />
       <MessageView
-        v-if="displayedMessageView"
+        v-if="displayedMessageView && !imapFolderSelected"
         :maximized="messageViewMaximized"
         @toggle-maximized="messageViewMaximized = !messageViewMaximized"
       />
@@ -1319,7 +1352,8 @@ body.spotlighting .folder-subs {
     display: none;
   }
   .shell--message-view-hidden > .msg-columns,
-  .shell--message-list-hidden > .message-view {
+  .shell--message-list-hidden > .message-view,
+  .shell > :deep(.imap-mail) {
     grid-column: 2 / -1;
   }
   /* Same 56px band: glyph, full-width filter, menu and avatar in one row.
@@ -1378,6 +1412,7 @@ body.spotlighting .folder-subs {
   .shell > .message-view,
   .shell > .contacts,
   .shell > .unified-attention,
+  .shell > :deep(.imap-mail),
   .shell--message-view-hidden > .msg-columns,
   .shell--message-list-hidden > .message-view {
     grid-column: 1;
@@ -1392,7 +1427,8 @@ body.spotlighting .folder-subs {
   .shell:has(> .shell__notice) > .app-spaces {
     grid-row: 4;
   }
-  .shell:has(> .shell__notice) > :is(.msg-columns, .message-view, .contacts, .unified-attention) {
+  .shell:has(> .shell__notice) > :is(.msg-columns, .message-view, .contacts, .unified-attention),
+  .shell:has(> .shell__notice) > :deep(.imap-mail) {
     grid-row: 3;
   }
   .shell:has(> .shell__notice) > .sidebar-slot {

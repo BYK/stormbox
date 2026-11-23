@@ -89,6 +89,9 @@ const props = withDefaults(defineProps<{
     seen: boolean;
     flagged: boolean;
     disabled: boolean;
+    canArchive?: boolean;
+    canJunk?: boolean;
+    canTrash?: boolean;
     body?: RelayMessageBody;
     bodyError?: string;
     actionError?: string;
@@ -935,10 +938,10 @@ function closeMessageView() {
              only Back and the view-mode toggle, and the banner below
              owns Cancel Send. -->
         <template v-if="!isPendingScheduled">
-          <AppIconButton v-if="imap || !isInArchiveFolder" class="message-view__action" :disabled="imap?.disabled" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
+          <AppIconButton v-if="imap ? imap.canArchive !== false : !isInArchiveFolder" class="message-view__action" :disabled="imap?.disabled" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="archiveIcon" />
           </AppIconButton>
-          <AppIconButton v-if="imap || !isInJunkFolder" class="message-view__action" :disabled="imap?.disabled" @click="junk" title="Junk" aria-label="Mark as junk">
+          <AppIconButton v-if="imap ? imap.canJunk !== false : !isInJunkFolder" class="message-view__action" :disabled="imap?.disabled" @click="junk" title="Junk" aria-label="Mark as junk">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="junkIcon" />
           </AppIconButton>
           <template v-if="imap">
@@ -962,7 +965,7 @@ function closeMessageView() {
               <component :is="imap.seen ? Mail : MailOpen" :size="17" :stroke-width="1.75" />
             </AppIconButton>
           </template>
-          <AppIconButton class="message-view__action" danger :disabled="imap?.disabled" @click="destroy" :title="imap ? 'Move to Trash' : actionTitle('Delete', 'delete')" aria-label="Delete">
+          <AppIconButton v-if="imap?.canTrash !== false" class="message-view__action" danger :disabled="imap?.disabled" @click="destroy" :title="imap ? 'Move to Trash' : actionTitle('Delete', 'delete')" aria-label="Delete">
             <Trash2 class="message-view__toolbar-icon" :size="18" :stroke-width="1.65" />
           </AppIconButton>
           <AppIconButton class="message-view__action" :disabled="!!imap && !imapCanRespond" @click="reply" :title="actionTitle('Reply', 'reply')" aria-label="Reply">

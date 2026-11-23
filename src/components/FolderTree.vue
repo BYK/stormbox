@@ -16,6 +16,8 @@ import {
   isMainFolder,
 } from '../utils/folder-presentation';
 
+const props = defineProps<{ externalFolderSelected?: boolean }>();
+const emit = defineEmits<{ pickPrimary: [] }>();
 const mailStore = useMailStore();
 const dragOverFolderId = ref(null);
 const showSubscriptionsDialog = ref(false);
@@ -137,7 +139,10 @@ function toggleFolderCollapsed(id) {
   expandedFolderIds.value = next;
 }
 
-function pickFolder(id) { mailStore.selectFolder(id); }
+function pickFolder(id) {
+  emit('pickPrimary');
+  mailStore.selectFolder(id);
+}
 
 function dropStateFor(folder) {
   if (!isDragging.value || dragOverFolderId.value !== folder.id) return null;
@@ -209,6 +214,7 @@ const tagRows = computed(() => [
 const dragOverTagKeyword = ref<string | null>(null);
 
 function pickTag(keyword: string) {
+  emit('pickPrimary');
   mailStore.selectFolder(mailStore.tagViewIdFor(keyword));
 }
 
@@ -265,7 +271,7 @@ function manageTags() {
       v-for="folder in mainFolders"
       :key="folder.id"
       :folder="folder"
-      :current-folder-id="mailStore.currentFolderId"
+      :current-folder-id="props.externalFolderSelected ? null : mailStore.currentFolderId"
       :on-pick="pickFolder"
       :is-collapsed="isFolderCollapsed"
       :on-toggle="toggleFolderCollapsed"
@@ -275,6 +281,7 @@ function manageTags() {
       :on-folder-drag-leave="onFolderDragLeave"
       :on-folder-drop="onFolderDrop"
     />
+    <slot name="connected-accounts" />
     <!--
       The heading row always renders (even with no user folders) so the
       manage button stays reachable without scrolling past the tree.
@@ -302,7 +309,7 @@ function manageTags() {
         :key="folder.id"
         tour-hook="folder-favorites"
         :folder="folder"
-        :current-folder-id="mailStore.currentFolderId"
+        :current-folder-id="props.externalFolderSelected ? null : mailStore.currentFolderId"
         :on-pick="pickFolder"
         :is-collapsed="isFolderCollapsed"
         :on-toggle="toggleFolderCollapsed"
@@ -318,7 +325,7 @@ function manageTags() {
       :key="folder.id"
       tour-hook="user-folders"
       :folder="folder"
-      :current-folder-id="mailStore.currentFolderId"
+      :current-folder-id="props.externalFolderSelected ? null : mailStore.currentFolderId"
       :on-pick="pickFolder"
       :is-collapsed="isFolderCollapsed"
       :on-toggle="toggleFolderCollapsed"
@@ -351,7 +358,7 @@ function manageTags() {
       :name="row.name"
       :color="row.color"
       :count="row.count"
-      :current="row.current"
+      :current="row.current && !props.externalFolderSelected"
       :drop-state="tagDropState(row.keyword)"
       @pick="pickTag"
       @dragenter="onTagDragEnter"
@@ -373,7 +380,7 @@ function manageTags() {
         :key="folder.id"
         tour-hook="shared-folders"
         :folder="folder"
-        :current-folder-id="mailStore.currentFolderId"
+        :current-folder-id="props.externalFolderSelected ? null : mailStore.currentFolderId"
         :on-pick="pickFolder"
         :is-collapsed="isFolderCollapsed"
         :on-toggle="toggleFolderCollapsed"

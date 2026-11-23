@@ -31,6 +31,13 @@ function fakeRelay() {
         { id: 'home', email: 'me@example.com', name: 'Home' },
       ] });
     }
+    if (url.endsWith('/mailboxes')) {
+      return Response.json({ mailboxes: [{ path: 'Clients & Projects', name: 'Clients & Projects', specialUse: null, delimiter: '/' }] });
+    }
+    if (new URL(url, 'https://relay.example').searchParams.get('mailbox') === 'Clients & Projects' && !url.includes('/messages/')) {
+      return Response.json({ mailbox: 'Clients & Projects', uidValidity: '9', total: 1,
+        messages: [{ uid: 12, subject: 'Client update', seen: false, flagged: false }] });
+    }
     if (url.endsWith('/send')) {
       server.sends.push({ url, draft: JSON.parse(String(init.body)) });
       return Response.json({ status: 'submitted', rejected: 1 });
@@ -70,6 +77,13 @@ const ownerId = 1;
 const workMessage = { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid: 12 };
 
 describe('Attention cache', () => {
+  it('rejects an unstable inbox window so it cannot replace cached mail', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({
+      mailbox: 'INBOX', uidValidity: '3', messages: [], total: 4, complete: false, minUid: null,
+    }));
+    await expect(new AttentionRelay(fetcher).inbox('work')).rejects.toMatchObject({ code: 'incomplete_window' });
+  });
+
   it('allows Google authorization redirects only to the Google consent endpoint', async () => {
     const google = 'https://accounts.google.com/o/oauth2/v2/auth?state=test';
     const fetcher = vi.fn<typeof fetch>()
@@ -119,6 +133,39 @@ describe('Attention cache', () => {
     expect(await handlers[DB_RPC.ATTENTION_BODY]({ ...args, cachedOnly: true })).toEqual(upgraded);
   });
 
+  it('shows the account when its first Inbox fetch fails and clears the error on recovery', async () => {
+    const { handlers, server } = fakeRelay();
+    server.accountTwoOnline = false;
+    expect(await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'token' })).toEqual(['me@example.com']);
+    const home = async () => (await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts.find(({ relay_id }) => relay_id === 'home');
+    expect(await home()).toMatchObject({ mailbox: null, messages: [], last_synced_at: null, sync_error: expect.any(String) });
+    server.accountTwoOnline = true;
+    expect(await handlers[DB_RPC.ATTENTION_REFRESH]({ ownerId })).toEqual([]);
+    expect(await home()).toMatchObject({ mailbox: 'INBOX', last_synced_at: expect.any(Number), sync_error: null });
+  });
+
+  it('keeps folder windows, message bodies and mutations scoped to account and mailbox', async () => {
+    const { handlers, server } = fakeRelay();
+    const args = { ownerId, accountId: 'work', mailbox: 'Clients & Projects' };
+    const location = { accountId: args.accountId, mailbox: args.mailbox, uidValidity: '9', uid: 12 };
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'token' });
+    await handlers[DB_RPC.IMAP_FOLDER_LIST_REFRESH](args);
+    expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts.find(({ relay_id }) => relay_id === 'work')?.folders)
+      .toMatchObject([{ path: args.mailbox }]);
+    expect(await handlers[DB_RPC.IMAP_FOLDER_GET]({ ...args, refresh: true })).toMatchObject({
+      uidValidity: '9', messages: [{ uid: 12, subject: 'Client update', flagged: false }], total: 1,
+    });
+    await handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location });
+    expect(await handlers[DB_RPC.ATTENTION_APPLY_IMAP_ACTION]({ ownerId, location, action: { type: 'star', value: true } }))
+      .toEqual({ ok: true });
+    expect(await handlers[DB_RPC.IMAP_FOLDER_GET]({ ...args, ownerId: 2 })).toBeNull();
+    expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts.find(({ relay_id }) => relay_id === 'work')?.messages)
+      .toMatchObject([{ uid: 12, flagged: false }]);
+    server.online = false;
+    expect(await handlers[DB_RPC.IMAP_FOLDER_GET](args)).toMatchObject({ messages: [{ uid: 12, flagged: true }] });
+    expect(await handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location, cachedOnly: true })).toMatchObject({ text: 'Body from work' });
+  });
+
   it('keeps accounts with transient failures and discards bodies when UIDVALIDITY changes', async () => {
     const { server, handlers } = fakeRelay();
     await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
@@ -130,7 +177,7 @@ describe('Attention cache', () => {
     expect(updated.accounts.map((account) => [account.relay_id, account.uid_validity])).toEqual([
       ['home', '3'], ['work', '4'],
     ]);
-    await expect(handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: workMessage })).rejects.toThrow('Refresh Attention');
+    await expect(handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: workMessage })).rejects.toThrow('Refresh this folder');
   });
 
   it('replaces previous aliases atomically and restores the bundle', async () => {

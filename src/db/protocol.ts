@@ -56,6 +56,8 @@ export const DB_RPC = Object.freeze({
   ATTENTION_PAIR: 'attention.pair',
   ATTENTION_DISCONNECT: 'attention.disconnect',
   ATTENTION_REFRESH: 'attention.refresh',
+  IMAP_FOLDER_LIST_REFRESH: 'imap.folderListRefresh',
+  IMAP_FOLDER_GET: 'imap.folderGet',
   ATTENTION_LIST_RELAY_ACCOUNTS: 'attention.listRelayAccounts',
   ATTENTION_START_GOOGLE_OAUTH: 'attention.startGoogleOauth',
   ATTENTION_SAVE_RELAY_ACCOUNT: 'attention.saveRelayAccount',
@@ -228,6 +230,7 @@ export const DB_RPC = Object.freeze({
 export const TABLE_FAMILIES = Object.freeze({
   ACCOUNTS: 'accounts',
   ATTENTION: 'attention',
+  IMAP_MUTATIONS: 'imap-mutations',
   FOLDERS: 'folders',
   MESSAGES: 'messages',
   THREADS: 'threads',

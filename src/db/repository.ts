@@ -318,6 +318,14 @@ export class Repository {
     return this.call<string[]>(DB_RPC.ATTENTION_REFRESH, { ownerId });
   }
 
+  refreshImapFolders(ownerId: number, accountId: string) {
+    return this.call<void>(DB_RPC.IMAP_FOLDER_LIST_REFRESH, { ownerId, accountId });
+  }
+
+  getImapFolder(ownerId: number, accountId: string, mailbox: string, refresh = false) {
+    return this.call<import('./attention').CachedImapFolder | null>(DB_RPC.IMAP_FOLDER_GET, { ownerId, accountId, mailbox, refresh });
+  }
+
   listAttentionRelayAccounts(ownerId: number) {
     return this.call<RelayAccountSettings>(DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS, { ownerId });
   }

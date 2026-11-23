@@ -74,7 +74,7 @@ test('Attention reads JMAP and IMAP and retains triage state and a downloaded bo
   }
 });
 
-test('Attention applies IMAP star, read state and Trash to the row, local cache and server', async ({ page }) => {
+test('Mail applies IMAP star, read state and Trash to the row, local cache and server', async ({ page }) => {
   const requireRelay = createRequire(new URL('../../infra/imap-relay/package.json', import.meta.url));
   const { ImapFlow } = requireRelay('imapflow');
   const imap = new ImapFlow({
@@ -114,13 +114,24 @@ test('Attention applies IMAP star, read state and Trash to the row, local cache 
     await expect.poll(serverFlags).toEqual({ seen: false, flagged: false });
 
     await loginViaOidc(page);
-    await page.getByRole('button', { name: 'Attention', exact: true }).click();
-    await page.getByLabel('Smart Inbox options', { exact: true }).and(page.locator('summary')).click();
-    await page.getByRole('button', { name: 'Connect IMAP accounts' }).click();
+    await page.getByRole('button', { name: 'Manage IMAP accounts' }).click();
     await page.getByLabel('Mail relay pairing token').fill(pairToken);
     await page.getByRole('button', { name: 'Connect', exact: true }).click();
     await page.getByRole('button', { name: 'Close IMAP accounts' }).click();
-    const row = page.locator('.attention-inbox__bundle').filter({ hasText: subject });
+
+    const account = page.locator('.imap-nav__account').filter({ hasText: relayEmail });
+    await account.locator('summary').click();
+    await account.getByRole('button', { name: 'Inbox', exact: true }).click();
+    const mail = page.getByRole('region', { name: 'IMAP mail' });
+    await expect(mail.getByRole('status')).toContainText('Last synced');
+    const row = mail.getByRole('listitem').filter({ hasText: subject });
+    await expect(row).toBeVisible();
+    await page.getByRole('searchbox').fill('A misspelled subject');
+    await expect(row).toHaveCount(0);
+    await page.getByRole('searchbox').fill(subject);
+    await row.getByRole('button', { name: /^Open message/ }).click();
+    await expect(mail.getByText('Please review and send your approval.')).toBeVisible();
+    await mail.getByRole('button', { name: 'Back to folder' }).click();
     const actions = row.getByRole('group', { name: 'Message actions' }).first();
     const star = actions.getByRole('button', { name: 'Star', exact: true });
 
@@ -148,6 +159,16 @@ test('Attention applies IMAP star, read state and Trash to the row, local cache 
     await expect.poll(cachedMessage).toBeNull();
     await expect.poll(serverFlags).toBeNull();
     await expect.poll(() => withMailbox(trash, (ids) => ids.length)).toBe(1);
+    await account.getByRole('button', { name: 'Trash', exact: true }).click();
+    await expect(mail.getByRole('heading', { name: 'Trash' })).toBeVisible();
+    await expect(row).toBeVisible();
+    await expect.poll(() => page.evaluate(async ({ relayAccountId, trash, subject }) => {
+      const repo = globalThis.__repo;
+      const [owner] = await repo.listAccounts();
+      const snapshot = await repo.getImapFolder(owner.id, relayAccountId, trash);
+      return snapshot?.messages.some((message) => message.subject === subject);
+    }, { relayAccountId, trash, subject })).toBe(true);
+
   } finally {
     try {
       for (const path of ['INBOX', trash].filter(Boolean)) {
