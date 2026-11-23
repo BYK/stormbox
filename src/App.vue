@@ -1353,7 +1353,7 @@ body.spotlighting .folder-subs {
   }
   .shell--message-view-hidden > .msg-columns,
   .shell--message-list-hidden > .message-view,
-  .shell > :deep(.imap-mail) {
+  .shell > .imap-mail {
     grid-column: 2 / -1;
   }
   /* Same 56px band: glyph, full-width filter, menu and avatar in one row.
@@ -1412,7 +1412,7 @@ body.spotlighting .folder-subs {
   .shell > .message-view,
   .shell > .contacts,
   .shell > .unified-attention,
-  .shell > :deep(.imap-mail),
+  .shell > .imap-mail,
   .shell--message-view-hidden > .msg-columns,
   .shell--message-list-hidden > .message-view {
     grid-column: 1;
@@ -1428,7 +1428,7 @@ body.spotlighting .folder-subs {
     grid-row: 4;
   }
   .shell:has(> .shell__notice) > :is(.msg-columns, .message-view, .contacts, .unified-attention),
-  .shell:has(> .shell__notice) > :deep(.imap-mail) {
+  .shell:has(> .shell__notice) > .imap-mail {
     grid-row: 3;
   }
   .shell:has(> .shell__notice) > .sidebar-slot {
