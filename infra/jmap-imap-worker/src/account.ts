@@ -1,8 +1,9 @@
 import { DurableObject } from 'cloudflare:workers';
+import { newAttentionNotifications } from './attention-notifications';
 import { mailAccounts, type Env } from './config';
-import { listMailboxWindows, listMessages, type ImapMessage, type MailAccount } from './mail-transport';
+import { listMailboxWindows, listMessages, readMessagePreviews, type ImapMessage, type MailAccount } from './mail-transport';
 import { getManagedAccount } from './managed-accounts';
-import { notifyArrival } from './push';
+import { notifyArrival, pushAttentionStates } from './push';
 
 export interface Address {
   email: string;
@@ -145,6 +146,10 @@ const SCHEMA = `
     event_id TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS gateway_push_previews (
+    message_id TEXT PRIMARY KEY REFERENCES gateway_messages(id) ON DELETE CASCADE,
+    preview TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS gateway_changes (
     version INTEGER NOT NULL,
     type TEXT NOT NULL,
@@ -220,6 +225,7 @@ function mailboxRole(path: string, specialUse: string | null): string | null {
 export class AccountState extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   private syncing?: Promise<AccountSnapshot>;
+  private delivering?: Promise<void>;
   private refreshedAt = 0;
   private forgotten = false;
 
@@ -425,18 +431,84 @@ export class AccountState extends DurableObject<Env> {
     this.sql.exec('INSERT OR IGNORE INTO gateway_push_outbox VALUES (?, ?)', eventId, Date.now());
   }
 
-  private async deliverArrivals(accountId: string): Promise<void> {
+  private deliveryMessages(uidValidity: string): StoredMessage[] {
+    return this.sql.exec<Row>(`SELECT m.*, b.path, p.preview AS body_preview
+      FROM gateway_messages m JOIN gateway_mailboxes b ON b.id = m.mailbox_id
+      LEFT JOIN gateway_push_previews p ON p.message_id = m.id
+      WHERE b.role = 'inbox' AND m.uid_validity = ? ORDER BY m.uid DESC`, uidValidity).toArray()
+      .map((row) => ({ ...messageFromRow(row), ...(row.body_preview === null ? {} : { preview: String(row.body_preview) }) }));
+  }
+
+  inboxPreviews(): { uidValidity: string; previews: Record<number, string> } | null {
+    const mailbox = this.sql.exec<{ id: string; uid_validity: string }>(
+      "SELECT id,uid_validity FROM gateway_mailboxes WHERE role = 'inbox' LIMIT 1",
+    ).toArray()[0];
+    if (!mailbox) return null;
+    const rows = this.sql.exec<{ uid: number; preview: string }>(`SELECT m.uid, p.preview
+      FROM gateway_messages m JOIN gateway_push_previews p ON p.message_id = m.id
+      WHERE m.mailbox_id = ? AND m.uid_validity = ?`, mailbox.id, mailbox.uid_validity).toArray();
+    return { uidValidity: mailbox.uid_validity, previews: Object.fromEntries(rows.map(({ uid, preview }) => [uid, preview])) };
+  }
+
+  private deliverArrivals(account: MailAccount): Promise<void> {
+    this.delivering ??= this.processArrivals(account).finally(() => { this.delivering = undefined; });
+    return this.delivering;
+  }
+
+  private async processArrivals(account: MailAccount): Promise<void> {
     const staleAt = Date.now() - 24 * 60 * 60 * 1000;
     this.sql.exec('DELETE FROM gateway_push_outbox WHERE created_at < ?', staleAt);
     const jobs = this.sql.exec<{ event_id: string }>(`
       SELECT event_id FROM gateway_push_outbox ORDER BY created_at,event_id LIMIT 10
     `).toArray();
+    if (jobs.length === 0) return;
     for (const { event_id: eventId } of jobs) {
       if (this.forgotten) return;
-      if (await notifyArrival(this.env, accountId, eventId) && !this.forgotten) {
+      const range = /^v(\d+):(\d+):(\d+)$/.exec(eventId);
+      if (!range || await this.deliverArrivalRange(account, range, eventId)) {
         this.sql.exec('DELETE FROM gateway_push_outbox WHERE event_id = ?', eventId);
       }
     }
+  }
+
+  private async deliverArrivalRange(
+    account: MailAccount, range: RegExpExecArray, eventId: string,
+  ): Promise<boolean> {
+    const [, validity, first, last] = range;
+    const firstUid = Number(first);
+    const lastUid = Number(last);
+    let messages = this.deliveryMessages(validity).filter(({ uid }) => uid <= lastUid);
+    if (!messages.some(({ uid }) => uid >= firstUid)) return true;
+    let states = await pushAttentionStates(this.env, account.id);
+    if (!states || this.forgotten) return true;
+
+    let plan = newAttentionNotifications(account, messages, firstUid, states);
+    const { missingPreviews } = plan;
+    if (missingPreviews.length) {
+      // Fetch the arriving conversations' missing excerpts together. Other rows do not affect these bundles.
+      const previews = await readMessagePreviews(account, messages[0].path, validity, missingPreviews.map(({ uid }) => uid))
+        .catch((): Record<number, string> => ({}));
+      if (this.forgotten) return true;
+      this.ctx.storage.transactionSync(() => {
+        for (const { id, uid } of missingPreviews) {
+          if (!Object.hasOwn(previews, uid)) continue;
+          this.sql.exec(`INSERT OR IGNORE INTO gateway_push_previews (message_id, preview)
+            SELECT id, ? FROM gateway_messages WHERE id = ?`, previews[uid], id);
+        }
+      });
+      messages = this.deliveryMessages(validity).filter(({ uid }) => uid <= lastUid);
+      // A user can snooze or complete a bundle while the IMAP fetch is in flight.
+      states = await pushAttentionStates(this.env, account.id);
+      if (!states) return true;
+      plan = newAttentionNotifications(account, messages, firstUid, states);
+    }
+
+    let delivered = plan.missingPreviews.length === 0;
+    for (const { bundleUid, notification } of plan.notifications) {
+      if (this.forgotten) return true;
+      if (!await notifyArrival(this.env, account.id, `${eventId}:${bundleUid}`, notification)) delivered = false;
+    }
+    return delivered;
   }
 
   private saveMessage(mailboxId: string, uidValidity: string, input: MessageEnvelope, changes: Change[]): void {
@@ -506,7 +578,7 @@ export class AccountState extends DurableObject<Env> {
       }];
     });
     const snapshot = this.reconcile(snapshots, { generation, allMailboxPaths: [...metadata.keys()] });
-    await this.deliverArrivals(account.id).catch(() => {});
+    this.ctx.waitUntil(this.deliverArrivals(account).catch(() => {}));
     return snapshot;
   }
 
@@ -543,7 +615,7 @@ export class AccountState extends DurableObject<Env> {
       uidValidity: window.uidValidity, total: window.total, complete: window.complete, minUid: window.minUid,
       messages: window.messages.map(normalizeEnvelope),
     }], { generation });
-    await this.deliverArrivals(account.id);
+    await this.deliverArrivals(account);
   }
 
   async alarm(): Promise<void> {

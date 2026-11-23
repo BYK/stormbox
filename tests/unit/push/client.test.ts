@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { enableWebPush, isWebPushEnabled } from '../../../src/push/client';
+import { enableWebPush, isWebPushEnabled, publishWebPushAttentionState, revokeWebPushOnSignOut } from '../../../src/push/client';
 import { browserRelayAssertion, browserSessionEnabled } from '../../../src/services/browser-session';
+import { writeCachedAccount } from '../../../src/pwa/cached-account';
 
 vi.mock('../../../src/services/browser-session', () => ({
   browserSessionEnabled: vi.fn(),
@@ -11,7 +12,10 @@ const publicKey = Uint8Array.of(4, 12);
 const endpoint = 'https://updates.push.services.mozilla.com/test';
 
 function makeSubscription(key = publicKey) {
-  return { endpoint, options: { applicationServerKey: key.buffer }, unsubscribe: vi.fn(async () => true) };
+  return {
+    endpoint, options: { applicationServerKey: key.buffer }, unsubscribe: vi.fn(async () => true),
+    toJSON: () => ({ endpoint, keys: { auth: 'auth', p256dh: 'public' } }),
+  };
 }
 
 function makeRegistration() {
@@ -57,6 +61,90 @@ describe('browser push registration', () => {
     await enableWebPush({ registration, publicKey });
     expect(subscribe).toHaveBeenCalledTimes(2);
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the notification subscription mode in sync with the local model', async () => {
+    const { registration, subscribe, getSubscription } = makeRegistration();
+    const subscription = makeSubscription() as unknown as PushSubscription;
+    subscribe.mockResolvedValue(subscription);
+    getSubscription.mockResolvedValue(subscription);
+    fetcher.mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(Response.json({ enabled: true }));
+
+    await enableWebPush({ registration, publicKey, confirmedOnly: true });
+    await expect(isWebPushEnabled(registration, publicKey, false)).resolves.toBe(true);
+    expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).toEqual({ ...subscription.toJSON(), confirmedOnly: true });
+    expect(JSON.parse(String(fetcher.mock.calls[1][1]?.body))).toEqual({ endpoint, confirmedOnly: false });
+  });
+
+  it('closes previews and blocks a leftover subscription after sign-out even if the relay cannot be reached', async () => {
+    const { registration, getSubscription, subscribe } = makeRegistration();
+    const subscription = makeSubscription();
+    const close = vi.fn();
+    Object.assign(registration, { scope: 'https://stormbox.example/', getNotifications: async () => [{ close }] });
+    getSubscription.mockResolvedValue(subscription as unknown as PushSubscription);
+    subscription.unsubscribe.mockResolvedValue(false);
+    vi.stubGlobal('navigator', { serviceWorker: { getRegistration: async () => registration } });
+    const markers = new Map<string, Response>();
+    vi.stubGlobal('caches', { open: async () => ({
+      put: (key: string, response: Response) => markers.set(key, response),
+      match: (key: string) => markers.get(key),
+      delete: (key: string) => markers.delete(key),
+    }) });
+    vi.mocked(browserSessionEnabled).mockReturnValue(true);
+    fetcher.mockResolvedValueOnce(new Response(null, { status: 401 }));
+
+    await revokeWebPushOnSignOut();
+    expect(close).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(browserRelayAssertion).not.toHaveBeenCalled();
+    await expect(isWebPushEnabled(registration, publicKey)).resolves.toBe(false);
+
+    subscribe.mockResolvedValue(subscription as unknown as PushSubscription);
+    fetcher.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await enableWebPush({ registration, publicKey });
+    expect(await markers.get('https://stormbox.example/.push-session')?.text()).toBe('allowed');
+  });
+
+  it('abandons a subscription that becomes ready after another tab signs out', async () => {
+    const { registration, subscribe } = makeRegistration();
+    const subscription = makeSubscription();
+    let finishSubscribe!: (value: PushSubscription) => void;
+    subscribe.mockReturnValue(new Promise((resolve) => { finishSubscribe = resolve; }));
+    const enabling = enableWebPush({ registration, publicKey });
+    writeCachedAccount(null);
+    finishSubscribe(subscription as unknown as PushSubscription);
+    await expect(enabling).rejects.toThrow('Sign in to enable notifications.');
+    expect(subscription.unsubscribe).toHaveBeenCalledOnce();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('queues local attention changes offline and delivers them on the next online sync', async () => {
+    const saved = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      get length() { return saved.size; },
+      key: (index: number) => [...saved.keys()][index],
+      getItem: (key: string) => saved.get(key),
+      setItem: (key: string, value: string) => saved.set(key, value),
+      removeItem: (key: string) => saved.delete(key),
+    });
+    const connectivity = { onLine: false };
+    vi.stubGlobal('navigator', connectivity);
+    const id = '["imap:personal","2-message","review@example.test"]';
+    const state = { disposition: 'done' as const, changedAt: Date.now() - 1, aliases: [id], observed: [], resolved: [] };
+
+    await publishWebPushAttentionState(id, state, []);
+    expect(saved.size).toBe(1);
+    expect(fetcher).not.toHaveBeenCalled();
+
+    connectivity.onLine = true;
+    fetcher.mockResolvedValue(new Response(null, { status: 204 }));
+    await publishWebPushAttentionState(id, null, []);
+    expect(fetcher.mock.calls.map(([path, init]) => [path, JSON.parse(String(init?.body)).state])).toEqual([
+      ['/api/push/attention', state],
+      ['/api/push/attention', null],
+    ]);
+    expect(saved.size).toBe(0);
   });
 
   it('reuses a matching subscription if the browser reports a registration error', async () => {

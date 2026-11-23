@@ -8,7 +8,6 @@
  */
 
 import type { AttentionCache } from './attention';
-import { MUTATION_TYPE } from '../constants/states';
 import type { AttentionImapDraft, AttentionImapSendResult, ImapAttentionAction, ImapMessageLocation, RelayAccount, RelayAccountInput, RelayAccountSettings, RelayMessageBody } from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
 import type {
@@ -306,8 +305,8 @@ export class Repository {
     return this.call<AttentionCache>(DB_RPC.ATTENTION_GET, { ownerId });
   }
 
-  pairAttentionRelay(ownerId: number, accessToken?: string) {
-    return this.call<string[]>(DB_RPC.ATTENTION_PAIR, { ownerId, accessToken });
+  pairAttentionRelay(ownerId: number, accessToken?: string, waitForSync = true) {
+    return this.call<string[]>(DB_RPC.ATTENTION_PAIR, { ownerId, accessToken, waitForSync });
   }
 
   disconnectAttentionRelay(ownerId: number) {
@@ -326,8 +325,8 @@ export class Repository {
     return this.call<import('./attention').CachedImapFolder | null>(DB_RPC.IMAP_FOLDER_GET, { ownerId, accountId, mailbox, refresh });
   }
 
-  listAttentionRelayAccounts(ownerId: number) {
-    return this.call<RelayAccountSettings>(DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS, { ownerId });
+  listAttentionRelayAccounts(ownerId: number, cachedOnly = false) {
+    return this.call<RelayAccountSettings & { paired?: boolean }>(DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS, { ownerId, cachedOnly });
   }
 
   startAttentionGoogleOAuth(ownerId: number, accountId?: string) {
@@ -346,20 +345,16 @@ export class Repository {
     return this.call<RelayMessageBody | null>(DB_RPC.ATTENTION_BODY, { ownerId, location, cachedOnly });
   }
 
-  async mutateAttentionImapMessage(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction) {
-    const { id } = await this.insertPendingMutation({
-      accountId: ownerId,
-      mutationType: MUTATION_TYPE.ATTENTION_IMAP,
-      requestJson: JSON.stringify({ location, action }),
-    });
-    const outcome = await this.runMutation(ownerId, id);
-    if (outcome.succeeded > 0) return;
-    if (outcome.failed > 0) {
-      const failure = await this.getPendingMutationError(id);
-      const error = JSON.parse(failure?.error_json ?? '{}');
-      throw new Error(error.message ?? 'Could not update this IMAP message.');
-    }
-    throw new Error('This change is queued until mail reconnects.');
+  mutateAttentionImapMessage(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction) {
+    return this.call<void>(DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION, { ownerId, location, action });
+  }
+
+  resumeAttentionImapActions(ownerId: number) {
+    return this.call<void>(DB_RPC.ATTENTION_RESUME_IMAP_ACTIONS, { ownerId });
+  }
+
+  getAttentionImapUnreadCount(ownerId: number) {
+    return this.call<number>(DB_RPC.ATTENTION_IMAP_UNREAD_COUNT, { ownerId });
   }
 
   async sendAttentionImapMessage(ownerId: number, accountId: string, draft: AttentionImapDraft): Promise<AttentionImapSendResult> {
@@ -738,8 +733,8 @@ export class Repository {
 
   // Sync control plane ------------------------------------------------
 
-  startSyncAccount(input) {
-    return this.call(DB_RPC.SYNC_START_ACCOUNT, input);
+  startSyncAccount(input, options: CallOptions = {}) {
+    return this._call(DB_RPC.SYNC_START_ACCOUNT, input, options);
   }
 
   updateSyncAccountAuth(accountId, { token, issuedAt, expiresAt }) {

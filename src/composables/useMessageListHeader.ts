@@ -1,6 +1,6 @@
 import { computed } from 'vue';
 import type { Ref } from 'vue';
-import { Plus, RefreshCw, X } from '@lucide/vue';
+import { Layers, Plus, RefreshCw, X } from '@lucide/vue';
 
 import { MAX_MESSAGE_COLUMNS } from '../stores/message-columns-store';
 import { splitBulkActions } from './useBulkActionItems';
@@ -44,6 +44,8 @@ export interface UseMessageListHeaderInput {
   refresh: () => void;
   addColumn: () => void;
   removeColumn: () => void;
+  canOpenThreads?: Ref<boolean>;
+  openThreads?: () => void;
 }
 
 /**
@@ -99,7 +101,7 @@ export function useMessageListHeader(input: UseMessageListHeaderInput) {
       run: input.removeColumn,
     }));
 
-  /** Groups of the More menu; empty while everything fits in the row. */
+  /** Groups of the More menu, including view options and overflow controls. */
   const moreMenuGroups = computed<MoreMenuGroup[]>(() => {
     const groups: MoreMenuGroup[] = [];
     if (input.hasSelection.value && bulkActions.value.overflow.length > 0) {
@@ -132,6 +134,12 @@ export function useMessageListHeader(input: UseMessageListHeaderInput) {
           },
           columnControlItem.value,
         ],
+      });
+    }
+    if (!input.hasSelection.value && input.folderId.value != null && input.canOpenThreads?.value && input.openThreads) {
+      groups.push({
+        id: 'view',
+        items: [{ id: 'threads', label: 'Threaded view', icon: Layers, run: input.openThreads }],
       });
     }
     return groups;

@@ -141,6 +141,93 @@ describe('auth-store', () => {
     expect(repo.startSyncAccount).not.toHaveBeenCalled();
   });
 
+  it('opens downloaded mail before an online session reconnects', async () => {
+    definesOverrides.JMAP_SERVER_URL = 'https://mail.example.net';
+    const account = { id: 42, server_origin: 'https://mail.example.net', remote_account_id: 'owner' };
+    writeCachedAccount(account);
+    vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(true);
+    const repo = { ...makeRepo(), getAccount: vi.fn().mockResolvedValue(account) };
+    __setRepositoryForTests(repo);
+    const oidc = {
+      isUserLoggedIn: true,
+      getTokens: vi.fn().mockResolvedValue(oidcTokens('initial-token', 1_000)),
+      subscribeToTokensChange: vi.fn(() => ({ unsubscribeFromTokensChange: vi.fn() })),
+    };
+    let finishDiscovery!: (value: typeof oidc) => void;
+    const discovery = new Promise<typeof oidc>((resolve) => { finishDiscovery = resolve; });
+    authService.getOidc.mockReturnValue(oidc);
+    authService.initOidc.mockReturnValue(discovery);
+    const auth = useAuthStore();
+    expect(auth.isRestoringCachedSession).toBe(true);
+    await auth.initialize();
+    expect(auth.accountId).toBe(42);
+    expect(auth.isOfflineSession).toBe(true);
+    expect(auth.status).toBe(AUTH_STATE.OIDC_LOADING);
+    expect(repo.startSyncAccount).not.toHaveBeenCalled();
+    finishDiscovery(oidc);
+    await vi.waitFor(() => expect(auth.isConnected).toBe(true));
+    expect(auth.isOfflineSession).toBe(false);
+    auth.$reset();
+  });
+
+  it('opens the BYK inbox while a remembered browser cookie is validated', async () => {
+    definesOverrides.JMAP_SERVER_URL = 'https://jmap.byk.im';
+    vi.stubGlobal('location', { origin: 'https://webmail.byk.im', search: '?app-password' });
+    vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(true);
+    try {
+      const account = { id: 42, server_origin: 'https://jmap.byk.im', remote_account_id: 'owner', display_name: 'Owner' };
+      writeCachedAccount(account);
+      localStorage.setItem('stormbox.bykBrowserSession', 'remembered');
+      const repo = { ...makeRepo(), getAccount: vi.fn().mockResolvedValue(account) };
+      let finishConnection!: (value: { accountId: number }) => void;
+      repo.startSyncAccount.mockReturnValue(new Promise((resolve) => { finishConnection = resolve; }));
+      __setRepositoryForTests(repo);
+      const auth = useAuthStore();
+      await auth.initialize();
+      expect(auth.accountId).toBe(42);
+      expect(auth.isOfflineSession).toBe(true);
+      expect(auth.status).toBe(AUTH_STATE.CONNECTING);
+      await vi.waitFor(() => expect(repo.startSyncAccount).toHaveBeenCalledWith(expect.objectContaining({
+        auth: { kind: 'browser-session' }, cachedAccountId: 42,
+      }), { signal: expect.any(AbortSignal) }));
+      finishConnection({ accountId: 42 });
+      await expect(auth.reconnectCachedSession()).resolves.toBe(true);
+      expect(auth.username).toBe('Owner');
+      auth.$reset();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('does not restore the account when an in-flight reconnection finishes after logout', async () => {
+    definesOverrides.JMAP_SERVER_URL = 'https://mail.example.net';
+    const account = { id: 42, server_origin: 'https://mail.example.net', remote_account_id: 'owner' };
+    writeCachedAccount(account);
+    vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(true);
+    let finishConnection!: (value: { accountId: number }) => void;
+    const connection = new Promise<{ accountId: number }>((resolve) => { finishConnection = resolve; });
+    const repo = { ...makeRepo(), getAccount: vi.fn().mockResolvedValue(account) };
+    repo.startSyncAccount.mockReturnValue(connection);
+    __setRepositoryForTests(repo);
+    const oidc = {
+      isUserLoggedIn: true,
+      getTokens: vi.fn().mockResolvedValue(oidcTokens('initial-token', 1_000)),
+      subscribeToTokensChange: vi.fn(() => ({ unsubscribeFromTokensChange: vi.fn() })),
+      logout: vi.fn(),
+    };
+    authService.getOidc.mockReturnValue(oidc);
+    authService.initOidc.mockResolvedValue(oidc);
+    const auth = useAuthStore();
+    await auth.initialize();
+    await vi.waitFor(() => expect(repo.startSyncAccount).toHaveBeenCalledOnce());
+    const reconnect = auth.reconnectCachedSession();
+    await auth.logout();
+    finishConnection({ accountId: 42 });
+    await expect(reconnect).resolves.toBe(false);
+    expect(auth.accountId).toBeNull();
+    expect(readCachedAccount()).toBeNull();
+  });
+
   it.each([
     'mail.thundermail.com',
     'mail.stage-thundermail.com',

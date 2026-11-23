@@ -18,7 +18,7 @@ import {
   rowTimestamp,
   type MessageRowLike,
 } from '../utils/message-row-presentation';
-import { resolveMessageTags, type MessageTagDefinition } from '../utils/message-tags';
+import { resolveMessageTags, type MessageTagDefinition, type ResolvedTag } from '../utils/message-tags';
 import { isScheduledMessage } from '../utils/scheduled-message';
 import MessageTagStack from './MessageTagStack.vue';
 
@@ -58,6 +58,8 @@ const props = withDefaults(defineProps<{
   archiveAction?: boolean;
   /** False in a tag view, whose rows live in many folders: the overlay drops Delete. */
   deleteAction?: boolean;
+  /** Set while a row mutation is being saved locally. */
+  actionsDisabled?: boolean;
   /** False where rows cannot be dragged to a folder (a tag view). */
   draggable?: boolean;
   /** True while this row's tag menu is open, for the Tag button's aria-expanded. */
@@ -67,6 +69,7 @@ const props = withDefaults(defineProps<{
    * without one draws as a neutral icon; names go in the stack's title.
    */
   tagDefinitions?: ReadonlyArray<MessageTagDefinition>;
+  additionalTags?: ReadonlyArray<ResolvedTag>;
 }>(), {
   focused: false,
   cursor: false,
@@ -105,7 +108,10 @@ const controlTabIndex = computed(() => inFlow.value ? undefined : -1);
 const isUnread = computed(() => Number(props.message.is_seen) === 0);
 const avatarUnread = computed(() => !props.selectable && props.unreadOnAvatar);
 const isFlagged = computed(() => Number(props.message.is_flagged) === 1);
-const tags = computed(() => resolveMessageTags(props.message.keywords_json, props.tagDefinitions));
+const tags = computed(() => [
+  ...resolveMessageTags(props.message.keywords_json, props.tagDefinitions),
+  ...(props.additionalTags ?? []),
+]);
 const tagStackLabel = computed(() => (
   tags.value.length === 0 ? 'Tag' : `Tags: ${tags.value.map((tag) => tag.name).join(', ')}`
 ));
@@ -245,6 +251,7 @@ const rowLabel = computed(() => [
               :aria-label="tagStackLabel"
               aria-haspopup="dialog"
               :aria-expanded="tagMenuOpen"
+              :disabled="actionsDisabled"
               data-row-tags
               @click="emit('tag', $event)"
             >
@@ -259,6 +266,7 @@ const rowLabel = computed(() => [
               :title="isFlagged ? 'Unstar' : 'Star'"
               :aria-label="isFlagged ? 'Unstar' : 'Star'"
               :aria-pressed="isFlagged"
+              :disabled="actionsDisabled"
               @click="emit('star', !isFlagged)"
             >
               <Star :size="17" :stroke-width="1.75" :fill="isFlagged ? '#facc15' : 'none'" />
@@ -271,6 +279,7 @@ const rowLabel = computed(() => [
               data-message-control
               title="Archive"
               aria-label="Archive"
+              :disabled="actionsDisabled"
               @click="emit('archive')"
             >
               <span class="msg-list__action-icon--folder" aria-hidden="true" v-html="archiveIcon" />
@@ -283,6 +292,7 @@ const rowLabel = computed(() => [
               data-message-control
               title="Delete"
               aria-label="Delete"
+              :disabled="actionsDisabled"
               @click="emit('delete')"
             >
               <Trash2 :size="18" :stroke-width="1.65" />

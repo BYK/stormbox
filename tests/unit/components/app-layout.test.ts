@@ -160,6 +160,7 @@ function makeRepo() {
     },
     async listAccounts() { return []; },
     async listFolders() { return []; },
+    async getAttentionImapUnreadCount() { return 0; },
     async listMessagesForView() { return []; },
     async queryViewProgress() { return { total: 0, covered: 0, percent: 0 }; },
     async ensureFolderWindow() { return { total: 0, fetched: 0 }; },
@@ -1482,7 +1483,14 @@ describe('App mail layout', () => {
     expect(document.title).toBe(APP_TITLE);
   });
 
-  it('passes the Inbox unread count to the spaces toolbar badge', async () => {
+  it('uses the primary and cached IMAP Inbox unread counts in the toolbar and title', async () => {
+    const repo = makeRepo();
+    vi.spyOn(repo, 'getAttentionImapUnreadCount').mockResolvedValue(2);
+    __setRepositoryForTests(repo);
+    useAuthStore().username = 'alice@example.com';
+    const wrapper = mountApp();
+    await flushPromises();
+
     const mailStore = useMailStore();
     mailStore.folders = [
       {
@@ -1531,11 +1539,11 @@ describe('App mail layout', () => {
       },
     ];
 
-    const wrapper = mountApp();
     await nextTick();
 
-    expect(wrapper.getComponent(AppSpaces).props('unreadCount')).toBe(3);
-    expect(wrapper.get('.app-spaces__badge').text()).toBe('3');
+    expect(wrapper.getComponent(AppSpaces).props('unreadCount')).toBe(5);
+    expect(wrapper.get('.app-spaces__badge').text()).toBe('5');
+    expect(document.title).toBe(`(5) ${APP_TITLE} - alice@example.com`);
   });
 
   it('closes the app drawer when clicking outside it', async () => {

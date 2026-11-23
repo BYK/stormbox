@@ -20,8 +20,9 @@
  *     attempts/not_before columns get updated and a setTimeout wakes
  *     the runner exactly when the next row is eligible. A row that
  *     reaches the attempt cap (default 8) or returns a terminal
- *     error type (forbidden/notFound/unknownMessage/unsupportedMutation)
- *     becomes 'conflicted' and is left for manual recovery.
+ *     error type becomes 'conflicted' and is left for manual recovery.
+ *     IMAP message edits keep their capped retry delay until a terminal
+ *     outcome because the browser can stay offline indefinitely.
  *   - runMutation(mutationId) clears that row's backoff, kicks the
  *     drain immediately, and resolves with the per-row outcome once
  *     the runner reaches a terminal state for that id. Callers that
@@ -66,6 +67,27 @@ const DEFAULT_BACKOFF_BASE_MS = 1_000;
 const DEFAULT_BACKOFF_CAP_MS = 60_000;
 const DRAIN_BATCH_SIZE = 50;
 const RECENT_IMAP_SEND_LIMIT = 32;
+
+// An older retry must keep later edits to the same IMAP message from
+// overtaking it. Gmail shares message state across mailboxes, so its edits
+// stay ordered across the whole relay account.
+const IMAP_ACTION_IS_NEXT = `(mutation.mutation_type != '${MUTATION_TYPE.ATTENTION_IMAP}' OR NOT EXISTS (
+  SELECT 1 FROM pending_mutations earlier
+  WHERE earlier.account_id = mutation.account_id
+    AND earlier.mutation_type = mutation.mutation_type
+    AND earlier.id < mutation.id
+    AND earlier.local_status IN ('pending', 'retry', 'in_flight')
+    AND json_extract(earlier.request_json, '$.location.accountId') = json_extract(mutation.request_json, '$.location.accountId')
+    AND (
+      json_extract(earlier.request_json, '$.accountScoped') = 1
+      OR json_extract(mutation.request_json, '$.accountScoped') = 1
+      OR (
+        json_extract(earlier.request_json, '$.location.mailbox') = json_extract(mutation.request_json, '$.location.mailbox')
+        AND json_extract(earlier.request_json, '$.location.uidValidity') = json_extract(mutation.request_json, '$.location.uidValidity')
+        AND json_extract(earlier.request_json, '$.location.uid') = json_extract(mutation.request_json, '$.location.uid')
+      )
+    )
+))`;
 
 export type ProcessRowContext = {
   /** Forwards a row's progress reports to every runMutation caller awaiting it. */
@@ -679,6 +701,7 @@ export class OutboxRunner {
     } finally {
       this._signalForeground(-1);
     }
+    const imapAction = activeRow.mutation_type === MUTATION_TYPE.ATTENTION_IMAP;
     if (result?.ok) {
       if (activeRow.mutation_type === MUTATION_TYPE.ATTENTION_IMAP_SEND && result.result?.rejected > 0) {
         this.recentImapSendResults.set(activeRow.id, { rejected: result.result.rejected });
@@ -687,23 +710,26 @@ export class OutboxRunner {
           if (oldest !== undefined) this.recentImapSendResults.delete(oldest);
         }
       }
-      await this._deleteRow(activeRow.id);
+      if (imapAction) await this._handlers[DB_RPC.ATTENTION_SETTLE_IMAP_ACTION]({ mutationId: activeRow.id });
+      else await this._deleteRow(activeRow.id);
       this._resolveAwaiters(activeRow.id, { ok: true, result: result.result });
       this._fireTally(activeRow.id, { ok: true, result: result.result });
       return;
     }
     const errorType = result?.error?.type ?? 'unknown';
     const maxAttempts = this._maxAttemptsByType.get(activeRow.mutation_type) ?? this._maxAttempts;
-    // The classifier only decides whether the error type itself is
-    // retryable; an explicit terminal flag and the attempt cap apply to
-    // every error so a persistently rejected credential cannot retry
-    // forever and leave awaiters unresolved.
+    // Explicit server and authentication rejections are terminal even for
+    // IMAP edits, which keep retrying transport failures across long outages.
     const authentication = classifyAuthenticationOrAuthorizationError(result?.error);
     const terminal = result?.error?.terminal === true
       || (authentication ? authentication.terminal : TERMINAL_ERROR_TYPES.has(errorType))
-      || attemptNumber >= maxAttempts;
+      || (!imapAction && attemptNumber >= maxAttempts);
     if (terminal) {
-      await this._markConflicted(activeRow.id, result?.error);
+      if (imapAction) {
+        await this._handlers[DB_RPC.ATTENTION_SETTLE_IMAP_ACTION]({
+          mutationId: activeRow.id, error: result?.error ?? { type: 'unknown' },
+        });
+      } else await this._markConflicted(activeRow.id, result?.error);
       this._resolveAwaiters(activeRow.id, {
         ok: false,
         error: result?.error,
@@ -733,10 +759,11 @@ export class OutboxRunner {
     }
     const rows = await this._handlers[DB_RPC.QUERY]({
       sql: `SELECT MIN(not_before) AS next_ms
-              FROM pending_mutations
+              FROM pending_mutations mutation
              WHERE account_id = ?
                AND local_status IN ('pending','retry')
-               AND not_before IS NOT NULL`,
+               AND not_before IS NOT NULL
+               AND ${IMAP_ACTION_IS_NEXT}`,
       params: [this._accountId],
     });
     const nextMs = Number(rows?.[0]?.next_ms ?? 0);
@@ -750,10 +777,11 @@ export class OutboxRunner {
 
   async _loadReadyRows() {
     return this._handlers[DB_RPC.QUERY]({
-      sql: `SELECT * FROM pending_mutations
+      sql: `SELECT * FROM pending_mutations mutation
              WHERE account_id = ?
                AND local_status IN ('pending','retry')
                AND (not_before IS NULL OR not_before <= ?)
+               AND ${IMAP_ACTION_IS_NEXT}
              ORDER BY created_at, id
              LIMIT ?`,
       params: [this._accountId, this._now(), DRAIN_BATCH_SIZE],

@@ -249,6 +249,47 @@ describe('worker shutdown', () => {
 });
 
 describe('SYNC_START_ACCOUNT', () => {
+  it('does not start the backend after a cached reconnect is cancelled', async () => {
+    const { row: cached } = await handlers[DB_RPC.ACCOUNT_UPSERT]({
+      serverOrigin: 'https://mail.example.com', remoteAccountId: 'acct-1', isPrimary: true,
+    });
+    let finishSession!: (response: Response) => void;
+    const sessionResponse = new Promise<Response>((resolve) => { finishSession = resolve; });
+    const fetcher = vi.fn(() => sessionResponse);
+    const syncHandlers = makeSyncRpcHandlers({ handlers, fetch: fetcher, WebSocketImpl: FakeWebSocket as any });
+    const controller = new AbortController();
+    const started = syncHandlers[DB_RPC.SYNC_START_ACCOUNT]({
+      sessionUrl: 'https://mail.example.com/.well-known/jmap', serverOrigin: 'https://mail.example.com',
+      auth: { kind: 'basic', username: 'tester', password: 'secret' }, cachedAccountId: cached.id,
+      useWebSocket: false,
+    }, { signal: controller.signal });
+    const failed = expect(started).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    controller.abort();
+    await syncHandlers[DB_RPC.SYNC_STOP_ACCOUNT]({ accountId: cached.id });
+    finishSession(Response.json(SESSION));
+    await failed;
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(await syncHandlers[DB_RPC.SYNC_SET_ACTIVE_FOLDER_VIEWS]({ accountId: cached.id, folderIds: [] })).toEqual({ applied: false });
+  });
+
+  it('does not reconcile a cached account against a different authenticated login', async () => {
+    const serverOrigin = 'https://mail.example.com';
+    const { row: cached } = await handlers[DB_RPC.ACCOUNT_UPSERT]({
+      serverOrigin, remoteAccountId: 'previous-owner', isPrimary: true,
+    });
+    await handlers[DB_RPC.ACCOUNT_UPSERT]({ serverOrigin, remoteAccountId: 'shared-with-previous-owner', isPrimary: false });
+    const syncHandlers = makeSyncRpcHandlers({ handlers, fetch: makeFetch() as any, WebSocketImpl: FakeWebSocket as any });
+    await expect(syncHandlers[DB_RPC.SYNC_START_ACCOUNT]({
+      sessionUrl: `${serverOrigin}/.well-known/jmap`, serverOrigin,
+      auth: { kind: 'basic', username: 'tester', password: 'secret' }, cachedAccountId: cached.id,
+      useWebSocket: false,
+    })).rejects.toThrow('The server returned a different account');
+    const accountIds = (await handlers[DB_RPC.ACCOUNT_LIST]()).map((row) => row.remote_account_id);
+    expect(accountIds).toEqual(expect.arrayContaining(['previous-owner', 'shared-with-previous-owner']));
+    expect(accountIds).toHaveLength(2);
+  });
+
   it.each([
     ['mail.thundermail.com', 'jmap.thundermail.com'],
     ['mail.stage-thundermail.com', 'jmap.stage-thundermail.com'],

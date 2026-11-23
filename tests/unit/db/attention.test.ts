@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MUTATION_TYPE } from '../../../src/constants/states';
 import { makeAttentionHandlers } from '../../../src/db/attention';
 import { bootTestEngine } from '../../../src/db/bootstrap-memory';
+import { makeHandlers } from '../../../src/db/handlers';
 import { DB_RPC } from '../../../src/db/protocol';
 import { AttentionRelay, type AttentionImapDraft } from '../../../src/sync/backends/imap/attention-relay';
 import { processMutationRow } from '../../../src/sync/backends/jmap/outbox';
+import { OutboxRunner } from '../../../src/sync/backends/jmap/outbox-runner';
 
 let engine: Awaited<ReturnType<typeof bootTestEngine>>;
 
@@ -16,8 +18,11 @@ beforeEach(async () => {
 afterEach(async () => engine.close());
 
 function fakeRelay() {
+  const notify = vi.fn();
   const server = { online: true, uidValidity: '3', accountTwoOnline: true, lastToken: '',
     flags: { seen: true, flagged: false }, trashed: false, archived: false, labels: ['Read later'],
+    homeWindowGate: undefined as Promise<void> | undefined, actionFailure: 0, actionFailureCode: '',
+    attemptedPatches: [] as unknown[],
     sends: [] as { url: string; draft: AttentionImapDraft }[] };
   const fetcher = vi.fn(async (url: string, init: RequestInit) => {
     if (!server.online) throw new TypeError('Offline');
@@ -46,6 +51,8 @@ function fakeRelay() {
       if (init.method === 'PATCH') {
         expect(init.credentials).toBe('same-origin');
         const patch = JSON.parse(String(init.body));
+        server.attemptedPatches.push(patch);
+        if (server.actionFailure) return Response.json({ error: server.actionFailureCode }, { status: server.actionFailure });
         if (patch.tags) {
           server.labels = server.labels.filter((label) => !patch.tags.removeLabels?.includes(label));
           return Response.json({ uid: 12, ...server.flags, keywords: [], labels: server.labels, tagsApplied: true });
@@ -66,17 +73,51 @@ function fakeRelay() {
     }
     if (url.includes('/home/') && !server.accountTwoOnline) return Response.json({}, { status: 502 });
     const work = url.includes('/work/');
+    if (!work) await server.homeWindowGate;
     return Response.json({ mailbox: 'INBOX', uidValidity: server.uidValidity, canSend: work,
       messages: work && (server.trashed || server.archived) ? [] : [{ uid: 12, subject: url, ...server.flags, labels: server.labels }] });
   });
-  const handlers = makeAttentionHandlers(engine, { touch: vi.fn() }, fetcher as unknown as typeof fetch);
-  return { server, handlers };
+  const handlers = makeAttentionHandlers(engine, { touch: vi.fn() }, fetcher as unknown as typeof fetch, notify);
+  return { server, handlers, fetcher, notify };
 }
 
 const ownerId = 1;
 const workMessage = { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid: 12 };
 
 describe('Attention cache', () => {
+  it('persists scoped account settings before a slow inbox sync completes', async () => {
+    const google = {
+      id: 'work', email: 'work@example.com', name: 'Work', managed: true, host: 'imap.gmail.com', auth: 'google-oauth',
+    };
+    let finishInbox!: (value: Response) => void;
+    const inbox = new Promise<Response>((resolve) => { finishInbox = resolve; });
+    const fetcher = vi.fn<typeof fetch>(async (url) => {
+      if (String(url).endsWith('/session')) return new Response(null, { status: 204 });
+      if (String(url).endsWith('/accounts')) {
+        return Response.json({ googleOAuth: true, accounts: [{ ...google, password: 'should-not-be-cached' }] });
+      }
+      return inbox;
+    });
+    const handlers = makeAttentionHandlers(engine, { touch: vi.fn() }, fetcher);
+    try {
+      await expect(handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'pair', waitForSync: false })).resolves.toEqual([]);
+      await handlers[DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS]({ ownerId });
+      const expected = { paired: true, accounts: [google], googleOAuth: true };
+      const reopened = makeAttentionHandlers(engine, { touch: vi.fn() }, fetcher);
+      fetcher.mockClear();
+      expect(await reopened[DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS]({ ownerId, cachedOnly: true })).toEqual(expected);
+      expect(await reopened[DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS]({ ownerId: 2, cachedOnly: true }))
+        .toEqual({ paired: false, accounts: [] });
+      await engine.run('INSERT INTO attention_imap_pairing VALUES (?)', [2]);
+      expect(await reopened[DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS]({ ownerId: 2, cachedOnly: true }))
+        .toEqual({ paired: true, accounts: [] });
+      expect(fetcher).not.toHaveBeenCalledWith(expect.stringMatching(/\/accounts$/), expect.anything());
+    } finally {
+      finishInbox(Response.json({ mailbox: 'INBOX', uidValidity: '3', messages: [] }));
+      await handlers[DB_RPC.ATTENTION_REFRESH]({ ownerId });
+    }
+  });
+
   it('rejects an unstable inbox window so it cannot replace cached mail', async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({
       mailbox: 'INBOX', uidValidity: '3', messages: [], total: 4, complete: false, minUid: null,
@@ -178,6 +219,140 @@ describe('Attention cache', () => {
       ['home', '3'], ['work', '4'],
     ]);
     await expect(handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: workMessage })).rejects.toThrow('Refresh this folder');
+  });
+
+  it('reprojects durable offline edits over refreshed windows and restores the row after a rejection', async () => {
+    const { server, handlers, fetcher, notify } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const enqueue = (action: object) => handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]({
+      ownerId, location: workMessage, action,
+    });
+    const work = (cache: Awaited<ReturnType<typeof handlers[typeof DB_RPC.ATTENTION_GET]>>) =>
+      cache.accounts.find(({ relay_id }) => relay_id === 'work');
+
+    server.online = false;
+    await enqueue({ type: 'star', value: true });
+    await enqueue({ type: 'seen', value: false });
+    await enqueue({ type: 'tags', tags: { add: ['FollowUp'], addLabels: ['To do'], removeLabels: ['Read later'] } });
+    expect(notify).toHaveBeenCalledTimes(3);
+    expect(server.flags).toEqual({ seen: true, flagged: false });
+    expect(work(await handlers[DB_RPC.ATTENTION_GET]({ ownerId }))?.messages).toMatchObject([
+      { uid: 12, flagged: true, seen: false, keywords: ['FollowUp'], labels: ['To do'] },
+    ]);
+    expect(await handlers[DB_RPC.ATTENTION_IMAP_UNREAD_COUNT]({ ownerId })).toBe(1);
+
+    await enqueue({ type: 'archive' });
+    expect(work(await handlers[DB_RPC.ATTENTION_GET]({ ownerId }))?.messages).toEqual([]);
+    const reopened = makeAttentionHandlers(engine, { touch: vi.fn() }, fetcher as unknown as typeof fetch);
+    expect(work(await reopened[DB_RPC.ATTENTION_GET]({ ownerId }))?.messages).toEqual([]);
+    expect(await reopened[DB_RPC.ATTENTION_IMAP_UNREAD_COUNT]({ ownerId })).toBe(0);
+
+    server.online = true;
+    await reopened[DB_RPC.ATTENTION_REFRESH]({ ownerId });
+    expect(work(await reopened[DB_RPC.ATTENTION_GET]({ ownerId }))?.messages).toEqual([]);
+    const archive = await engine.get(`SELECT id FROM pending_mutations
+      WHERE json_extract(request_json, '$.action.type') = 'archive'`);
+    await reopened[DB_RPC.ATTENTION_SETTLE_IMAP_ACTION]({
+      mutationId: archive?.id, error: { type: 'archive_not_configured', message: 'Archive is unavailable.' },
+    });
+    const recovered = await reopened[DB_RPC.ATTENTION_GET]({ ownerId });
+    expect(recovered.actionFailure).toMatchObject({ accountId: 'work', message: 'Archive is unavailable.' });
+    expect(work(recovered)?.messages).toMatchObject([
+      { uid: 12, flagged: true, seen: false, keywords: ['FollowUp'], labels: ['To do'] },
+    ]);
+  });
+
+  it('replays Gmail edits across mailbox aliases in order while another account is refreshing', async () => {
+    const { server, handlers, fetcher } = fakeRelay();
+    const broadcaster = { touch: vi.fn() };
+    const allHandlers = { ...makeHandlers(engine, broadcaster), ...handlers };
+    const runner = new OutboxRunner({
+      accountId: ownerId, handlers: allHandlers,
+      processRow: (row) => processMutationRow({ account: { id: ownerId }, transport: null, handlers: allHandlers, row }),
+      options: { maxAttempts: 1, backoffBaseMs: 30_000 },
+    });
+    let releaseHome = () => {};
+    let refresh: Promise<string[]> | undefined;
+    try {
+      await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+      const alternate = { ...workMessage, mailbox: 'Clients & Projects', uidValidity: '9' };
+      await handlers[DB_RPC.IMAP_FOLDER_GET]({ ownerId, ...alternate, refresh: true });
+      server.homeWindowGate = new Promise<void>((resolve) => { releaseHome = resolve; });
+      refresh = handlers[DB_RPC.ATTENTION_REFRESH]({ ownerId });
+      await vi.waitFor(() => expect(fetcher.mock.calls.filter(([url]) => url.includes('/home/') && url.includes('/messages?')))
+        .toHaveLength(2));
+      server.actionFailure = 429;
+      for (const [location, value] of [[workMessage, true], [alternate, false]] as const) {
+        await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]({
+          ownerId, location, action: { type: 'star', value },
+        });
+      }
+
+      await runner.drain();
+      expect(server.attemptedPatches).toEqual([{ flagged: true }]);
+      expect((await engine.all('SELECT local_status FROM pending_mutations ORDER BY id')).map(({ local_status }) => local_status))
+        .toEqual(['retry', 'pending']);
+
+      server.actionFailure = 0;
+      await handlers[DB_RPC.ATTENTION_RESUME_IMAP_ACTIONS]({ ownerId });
+      await runner.drain();
+      expect(server.attemptedPatches).toEqual([{ flagged: true }, { flagged: true }, { flagged: false }]);
+      expect(server.flags.flagged).toBe(false);
+      expect(await engine.all('SELECT id FROM pending_mutations')).toEqual([]);
+
+      await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]({
+        ownerId, location: { ...workMessage, accountId: 'home' }, action: { type: 'star', value: true },
+      });
+      const finishing = runner.drain();
+      await vi.waitFor(async () => expect(await engine.get('SELECT local_status FROM pending_mutations'))
+        .toMatchObject({ local_status: 'in_flight' }));
+      await handlers[DB_RPC.ATTENTION_DISCONNECT]({ ownerId });
+      releaseHome();
+      await finishing;
+      expect(server.attemptedPatches).toHaveLength(3);
+      expect(await engine.all('SELECT id FROM pending_mutations')).toEqual([]);
+      expect(await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).toMatchObject({ paired: false, accounts: [] });
+      expect(await engine.get('SELECT 1 FROM attention_imap_settings WHERE owner_account_id = ?', [ownerId])).toBeNull();
+    } finally {
+      releaseHome();
+      await refresh;
+      await runner.stop();
+    }
+  });
+
+  it.each([
+    [401, 'unauthorized'],
+    [422, 'google_reconnect_required'],
+    [502, 'authentication_failed'],
+  ])('keeps a queued edit through recoverable IMAP authentication %s (%s)', async (status, code) => {
+    const { server, handlers } = fakeRelay();
+    const allHandlers = { ...makeHandlers(engine, { touch: vi.fn() }), ...handlers };
+    const runner = new OutboxRunner({
+      accountId: ownerId, handlers: allHandlers,
+      processRow: (row) => processMutationRow({ account: { id: ownerId }, transport: null, handlers: allHandlers, row }),
+      options: { maxAttempts: 1, backoffBaseMs: 30_000 },
+    });
+    try {
+      await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+      server.actionFailure = status;
+      server.actionFailureCode = code;
+      await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]({
+        ownerId, location: workMessage, action: { type: 'star', value: true },
+      });
+      await runner.drain();
+      expect(await engine.get('SELECT local_status FROM pending_mutations')).toMatchObject({ local_status: 'retry' });
+      expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts.find(({ relay_id }) => relay_id === 'work')
+        ?.messages[0]?.flagged).toBe(true);
+      expect(server.flags.flagged).toBe(false);
+
+      server.actionFailure = 0;
+      await handlers[DB_RPC.ATTENTION_REFRESH]({ ownerId });
+      await runner.drain();
+      expect(server.flags.flagged).toBe(true);
+      expect(await engine.get('SELECT 1 FROM pending_mutations')).toBeNull();
+    } finally {
+      await runner.stop();
+    }
   });
 
   it('replaces previous aliases atomically and restores the bundle', async () => {

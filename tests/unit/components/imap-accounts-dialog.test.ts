@@ -5,6 +5,7 @@ import { expect, it, vi } from 'vitest';
 import ImapAccountsDialog from '../../../src/components/ImapAccountsDialog.vue';
 import { __resetRepositoryForTests, __setRepositoryForTests } from '../../../src/composables/useRepository';
 import { replaceLocation } from '../../../src/services/navigation';
+import type { RelayAccountSettings } from '../../../src/sync/backends/imap/attention-relay';
 
 vi.mock('../../../src/services/navigation', () => ({ replaceLocation: vi.fn() }));
 
@@ -24,7 +25,7 @@ it('pairs through the browser session and adds, updates, and removes a Gmail acc
 
   try {
     await flushPromises();
-    expect(pairAttentionRelay).toHaveBeenCalledWith(1, undefined);
+    expect(pairAttentionRelay).toHaveBeenCalledWith(1, undefined, false);
     expect(wrapper.text()).not.toContain('Mail relay pairing token');
     await wrapper.get('input[type="email"]').setValue(account.email);
     await wrapper.get('input[type="password"]').setValue('0123 4567 89ab cdef');
@@ -111,6 +112,90 @@ it('passes the selected account ID when reconnecting Google', async () => {
     await reconnect!.trigger('click');
     await flushPromises();
     expect(startAttentionGoogleOAuth).toHaveBeenCalledWith(1, 'managed_work');
+  } finally {
+    wrapper.unmount();
+    __resetRepositoryForTests();
+    vi.mocked(replaceLocation).mockClear();
+  }
+});
+
+it('shows cached accounts and dismisses the dialog while the live list is pending', async () => {
+  const settings = { paired: true, accounts: [{ id: 'cached', email: 'cached@example.net', name: 'Cached mailbox' }] };
+  let resolveLive!: (value: RelayAccountSettings) => void;
+  const response = new Promise<RelayAccountSettings>((resolve) => { resolveLive = resolve; });
+  const pairAttentionRelay = vi.fn();
+  const listAttentionRelayAccounts = vi.fn((_ownerId: number, cachedOnly = false) =>
+    cachedOnly ? Promise.resolve(settings) : response);
+  __setRepositoryForTests({ pairAttentionRelay, listAttentionRelayAccounts });
+  const wrapper = mount(ImapAccountsDialog, {
+    props: { ownerId: 1, paired: false, automatic: true, disconnect: vi.fn() },
+    global: { stubs: { Teleport: true } },
+  });
+  try {
+    await flushPromises();
+    expect(wrapper.text()).toContain('Cached mailbox');
+    expect(wrapper.get('[role="status"]').text()).toBe('Refreshing accounts…');
+    expect(listAttentionRelayAccounts).toHaveBeenNthCalledWith(1, 1, true);
+    expect(listAttentionRelayAccounts).toHaveBeenNthCalledWith(2, 1);
+    expect(pairAttentionRelay).not.toHaveBeenCalled();
+    await wrapper.get('[role="dialog"]').trigger('keydown', { key: 'Escape' });
+    expect(wrapper.emitted('close')).toHaveLength(1);
+    resolveLive({ accounts: [] });
+    await flushPromises();
+    expect(wrapper.find('form').exists()).toBe(false);
+  } finally {
+    wrapper.unmount();
+    __resetRepositoryForTests();
+  }
+});
+
+it('allows cancel during session pairing', async () => {
+  let finishPairing!: (value: string[]) => void;
+  const pairing = new Promise<string[]>((resolve) => { finishPairing = resolve; });
+  const listAttentionRelayAccounts = vi.fn(async () => ({ paired: false, accounts: [] }));
+  __setRepositoryForTests({ pairAttentionRelay: vi.fn(() => pairing), listAttentionRelayAccounts });
+  const wrapper = mount(ImapAccountsDialog, {
+    props: { ownerId: 1, paired: false, automatic: true, disconnect: vi.fn() },
+    global: { stubs: { Teleport: true } },
+  });
+  try {
+    await flushPromises();
+    expect(wrapper.text()).toContain('Connecting to your mail relay…');
+    await wrapper.get('.imap-accounts').trigger('click');
+    expect(wrapper.emitted('close')).toHaveLength(1);
+    finishPairing([]);
+    await flushPromises();
+    expect(wrapper.emitted('paired')).toBeUndefined();
+    expect(listAttentionRelayAccounts).toHaveBeenCalledExactlyOnceWith(1, true);
+  } finally {
+    wrapper.unmount();
+    __resetRepositoryForTests();
+  }
+});
+
+it('ignores a Google authorization URL that arrives after the dialog closes', async () => {
+  const settings = { accounts: [], googleOAuth: true };
+  let finishAuthorization!: (url: string) => void;
+  const authorization = new Promise<string>((resolve) => { finishAuthorization = resolve; });
+  const startAttentionGoogleOAuth = vi.fn(() => authorization);
+  __setRepositoryForTests({
+    listAttentionRelayAccounts: vi.fn(async () => settings),
+    startAttentionGoogleOAuth,
+  });
+  const wrapper = mount(ImapAccountsDialog, {
+    props: { ownerId: 1, paired: true, automatic: true, disconnect: vi.fn() },
+    global: { stubs: { Teleport: true } },
+  });
+  try {
+    await flushPromises();
+    await wrapper.get('form').trigger('submit');
+    await flushPromises();
+    expect(startAttentionGoogleOAuth).toHaveBeenCalledWith(1, undefined);
+    await wrapper.get('[aria-label="Close IMAP accounts"]').trigger('click');
+    expect(wrapper.emitted('close')).toHaveLength(1);
+    finishAuthorization('https://accounts.google.com/o/oauth2/v2/auth?state=test');
+    await flushPromises();
+    expect(replaceLocation).not.toHaveBeenCalled();
   } finally {
     wrapper.unmount();
     __resetRepositoryForTests();

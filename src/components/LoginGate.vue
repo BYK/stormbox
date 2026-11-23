@@ -114,6 +114,7 @@ onBeforeUnmount(() => window.removeEventListener('pageshow', onPageShow));
       <AppButton v-if="isFailed" class="login-card__retry" @click="authStore.retryOidc">
         Try again
       </AppButton>
+      <slot />
     </div>
   </div>
 </template>

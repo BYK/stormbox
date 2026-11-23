@@ -5,6 +5,7 @@ import {
 
 import { useColumnResize } from '../composables/useColumnResize';
 import { useMailStore } from '../stores/mail-store';
+import type { FolderRow } from '../types';
 import {
   MESSAGE_COLUMN_MAX_WIDTH,
   MESSAGE_COLUMN_MIN_WIDTH,
@@ -25,10 +26,12 @@ const props = withDefaults(defineProps<{
   quickFilterQuery?: string;
   /** Whether the reading pane sits beside the columns; the last handle resizes against it. */
   readingPaneVisible?: boolean;
+  enableThreadedView?: boolean;
 }>(), {
   quickFilterQuery: '',
   readingPaneVisible: false,
 });
+const emit = defineEmits<{ 'show-threads': [folder: FolderRow] }>();
 
 const columnsStore = useMessageColumnsStore();
 const mailStore = useMailStore();
@@ -136,10 +139,12 @@ defineExpose({ addColumn, removeColumn });
         :sole-column="columns.length === 1"
         :quick-filter-query="quickFilterQuery"
         :can-add-column="columnsStore.canAddColumn"
+        :enable-threaded-view="enableThreadedView"
         @add-column="addColumn"
         @remove-column="removeColumn(column.id)"
         @change-folder="changeFolder(column.id, $event)"
         @open="rememberActiveColumn(column.id)"
+        @show-threads="emit('show-threads', $event)"
       />
       <div
         v-if="showsResizerAfter(index)"

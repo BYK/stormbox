@@ -30,7 +30,7 @@ import {
   SERVICE_KIND,
 } from '../../../constants/states';
 import { wlog } from '../../../db/worker-log';
-import { ingestSession } from './session';
+import { ingestSession, sessionMailAccountId } from './session';
 import { syncMailboxes, syncMailboxChanges } from './mailboxes';
 import {
   syncFolderWindow,
@@ -385,18 +385,27 @@ export class JmapBackend {
    * off in the background after start() resolves so the UI can paint a
    * folder list within a single round trip of "login complete".
    */
-  async start() {
+  async start({ signal, cachedAccountId }: { signal?: AbortSignal; cachedAccountId?: number } = {}) {
     if (this._started) {
       return;
     }
     wlog.info('jmap-backend', 'fetchSession');
-    const session = await this.transport.fetchSession();
+    const session = await this.transport.fetchSession({ signal });
+    signal?.throwIfAborted();
+    if (cachedAccountId != null) {
+      const cached = await this.handlers[DB_RPC.ACCOUNT_GET]({ accountId: cachedAccountId });
+      signal?.throwIfAborted();
+      if (!cached || cached.server_origin !== this.serverOrigin || cached.remote_account_id !== sessionMailAccountId(session)) {
+        throw new Error('The server returned a different account. Sign in again to switch accounts.');
+      }
+    }
     wlog.info('jmap-backend', `session ok, primaryMail=${session.primaryAccounts?.['urn:ietf:params:jmap:mail']}, caps=${Object.keys(session.capabilities ?? {}).length}`);
     const ingest = await ingestSession({
       session,
       serverOrigin: this.serverOrigin,
       handlers: this.handlers,
     });
+    signal?.throwIfAborted();
     this.account = ingest.account;
     this.services = ingest.services;
     this.sharedAccounts = ingest.sharedAccounts ?? [];
@@ -480,6 +489,7 @@ export class JmapBackend {
       }
     }
 
+    signal?.throwIfAborted();
     this._started = true;
 
     // Fire-and-forget background bootstrap: identities, contacts, then

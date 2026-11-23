@@ -28,7 +28,8 @@ import { isStaffEmail } from '../constants/staff';
 import { staffRedirectUrl } from '../utils/staff-redirect';
 import { getRepositoryAsync } from '../composables/useRepository';
 import { DatabaseUnavailableError } from '../db/availability';
-import { readCachedAccount, writeCachedAccount } from '../pwa/cached-account';
+import { offlineSessionRevision, readCachedAccount, writeCachedAccount } from '../pwa/cached-account';
+import { revokeWebPushOnSignOut } from '../push/client';
 
 interface BasicAuth { kind: 'basic'; username: string; password: string }
 interface BearerAuth {
@@ -79,6 +80,14 @@ function setOidcRedirectPending(pending: boolean): void {
   }
 }
 
+function cachedAccountForServer() {
+  if (oidcRedirectPending() || (browserSessionEnabled(JMAP_SERVER_URL) && browserSessionState() === 'logout-pending')) {
+    return null;
+  }
+  const cached = readCachedAccount();
+  return cached?.server_origin === jmapAccountOriginForServer(JMAP_SERVER_URL) ? cached : null;
+}
+
 function bearerAuth(tokens: OidcTokenSnapshot): BearerAuth {
   return {
     kind: 'bearer',
@@ -121,6 +130,7 @@ export const useAuthStore = defineStore('auth', () => {
   const authServerUnavailable = ref(false);
   const databaseUnavailable = ref(false);
   const isOfflineSession = ref(false);
+  const isRestoringCachedSession = ref(cachedAccountForServer() != null);
 
   /**
    * Global staff flag: gates staff-only UI. The same claim decides the
@@ -149,6 +159,9 @@ export const useAuthStore = defineStore('auth', () => {
   let tokenUpdateRetryTimer: ReturnType<typeof setTimeout> | null = null;
   let offlineSessionGeneration = 0;
   let cachedReconnect: Promise<boolean> | null = null;
+  let cachedRestore: Promise<void> | null = null;
+  let syncStart: AbortController | null = null;
+  let signingOut = false;
 
   const hasStorageQuota = computed(() =>
     quotaHardLimitBytes.value != null && quotaHardLimitBytes.value > 0,
@@ -182,14 +195,14 @@ export const useAuthStore = defineStore('auth', () => {
     quotaHardLimitBytes.value = snapshot?.hardLimitBytes ?? null;
   }
 
-  async function openCachedSession(): Promise<boolean> {
-    const cached = readCachedAccount();
-    if (!cached || cached.server_origin !== jmapAccountOriginForServer(JMAP_SERVER_URL)) return false;
+  async function openCachedSession(cached: NonNullable<ReturnType<typeof cachedAccountForServer>>): Promise<boolean> {
     const generation = offlineSessionGeneration;
     try {
       const repo = await getRepositoryAsync();
       const row = await repo.getAccount(cached.id);
       if (generation !== offlineSessionGeneration || status.value !== AUTH_STATE.IDLE) return false;
+      const current = cachedAccountForServer();
+      if (current?.id !== cached.id || current.remote_account_id !== cached.remote_account_id) return false;
       if (!row || row.server_origin !== cached.server_origin
           || row.remote_account_id !== cached.remote_account_id) return false;
       isOfflineSession.value = true;
@@ -204,26 +217,45 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  /**
-   * Select the explicit password flow or connect through OIDC once on boot.
-   */
-  async function initialize(): Promise<void> {
-    if (status.value !== AUTH_STATE.IDLE) {
-      return;
+  function initialize(): Promise<void> {
+    if (signingOut || status.value !== AUTH_STATE.IDLE) return Promise.resolve();
+    if (cachedRestore) return cachedRestore;
+    const cached = cachedAccountForServer();
+    if (cached) {
+      const generation = offlineSessionGeneration;
+      isRestoringCachedSession.value = true;
+      cachedRestore = openCachedSession(cached).then(async (opened) => {
+        if (generation !== offlineSessionGeneration || databaseUnavailable.value) return;
+        if (opened) {
+          if (globalThis.navigator?.onLine !== false) void reconnectCachedSession();
+        } else if (status.value === AUTH_STATE.IDLE && globalThis.navigator?.onLine !== false) {
+          isRestoringCachedSession.value = false;
+          await initializeOnline();
+        }
+      }).finally(() => {
+        isRestoringCachedSession.value = false;
+        cachedRestore = null;
+      });
+      return cachedRestore;
     }
-    if (globalThis.navigator?.onLine === false) {
-      await openCachedSession();
-      return;
-    }
+    isRestoringCachedSession.value = false;
+    return globalThis.navigator?.onLine === false ? Promise.resolve() : initializeOnline();
+  }
+
+  async function initializeOnline(): Promise<void> {
+    const generation = offlineSessionGeneration;
+    const cachedAccountId = isOfflineSession.value ? accountId.value ?? undefined : undefined;
     if (appPasswordMode.value) {
       setOidcRedirectPending(false);
       if (browserSessionEnabled(JMAP_SERVER_URL)) {
         const sessionState = browserSessionState();
         if (sessionState === 'logout-pending') await clearBrowserSession();
+        if (generation !== offlineSessionGeneration) return;
         if (sessionState === 'remembered') {
-          const connected = await _connect({ kind: 'browser-session' }, username.value);
-          if (connected || databaseUnavailable.value) return;
-          error.value = null;
+          const connected = await _connect({ kind: 'browser-session' }, null, null, null, cachedAccountId);
+          if (connected || databaseUnavailable.value || generation !== offlineSessionGeneration) return;
+          if (isOfflineSession.value) return;
+          if (browserSessionState() !== 'signed-out') error.value = null;
         }
       }
       status.value = AUTH_STATE.OIDC_READY;
@@ -234,10 +266,10 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       oidc = await initOidc();
     } catch (err) {
-      reportOidcInitializationError(err);
+      if (generation === offlineSessionGeneration) reportOidcInitializationError(err);
       return;
     }
-    if (databaseUnavailable.value) return;
+    if (databaseUnavailable.value || generation !== offlineSessionGeneration) return;
     if (oidc && !oidc.isUserLoggedIn && oidc.initializationError) {
       reportOidcInitializationError(oidc.initializationError);
       return;
@@ -247,17 +279,23 @@ export const useAuthStore = defineStore('auth', () => {
       error.value = OIDC_SIGN_IN_INCOMPLETE;
       return;
     }
+    if (isOfflineSession.value && !oidc?.isUserLoggedIn) {
+      status.value = AUTH_STATE.FAILED;
+      error.value = 'The browser session expired. Sign in again to reconnect.';
+      return;
+    }
     status.value = AUTH_STATE.OIDC_READY;
-    await connectViaOidc();
+    await connectViaOidc(cachedAccountId);
   }
 
   async function reconnectCachedSession(): Promise<boolean> {
     if (!isOfflineSession.value || databaseUnavailable.value) return isConnected.value;
+    if (globalThis.navigator?.onLine === false) return false;
     if (cachedReconnect) return cachedReconnect;
     if (appPasswordMode.value && (!browserSessionEnabled(JMAP_SERVER_URL) || browserSessionState() !== 'remembered')) return false;
     if (status.value !== AUTH_STATE.IDLE && status.value !== AUTH_STATE.FAILED && status.value !== AUTH_STATE.OIDC_READY) return false;
     status.value = AUTH_STATE.IDLE;
-    cachedReconnect = initialize().then(() => isConnected.value).finally(() => {
+    cachedReconnect = initializeOnline().then(() => isConnected.value).finally(() => {
       cachedReconnect = null;
     });
     return cachedReconnect;
@@ -280,7 +318,7 @@ export const useAuthStore = defineStore('auth', () => {
   async function connectWithPassword(
     { username: u, password }: { username: string; password: string },
   ): Promise<boolean> {
-    if (databaseUnavailable.value || status.value === AUTH_STATE.CONNECTING) return false;
+    if (signingOut || databaseUnavailable.value || status.value === AUTH_STATE.CONNECTING) return false;
     const loginName = u.trim();
     if (!loginName || !password) {
       error.value = 'Username and password are required.';
@@ -307,14 +345,16 @@ export const useAuthStore = defineStore('auth', () => {
    * Connect via OIDC. If the user is not yet logged in this redirects
    * them to the IdP; on return, initialize() will pick the session up.
    */
-  async function connectViaOidc(): Promise<boolean> {
-    if (databaseUnavailable.value || status.value === AUTH_STATE.CONNECTING) return false;
+  async function connectViaOidc(cachedAccountId?: number): Promise<boolean> {
+    if (signingOut || databaseUnavailable.value || status.value === AUTH_STATE.CONNECTING) return false;
+    const attempt = offlineSessionGeneration;
     status.value = AUTH_STATE.CONNECTING;
     authServerUnavailable.value = false;
     error.value = null;
     try {
-      return await _connectViaOidc();
+      return await _connectViaOidc(cachedAccountId);
     } catch (err: any) {
+      if (attempt !== offlineSessionGeneration) return false;
       stopTokenSync();
       if (databaseUnavailable.value || reportDatabaseError(err)) return false;
       status.value = AUTH_STATE.FAILED;
@@ -323,7 +363,7 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  async function _connectViaOidc(): Promise<boolean> {
+  async function _connectViaOidc(cachedAccountId?: number): Promise<boolean> {
     const oidc = getOidc();
     if (!oidc) {
       error.value = 'OIDC is not available on this server.';
@@ -348,7 +388,7 @@ export const useAuthStore = defineStore('auth', () => {
       if (generation === tokenSyncGeneration) stopTokenSync();
       throw err;
     }
-    if (databaseUnavailable.value) return false;
+    if (databaseUnavailable.value || generation !== tokenSyncGeneration) return false;
     handleOidcTokens(generation, oidc, tokens);
     const initialAuth = latestBearerAuth;
     if (!initialAuth) {
@@ -377,6 +417,7 @@ export const useAuthStore = defineStore('auth', () => {
       emailClaim,
       emailClaim,
       recoveryEmailClaim,
+      cachedAccountId,
     );
     if (!connected || generation !== tokenSyncGeneration || accountId.value == null) {
       if (generation === tokenSyncGeneration) stopTokenSync();
@@ -387,6 +428,7 @@ export const useAuthStore = defineStore('auth', () => {
       try {
         await synchronizeWorkerAuth(generation);
       } catch {
+        if (generation !== tokenSyncGeneration) return false;
         stopTokenSync();
         accountId.value = null;
         username.value = null;
@@ -585,23 +627,41 @@ export const useAuthStore = defineStore('auth', () => {
     displayName: string | null,
     emailClaim: string | null = null,
     recoveryEmailClaim: string | null = null,
+    cachedAccountId?: number,
   ): Promise<boolean> {
     if (databaseUnavailable.value) return false;
+    const attempt = offlineSessionGeneration;
+    const revision = offlineSessionRevision();
+    const cancelled = () => attempt !== offlineSessionGeneration || revision !== offlineSessionRevision();
     status.value = AUTH_STATE.CONNECTING;
     error.value = null;
     try {
       const repo = await getRepositoryAsync();
-      if (databaseUnavailable.value) return false;
+      if (databaseUnavailable.value || cancelled()) return false;
       const sessionPath = auth.kind === 'browser-session' ? '/jmap/session' : '/.well-known/jmap';
-      const result = await repo.startSyncAccount({
+      const input = {
         sessionUrl: `${JMAP_SERVER_URL.replace(/\/$/, '')}${sessionPath}`,
         serverOrigin: serverOrigin.value,
         auth,
         wsProxyUrl: JMAP_WS_PROXY_URL || null,
-      });
-      if (databaseUnavailable.value) return false;
+        ...(cachedAccountId == null ? {} : { cachedAccountId }),
+      };
+      let result;
+      if (isOfflineSession.value) {
+        const controller = new AbortController();
+        syncStart = controller;
+        try {
+          result = await repo.startSyncAccount(input, { signal: controller.signal });
+        } finally {
+          if (syncStart === controller) syncStart = null;
+        }
+      } else {
+        result = await repo.startSyncAccount(input);
+      }
+      if (databaseUnavailable.value || cancelled()) return false;
+      const previousUsername = accountId.value === result.accountId ? username.value : null;
       accountId.value = result.accountId;
-      username.value = displayName;
+      username.value = displayName ?? (auth.kind === 'browser-session' ? previousUsername : null);
       email.value = emailClaim;
       recoveryEmail.value = recoveryEmailClaim;
       isOfflineSession.value = false;
@@ -610,7 +670,8 @@ export const useAuthStore = defineStore('auth', () => {
       const generation = ++offlineSessionGeneration;
       if (typeof repo.getAccount === 'function') {
         void repo.getAccount(result.accountId).then((row) => {
-          if (row && generation === offlineSessionGeneration && accountId.value === row.id) {
+          if (row && generation === offlineSessionGeneration && accountId.value === row.id
+              && revision === offlineSessionRevision()) {
             if (auth.kind === 'browser-session' && !displayName) username.value = row.display_name ?? row.primary_email;
             writeCachedAccount(row);
           }
@@ -618,7 +679,7 @@ export const useAuthStore = defineStore('auth', () => {
       }
       return true;
     } catch (err: any) {
-      if (databaseUnavailable.value || reportDatabaseError(err)) return false;
+      if (cancelled() || databaseUnavailable.value || reportDatabaseError(err)) return false;
       status.value = AUTH_STATE.FAILED;
       if (auth.kind === 'browser-session' && err?.status === 401) {
         expireBrowserSession();
@@ -632,11 +693,14 @@ export const useAuthStore = defineStore('auth', () => {
 
   /**
    * Drop every piece of session-scoped auth state without touching
-   * the OIDC session. Used by logout after stopSyncAccount, and
+   * the OIDC session. Used at the start of logout, and
    * exposed as $reset for callers that want the local clear without
    * the IdP redirect.
    */
   function $reset(): void {
+    offlineSessionGeneration += 1;
+    syncStart?.abort();
+    syncStart = null;
     stopTokenSync();
     accountId.value = null;
     username.value = null;
@@ -646,29 +710,39 @@ export const useAuthStore = defineStore('auth', () => {
     authServerUnavailable.value = false;
     databaseUnavailable.value = false;
     isOfflineSession.value = false;
+    isRestoringCachedSession.value = false;
     status.value = AUTH_STATE.IDLE;
     clearStorageQuota();
   }
 
-  async function logout(): Promise<void> {
-    offlineSessionGeneration += 1;
-    writeCachedAccount(null);
-    stopTokenSync();
-    const browserSessionLogout = browserSessionEnabled(JMAP_SERVER_URL) ? clearBrowserSession() : null;
-    if (accountId.value != null) {
-      try {
-        const repo = await getRepositoryAsync();
-        await repo.stopSyncAccount(accountId.value);
-      } catch (err) {
-        // We are tearing down; surface the error but do not block.
-        console.warn('stopSyncAccount failed during logout', err);
-      }
-    }
+  function expireCachedAccount(): void {
     $reset();
-    await browserSessionLogout;
-    const oidc = getOidc();
-    if (oidc?.isUserLoggedIn) {
-      await oidc.logout({ redirectTo: 'home' });
+    status.value = AUTH_STATE.FAILED;
+    error.value = 'This session ended in another window.';
+  }
+
+  async function logout(): Promise<void> {
+    if (signingOut) return;
+    signingOut = true;
+    const previousAccountId = accountId.value;
+    writeCachedAccount(null);
+    const pushLogout = revokeWebPushOnSignOut().catch(() => {});
+    const browserSessionLogout = browserSessionEnabled(JMAP_SERVER_URL) ? clearBrowserSession() : null;
+    $reset();
+    try {
+      if (previousAccountId != null) {
+        try {
+          const repo = await getRepositoryAsync();
+          await repo.stopSyncAccount(previousAccountId);
+        } catch (err) {
+          console.warn('stopSyncAccount failed during logout', err);
+        }
+      }
+      await Promise.all([pushLogout, browserSessionLogout]);
+      const oidc = getOidc();
+      if (oidc?.isUserLoggedIn) await oidc.logout({ redirectTo: 'home' });
+    } finally {
+      signingOut = false;
     }
   }
 
@@ -684,6 +758,8 @@ export const useAuthStore = defineStore('auth', () => {
     authServerUnavailable,
     databaseUnavailable,
     isOfflineSession,
+    isRestoringCachedSession,
+    expireCachedAccount,
     reportDatabaseError,
     serverOrigin,
     serverHostname,

@@ -108,13 +108,18 @@ export function makeSyncRpcHandlers({
   }
 
   return {
-    [DB_RPC.SYNC_START_ACCOUNT]: async (input) => {
+    [DB_RPC.SYNC_START_ACCOUNT]: async (input, { signal }: { signal?: AbortSignal } = {}) => {
+      signal?.throwIfAborted();
       input = { ...input, serverOrigin: jmapAccountOriginForServer(input.serverOrigin) };
       let releaseBearerStart: (() => void) | null = null;
       if (input.auth?.kind === 'bearer') {
         for (;;) {
+          signal?.throwIfAborted();
           const existing = findBearerBackend(backends, authByBackend, input.serverOrigin);
           if (existing) {
+            if (input.cachedAccountId != null && existing.account.id !== input.cachedAccountId) {
+              throw new Error('The server returned a different account. Sign in again to switch accounts.');
+            }
             updateBackendBearer(existing, authByBackend, copyAuth(input.auth));
             return { accountId: existing.account.id };
           }
@@ -144,11 +149,17 @@ export function makeSyncRpcHandlers({
         handlers,
         options: { useWebSocket: input.useWebSocket ?? true },
       });
+      const abortStartup = () => transport.abort();
+      signal?.addEventListener('abort', abortStartup, { once: true });
       try {
         try {
-          await backend.start();
+          await backend.start({ signal, cachedAccountId: input.cachedAccountId });
+          if (signal?.aborted) {
+            await backend.stop();
+            signal.throwIfAborted();
+          }
         } catch (err) {
-          wlog.error('sync-host', 'backend.start() threw', err);
+          if (!signal?.aborted) wlog.error('sync-host', 'backend.start() threw', err);
           throw err;
         }
         const existing = backends.get(backend.account.id);
@@ -173,6 +184,7 @@ export function makeSyncRpcHandlers({
         wlog.info('sync-host', `startAccount complete; accountId=${backend.account.id}, services=${backend.services.map((s) => s.serviceKind).join(',')}`);
         return { accountId: backend.account.id };
       } finally {
+        signal?.removeEventListener('abort', abortStartup);
         if (releaseBearerStart) {
           if (bearerStarts.get(input.serverOrigin)) {
             bearerStarts.delete(input.serverOrigin);

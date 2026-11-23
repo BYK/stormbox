@@ -712,12 +712,9 @@ export const useMailStore = defineStore('mail', () => {
     unsubscribe = repo.subscribe(onTablesTouched);
     watch(
       () => authStore.accountId,
-      (newId) => {
-        if (newId) {
-          refreshFolders();
-        } else {
-          $reset();
-        }
+      (newId, previousId) => {
+        if (previousId != null || newId == null) $reset();
+        if (newId != null) void refreshFolders();
       },
       { immediate: true },
     );
@@ -833,7 +830,8 @@ export const useMailStore = defineStore('mail', () => {
   const optimisticSubscriptions = new Map<number, 0 | 1>();
 
   async function refreshFolders() {
-    if (!repo || authStore.accountId == null) {
+    const accountId = authStore.accountId;
+    if (!repo || accountId == null) {
       folders.value = [];
       accounts.value = [];
       return;
@@ -844,13 +842,14 @@ export const useMailStore = defineStore('mail', () => {
       // the concatenated folder list keeps the user's own folders at
       // the top.
       const allAccounts: AccountRow[] = await repo.listAccounts();
-      const primary = allAccounts.find((a) => a.id === authStore.accountId) ?? null;
+      const primary = allAccounts.find((a) => a.id === accountId) ?? null;
       const visibleAccounts = primary
-        ? allAccounts.filter((a) => a.id === primary.id || a.server_origin === primary.server_origin)
-        : allAccounts;
+        ? allAccounts.filter((a) => a.id === primary.id || (!a.is_primary && a.server_origin === primary.server_origin))
+        : [];
       const folderLists = await Promise.all(
         visibleAccounts.map((a) => repo!.listFolders(a.id)),
       );
+      if (accountId !== authStore.accountId) return;
       accounts.value = visibleAccounts;
       const rows = folderLists.flat();
       // Keep in-flight optimistic subscription flips on top of the DB
@@ -865,6 +864,7 @@ export const useMailStore = defineStore('mail', () => {
       folders.value = rows;
       await refreshFolderProgress();
     } catch (err) {
+      if (accountId !== authStore.accountId) return;
       error.value = err?.message ?? String(err);
       console.error('[mail-store] refreshFolders failed', err);
     }

@@ -74,7 +74,7 @@ test('Attention reads JMAP and IMAP and retains triage state and a downloaded bo
   }
 });
 
-test('Mail applies IMAP star, read state and Trash to the row, local cache and server', async ({ page }) => {
+test('Mail applies IMAP row actions offline and reconciles them when it reconnects', async ({ page, context }) => {
   const requireRelay = createRequire(new URL('../../infra/imap-relay/package.json', import.meta.url));
   const { ImapFlow } = requireRelay('imapflow');
   const imap = new ImapFlow({
@@ -132,20 +132,23 @@ test('Mail applies IMAP star, read state and Trash to the row, local cache and s
     await row.getByRole('button', { name: /^Open message/ }).click();
     await expect(mail.getByText('Please review and send your approval.')).toBeVisible();
     await mail.getByRole('button', { name: 'Back to folder' }).click();
-    const actions = row.getByRole('group', { name: 'Message actions' }).first();
-    const star = actions.getByRole('button', { name: 'Star', exact: true });
-
+    const actions = row.locator('.attention-row-menu').getByRole('group', { name: 'Message actions' });
     const openActions = async () => {
       await row.locator('.msg-list__open').hover();
       await row.getByLabel('Message actions', { exact: true }).and(row.locator('summary')).click();
     };
-    await openActions();
-    await star.click();
-    await openActions();
-    await expect(star).toHaveAttribute('aria-pressed', 'true');
+    await row.locator('.msg-list__open').hover();
+    const quickStar = row.locator('.msg-list__actions').getByRole('button', { name: 'Star', exact: true });
+    await expect(quickStar).toBeVisible();
+    await context.setOffline(true);
+    await quickStar.click();
+    await expect(row.locator('.msg-list__actions').getByRole('button', { name: 'Unstar' })).toHaveAttribute('aria-pressed', 'true');
     await expect.poll(cachedMessage).toMatchObject({ flagged: true });
+    expect(await serverFlags()).toMatchObject({ flagged: false });
+    await context.setOffline(false);
     await expect.poll(serverFlags).toMatchObject({ flagged: true });
 
+    await openActions();
     await actions.getByRole('button', { name: 'Mark as read', exact: true }).click();
     await openActions();
     await actions.getByRole('button', { name: 'Mark as unread', exact: true }).click();
@@ -154,9 +157,12 @@ test('Mail applies IMAP star, read state and Trash to the row, local cache and s
     await expect.poll(cachedMessage).toMatchObject({ seen: false, flagged: true });
     await expect.poll(serverFlags).toEqual({ seen: false, flagged: true });
 
+    await context.setOffline(true);
     await actions.getByRole('button', { name: 'Move to Trash', exact: true }).click();
     await expect(row).toHaveCount(0);
     await expect.poll(cachedMessage).toBeNull();
+    expect(await serverFlags()).not.toBeNull();
+    await context.setOffline(false);
     await expect.poll(serverFlags).toBeNull();
     await expect.poll(() => withMailbox(trash, (ids) => ids.length)).toBe(1);
     await account.getByRole('button', { name: 'Trash', exact: true }).click();
@@ -170,6 +176,7 @@ test('Mail applies IMAP star, read state and Trash to the row, local cache and s
     }, { relayAccountId, trash, subject })).toBe(true);
 
   } finally {
+    await context.setOffline(false);
     try {
       for (const path of ['INBOX', trash].filter(Boolean)) {
         await withMailbox(path, (ids) => ids.length && imap.messageDelete(ids, { uid: true }), false);

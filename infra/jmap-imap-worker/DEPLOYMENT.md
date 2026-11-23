@@ -104,6 +104,12 @@ For Web Push, set `WEB_PUSH_VAPID_PUBLIC_KEY`, `WEB_PUSH_VAPID_PRIVATE_KEY`, and
 `WEB_PUSH_VAPID_SUBJECT`. Configure the `/api/push/*` route when the Worker is
 ready to serve it. When adding this route with Wrangler, pass both routes
 in the same deployment command so the existing IMAP route remains bound.
+Deploy the Worker and web app together when moving from generic new-mail
+alerts to Smart Inbox notifications. After the first Inbox snapshot, the
+Worker sends an encrypted sender, subject, and message excerpt only when new
+IMAP mail adds a Needs attention bundle. Browsers using the optional local
+model receive only rule-confirmed actions. Primary JMAP mail continues to
+refresh through the app's JMAP connection while the app is open.
 
 ## Publish the app
 

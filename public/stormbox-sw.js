@@ -33,10 +33,14 @@ self.addEventListener('fetch', (event) => {
   if (request.mode === 'navigate' && (url.pathname === scope.pathname || url.pathname === shell.pathname)) {
     // OIDC redirects always go to the network. The shell cache contains no credentials.
     if (['code', 'state', 'error'].some((key) => url.searchParams.has(key))) return;
-    event.respondWith(fetch(request).catch(async () => {
+    event.respondWith((async () => {
       const cache = await caches.open(cacheName);
-      return (await cache.match(shell.href)) ?? Response.error();
-    }));
+      const cached = await cache.match(shell.href);
+      // Launch with the shell and assets from the same precache version.
+      // Reloads and the service worker update check can pick up a new release.
+      if (cached && request.cache !== 'reload' && request.cache !== 'no-cache') return cached;
+      return fetch(request).catch(() => cached ?? Response.error());
+    })());
     return;
   }
 

@@ -232,7 +232,7 @@ export function buildTriageBundles(
         - timeAdjustedScore(left.classification.baseScore, left.message.receivedAt, now)
       || recency(left, right));
     const leading = nextItems[0] ?? group.items[0];
-    let status: TriageBundle['status'] = nextItems[0]?.classification.disposition
+    let status: TriageBundle['status'] = nextItems.at(0)?.classification.disposition
       ?? (resolved.size || latestState?.disposition === 'done' ? 'done' : 'update');
     const until = latestState?.snoozedUntil;
     if (latestState?.disposition === 'snoozed' && until != null && until > now) {

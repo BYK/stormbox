@@ -14,12 +14,13 @@ import { TABLE_FAMILIES } from '../db/protocol';
 import { JMAP_SERVER_URL } from '../defines';
 import type { AttentionCache } from '../db/attention';
 import type { Repository } from '../db/repository';
+import { useAuthStore } from '../stores/auth-store';
 import { useMailStore } from '../stores/mail-store';
 import { browserSessionEnabled } from '../services/browser-session';
 import { GOOGLE_IMAP_RESULTS, type GoogleImapResult, type ImapAttentionAction } from '../sync/backends/imap/attention-relay';
 import { browserTriageMessageKey, createBrowserTriageRanker, type BrowserTriageProgress } from '../triage/browser-model';
 import { buildTriageBundles, markBundleDone, snoozeBundle, type BundleState, type TriageBundle, type TriageClassification, type TriageMessage } from '../triage/smart-sort';
-import { disableWebPush, enableWebPush, getWebPushPublicKey, isWebPushEnabled, onWebPushRefresh } from '../push/client';
+import { disableWebPush, enableWebPush, getWebPushPublicKey, isWebPushEnabled, onWebPushRefresh, publishWebPushAttentionState } from '../push/client';
 import type { MessageRow, FolderRow } from '../types';
 import { parseAddressList } from '../utils/address-list';
 import { closeContainingDropdown } from '../utils/dropdown';
@@ -44,6 +45,7 @@ const jmapRows = shallowRef<MessageRow[]>([]);
 const cache = shallowRef<AttentionCache>({ paired: false, accounts: [], states: {} });
 type Reading = { kind: 'jmap' | 'imap'; message: TriageMessage };
 const mailStore = useMailStore();
+const authStore = useAuthStore();
 const { definitions: tagDefinitions } = useMessageTags();
 const reading = shallowRef<Reading>();
 const reader = ref<HTMLElement>();
@@ -177,6 +179,9 @@ async function runLocalModel() {
 
 watch(baseMessages, () => { void runLocalModel(); });
 watch(localModelEnabled, (enabled) => {
+  if (pushRegistration.value && pushKey.value && online.value) {
+    void isWebPushEnabled(pushRegistration.value, pushKey.value, enabled).catch(() => {});
+  }
   if (enabled) {
     modelFailed.value = false;
     void runLocalModel();
@@ -223,7 +228,9 @@ async function refresh() {
       error.value = '';
       try {
         const jobs: Promise<unknown>[] = [];
-        if (jmapFolder.value) jobs.push(repo.ensureFolderWindow(props.ownerId, jmapFolder.value.id, { limit: WINDOW_SIZE }));
+        if (jmapFolder.value && !authStore.isOfflineSession) {
+          jobs.push(repo.ensureFolderWindow(props.ownerId, jmapFolder.value.id, { limit: WINDOW_SIZE }));
+        }
         if (cache.value.paired) jobs.push(repo.refreshAttentionRelay(props.ownerId).then(showFailedAccounts));
         for (const result of await Promise.allSettled(jobs)) {
           if (result.status === 'rejected') report(result.reason);
@@ -243,6 +250,13 @@ function requestRefresh() {
   void refresh();
 }
 
+watch(() => authStore.isOfflineSession, (isOffline, wasOffline) => {
+  if (wasOffline && !isOffline) requestRefresh();
+});
+watch(online, (connected) => {
+  if (connected && cache.value.paired) void prepareWebPush();
+});
+
 async function prepareWebPush() {
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
   try {
@@ -251,7 +265,7 @@ async function prepareWebPush() {
       navigator.serviceWorker.ready,
       getWebPushPublicKey(),
     ]);
-    const enabled = await isWebPushEnabled(registration, key).catch(() => false);
+    const enabled = await isWebPushEnabled(registration, key, localModelEnabled.value).catch(() => false);
     if (!active) return;
     pushEnabled.value = enabled;
     pushRegistration.value = registration;
@@ -267,8 +281,11 @@ async function togglePush() {
   error.value = '';
   const enabling = !pushEnabled.value;
   try {
-    if (enabling) await enableWebPush({ registration: pushRegistration.value, publicKey: pushKey.value });
-    else await disableWebPush(pushRegistration.value);
+    if (enabling) {
+      await enableWebPush({
+        registration: pushRegistration.value, publicKey: pushKey.value, confirmedOnly: localModelEnabled.value,
+      });
+    } else await disableWebPush(pushRegistration.value);
     if (active) pushEnabled.value = enabling;
   } catch (cause) {
     report(cause);
@@ -315,6 +332,9 @@ async function saveState(bundle: TriageBundle, state: BundleState | null) {
       .filter(([id, previous]) => aliases.has(id) || previous.aliases.some((alias) => aliases.has(alias)))
       .map(([id]) => id);
     await repo.setAttentionBundleState(props.ownerId, bundle.id, state, replacedIds);
+    if (typeof bundle.accountId === 'string' && bundle.accountId.startsWith('imap:')) {
+      void publishWebPushAttentionState(bundle.id, state, replacedIds).catch(report);
+    }
     await loadCache();
   } catch (cause) {
     report(cause);
@@ -371,7 +391,6 @@ async function runMessageAction(message: TriageMessage, action: ImapAttentionAct
     const entry = findImapMessage(message);
     if (!entry) return;
     await imapReading.runAction(entry, action);
-    await loadCache().catch(report);
     return;
   }
   const key = browserTriageMessageKey(message);
@@ -415,7 +434,6 @@ onMounted(async () => {
     if (!active) return;
     removePushRefresh = onWebPushRefresh(requestRefresh);
     unsubscribe = repo.subscribe((tables) => {
-      if (online.value && tables.includes(TABLE_FAMILIES.IMAP_MUTATIONS)) void refreshAfterAccountChange();
       if ([TABLE_FAMILIES.MESSAGES, TABLE_FAMILIES.FOLDERS, TABLE_FAMILIES.ATTENTION].some((table) => tables.includes(table))) {
         void loadCache().catch(report);
       }
@@ -465,7 +483,7 @@ onBeforeUnmount(() => {
         :bundles="bundles"
         :account-labels="accountLabels"
         :loading="loading"
-        :error="error"
+        :error="error || cache.actionFailure?.message"
         :open-message="reading?.message"
         :rows="rows"
         :disabled-actions="disabledActions"

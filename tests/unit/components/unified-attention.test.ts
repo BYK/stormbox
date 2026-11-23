@@ -210,14 +210,16 @@ it('keeps the shared reader mounted while loading IMAP HTML and sends its toolba
   const download = new Promise<RelayMessageBody>((resolve) => { receiveBody = resolve; });
   const readAttentionImapMessage = vi.fn(async (_owner, _location, cachedOnly) => cachedOnly
     ? { text: 'Previously downloaded text', html: null } : download);
+  let announce: (tables: string[]) => void = () => {};
   const mutateAttentionImapMessage = vi.fn(async (_owner, _location, action) => {
     if (action.type === 'star') row.flagged = action.value;
     if (action.type === 'seen') row.seen = action.value;
     if (action.type === 'tags') row.labels = row.labels.filter((label) => !action.tags.removeLabels?.includes(label));
     if (action.type === 'trash') messages = [];
+    announce([TABLE_FAMILIES.ATTENTION]);
   });
   __setRepositoryForTests({
-    subscribe: () => () => {},
+    subscribe: (callback: typeof announce) => { announce = callback; return () => {}; },
     getAttentionCache: async () => ({ paired: true, accounts: [{
       relay_id: 'personal-gmail', address: 'my-gmail@example.org', name: 'Gmail',
       mailbox: 'INBOX', uid_validity: '3', can_send: true, messages,

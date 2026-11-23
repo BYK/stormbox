@@ -206,6 +206,15 @@ test('lists and reads multiple IMAP windows over one TLS connection', async () =
   assert.equal(new TextDecoder().decode(await transport.readMessageSource(account, 'INBOX', '7', 44)), sample);
 });
 
+test('reads notification previews with a bounded read-only FETCH', async () => {
+  const fixture = makeImapSocket();
+  const transport = createMailTransport(fixture.connect);
+  assert.match((await transport.readMessagePreviews(account, 'INBOX', '7', [44]))[44], /Hi from IMAP!/);
+  assert.equal(fixture.connections(), 1);
+  assert.equal(fixture.calls.filter((line) => / UID FETCH 44 .*BODY\.PEEK\[\]<0\.24576>/i.test(line)).length, 1);
+  assert.equal(fixture.calls.some((line) => /\bSELECT\b|\bSTORE\b/i.test(line)), false);
+});
+
 test('reads custom Gmail labels and IMAP keywords from the message list', async () => {
   const fixture = makeImapSocket({ gmail: true });
   const transport = createMailTransport(fixture.connect);

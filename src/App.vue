@@ -18,6 +18,10 @@ import {
   DIRECTORY_RESIZER_WIDTH,
 } from './composables/useDirectoryColumnResize';
 import { useThunderbirdShortcuts } from './composables/useThunderbirdShortcuts';
+import { useImapInboxUnread } from './composables/useImapInboxUnread';
+import { useInboxFavicon } from './composables/useInboxFavicon';
+import { getRepositoryAsync } from './composables/useRepository';
+import { CACHED_ACCOUNT_KEY, readCachedAccount } from './pwa/cached-account';
 import { APP_TITLE } from './app-config';
 import { BUG_REPORT_URL, FEEDBACK_URL } from './defines';
 
@@ -123,8 +127,10 @@ const quickFilterAriaShortcut = computed(() =>
 
 const isOnline = useOnline();
 const offlineSignInRequested = ref(false);
-const showLogin = computed(() => authStore.status !== AUTH_STATE.CONNECTED
-  && (!authStore.isOfflineSession || authStore.databaseUnavailable || offlineSignInRequested.value));
+const showLogin = computed(() => authStore.databaseUnavailable || (authStore.status !== AUTH_STATE.CONNECTED
+  && (offlineSignInRequested.value || (!authStore.isOfflineSession && !authStore.isRestoringCachedSession))));
+const reconnecting = computed(() => authStore.isOfflineSession
+  && [AUTH_STATE.CONNECTING, AUTH_STATE.OIDC_LOADING].some((state) => state === authStore.status));
 
 watch(isOnline, (online) => {
   if (!online) offlineSignInRequested.value = false;
@@ -134,26 +140,36 @@ watch(isOnline, (online) => {
 watch(() => authStore.isOfflineSession, (cached) => {
   if (!cached) offlineSignInRequested.value = false;
 });
+watch([() => authStore.accountId, isOnline], ([ownerId, online], _previous, onCleanup) => {
+  if (ownerId == null || !online) return;
+  let current = true;
+  onCleanup(() => { current = false; });
+  void getRepositoryAsync().then(async (repo) => {
+    if (current) await repo.resumeAttentionImapActions(ownerId);
+  }).catch((error) => authStore.reportDatabaseError(error));
+}, { immediate: true });
 
 async function restoreOfflineConnection() {
-  if (!await authStore.reconnectCachedSession() && authStore.appPasswordMode && authStore.isOfflineSession) {
+  if (!await authStore.reconnectCachedSession() && authStore.isOfflineSession && isOnline.value) {
     offlineSignInRequested.value = true;
   }
 }
 
-const inboxUnread = computed(() => {
-  const inbox = mailStore.folders.find((folder) => folder.role === 'inbox');
-  return Number(inbox?.unread_emails) || 0;
-});
+const imapInboxUnread = useImapInboxUnread(() => showLogin.value ? null : authStore.accountId);
+const inboxUnread = computed(() => showLogin.value
+  ? 0
+  : (Number(mailStore.inbox?.unread_emails) || 0) + imapInboxUnread.value);
 
 const accountLabel = computed(() =>
   authStore.username || authStore.serverHostname,
 );
 const documentTitle = computed(() => {
   const username = authStore.username?.trim();
-  return username ? `${APP_TITLE} - ${username}` : APP_TITLE;
+  const accountTitle = username ? `${APP_TITLE} - ${username}` : APP_TITLE;
+  return inboxUnread.value > 0 ? `(${inboxUnread.value}) ${accountTitle}` : accountTitle;
 });
 useTitle(documentTitle, { restoreOnUnmount: false });
+useInboxFavicon(() => inboxUnread.value);
 
 type ResizePane = 'folderList';
 
@@ -315,6 +331,14 @@ useThunderbirdShortcuts({
 let appMounted = false;
 let removePushListener: (() => void) | undefined;
 
+function onCachedAccountChange(event: StorageEvent) {
+  if (event.storageArea !== localStorage || (event.key != null && event.key !== CACHED_ACCOUNT_KEY)) return;
+  const cached = readCachedAccount();
+  const removed = event.newValue == null;
+  if ((removed && authStore.isRestoringCachedSession) || (authStore.accountId != null
+      && (removed || cached?.id !== authStore.accountId))) authStore.expireCachedAccount();
+}
+
 onMounted(async () => {
   appMounted = true;
   removePushListener = onWebPushOpenAttention(() => { void requestSpaceChange('attention'); });
@@ -324,6 +348,7 @@ onMounted(async () => {
   applyResponsiveLayout();
   clampColumnWidths();
   window.addEventListener('resize', onWindowResize);
+  window.addEventListener('storage', onCachedAccountChange);
 
   await settingsStore.attach().catch((error) => {
     console.warn('[app] settings attach failed', error);
@@ -348,6 +373,7 @@ onBeforeUnmount(() => {
   removePushListener?.();
   clearMessageViewTimer();
   window.removeEventListener('resize', onWindowResize);
+  window.removeEventListener('storage', onCachedAccountChange);
   unwatchSystemTheme();
   settingsStore.detach();
 });
@@ -733,9 +759,9 @@ function unwatchSystemTheme() {
       v-if="(!isOnline || authStore.isOfflineSession) && !messageViewMaximized"
       class="shell__notice shell__offline"
     >
-      <span role="status">{{ isOnline ? 'Viewing downloaded mail' : 'Offline · Viewing downloaded mail' }}</span>
+      <span role="status">{{ !isOnline ? 'Offline · Viewing downloaded mail' : reconnecting ? 'Reconnecting…' : 'Viewing downloaded mail' }}</span>
       <AppButton
-        v-if="isOnline && authStore.isOfflineSession"
+        v-if="isOnline && authStore.isOfflineSession && !reconnecting"
         @click="restoreOfflineConnection"
       >
         Reconnect account
@@ -918,6 +944,8 @@ function unwatchSystemTheme() {
         :aria-hidden="messageViewMaximized"
         :quick-filter-query="quickFilterQuery"
         :reading-pane-visible="displayedMessageView"
+        :enable-threaded-view="Boolean(imapFolderNav)"
+        @show-threads="imapMail?.openJmapFolder($event)"
       />
       <MessageView
         v-if="displayedMessageView && !imapFolderSelected"

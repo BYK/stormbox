@@ -47,6 +47,7 @@ import {
 import { adaptHtmlForDarkMode } from '../utils/dark-email';
 import { formatAddressList } from '../utils/address-parse';
 import { titleWithShortcut, type ShortcutAction } from '../constants/shortcuts';
+import { gmailLabelTags, imapTagPatch } from '../utils/imap-message-tags';
 import { plaintextToHtml } from '../utils/plaintext-html';
 import { printMessage } from '../utils/message-print';
 import { shortFrom } from '../utils/sender-avatar';
@@ -71,7 +72,6 @@ import TagPickerPopover, { type PopoverAnchor } from './TagPickerPopover.vue';
 // content as if it has at least this width and apply CSS zoom to fit,
 // even when scrollWidth would technically not overflow.
 const MIN_EMAIL_LAYOUT_WIDTH = 400;
-const GMAIL_SYSTEM_LABEL = /^(?:inbox|spam|trash|unread|starred|important|sent|drafts?|all mail|category_\w+|\[gmail\]|\[googlemail\])$/i;
 
 const props = withDefaults(defineProps<{
   maximized?: boolean;
@@ -266,19 +266,13 @@ const messageAccountId = computed(() => message.value?.account_id ?? null);
 // single-column layout has no row hover, so this is where a phone user
 // tags a single message.
 const { definitions: tagDefinitions, tagsFor } = useMessageTags();
-const gmailTags = computed(() => {
-  if (!props.imap?.gmailLabels) return [];
-  const colors = new Map(tagDefinitions.value.filter(({ name }) => !GMAIL_SYSTEM_LABEL.test(name))
-    .map((tag) => [tag.name, tag.color]));
-  const applied = new Set(props.imap.labels);
-  return [...new Set([...colors.keys(), ...props.imap.knownLabels, ...applied])].map((label) => ({
-    keyword: `gmail label:${label}`, name: label, color: colors.get(label) ?? null, applied: applied.has(label),
-  }));
-});
+const gmailTags = computed(() => props.imap?.gmailLabels
+  ? gmailLabelTags(props.imap.labels, tagDefinitions.value, props.imap.knownLabels)
+  : []);
 const keywordTags = computed(() => tagsFor(viewMessage.value));
 const messageTags = computed(() => [
   ...keywordTags.value,
-  ...gmailTags.value.filter((tag) => tag.applied).map((tag) => ({ ...tag, defined: true })),
+  ...gmailTags.value.filter((tag) => tag.applied),
 ]);
 const seenLabel = computed(() => props.imap?.seen ? 'Mark as unread' : 'Mark as read');
 const messageTagTargets = computed(() => (viewMessage.value ? [viewMessage.value] : []));
@@ -316,10 +310,7 @@ watch(viewMessageId, closeTagMenu);
 async function setMessageTag(keyword: string, on: boolean) {
   if (props.imap) {
     if (props.imap.disabled) return;
-    const label = gmailTags.value.find((tag) => tag.keyword === keyword);
-    emit('imapAction', { type: 'tags', tags: label
-      ? { [on ? 'addLabels' : 'removeLabels']: [label.name] }
-      : { [on ? 'add' : 'remove']: [keyword] } });
+    emit('imapAction', { type: 'tags', tags: imapTagPatch(keyword, on, gmailTags.value) });
     return;
   }
   if (!message.value) return;

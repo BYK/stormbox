@@ -26,6 +26,10 @@ function serviceKindFor(capability) {
   return null;
 }
 
+export function sessionMailAccountId(session): string | undefined {
+  return session.primaryAccounts?.[JMAP_CAPS.MAIL] ?? Object.keys(session.accounts ?? {})[0];
+}
+
 /**
  * Ingest a JMAP session into the local store. Returns the local account
  * row (post-upsert). serverOrigin must be the server's https origin
@@ -54,9 +58,7 @@ export async function ingestSession({ session, serverOrigin, handlers }) {
   if (!session) {
     throw new Error('ingestSession requires a session document');
   }
-  const primaryAccounts = session.primaryAccounts ?? {};
-  const remoteAccountId = primaryAccounts[JMAP_CAPS.MAIL]
-    ?? Object.keys(session.accounts ?? {})[0];
+  const remoteAccountId = sessionMailAccountId(session);
   if (!remoteAccountId) {
     throw new Error('JMAP session has no primary mail account');
   }

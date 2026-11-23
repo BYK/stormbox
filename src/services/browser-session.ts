@@ -39,8 +39,12 @@ export async function browserRelayAssertion(fetcher: typeof fetch): Promise<stri
     redirect: 'error',
     signal: AbortSignal.timeout(15_000),
   });
-  if (response.status === 401) throw new Error('Sign in to Thundermail again to connect IMAP accounts.');
-  if (response.status === 403) throw new Error('IMAP account management is reserved for this webmail’s owner.');
+  if (response.status === 401) {
+    throw Object.assign(new Error('Sign in to Thundermail again to connect IMAP accounts.'), { status: 401 });
+  }
+  if (response.status === 403) {
+    throw Object.assign(new Error('IMAP account management is reserved for this webmail’s owner.'), { status: 403 });
+  }
   if (!response.ok) throw new Error('The mail relay sign-in service is unavailable. Try again shortly.');
   const { assertion } = await response.json();
   if (typeof assertion !== 'string' || !assertion) throw new Error('The mail relay did not receive a session.');

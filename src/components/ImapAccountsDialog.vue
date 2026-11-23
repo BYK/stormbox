@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { X } from '@lucide/vue';
-import { computed, nextTick, onMounted, ref, useId } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue';
 import { useOnline } from '@vueuse/core';
 
 import { useModalFocus } from '../composables/useModalFocus';
 import { getRepositoryAsync } from '../composables/useRepository';
 import { replaceLocation } from '../services/navigation';
-import { GOOGLE_IMAP_RETURN_SPACE, type GoogleImapResult, type RelayAccount, type RelayAccountInput } from '../sync/backends/imap/attention-relay';
+import { GOOGLE_IMAP_RETURN_SPACE, type GoogleImapResult, type RelayAccount, type RelayAccountInput, type RelayAccountSettings } from '../sync/backends/imap/attention-relay';
 import AppButton from './AppButton.vue';
 import AppIconButton from './AppIconButton.vue';
 
@@ -30,8 +30,9 @@ const dialog = ref<HTMLElement | null>(null);
 const tokenInput = ref<HTMLInputElement | null>(null);
 const emailInput = ref<HTMLInputElement | null>(null);
 const passwordInput = ref<HTMLInputElement | null>(null);
-const screen = ref<'pair' | 'list' | 'form' | 'remove'>(props.paired && !props.automatic ? 'list' : 'pair');
+const screen = ref<'pair' | 'list' | 'form' | 'remove'>(props.paired ? 'list' : 'pair');
 const busy = ref(false);
+const refreshing = ref(false);
 const error = ref('');
 const notice = ref('');
 const accounts = ref<RelayAccount[]>([]);
@@ -39,7 +40,7 @@ const editing = ref<RelayAccount>();
 const removing = ref<RelayAccount>();
 const token = ref('');
 const provider = ref<'gmail' | 'imap'>('gmail');
-const googleOAuth = ref(false);
+const googleOAuth = ref<boolean>();
 const useAppPassword = ref(false);
 const googleSignIn = computed(() => provider.value === 'gmail' && googleOAuth.value && !useAppPassword.value && !editing.value);
 const email = ref('');
@@ -47,61 +48,96 @@ const password = ref('');
 const host = ref('');
 const user = ref('');
 const mode = ref<'tls' | 'starttls'>('tls');
+let active = true;
 let pendingGoogleResult = props.googleResult;
 
 useModalFocus(dialog, { containTab: true, initialFocus: tokenInput });
 
 function close() {
-  if (!busy.value) emit('close');
+  if (!active) return;
+  active = false;
+  emit('close');
+}
+
+function showError(cause: unknown) {
+  if (screen.value !== 'pair' && (cause as { code?: string } | null)?.code === 'unauthorized') {
+    screen.value = 'pair';
+    error.value = 'Pair this browser again to manage your IMAP accounts.';
+  } else {
+    error.value = cause instanceof Error ? cause.message : 'Could not update IMAP accounts.';
+  }
 }
 
 async function run(operation: () => Promise<void>) {
-  if (busy.value || !online.value) return;
+  if (!active || busy.value || !online.value) return;
   busy.value = true;
   error.value = '';
   notice.value = '';
   try {
     await operation();
   } catch (cause) {
-    if (screen.value !== 'pair' && (cause as { code?: string } | null)?.code === 'unauthorized') {
-      screen.value = 'pair';
-      accounts.value = [];
-      error.value = 'Pair this browser again to manage your IMAP accounts.';
-    } else {
-      error.value = cause instanceof Error ? cause.message : 'Could not update IMAP accounts.';
-    }
+    if (active) showError(cause);
   } finally {
     busy.value = false;
   }
 }
 
-async function loadAccounts() {
-  const repo = await getRepositoryAsync();
-  const settings = await repo.listAttentionRelayAccounts(props.ownerId);
+function showSettings(settings: RelayAccountSettings) {
   accounts.value = settings.accounts;
-  googleOAuth.value = settings.googleOAuth === true;
-  if (!accounts.value.length) openForm();
-  if (pendingGoogleResult === 'connected') {
-    notice.value = 'Google account connected.';
-    if (!props.automatic) emit('account-change');
-  } else if (pendingGoogleResult === 'cancelled') {
-    notice.value = 'Google sign-in was cancelled.';
-  } else if (pendingGoogleResult === 'blocked') {
-    error.value = 'Your organization blocked this Google connection. Ask your Google Workspace administrator to approve Stormbox.';
-  } else if (pendingGoogleResult === 'account_mismatch') {
-    error.value = 'You selected a different Google account. Try again with the account you want to reconnect.';
-  } else if (pendingGoogleResult === 'failed') {
-    error.value = 'Google did not connect the account. Try signing in again.';
-  }
-  pendingGoogleResult = undefined;
+  googleOAuth.value = settings.googleOAuth;
 }
 
-onMounted(() => {
-  if (props.automatic) void pair();
-  else if (props.paired) void run(loadAccounts);
+async function loadAccounts(justPaired = false) {
+  if (!active || refreshing.value) return;
+  refreshing.value = true;
+  try {
+    const repo = await getRepositoryAsync();
+    if (!active) return;
+    const cached = await repo.listAttentionRelayAccounts(props.ownerId, true).catch(() => undefined);
+    if (!active) return;
+    if (!props.paired && !cached?.paired && !justPaired) {
+      if (props.automatic) void pair();
+      return;
+    }
+    if (cached) showSettings(cached);
+    if (screen.value === 'pair') screen.value = 'list';
+    showGoogleResult();
+    if (!online.value) return;
+    const settings = await repo.listAttentionRelayAccounts(props.ownerId);
+    if (!active) return;
+    showSettings(settings);
+    if (!accounts.value.length && screen.value === 'list') openForm(undefined, false);
+  } catch (cause) {
+    if (active) showError(cause);
+  } finally {
+    refreshing.value = false;
+  }
+}
+
+function showGoogleResult() {
+  const result = pendingGoogleResult;
+  pendingGoogleResult = undefined;
+  if (result === 'connected') {
+    notice.value = 'Google account connected.';
+    emit('account-change');
+  } else if (result === 'cancelled') {
+    notice.value = 'Google sign-in was cancelled.';
+  } else if (result === 'blocked') {
+    error.value = 'Your organization blocked this Google connection. Ask your Google Workspace administrator to approve Stormbox.';
+  } else if (result === 'account_mismatch') {
+    error.value = 'You selected a different Google account. Try again with the account you want to reconnect.';
+  } else if (result === 'failed') {
+    error.value = 'Google did not connect the account. Try signing in again.';
+  }
+}
+
+onMounted(() => void loadAccounts());
+onBeforeUnmount(() => { active = false; });
+watch(online, (connected) => {
+  if (connected && screen.value === 'list') void loadAccounts();
 });
 
-function openForm(account?: RelayAccount) {
+function openForm(account?: RelayAccount, clearFeedback = true) {
   editing.value = account;
   provider.value = !account || account.host === 'imap.gmail.com' ? 'gmail' : 'imap';
   useAppPassword.value = false;
@@ -110,8 +146,10 @@ function openForm(account?: RelayAccount) {
   host.value = account?.host ?? '';
   user.value = account?.user ?? '';
   mode.value = account?.mode ?? 'tls';
-  error.value = '';
-  notice.value = '';
+  if (clearFeedback) {
+    error.value = '';
+    notice.value = '';
+  }
   screen.value = 'form';
   void nextTick(() => (account ? passwordInput : emailInput).value?.focus());
 }
@@ -127,7 +165,9 @@ async function connectGoogle(account?: RelayAccount) {
   if (!googleOAuth.value) return;
   await run(async () => {
     const repo = await getRepositoryAsync();
+    if (!active) return;
     const url = await repo.startAttentionGoogleOAuth(props.ownerId, account?.id);
+    if (!active) return;
     if (props.returnToMail) window.sessionStorage.setItem(GOOGLE_IMAP_RETURN_SPACE, 'mail');
     else window.sessionStorage.removeItem(GOOGLE_IMAP_RETURN_SPACE);
     replaceLocation(url);
@@ -147,10 +187,12 @@ async function pair() {
   await run(async () => {
     token.value = '';
     const repo = await getRepositoryAsync();
-    const failed = await repo.pairAttentionRelay(props.ownerId, accessToken);
+    if (!active) return;
+    const failed = await repo.pairAttentionRelay(props.ownerId, accessToken, false);
+    if (!active) return;
     screen.value = 'list';
     emit('paired', failed);
-    await loadAccounts();
+    void loadAccounts(true);
   });
 }
 
@@ -172,6 +214,7 @@ async function save() {
     password.value = '';
     const repo = await getRepositoryAsync();
     const saved = await repo.saveAttentionRelayAccount(props.ownerId, account);
+    if (!active) return;
     accounts.value = [...accounts.value.filter(({ id }) => id !== saved.id), saved];
     showList();
     notice.value = `${saved.email} is connected.`;
@@ -192,6 +235,7 @@ async function remove() {
   await run(async () => {
     const repo = await getRepositoryAsync();
     await repo.removeAttentionRelayAccount(props.ownerId, account.id);
+    if (!active) return;
     accounts.value = accounts.value.filter(({ id }) => id !== account.id);
     showList();
     notice.value = `${account.email} was disconnected.`;
@@ -202,7 +246,7 @@ async function remove() {
 async function disconnectBrowser() {
   await run(async () => {
     await props.disconnect();
-    emit('close');
+    close();
   });
 }
 </script>
@@ -216,13 +260,12 @@ async function disconnectBrowser() {
         role="dialog"
         aria-modal="true"
         :aria-labelledby="heading"
-        :aria-busy="busy"
         tabindex="-1"
         @keydown.esc.stop="close"
       >
         <header class="imap-accounts__header">
           <h2 :id="heading">IMAP accounts</h2>
-          <AppIconButton aria-label="Close IMAP accounts" :disabled="busy" @click="close">
+          <AppIconButton aria-label="Close IMAP accounts" @click="close">
             <X :size="18" aria-hidden="true" />
           </AppIconButton>
         </header>
@@ -238,8 +281,8 @@ async function disconnectBrowser() {
             <input ref="tokenInput" v-model="token" type="password" autocomplete="off" required :disabled="busy" />
           </label>
           <footer class="imap-accounts__footer">
-            <AppButton variant="outline" :disabled="busy" @click="close">Cancel</AppButton>
-            <AppButton form-action="submit" :disabled="busy || !online || (!automatic && !token.trim())">Connect</AppButton>
+            <AppButton variant="outline" @click="close">Cancel</AppButton>
+            <AppButton form-action="submit" :disabled="busy || refreshing || !online || (!automatic && !token.trim())">Connect</AppButton>
           </footer>
         </form>
 
@@ -325,10 +368,11 @@ async function disconnectBrowser() {
               </div>
             </li>
           </ul>
-          <p v-else class="imap-accounts__message">{{ busy ? 'Loading accounts…' : 'No IMAP accounts connected.' }}</p>
+          <p v-else-if="!refreshing && !error" class="imap-accounts__message">No IMAP accounts connected.</p>
+          <p v-if="refreshing && online" class="imap-accounts__message" role="status">Refreshing accounts…</p>
           <footer class="imap-accounts__footer imap-accounts__footer--list">
             <AppButton variant="outline" :disabled="busy || !online" @click="disconnectBrowser">Disconnect this browser</AppButton>
-            <AppButton :disabled="busy || !online" @click="openForm()">Add account</AppButton>
+            <AppButton :disabled="busy || !online || (refreshing && googleOAuth === undefined)" @click="openForm()">Add account</AppButton>
           </footer>
         </template>
       </section>

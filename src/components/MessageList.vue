@@ -62,6 +62,7 @@ const props = withDefaults(defineProps<{
   soleColumn?: boolean;
   quickFilterQuery?: string;
   canAddColumn?: boolean;
+  enableThreadedView?: boolean;
 }>(), {
   folderId: undefined,
   listId: '',
@@ -79,6 +80,7 @@ const emit = defineEmits<{
   'add-column': [];
   'remove-column': [];
   'change-folder': [folderId: number];
+  'show-threads': [folder: FolderRow];
   /** A row was opened in this column. */
   'open': [messageId: number];
 }>();
@@ -864,6 +866,9 @@ const {
   refresh,
   addColumn: () => emit('add-column'),
   removeColumn: () => emit('remove-column'),
+  canOpenThreads: computed(() => props.enableThreadedView && folder.value != null
+    && folder.value.id > 0 && folder.value.account_id > 0),
+  openThreads: () => { if (folder.value) emit('show-threads', folder.value); },
 });
 
 const titleEl = ref<InstanceType<typeof MessageListHeaderTitle> | null>(null);

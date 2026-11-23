@@ -106,6 +106,7 @@ export class MailTransportError extends Error {
 
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_WINDOW_SIZE = 500;
+const MAX_PREVIEW_SOURCE_BYTES = 24 * 1024;
 
 const MESSAGE_QUERY: FetchQueryObject = {
   envelope: true,
@@ -312,6 +313,25 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     });
   }
 
+  function readMessagePreviews(account: MailAccount, mailbox: string, uidValidity: string, uids: number[]): Promise<Record<number, string>> {
+    return withMailbox(account, mailbox, { readOnly: true, uidValidity }, async (client) => {
+      const records = await client.fetchAll(uids.join(','), { source: { start: 0, maxLength: MAX_PREVIEW_SOURCE_BYTES } }, { uid: true });
+      const previews: Record<number, string> = {};
+      for (const { uid, source } of records) {
+        if (!source) continue;
+        try {
+          const parsed = await PostalMime.parse(source.subarray(0, MAX_PREVIEW_SOURCE_BYTES), {
+            maxNestingDepth: 24, maxHeadersSize: MAX_PREVIEW_SOURCE_BYTES,
+          });
+          previews[uid] = parsed.text?.slice(0, 2400) ?? '';
+        } catch {
+          previews[uid] = '';
+        }
+      }
+      return previews;
+    });
+  }
+
   function patchMessage(
     account: MailAccount, mailbox: string, uidValidity: string, uid: number,
     flags: { seen?: boolean; flagged?: boolean },
@@ -464,9 +484,9 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     }
   }
 
-  return { listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, patchMessageTags, moveMessage, moveToRole, trashMessage, submitMessage };
+  return { listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessagePreviews, readMessageSource, patchMessage, patchMessageTags, moveMessage, moveToRole, trashMessage, submitMessage };
 }
 
 export const {
-  listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessageSource, patchMessage, patchMessageTags, moveMessage, moveToRole, trashMessage, submitMessage,
+  listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessagePreviews, readMessageSource, patchMessage, patchMessageTags, moveMessage, moveToRole, trashMessage, submitMessage,
 } = createMailTransport();

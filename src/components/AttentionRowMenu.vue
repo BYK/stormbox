@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Check, Clock, Mail, MailOpen, RotateCcw, Star, Trash2 } from '@lucide/vue';
+import { Archive, Check, Clock, Flame, Mail, MailOpen, RotateCcw, Star, Tags, Trash2 } from '@lucide/vue';
 import { computed } from 'vue';
 
 import type { ImapAttentionAction } from '../sync/backends/imap/attention-relay';
@@ -13,9 +13,13 @@ const props = withDefaults(defineProps<{
   bundle?: TriageBundle;
   disabled?: boolean;
   canTrash?: boolean;
+  canArchive?: boolean;
+  canJunk?: boolean;
+  canTag?: boolean;
 }>(), { canTrash: true });
 const emit = defineEmits<{
   action: [action: ImapAttentionAction, event: MouseEvent];
+  tag: [trigger: HTMLElement];
   done: [bundle: TriageBundle, event: MouseEvent];
   restore: [bundle: TriageBundle, event: MouseEvent];
   snooze: [bundle: TriageBundle, until: number, event: MouseEvent];
@@ -27,6 +31,13 @@ const handled = computed(() => props.bundle?.status === 'done' || props.bundle?.
 function chooseAction(event: MouseEvent, action: ImapAttentionAction): void {
   closeContainingDropdown(event, true);
   emit('action', action, event);
+}
+
+function chooseTag(event: MouseEvent): void {
+  if (!(event.currentTarget instanceof HTMLElement)) return;
+  const trigger = event.currentTarget.closest('details')?.querySelector('summary');
+  closeContainingDropdown(event, true);
+  if (trigger) emit('tag', trigger);
 }
 
 function snoozeUntilTomorrow(): number {
@@ -58,6 +69,37 @@ function snoozeUntilTomorrow(): number {
     >
       <component :is="unread ? MailOpen : Mail" :size="16" aria-hidden="true" />
       {{ unread ? 'Mark as read' : 'Mark as unread' }}
+    </button>
+    <button
+      v-if="canTag"
+      class="app-dropdown__item"
+      type="button"
+      aria-haspopup="dialog"
+      :disabled="disabled"
+      @click="chooseTag"
+    >
+      <Tags :size="16" aria-hidden="true" />
+      Tags
+    </button>
+    <button
+      v-if="canArchive"
+      class="app-dropdown__item"
+      type="button"
+      :disabled="disabled"
+      @click="chooseAction($event, { type: 'archive' })"
+    >
+      <Archive :size="16" aria-hidden="true" />
+      Archive
+    </button>
+    <button
+      v-if="canJunk"
+      class="app-dropdown__item"
+      type="button"
+      :disabled="disabled"
+      @click="chooseAction($event, { type: 'junk' })"
+    >
+      <Flame :size="16" aria-hidden="true" />
+      Move to Junk
     </button>
     <template v-if="bundle">
       <button

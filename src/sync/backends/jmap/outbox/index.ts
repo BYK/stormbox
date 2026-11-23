@@ -274,8 +274,9 @@ export async function processMutationRow({
     case MUTATION_TYPES.SET_SIEVE_RULES:
       return runSetSieveRules({ transport, account, request, useWebSocket });
     case MUTATION_TYPES.ATTENTION_IMAP:
+      if (request?.cancelled === 1) return { ok: true };
       return handlers[DB_RPC.ATTENTION_APPLY_IMAP_ACTION]({
-        ownerId: row.account_id, location: request?.location, action: request?.action,
+        ownerId: row.account_id, location: request?.location, action: request?.action, mutationId: row.id,
       });
     case MUTATION_TYPES.ATTENTION_IMAP_SEND:
       return handlers[DB_RPC.ATTENTION_APPLY_IMAP_SEND]({

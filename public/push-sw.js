@@ -1,25 +1,45 @@
 /* global clients */
-self.addEventListener('push', (event) => {
-  let tag = 'stormbox-mail';
+async function previewsAllowed() {
   try {
-    const payload = event.data?.json();
-    if (typeof payload?.tag === 'string' && /^stormbox-[a-f0-9]{20}$/.test(payload.tag)) {
-      tag = payload.tag;
-    }
+    const permission = await caches.match(new URL('.push-session', self.registration.scope).href, {
+      cacheName: 'stormbox-push',
+    });
+    return await permission?.text() === 'allowed';
   } catch {
-    // Keep the alert visible if the payload was missing or unrecognized.
+    return false;
   }
+}
 
-  event.waitUntil(Promise.all([
-    self.registration.showNotification('Stormbox', {
-      body: 'New mail is available.',
-      tag,
-      data: { type: 'stormbox:new-mail' },
-    }),
+self.addEventListener('push', (event) => {
+  let payload;
+  try {
+    payload = event.data?.json();
+  } catch {
+    // Old or malformed payloads cannot describe a Needs attention item.
+  }
+  const work = [
     clients.matchAll({ type: 'window' }).then((windows) => {
       for (const window of windows) window.postMessage({ type: 'stormbox:refresh' });
     }),
-  ]));
+  ];
+  if (typeof payload?.tag === 'string' && /^stormbox-[a-f0-9]{20}$/.test(payload.tag)
+    && typeof payload.sender === 'string' && payload.sender.length > 0 && payload.sender.length <= 200
+    && typeof payload.subject === 'string' && payload.subject.length > 0 && payload.subject.length <= 300
+    && typeof payload.preview === 'string' && payload.preview.length <= 400) {
+    const { sender, subject, preview, tag } = payload;
+    work.push((async () => {
+      if (!await previewsAllowed()) return;
+      await self.registration.showNotification(sender, {
+        body: preview ? `${subject}\n${preview}` : subject,
+        tag,
+        data: { type: 'stormbox:new-mail' },
+      });
+      if (!await previewsAllowed()) {
+        for (const notification of await self.registration.getNotifications({ tag })) notification.close();
+      }
+    })());
+  }
+  event.waitUntil(Promise.all(work));
 });
 
 self.addEventListener('notificationclick', (event) => {

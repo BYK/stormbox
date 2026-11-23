@@ -179,8 +179,14 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
   const mailbox = url.searchParams.get('mailbox') ?? 'INBOX';
   if (!mailbox || mailbox.length > 1024 || /[\0\r\n]/.test(mailbox)) throw new HttpError(400, 'invalid_mailbox');
   if (parts.length === 3 && request.method === 'GET') {
-    const window = await listMessages(account, mailbox, number(url.searchParams.get('limit') ?? '50', 100));
-    return json({ ...window, canSend: Boolean(env.MANAGED_ACCOUNTS) && managed && canSubmitAttentionMessage(account) });
+    const [window, cached] = await Promise.all([
+      listMessages(account, mailbox, number(url.searchParams.get('limit') ?? '50', 100)),
+      mailbox.toUpperCase() === 'INBOX' ? accountObject(env, account).inboxPreviews().catch(() => null) : null,
+    ]);
+    const messages = cached?.uidValidity === window.uidValidity
+      ? window.messages.map((message) => ({ ...message, preview: cached.previews[message.uid] }))
+      : window.messages;
+    return json({ ...window, messages, canSend: Boolean(env.MANAGED_ACCOUNTS) && managed && canSubmitAttentionMessage(account) });
   }
   const action = parts.length === 5 && Object.hasOwn(MOVE_ROLES, parts[4]) ? parts[4] as MoveAction : null;
   if (parts.length !== 4 && !action) {

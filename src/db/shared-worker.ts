@@ -77,7 +77,8 @@ function getHandlers() {
     const repoHandlers = lifecycle.storageHandlers({ ...makeHandlers(engine, broadcaster, {
       onMutationInserted: ({ accountId, mutationId }) =>
         outboxNotifier.dispatch(accountId, mutationId),
-    }), ...makeAttentionHandlers(engine, broadcaster) });
+    }), ...makeAttentionHandlers(engine, broadcaster, undefined,
+      (accountId, mutationId) => outboxNotifier.dispatch(accountId, mutationId)) });
     let stopSync: () => Promise<void> = async () => {};
     const syncHandlers = makeSyncRpcHandlers({
       handlers: repoHandlers,
@@ -86,6 +87,7 @@ function getHandlers() {
     });
     const publicRepoHandlers = { ...repoHandlers };
     delete publicRepoHandlers[DB_RPC.ATTENTION_APPLY_IMAP_ACTION];
+    delete publicRepoHandlers[DB_RPC.ATTENTION_SETTLE_IMAP_ACTION];
     delete publicRepoHandlers[DB_RPC.ATTENTION_APPLY_IMAP_SEND];
     return lifecycle.requestHandlers({ ...publicRepoHandlers, ...syncHandlers }, {
       stopSync: () => stopSync(),

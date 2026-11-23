@@ -59,7 +59,7 @@ export function useImapReader(
   });
 
   function disabled(id: string) {
-    return !online.value || pending.value.has(id);
+    return pending.value.has(id);
   }
 
   function close() { reading.value = undefined; }
