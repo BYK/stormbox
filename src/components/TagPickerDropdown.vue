@@ -17,6 +17,7 @@ import TagPickerPanel from './TagPickerPanel.vue';
 withDefaults(defineProps<{
   targets: ReadonlyArray<MessageRowLike | null | undefined>;
   definitions: ReadonlyArray<MessageTagDefinition>;
+  additionalTags?: InstanceType<typeof TagPickerPanel>['$props']['additionalTags'];
   /** Accessible name of the trigger. */
   label?: string;
   /** Tooltip of the trigger; the label when omitted. */
@@ -92,6 +93,7 @@ defineExpose({ focusTrigger });
         ref="panelEl"
         :targets="targets"
         :definitions="definitions"
+        :additional-tags="additionalTags"
         @toggle="(keyword, on) => emit('toggle', keyword, on)"
         @clear="emit('clear')"
         @manage="onManage"

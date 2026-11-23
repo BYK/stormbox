@@ -1,6 +1,6 @@
 import { computed } from 'vue';
 import type { Ref } from 'vue';
-import { Layers, Plus, RefreshCw, X } from '@lucide/vue';
+import { Plus, RefreshCw, X } from '@lucide/vue';
 
 import { MAX_MESSAGE_COLUMNS } from '../stores/message-columns-store';
 import { splitBulkActions } from './useBulkActionItems';
@@ -34,18 +34,20 @@ export interface UseMessageListHeaderInput {
   /** Measured list width; 0 while unknown. */
   listWidth: Ref<number>;
   hasSelection: Ref<boolean>;
-  folderId: Ref<number | null>;
+  folderId: Ref<number | string | null>;
   folderName: Ref<string>;
   isLoading: Ref<boolean>;
   primary: Ref<boolean>;
   canAddColumn: Ref<boolean>;
   columnIndex: Ref<number>;
   bulkActionItems: Ref<BulkActionItem[]>;
+  columnControls: Ref<boolean>;
+  hasStatus: Ref<boolean>;
+  refreshDisabled: Ref<boolean>;
+  viewActions: Ref<MoreMenuItem[]>;
   refresh: () => void;
   addColumn: () => void;
   removeColumn: () => void;
-  canOpenThreads?: Ref<boolean>;
-  openThreads?: () => void;
 }
 
 /**
@@ -74,7 +76,8 @@ export function useMessageListHeader(input: UseMessageListHeaderInput) {
 
   const bulkCapacity = computed(() => (
     measured.value
-      ? Math.max(1, Math.floor((input.listWidth.value - BULK_ROW_FIXED_WIDTH) / BULK_ACTION_SLOT_WIDTH))
+      ? Math.max(1, Math.floor((input.listWidth.value - BULK_ROW_FIXED_WIDTH
+          - (input.hasStatus.value ? 44 : 0)) / BULK_ACTION_SLOT_WIDTH))
       : null
   ));
   const bulkActions = computed(() => splitBulkActions(input.bulkActionItems.value, bulkCapacity.value));
@@ -129,17 +132,17 @@ export function useMessageListHeader(input: UseMessageListHeaderInput) {
             id: 'refresh',
             label: 'Refresh',
             icon: RefreshCw,
-            disabled: input.isLoading.value,
+            disabled: input.isLoading.value || input.refreshDisabled.value,
             run: input.refresh,
           },
-          columnControlItem.value,
+          ...(input.columnControls.value ? [columnControlItem.value] : []),
         ],
       });
     }
-    if (!input.hasSelection.value && input.folderId.value != null && input.canOpenThreads?.value && input.openThreads) {
+    if (!input.hasSelection.value && input.folderId.value != null && input.viewActions.value.length > 0) {
       groups.push({
         id: 'view',
-        items: [{ id: 'threads', label: 'Threaded view', icon: Layers, run: input.openThreads }],
+        items: input.viewActions.value,
       });
     }
     return groups;

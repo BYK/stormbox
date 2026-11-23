@@ -226,6 +226,21 @@ test('keeps managed account records encrypted and exposes metadata only to paire
   assert.deepEqual(bearerList.accounts.map(({ id }) => id), ['alpha']);
   const session = await (await request('/.well-known/jmap', { headers: bearer })).json();
   assert.deepEqual(Object.keys(session.accounts), ['alpha']);
+  assert.equal((await request(`${api}/jmap/session`, { headers: bearer })).status, 401);
+  assert.equal((await request(`${api}/jmap/session`, { headers: { Cookie, Origin: 'https://other.example.test' } })).status, 401);
+  const pairedSession = await (await request(`${api}/jmap/session`, { headers })).json();
+  assert.deepEqual(Object.keys(pairedSession.accounts), ['alpha', id]);
+  assert.equal(pairedSession.accounts[id].isReadOnly, false);
+  assert.equal(pairedSession.apiUrl, `${origin}${api}/jmap`);
+  assert.match(pairedSession.downloadUrl, new RegExp(`${api}/jmap/download/`));
+  assert.doesNotMatch(JSON.stringify(pairedSession), /fictional-password|imap\.gmail\.com/);
+  const call = {
+    method: 'POST', body: JSON.stringify({ using: ['urn:ietf:params:jmap:mail'],
+      methodCalls: [['Email/set', { accountId: 'removed', update: { m1: { 'keywords/$seen': true } } }, 'a']] }),
+  };
+  assert.equal((await request(`${api}/jmap`, { ...call, headers: { Cookie } })).status, 401);
+  assert.deepEqual((await (await request(`${api}/jmap`, { ...call, headers })).json()).methodResponses,
+    [['error', { type: 'accountNotFound' }, 'a']]);
   assert.equal((await request(`${api}/accounts/${id}/messages?mailbox=INBOX`, { headers: bearer })).status, 404);
   assert.equal((await request(`${api}/accounts/${id}`, { method: 'DELETE', headers })).status, 204);
   assert.equal(await registry.byId(id), null);

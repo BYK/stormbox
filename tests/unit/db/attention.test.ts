@@ -3,7 +3,7 @@ import { MUTATION_TYPE } from '../../../src/constants/states';
 import { makeAttentionHandlers } from '../../../src/db/attention';
 import { bootTestEngine } from '../../../src/db/bootstrap-memory';
 import { makeHandlers } from '../../../src/db/handlers';
-import { DB_RPC } from '../../../src/db/protocol';
+import { DB_RPC, TABLE_FAMILIES } from '../../../src/db/protocol';
 import { AttentionRelay, type AttentionImapDraft } from '../../../src/sync/backends/imap/attention-relay';
 import { processMutationRow } from '../../../src/sync/backends/jmap/outbox';
 import { OutboxRunner } from '../../../src/sync/backends/jmap/outbox-runner';
@@ -19,6 +19,7 @@ afterEach(async () => engine.close());
 
 function fakeRelay() {
   const notify = vi.fn();
+  const touch = vi.fn();
   const server = { online: true, uidValidity: '3', accountTwoOnline: true, lastToken: '',
     flags: { seen: true, flagged: false }, trashed: false, archived: false, labels: ['Read later'],
     homeWindowGate: undefined as Promise<void> | undefined, actionFailure: 0, actionFailureCode: '',
@@ -77,8 +78,8 @@ function fakeRelay() {
     return Response.json({ mailbox: 'INBOX', uidValidity: server.uidValidity, canSend: work,
       messages: work && (server.trashed || server.archived) ? [] : [{ uid: 12, subject: url, ...server.flags, labels: server.labels }] });
   });
-  const handlers = makeAttentionHandlers(engine, { touch: vi.fn() }, fetcher as unknown as typeof fetch, notify);
-  return { server, handlers, fetcher, notify };
+  const handlers = makeAttentionHandlers(engine, { touch }, fetcher as unknown as typeof fetch, notify);
+  return { server, handlers, fetcher, notify, touch };
 }
 
 const ownerId = 1;
@@ -260,6 +261,50 @@ describe('Attention cache', () => {
     expect(work(recovered)?.messages).toMatchObject([
       { uid: 12, flagged: true, seen: false, keywords: ['FollowUp'], labels: ['To do'] },
     ]);
+  });
+
+  it('queues a selection across IMAP accounts in request order with one offline wake-up', async () => {
+    const { server, handlers, notify, touch } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    server.online = false;
+    touch.mockClear();
+    notify.mockClear();
+    const homeMessage = { ...workMessage, accountId: 'home' };
+    const requests = [
+      { location: workMessage, action: { type: 'star', value: true } },
+      { location: homeMessage, action: { type: 'seen', value: false } },
+      { location: workMessage, action: { type: 'star', value: false } },
+    ];
+    const { mutationIds } = await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS]({ ownerId, requests });
+    const rows = await engine.all(`SELECT id, request_json FROM pending_mutations ORDER BY id`);
+    expect(mutationIds).toEqual(rows.map(({ id }) => id));
+    expect(rows.map(({ request_json }) => JSON.parse(String(request_json)))).toEqual(
+      requests.map((request) => ({ ...request, accountScoped: true })),
+    );
+    expect(notify).toHaveBeenCalledExactlyOnceWith(ownerId, mutationIds[0]);
+    expect(touch.mock.calls).toEqual([[TABLE_FAMILIES.ATTENTION], [TABLE_FAMILIES.MUTATIONS]]);
+    expect(server.attemptedPatches).toEqual([]);
+    expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts).toEqual([
+      expect.objectContaining({ relay_id: 'home', messages: [expect.objectContaining({ seen: false })] }),
+      expect.objectContaining({ relay_id: 'work', messages: [expect.objectContaining({ flagged: false })] }),
+    ]);
+  });
+
+  it('leaves every row untouched when a selected IMAP UID belongs to an old mailbox window', async () => {
+    const { handlers, notify, touch } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    touch.mockClear();
+    notify.mockClear();
+    const requests = [
+      { location: workMessage, action: { type: 'archive' } },
+      { location: { ...workMessage, accountId: 'home', uidValidity: '2' }, action: { type: 'archive' } },
+    ];
+    await expect(handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS]({ ownerId, requests })).rejects.toThrow('This mailbox changed');
+    expect(await engine.all('SELECT id FROM pending_mutations')).toEqual([]);
+    expect(notify).not.toHaveBeenCalled();
+    expect(touch).not.toHaveBeenCalled();
+    expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts.map(({ messages }) => messages.length))
+      .toEqual([1, 1]);
   });
 
   it('replays Gmail edits across mailbox aliases in order while another account is refreshing', async () => {

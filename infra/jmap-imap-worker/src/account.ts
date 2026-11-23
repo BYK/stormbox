@@ -1,7 +1,8 @@
 import { DurableObject } from 'cloudflare:workers';
 import { newAttentionNotifications } from './attention-notifications';
 import { mailAccounts, type Env } from './config';
-import { listMailboxWindows, listMessages, readMessagePreviews, type ImapMessage, type MailAccount } from './mail-transport';
+import { jmapKeywords, type KeywordError, type KeywordUpdate, type KeywordWriteOutcome } from './keywords';
+import { listMailboxWindows, listMessages, MailTransportError, patchMailboxKeywords, readMessagePreviews, type ImapKeywordResult, type ImapMessage, type MailAccount } from './mail-transport';
 import { getManagedAccount } from './managed-accounts';
 import { notifyArrival, pushAttentionStates } from './push';
 
@@ -201,16 +202,13 @@ function normalizeMessageId(value: string): string {
 function normalizeEnvelope(message: ImapMessage): MessageEnvelope {
   const addresses = (items: ImapMessage['from']): Address[] =>
     items.map(({ address, name }) => ({ email: address, name: name || null }));
-  const keywords: Record<string, true> = {};
-  if (message.seen) keywords.$seen = true;
-  if (message.flagged) keywords.$flagged = true;
   return {
     uid: message.uid, receivedAt: message.receivedAt, subject: message.subject,
     from: addresses(message.from), to: addresses(message.to), cc: addresses(message.cc),
     messageId: message.messageId ? [normalizeMessageId(message.messageId)] : [],
     inReplyTo: message.inReplyTo ? [normalizeMessageId(message.inReplyTo)] : [],
     references: message.references.map(normalizeMessageId),
-    keywords, size: message.size, hasAttachment: message.hasAttachments,
+    keywords: jmapKeywords(message), size: message.size, hasAttachment: message.hasAttachments,
   };
 }
 
@@ -225,6 +223,7 @@ function mailboxRole(path: string, specialUse: string | null): string | null {
 export class AccountState extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   private syncing?: Promise<AccountSnapshot>;
+  private settingKeywords?: Promise<KeywordWriteOutcome>;
   private delivering?: Promise<void>;
   private refreshedAt = 0;
   private forgotten = false;
@@ -295,6 +294,113 @@ export class AccountState extends DurableObject<Env> {
       SELECT m.*, b.path FROM gateway_messages m JOIN gateway_mailboxes b ON b.id = m.mailbox_id WHERE m.id = ?
     `, id).toArray()[0];
     return row ? messageFromRow(row) : null;
+  }
+
+  async setKeywords(account: MailAccount, updates: KeywordUpdate[], ifInState: string | null): Promise<KeywordWriteOutcome> {
+    if (this.ctx.id.name && account.id !== this.ctx.id.name) throw new Error('Account does not match this storage object.');
+    const previous = this.settingKeywords;
+    const sync = this.syncing;
+    const pending = Promise.allSettled([previous, sync]).then(() => this.writeKeywords(account, updates, ifInState));
+    this.settingKeywords = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.settingKeywords === pending) this.settingKeywords = undefined;
+    }
+  }
+
+  private async writeKeywords(account: MailAccount, updates: KeywordUpdate[], ifInState: string | null): Promise<KeywordWriteOutcome> {
+    if (this.forgotten) throw new Error('Account is disconnected.');
+    const oldState = String(this.getState('version'));
+    if (ifInState !== null && ifInState !== oldState) return null;
+    const groups = new Map<string, { message: StoredMessage; update: KeywordUpdate }[]>();
+    const outcomes: [string, KeywordError][] = [];
+    for (const update of updates) {
+      const message = this.message(update.id);
+      if (!message) {
+        outcomes.push([update.id, 'notFound']);
+        continue;
+      }
+      const group = groups.get(message.mailboxId) ?? [];
+      group.push({ message, update });
+      groups.set(message.mailboxId, group);
+    }
+
+    const confirmed: { id: string; result: ImapKeywordResult }[] = [];
+    let failure: 'serverPartialFail' | 'serverUnavailable' | undefined;
+    for (const group of groups.values()) {
+      if (this.forgotten) break;
+      const { path, uidValidity } = group[0].message;
+      try {
+        const results = await patchMailboxKeywords(account, path, uidValidity, group.map(({ message, update }) =>
+          ({ uid: message.uid, add: update.add, keyword: update.keyword })));
+        const idsByUid = new Map(group.map(({ message }) => [message.uid, message.id]));
+        for (const result of results) {
+          const id = idsByUid.get(result.uid)!;
+          confirmed.push({ id, result });
+          if (result.error) outcomes.push([id, result.error]);
+        }
+      } catch (error) {
+        this.refreshedAt = 0;
+        const code = error instanceof MailTransportError ? error.code : undefined;
+        if (code === 'mailbox_changed') {
+          for (const { message } of group) outcomes.push([message.id, 'notFound']);
+          continue;
+        }
+        failure = confirmed.length || code === 'keyword_write_unknown' ? 'serverPartialFail' : 'serverUnavailable';
+        break;
+      }
+    }
+    if (this.forgotten) return { error: confirmed.length || failure === 'serverPartialFail' ? 'serverPartialFail' : 'serverUnavailable' };
+    let newState: string;
+    try {
+      this.ctx.storage.transactionSync(() => this.saveConfirmedKeywords(confirmed));
+      newState = String(this.getState('version'));
+    } catch {
+      this.refreshedAt = 0;
+      return { error: confirmed.length || failure === 'serverPartialFail' ? 'serverPartialFail' : 'serverUnavailable' };
+    }
+    if (failure) return { error: failure };
+    return {
+      oldState, newState,
+      updated: confirmed.filter(({ result }) => !result.error).map(({ id }) => id),
+      notUpdated: Object.fromEntries(outcomes),
+    };
+  }
+
+  private saveConfirmedKeywords(confirmed: { id: string; result: ImapKeywordResult }[]): void {
+    if (!confirmed.length) return;
+    // An IMAP snapshot fetched before the STORE must not overwrite its confirmed flags.
+    this.setState('applied_generation', this.beginSync());
+    const changes: Change[] = [];
+    const mailboxDeltas = new Map<string, { total: number; unread: number }>();
+    for (const { id, result } of confirmed) {
+      const row = this.sql.exec<Row>('SELECT mailbox_id,envelope FROM gateway_messages WHERE id = ?', id).toArray()[0];
+      if (!row) continue;
+      const mailboxId = String(row.mailbox_id);
+      const delta = mailboxDeltas.get(mailboxId) ?? { total: 0, unread: 0 };
+      const previous = JSON.parse(String(row.envelope)) as MessageEnvelope;
+      if (result.keywords) {
+        const encoded = JSON.stringify(canonicalEnvelope({ ...previous, keywords: result.keywords }));
+        if (encoded === row.envelope) continue;
+        this.sql.exec('UPDATE gateway_messages SET envelope = ? WHERE id = ?', encoded, id);
+        changes.push({ type: 'email', kind: 'updated', id });
+        delta.unread += Number(Boolean(previous.keywords.$seen)) - Number(Boolean(result.keywords.$seen));
+      } else if (result.error === 'notFound') {
+        this.sql.exec('DELETE FROM gateway_messages WHERE id = ?', id);
+        changes.push({ type: 'email', kind: 'destroyed', id });
+        delta.total -= 1;
+        delta.unread -= Number(!previous.keywords.$seen);
+      }
+      mailboxDeltas.set(mailboxId, delta);
+    }
+    for (const [id, { total, unread }] of mailboxDeltas) {
+      if (!total && !unread) continue;
+      this.sql.exec(`UPDATE gateway_mailboxes SET total = MAX(0, total + ?),
+        unread = MIN(MAX(0, total + ?), MAX(0, unread + ?)) WHERE id = ?`, total, total, unread, id);
+      changes.push({ type: 'mailbox', kind: 'updated', id });
+    }
+    this.recordChanges(changes);
   }
 
   reconcile(snapshots: MailboxSnapshot[], options: ReconcileOptions = {}): AccountSnapshot {
@@ -551,6 +657,10 @@ export class AccountState extends DurableObject<Env> {
       await running.catch(() => {});
       return this.refresh(account, options);
     }
+    if (this.settingKeywords) {
+      await this.settingKeywords.catch(() => {});
+      return this.refresh(account, options);
+    }
     if (!options.force && Date.now() - this.refreshedAt < REFRESH_COOLDOWN) return this.snapshot();
     const generation = this.beginSync();
     this.syncing = this.refreshMailboxes(account, generation);
@@ -635,6 +745,7 @@ export class AccountState extends DurableObject<Env> {
       }
       const running = this.syncing;
       if (running) await running;
+      else if (this.settingKeywords) await this.settingKeywords.catch(() => {});
       else await this.pollInbox(account);
     } finally {
       // A disconnect can cancel polling while the refresh awaits IMAP.

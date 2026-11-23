@@ -86,6 +86,7 @@ function toggle() {
     <button
       type="button"
       class="folder-node__button"
+      :aria-current="current ? 'page' : undefined"
       @click="onPick(folder.id)"
     >
       <span class="folder-node__icon-wrap">

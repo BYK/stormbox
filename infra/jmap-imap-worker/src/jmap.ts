@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { AccountSnapshot, ChangePage, StoredMailbox, StoredMessage } from './account';
 import type { ImapMessageBody, MailAccount } from './mail-transport';
 import { HttpError, json, readJson } from './http';
+import { imapFlag, type KeywordUpdate, type KeywordWriteOutcome } from './keywords';
 
 const CORE = 'urn:ietf:params:jmap:core';
 const MAIL = 'urn:ietf:params:jmap:mail';
@@ -11,11 +12,14 @@ const MAX_BODY_FETCHES = 4;
 const PAGE_LIMIT = 5000;
 
 export interface JmapStore {
-  snapshot(account: MailAccount): Promise<AccountSnapshot>;
-  changes(account: MailAccount, type: 'email' | 'mailbox', since: string, max?: number): Promise<ChangePage | null>;
-  body(account: MailAccount, message: StoredMessage): Promise<ImapMessageBody>;
-  source(account: MailAccount, id: string): Promise<Uint8Array<ArrayBufferLike> | null>;
+  snapshot(account: JmapAccount): Promise<AccountSnapshot>;
+  changes(account: JmapAccount, type: 'email' | 'mailbox', since: string, max?: number): Promise<ChangePage | null>;
+  body(account: JmapAccount, message: StoredMessage): Promise<ImapMessageBody>;
+  source(account: JmapAccount, id: string): Promise<Uint8Array<ArrayBufferLike> | null>;
+  setKeywords?(account: JmapAccount, updates: KeywordUpdate[], ifInState: string | null): Promise<KeywordWriteOutcome>;
 }
+
+export type JmapAccount = Pick<MailAccount, 'id' | 'name' | 'email'>;
 
 type ObjectMap = Record<string, any>;
 type MethodResult = [string, ObjectMap, string];
@@ -148,7 +152,7 @@ function filterEmails(value: unknown, depth = 0): (row: StoredMessage) => boolea
         return (row) => !operand.includes(row.mailboxId);
       case 'hasKeyword': case 'notKeyword':
         if (typeof operand !== 'string') throw new MethodError('invalidArguments');
-        return (row) => Object.hasOwn(row.keywords, operand) === (key === 'hasKeyword');
+        return (row) => Object.hasOwn(row.keywords, operand.toLowerCase()) === (key === 'hasKeyword');
       case 'before': case 'after': {
         const threshold = typeof operand === 'string' ? Date.parse(operand) : NaN;
         if (!Number.isFinite(threshold)) throw new MethodError('invalidArguments');
@@ -214,9 +218,9 @@ function queryIds<T>(input: T[], args: ObjectMap, state: string, candidates: Rec
   };
 }
 
-export function session(origin: string, accounts: readonly MailAccount[]) {
+export function session(origin: string, accounts: readonly JmapAccount[], writable = false) {
   const accountMap = Object.fromEntries(accounts.map((account) => [account.id, {
-    name: account.name ?? account.email, isPersonal: true, isReadOnly: true,
+    name: account.name ?? account.email, isPersonal: true, isReadOnly: !writable,
     accountCapabilities: { [MAIL]: {
       maxMailboxesPerEmail: 1, maxMailboxDepth: null, maxSizeMailboxName: 255,
       maxSizeAttachmentsPerEmail: 0, emailQuerySortOptions: ['receivedAt', 'sentAt', 'size', 'subject'], mayCreateTopLevelMailbox: false,
@@ -226,18 +230,18 @@ export function session(origin: string, accounts: readonly MailAccount[]) {
     capabilities: {
       [CORE]: {
         maxSizeUpload: 0, maxConcurrentUpload: 0, maxSizeRequest: 131_072, maxConcurrentRequests: 4,
-        maxCallsInRequest: MAX_CALLS, maxObjectsInGet: MAX_OBJECTS, maxObjectsInSet: 0, collationAlgorithms: [],
+        maxCallsInRequest: MAX_CALLS, maxObjectsInGet: MAX_OBJECTS, maxObjectsInSet: writable ? MAX_OBJECTS : 0, collationAlgorithms: [],
       },
       [MAIL]: {},
     },
     accounts: accountMap, primaryAccounts: accounts.length ? { [MAIL]: accounts[0].id } : {}, username: accounts[0]?.email ?? '',
     apiUrl: `${origin}/jmap`, downloadUrl: `${origin}/jmap/download/{accountId}/{blobId}/{type}/{name}`,
     uploadUrl: `${origin}/jmap/upload/{accountId}`, eventSourceUrl: `${origin}/jmap/eventsource{?types,closeafter,ping}`,
-    state: createHash('sha256').update(JSON.stringify(accounts.map(({ id, name, email }) => [id, name, email]))).digest('base64url'),
+    state: createHash('sha256').update(JSON.stringify([writable, accounts.map(({ id, name, email }) => [id, name, email])])).digest('base64url'),
   };
 }
 
-export async function jmap(request: Request, accounts: readonly MailAccount[], store: JmapStore) {
+export async function jmap(request: Request, accounts: readonly JmapAccount[], store: JmapStore) {
   const payload = await readJson(request);
   if (!record(payload) || !strings(payload.using) || !Array.isArray(payload.methodCalls)) throw new HttpError(400, 'notRequest');
   if (!payload.using.every((capability) => capability === CORE || capability === MAIL)) throw new HttpError(400, 'unknownCapability');
@@ -251,6 +255,7 @@ export async function jmap(request: Request, accounts: readonly MailAccount[], s
     'Core/echo', 'Email/get', 'Email/query', 'Email/changes', 'Email/queryChanges',
     'Mailbox/get', 'Mailbox/query', 'Mailbox/changes', 'Mailbox/queryChanges', 'Thread/get',
   ]);
+  if (store.setKeywords) methods.add('Email/set');
   for (const [name, args, callId] of payload.methodCalls) {
     try {
       if (!methods.has(name)) throw new MethodError('unknownMethod');
@@ -268,17 +273,65 @@ export async function jmap(request: Request, accounts: readonly MailAccount[], s
         snapshots.set(account.id, pending);
       }
       const snapshot = await pending;
-      const output = await handleMethod(name, resolved, account, snapshot, store, bodyBudget);
-      methodResponses.push([name, output, callId]);
+      if (name === 'Email/set') {
+        try {
+          methodResponses.push([name, await emailSet(resolved, account, store), callId]);
+        } finally {
+          snapshots.delete(account.id);
+        }
+      } else {
+        methodResponses.push([name, await handleMethod(name, resolved, account, snapshot, store, bodyBudget), callId]);
+      }
     } catch (error) {
       methodResponses.push(['error', { type: error instanceof MethodError ? error.type : 'serverFail' }, callId]);
     }
   }
   const origin = new URL(request.url).origin;
-  return json({ methodResponses, sessionState: session(origin, accounts).state });
+  return json({ methodResponses, sessionState: session(origin, accounts, Boolean(store.setKeywords)).state });
 }
 
-async function handleMethod(name: string, args: ObjectMap, account: MailAccount, snapshot: AccountSnapshot,
+async function emailSet(args: ObjectMap, account: JmapAccount, store: JmapStore): Promise<ObjectMap> {
+  const { create = null, destroy = null, ifInState = null, update = null } = args;
+  if ((create !== null && !record(create)) || (update !== null && !record(update))
+    || (destroy !== null && !strings(destroy)) || (ifInState !== null && typeof ifInState !== 'string')) {
+    throw new MethodError('invalidArguments');
+  }
+  const creations = Object.keys(create ?? {});
+  const destructions = destroy ?? [];
+  const patches = Object.entries(update ?? {});
+  if (creations.length + destructions.length + patches.length > MAX_OBJECTS) throw new MethodError('requestTooLarge');
+  const updates: KeywordUpdate[] = [];
+  const invalid: [string, ObjectMap][] = [];
+  for (const [id, patch] of patches) {
+    // One keyword per Email keeps each object update a single atomic IMAP STORE (RFC 8620 §5.3).
+    if (!record(patch) || Object.keys(patch).length !== 1) {
+      invalid.push([id, { type: 'invalidPatch' }]);
+      continue;
+    }
+    const [path, value] = Object.entries(patch)[0];
+    const pointer = /^keywords\/((?:[^/~]|~[01])+)$/.exec(path)?.[1];
+    const keyword = pointer?.replace(/~1/g, '/').replace(/~0/g, '~').toLowerCase();
+    if (!keyword || !imapFlag(keyword) || (value !== true && value !== null)) {
+      invalid.push([id, { type: 'invalidProperties', properties: [path] }]);
+      continue;
+    }
+    updates.push({ id, keyword, add: value === true });
+  }
+  const result = await store.setKeywords!(account, updates, ifInState);
+  if (!result) throw new MethodError('stateMismatch');
+  if ('error' in result) throw new MethodError(result.error);
+  const rejected = [...invalid, ...Object.entries(result.notUpdated).map(([id, type]): [string, ObjectMap] => [id, { type }])];
+  return {
+    accountId: account.id, oldState: result.oldState, newState: result.newState,
+    created: null, destroyed: null,
+    updated: result.updated.length ? Object.fromEntries(result.updated.map((id) => [id, null])) : null,
+    notUpdated: rejected.length ? Object.fromEntries(rejected) : null,
+    notCreated: creations.length ? Object.fromEntries(creations.map((id) => [id, { type: 'forbidden' }])) : null,
+    notDestroyed: destructions.length ? Object.fromEntries(destructions.map((id: string) => [id, { type: 'forbidden' }])) : null,
+  };
+}
+
+async function handleMethod(name: string, args: ObjectMap, account: JmapAccount, snapshot: AccountSnapshot,
   store: JmapStore, bodyBudget: { left: number }): Promise<ObjectMap> {
   const { mailboxes, messages, state } = snapshot;
   const base = { accountId: account.id, state };

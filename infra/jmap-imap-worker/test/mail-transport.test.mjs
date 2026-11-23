@@ -10,6 +10,9 @@ const hooks = registerHooks({
         shortCircuit: true,
       };
     }
+    if (specifier === './keywords' && context.parentURL?.endsWith('/src/mail-transport.ts')) {
+      return nextResolve('./keywords.ts', context);
+    }
     return nextResolve(specifier, context);
   },
 });
@@ -74,7 +77,7 @@ const sample = [
 
 function makeImapSocket({
   mailboxSize = 1, trash = false, junk = false, archive = true, supportsMove = true, oauth = false, gmail = false,
-  keywordsAllowed = true, rejectLabelUpdate = false,
+  keywordsAllowed = true, rejectLabelUpdate = false, omitKeywordFetch = false,
 } = {}) {
   const calls = [];
   let connections = 0;
@@ -130,13 +133,15 @@ function makeImapSocket({
         write('* OK [UIDNEXT 45] fixture next UID\r\n');
         if (!keywordsAllowed) write('* OK [PERMANENTFLAGS (\\Seen \\Flagged)] fixture flags\r\n');
         ok(`OK [${command.startsWith('SELECT') ? 'READ-WRITE' : 'READ-ONLY'}] selected`);
-      } else if (/^UID STORE 44 ([+-])FLAGS/i.test(command)) {
-        const [, sign, values] = /^UID STORE 44 ([+-])FLAGS(?:\.SILENT)? \((.*)\)/i.exec(command);
-        for (const flag of values.split(' ')) {
-          if (sign === '+') flags.add(flag);
-          else flags.delete([...flags].find((value) => value.toLowerCase() === flag.toLowerCase()));
+      } else if (/^UID STORE [\d,:]+ ([+-])FLAGS/i.test(command)) {
+        const [, range, sign, values] = /^UID STORE ([\d,:]+) ([+-])FLAGS(?:\.SILENT)? \((.*)\)/i.exec(command);
+        if (range.split(',').includes('44')) {
+          for (const flag of values.split(' ')) {
+            if (sign === '+') flags.add(flag);
+            else flags.delete([...flags].find((value) => value.toLowerCase() === flag.toLowerCase()));
+          }
+          write(`* 1 FETCH (UID 44 FLAGS (${[...flags].join(' ')}))\r\n`);
         }
-        write(`* 1 FETCH (UID 44 FLAGS (${[...flags].join(' ')}))\r\n`);
         ok();
       } else if (/^CREATE /i.test(command)) {
         const label = command.slice('CREATE '.length);
@@ -163,8 +168,12 @@ function makeImapSocket({
         moved = true;
         write('* 1 EXPUNGE\r\n');
         ok('OK [COPYUID 8 44 45] moved');
+      } else if (/^UID SEARCH UID /i.test(command)) {
+        const includesUid = command.slice('UID SEARCH UID '.length).split(',').includes('44');
+        write(`* SEARCH${!moved && includesUid ? ' 44' : ''}\r\n`);
+        ok();
       } else if (/^(UID )?FETCH /i.test(command)) {
-        if (moved) return ok();
+        if (moved || (omitKeywordFetch && /^UID FETCH [\d,:]+ \(FLAGS UID\)$/i.test(command))) return ok();
         if (/BODY\.PEEK\[\]<0\./i.test(command)) {
           write(`* 1 FETCH (UID 44 BODY[]<0> {${encoder.encode(sample).byteLength}}\r\n${sample})\r\n`);
         } else {
@@ -204,6 +213,32 @@ test('lists and reads multiple IMAP windows over one TLS connection', async () =
   const body = await transport.readMessage(account, 'INBOX', '7', 44);
   assert.match(body.text, /Hi from IMAP!/);
   assert.equal(new TextDecoder().decode(await transport.readMessageSource(account, 'INBOX', '7', 44)), sample);
+});
+
+test('applies compatible JMAP keyword updates in a single batched UID STORE', async () => {
+  const fixture = makeImapSocket();
+  const transport = createMailTransport(fixture.connect);
+  const updates = [44, 50].map((uid) => ({ uid, keyword: '$flagged', add: true }));
+  const result = await transport.patchMailboxKeywords(account, 'INBOX', '7', updates);
+  assert.deepEqual(result, [
+    { uid: 44, keywords: { $seen: true, $flagged: true, 'localtriage-category-newsletter': true } },
+    { uid: 50, error: 'notFound' },
+  ]);
+  const stores = fixture.calls.filter((line) => / UID STORE /.test(line));
+  assert.equal(stores.length, 1);
+  assert.match(stores[0], /UID STORE 44,50 \+FLAGS(?:\.SILENT)? \(\\Flagged\)/);
+  assert.equal(fixture.connections(), 1);
+  await assert.rejects(transport.patchMailboxKeywords(account, 'INBOX', '8', updates), { code: 'mailbox_changed' });
+  assert.equal(fixture.calls.filter((line) => / UID STORE /.test(line)).length, 1);
+});
+
+test('keeps an incomplete post-STORE FETCH distinct from a verified absent UID', async () => {
+  const fixture = makeImapSocket({ omitKeywordFetch: true });
+  const transport = createMailTransport(fixture.connect);
+  await assert.rejects(transport.patchMailboxKeywords(account, 'INBOX', '7', [{ uid: 44, keyword: '$flagged', add: true }]),
+    { code: 'keyword_write_unknown' });
+  assert.equal(fixture.calls.filter((line) => / UID STORE /.test(line)).length, 1);
+  assert.equal(fixture.calls.filter((line) => / UID SEARCH UID 44$/.test(line)).length, 1);
 });
 
 test('reads notification previews with a bounded read-only FETCH', async () => {

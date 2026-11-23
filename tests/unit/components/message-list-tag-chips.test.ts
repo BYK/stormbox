@@ -84,21 +84,19 @@ afterEach(() => {
 });
 
 describe('MessageList tag view note', () => {
-  it('stays a collapsed grid row in a folder and spells out truncation and account scope in a tag view', async () => {
+  it('shows truncation and account scope inside the existing toolbar', async () => {
     const { wrapper, mailStore } = mountList([makeRow(1)]);
     await nextTick();
-    const note = wrapper.find('[data-tag-view-coverage]');
-    expect(note.exists()).toBe(true);
-    expect(note.classes()).toContain('is-idle');
-    expect(note.text()).toBe('');
+    const header = wrapper.get('.msg-list__header').element;
+    expect(wrapper.find('.msg-list__status').exists()).toBe(false);
 
     const workId = mailStore.tagViewIdFor('$label2');
     mailStore.currentFolderId = workId;
     mailStore.tagCounts = new Map([['$label2', 2500]]);
     mailStore.accounts = [{ id: 1 }, { id: 2 }] as any;
     await nextTick();
-    expect(note.classes()).not.toContain('is-idle');
-    expect(note.text()).toBe(
+    expect(wrapper.get('.msg-list__header').element).toBe(header);
+    expect(wrapper.get('.msg-list__header .msg-list__status-panel').text()).toBe(
       'Showing the newest 2,000 of 2,500 tagged messages. Shared folders are not included.',
     );
   });

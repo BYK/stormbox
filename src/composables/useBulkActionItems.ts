@@ -58,7 +58,7 @@ export interface BulkActionHandlers {
 }
 
 export interface UseBulkActionItemsInput {
-  folder: Ref<FolderRow | null | undefined>;
+  folder: Ref<Pick<FolderRow, 'role'> | null | undefined>;
   /** Whether "Not junk" applies (Junk folder of the primary account). */
   canWhitelist: Ref<boolean>;
   whitelisting: Ref<boolean>;

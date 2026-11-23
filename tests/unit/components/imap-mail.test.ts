@@ -6,12 +6,14 @@ import ImapMail from '../../../src/components/ImapMail.vue';
 import { __resetRepositoryForTests, __setRepositoryForTests } from '../../../src/composables/useRepository';
 import type { CachedImapAccount } from '../../../src/db/attention';
 import { useAuthStore } from '../../../src/stores/auth-store';
+import { useMailStore } from '../../../src/stores/mail-store';
 
 vi.mock('../../../src/services/auth', () => ({ initOidc: async () => null, getOidc: () => null }));
 
 beforeEach(() => {
   __resetRepositoryForTests();
   localStorage.clear();
+  window.history.replaceState(null, '', '/');
 });
 
 it('shows a failed Google account in Mail and makes its messages available after refresh', async () => {
@@ -21,7 +23,8 @@ it('shows a failed Google account in Mail and makes its messages available after
   };
   const body = vi.fn(async () => ({ text: 'Work message body.', html: '' }));
   const refresh = vi.fn(async () => []);
-  const star = vi.fn(async () => {});
+  const mutate = vi.fn(async () => {});
+  const batch = vi.fn(async () => ({ mutationIds: [1, 2] }));
   const target = document.createElement('div');
   document.body.append(target);
   __setRepositoryForTests({
@@ -30,35 +33,64 @@ it('shows a failed Google account in Mail and makes its messages available after
     refreshAttentionRelay: refresh,
     refreshImapFolders: async () => {},
     readAttentionImapMessage: body,
-    mutateAttentionImapMessage: star,
+    mutateAttentionImapMessage: mutate,
+    mutateAttentionImapMessages: batch,
   });
-  const wrapper = mount(ImapMail, { props: { ownerId: 1, search: '', folderTarget: target }, global: { plugins: [createPinia()] } });
+  const wrapper = mount(ImapMail, { attachTo: document.body, props: { ownerId: 1, search: '', folderTarget: target }, global: { plugins: [createPinia()] } });
   try {
     await flushPromises();
-    expect(target.querySelector('summary')?.textContent).toContain('work@example.org');
-    target.querySelector<HTMLButtonElement>('details .folder-node__button')!.click();
+    const accountToggle = target.querySelector<HTMLButtonElement>('.mail-account-label');
+    expect(accountToggle?.textContent).toContain('work@example.org');
+    expect(accountToggle?.getAttribute('aria-expanded')).toBe('false');
+    accountToggle!.click();
     await flushPromises();
-    expect(wrapper.get('[role="status"]').text()).toContain('Reconnect this Google account');
+    expect(accountToggle?.getAttribute('aria-expanded')).toBe('true');
+    target.querySelector<HTMLButtonElement>('.imap-nav__account .folder-node__button')!.click();
+    await flushPromises();
+    const header = wrapper.get('.msg-list__header').element;
+    const scroller = wrapper.get('.msg-list__scroller').element;
+    expect(wrapper.get('.msg-list__header [role="status"]').text()).toContain('Reconnect this Google account');
+
+    const message = { uid: 12, subject: 'Work update', receivedAt: '2026-11-23T09:00:00Z', seen: false,
+      flagged: false, from: [{ name: 'Sender', address: 'sender@example.org' }], to: [], gmailLabels: true, labels: ['Project'] };
 
     Object.assign(account, {
       mailbox: 'INBOX', uid_validity: '7', last_synced_at: Date.now(), sync_error: null,
-      messages: [{ uid: 12, subject: 'Work update', receivedAt: '2026-11-23T09:00:00Z', seen: false,
-        flagged: false, from: [{ name: 'Sender', address: 'sender@example.org' }], to: [] }],
+      messages: [message, { ...message, uid: 13, subject: 'Other mail' }],
     });
-    await wrapper.get('button[aria-label="Refresh folder"]').trigger('click');
+    await wrapper.get('button[aria-label="Refresh"]').trigger('click');
     await flushPromises();
-    expect(wrapper.get('[role="status"]').text()).toContain('Last synced');
+    expect(wrapper.get('.msg-list__header [role="status"]').text()).toContain('Last synced');
+    expect(wrapper.get('.msg-list__header').element).toBe(header);
+    expect(wrapper.get('.msg-list__scroller').element).toBe(scroller);
+    expect(wrapper.find('.attention-row-menu').exists()).toBe(false);
+    expect(wrapper.findAll('.msg-list__check input')).toHaveLength(2);
+    expect(wrapper.findAll('.msg-list__state .msg-list__unread-dot')).toHaveLength(2);
+
+    await wrapper.get('.msg-list__select-all input').trigger('change');
+    await wrapper.get('[data-bulk-action="mark-read"]').trigger('click');
+    expect(batch).toHaveBeenCalledWith(1, [12, 13].map((uid) => ({
+      location: { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid }, action: { type: 'seen', value: true },
+    })));
     await wrapper.setProps({ search: 'absent subject' });
     expect(wrapper.text()).toContain('No matches in downloaded messages.');
     await wrapper.setProps({ search: 'work update' });
-    await wrapper.get('summary[aria-label="Message actions"]').trigger('click');
     expect(body).not.toHaveBeenCalled();
-    await wrapper.get('.app-dropdown__item[aria-label="Star"]').trigger('click');
-    expect(star).toHaveBeenCalledWith(1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 12 },
-      { type: 'star', value: true });
+    const location = { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 12 };
+    await wrapper.get('.msg-list__actions button[aria-label="Star"]').trigger('click');
+    await flushPromises();
+    expect(mutate).toHaveBeenCalledWith(1, location, { type: 'star', value: true });
+    await wrapper.get('.msg-list__actions button[aria-label="Tags: Project"]').trigger('click');
+    await flushPromises();
+    const label = document.querySelector<HTMLButtonElement>('button[data-tag-keyword="gmail label:Project"]')!;
+    expect(label.getAttribute('aria-checked')).toBe('true');
+    label.click();
+    expect(mutate).toHaveBeenCalledWith(1, location, { type: 'tags', tags: { removeLabels: ['Project'] } });
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     await wrapper.get('button[aria-label^="Open message: Work update"]').trigger('click');
     await flushPromises();
     expect(wrapper.text()).toContain('Work message body.');
+    expect(mutate).toHaveBeenCalledWith(1, location, { type: 'seen', value: true });
   } finally {
     wrapper.unmount();
     target.remove();
@@ -86,6 +118,7 @@ it('restores the Unified Inbox from saved mail and expands a conversation across
   const pendingSync = new Promise<[]>((resolve) => { finishSync = resolve; });
   const refresh = vi.fn(() => pendingSync);
   const refreshJmap = vi.fn(async () => {});
+  const mutateImap = vi.fn(async () => {});
   const target = document.createElement('div');
   document.body.append(target);
   localStorage.setItem('stormbox:mail-view:1', '{"kind":"unified"}');
@@ -94,12 +127,14 @@ it('restores the Unified Inbox from saved mail and expands a conversation across
     getAttentionCache: async () => ({ paired: true, accounts: [account], states: {} }),
     refreshAttentionRelay: refresh,
     readAttentionImapMessage: body,
+    mutateAttentionImapMessage: mutateImap,
     folderByRole: async () => primaryInbox,
     listMessagesForView: async () => [reply],
     ensureFolderWindow: refreshJmap,
   });
   const pinia = createPinia();
   const auth = useAuthStore(pinia);
+  const destroyJmap = vi.spyOn(useMailStore(pinia), 'destroyMessages');
   auth.isOfflineSession = true;
   const wrapper = mount(ImapMail, { props: { ownerId: 1, search: '', folderTarget: target }, global: { plugins: [pinia] } });
   try {
@@ -111,12 +146,20 @@ it('restores the Unified Inbox from saved mail and expands a conversation across
     expect(wrapper.find('button[aria-label^="Open message: Re: Planning"]').exists()).toBe(true);
     await wrapper.get('button[aria-label="Show 1 earlier messages"]').trigger('click');
     expect(wrapper.findAll('ul li')).toHaveLength(2);
+    await wrapper.get('button[aria-label^="Open message: Re: Planning"]').trigger('click', { ctrlKey: true });
+    expect(wrapper.get('.msg-list__header').text()).toContain('1 selected');
+    expect(body).not.toHaveBeenCalled();
     await wrapper.get('button[aria-label^="Open message: Planning"]').trigger('click');
     await flushPromises();
     expect(body).toHaveBeenCalledWith(1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 41 }, true);
     expect(wrapper.text()).toContain('Saved IMAP message body.');
-    await wrapper.get('button[aria-pressed="false"]').trigger('click');
-    expect(wrapper.findAll('ul li')).toHaveLength(2);
+    await wrapper.get('button[aria-label="Unread"]').trigger('click');
+    expect(wrapper.findAll('ul li')).toHaveLength(1);
+    expect(wrapper.find('button[aria-label^="Open message: Re: Planning"]').exists()).toBe(false);
+    await wrapper.get('.msg-list__select-all input').trigger('change');
+    await wrapper.get('[data-bulk-action="delete"]').trigger('click');
+    expect(mutateImap).toHaveBeenLastCalledWith(1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 41 }, { type: 'trash' });
+    expect(destroyJmap).not.toHaveBeenCalled();
     auth.isOfflineSession = false;
     await flushPromises();
     expect(refreshJmap).toHaveBeenCalledWith(1, primaryInbox.id, expect.objectContaining({ offset: 0 }));

@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import { Settings2 } from '@lucide/vue';
 
 import { useMailStore } from '../stores/mail-store';
 import { useMessageDragDrop } from '../composables/useMessageDragDrop';
@@ -8,6 +7,7 @@ import { useMessageTags } from '../composables/useMessageTags';
 import { requestTagManager } from '../composables/useTagManagerRequest';
 import FolderNode from './FolderNode.vue';
 import FolderManagerDialog from './FolderManagerDialog.vue';
+import FolderTreeHeading from './FolderTreeHeading.vue';
 import TagViewNode from './TagViewNode.vue';
 import {
   folderBadgeCount,
@@ -267,6 +267,8 @@ function manageTags() {
 
 <template>
   <nav class="folder-tree" aria-label="Mailboxes">
+    <slot name="unified-inbox" />
+    <slot name="primary-account" />
     <FolderNode
       v-for="folder in mainFolders"
       :key="folder.id"
@@ -286,21 +288,8 @@ function manageTags() {
       The heading row always renders (even with no user folders) so the
       manage button stays reachable without scrolling past the tree.
     -->
-    <div class="folder-tree__heading-row">
-      <h3 class="folder-tree__heading">Folders</h3>
-      <span class="folder-tree__heading-actions">
-        <button
-          type="button"
-          class="folder-tree__manage"
-          data-manage-folders
-          title="Manage Folders"
-          aria-label="Manage Folders"
-          @click="showSubscriptionsDialog = true"
-        >
-          <Settings2 :size="16" :stroke-width="1.75" aria-hidden="true" />
-        </button>
-      </span>
-    </div>
+    <FolderTreeHeading label="Folders" action-label="Manage Folders" :action-attrs="{ 'data-manage-folders': '' }"
+      @manage="showSubscriptionsDialog = true" />
     <!-- Starred folders lead the section; the gold star at the left
          edge of each row marks the group, no labeled divider needed. -->
     <template v-if="starredUserFolders.length > 0">
@@ -336,21 +325,8 @@ function manageTags() {
       :on-folder-drop="onFolderDrop"
     />
 
-    <div class="folder-tree__heading-row" data-tag-views>
-      <h3 class="folder-tree__heading">Tags</h3>
-      <span class="folder-tree__heading-actions">
-        <button
-          type="button"
-          class="folder-tree__manage"
-          data-manage-tags
-          title="Manage Tags"
-          aria-label="Manage Tags"
-          @click="manageTags"
-        >
-          <Settings2 :size="16" :stroke-width="1.75" aria-hidden="true" />
-        </button>
-      </span>
-    </div>
+    <FolderTreeHeading data-tag-views label="Tags" action-label="Manage Tags" :action-attrs="{ 'data-manage-tags': '' }"
+      @manage="manageTags" />
     <TagViewNode
       v-for="row in tagRows"
       :key="row.keyword"
@@ -406,51 +382,15 @@ function manageTags() {
   gap: 1px;
   min-height: 0;
 }
-.folder-tree__heading-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin: 14px 10px 4px;
-}
 .folder-tree__heading {
   margin: 14px 10px 4px;
   font-size: 12px;
   font-weight: 600;
   color: var(--muted);
 }
-.folder-tree__heading-row .folder-tree__heading {
-  margin: 0;
-}
-.folder-tree__heading-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  /* Pull the buttons toward the sidebar edge so the icons align with
-     the tree's right rail without inflating the heading row height. */
-  margin: -4px -6px -4px 0;
-}
 .folder-tree__heading--shared {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.folder-tree__manage {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-}
-.folder-tree__manage:hover,
-.folder-tree__manage:focus-visible {
-  background: var(--rowHover);
-  color: var(--text);
-  outline: none;
 }
 </style>

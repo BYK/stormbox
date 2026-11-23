@@ -2,9 +2,7 @@
 import {
   computed, nextTick, onBeforeUnmount, onMounted, ref, watch,
 } from 'vue';
-import {
-  Circle, Plus, RefreshCw, Star, X,
-} from '@lucide/vue';
+import { Layers, RefreshCw } from '@lucide/vue';
 
 import { useMailStore } from '../stores/mail-store';
 import { useBulkActionItems } from '../composables/useBulkActionItems';
@@ -14,7 +12,6 @@ import {
   useMessageDropTarget,
 } from '../composables/useMessageDragDrop';
 import { useMessageListFilters } from '../composables/useMessageListFilters';
-import { useMessageListHeader } from '../composables/useMessageListHeader';
 import { useMessageListViewport } from '../composables/useMessageListViewport';
 import { useMessageTags } from '../composables/useMessageTags';
 import { provideSenderAvatars } from '../composables/useSenderAvatars';
@@ -27,11 +24,9 @@ import { folderShowsRecipients } from '../utils/message-row-presentation';
 import { isScheduledMessage } from '../utils/scheduled-message';
 import type { CachedRow } from '../stores/mail-store-types';
 import type { FolderRow } from '../types';
-import MessageBulkActions from './MessageBulkActions.vue';
 import MessageListHeaderTitle from './MessageListHeaderTitle.vue';
-import MessageListMoreMenu from './MessageListMoreMenu.vue';
 import MessageListRow from './MessageListRow.vue';
-import SelectableListHeader from './SelectableListHeader.vue';
+import MessageListToolbar from './MessageListToolbar.vue';
 import TagPickerDropdown from './TagPickerDropdown.vue';
 import TagPickerPopover, { type PopoverAnchor } from './TagPickerPopover.vue';
 
@@ -477,9 +472,8 @@ const tagViewCoverage = computed(() => (
   isTagView.value ? mailStore.tagViewCoverage : null
 ));
 /**
- * The note under a tag view's header: which of the account's mail it can
- * show. Empty (and the row collapsed) when the view is complete and no
- * caveat applies.
+ * Explain which of the account's mail a tag view can show when the index
+ * is incomplete or has a narrower scope than the account list.
  */
 const tagViewNote = computed(() => {
   if (!isTagView.value) return '';
@@ -498,7 +492,7 @@ const tagViewNote = computed(() => {
   }
   return parts.join(' ');
 });
-const showsTagViewCoverage = computed(() => tagViewNote.value.length > 0);
+const headerStatus = computed(() => tagViewNote.value ? [tagViewNote.value] : []);
 
 const allLoadedSelected = computed(() => {
   const loadedIds = [];
@@ -843,68 +837,27 @@ function refresh() {
   void mailStore.refresh(folderId.value);
 }
 
-const {
-  tier: headerTier,
-  showsCount: headerShowsCount,
-  filterLabels: headerFilterLabels,
-  showsInlineControls,
-  showsMoreMenu,
-  moreMenuGroups,
-  bulkActions,
-  addColumnTitle,
-  removeColumnTitle,
-} = useMessageListHeader({
-  listWidth,
-  hasSelection,
-  folderId,
-  folderName,
-  isLoading,
-  primary: computed(() => props.primary),
-  canAddColumn: computed(() => props.canAddColumn),
-  columnIndex: computed(() => props.columnIndex),
-  bulkActionItems,
-  refresh,
-  addColumn: () => emit('add-column'),
-  removeColumn: () => emit('remove-column'),
-  canOpenThreads: computed(() => props.enableThreadedView && folder.value != null
-    && folder.value.id > 0 && folder.value.account_id > 0),
-  openThreads: () => { if (folder.value) emit('show-threads', folder.value); },
+const viewActions = computed(() => {
+  const current = folder.value;
+  if (!props.enableThreadedView || !current || current.role === 'scheduled' || current.id <= 0 || current.account_id <= 0) return [];
+  return [{
+    id: 'threads',
+    label: 'Threaded view',
+    icon: Layers,
+    run: () => emit('show-threads', current),
+  }];
 });
 
 const titleEl = ref<InstanceType<typeof MessageListHeaderTitle> | null>(null);
-const moreMenuEl = ref<InstanceType<typeof MessageListMoreMenu> | null>(null);
-const addColumnEl = ref<HTMLButtonElement | null>(null);
-const removeColumnEl = ref<HTMLButtonElement | null>(null);
+const toolbar = ref<InstanceType<typeof MessageListToolbar> | null>(null);
 
-/** Focus the folder dropdown trigger (a newly added column starts here). */
 function focusFolderPicker() {
   titleEl.value?.focusTrigger();
 }
 
-/**
- * Focus the column's own control: "+" on the primary column, "×" on
- * the others, or the More menu that holds it in a narrow column.
- */
 function focusColumnControl() {
-  const inline = props.primary ? addColumnEl.value : removeColumnEl.value;
-  if (inline) {
-    inline.focus();
-    return;
-  }
-  moreMenuEl.value?.focusTrigger();
+  toolbar.value?.focusColumnControl();
 }
-
-// A width change can dissolve the More menu (its controls return to the
-// row) while its trigger or one of its items has focus, e.g. the column
-// that grows into a removed neighbour's space; the focus follows the
-// control into the row.
-watch(showsMoreMenu, (shows, showed) => {
-  if (!showed || shows) return;
-  const active = document.activeElement;
-  const menu = msgListEl.value?.querySelector('.msg-list__more');
-  if (!menu || !active || !menu.contains(active)) return;
-  void nextTick(() => focusColumnControl());
-});
 
 // Keyboard focus survives a row removal: when the focused element left
 // the DOM with its row (Delete, Archive, a move), focus goes to the list
@@ -950,142 +903,56 @@ defineExpose({ focusColumnControl, focusFolderPicker });
     @dragleave="onColumnDragLeave"
     @drop="onColumnDrop"
   >
-    <SelectableListHeader
-      class="msg-list__header"
-      :data-header-tier="headerTier"
-      :all-selected="allLoadedSelected"
-      clear-class="msg-list__bulk-action msg-list__bulk-action--ghost"
-      count-class="msg-list__count"
-      :disabled="folderId == null"
-      item-label="messages"
-      select-all-class="msg-list__select-all"
-      selection-actions-class="msg-list__bulk-actions"
-      singular-item-label="message"
-      :selected-count="selectionCount"
-      :show-total-count="headerShowsCount"
+    <MessageListToolbar
+      ref="toolbar"
+      :list-width="listWidth"
+      :folder-id="folderId"
+      :folder-name="folderName"
       :total-count="rowCount"
+      :all-selected="allLoadedSelected"
+      :selected-count="selectionCount"
+      :unread-only="unreadOnly"
+      :starred-only="flaggedOnly"
+      :is-loading="isLoading"
+      :status="headerStatus"
+      column-controls
+      :column-index="columnIndex"
+      :primary="primary"
+      :can-add-column="canAddColumn"
+      :bulk-action-items="bulkActionItems"
+      :view-actions="viewActions"
       @clear-selection="selectNone"
       @toggle-all="toggleSelectAll"
+      @toggle-unread="toggleUnreadFilter"
+      @toggle-starred="toggleFlaggedFilter"
+      @refresh="refresh"
+      @add-column="emit('add-column')"
+      @remove-column="emit('remove-column')"
     >
-      <template #selection-actions>
-        <MessageBulkActions :items="bulkActions.inline">
-          <template #tag="{ item }">
-            <TagPickerDropdown
-              :targets="selectedRows"
-              :definitions="tagDefinitions"
-              :label="item.ariaLabel"
-              :title="item.title"
-              trigger-class="msg-list__bulk-action msg-list__bulk-action--tag"
-              @toggle="(keyword, on) => applyTagToggle([...selectedIds], keyword, on)"
-              @clear="clearTagsOn([...selectedIds], selectedRows)"
-              @manage="manageTags"
-            />
-          </template>
-        </MessageBulkActions>
-      </template>
-      <template #normal-actions>
+      <template v-if="showsTitle" #title="{ compact }">
         <MessageListHeaderTitle
-          v-if="showsTitle"
           ref="titleEl"
           :primary="primary"
           :folder="folder"
           :folder-id="folderId"
           :column-index="columnIndex"
-          :compact="!headerFilterLabels"
+          :compact="compact"
           @pick="emit('change-folder', $event)"
         />
-        <div
-          v-if="folderId != null"
-          class="msg-list__filters"
-          :class="{
-            'msg-list__filters--icons': !headerFilterLabels,
-            'msg-list__filters--lead': !showsTitle,
-          }"
-          role="group"
-          aria-label="Message filters"
-        >
-          <button
-            class="msg-list__filter"
-            :class="{ 'is-active': unreadOnly }"
-            type="button"
-            :aria-pressed="unreadOnly"
-            aria-label="Unread"
-            title="Unread"
-            @click="toggleUnreadFilter"
-          >
-            <Circle v-if="!headerFilterLabels" :size="10" :stroke-width="2" fill="currentColor" aria-hidden="true" />
-            <template v-else>Unread</template>
-          </button>
-          <button
-            class="msg-list__filter msg-list__filter--starred"
-            :class="{ 'is-active': flaggedOnly }"
-            type="button"
-            :aria-pressed="flaggedOnly"
-            aria-label="Starred"
-            title="Starred"
-            @click="toggleFlaggedFilter"
-          >
-            <Star v-if="!headerFilterLabels" :size="16" :stroke-width="1.75" aria-hidden="true" />
-            <template v-else>Starred</template>
-          </button>
-        </div>
       </template>
-      <template #trailing>
-        <template v-if="showsInlineControls">
-          <button
-            v-if="folderId != null"
-            class="msg-list__refresh"
-            type="button"
-            :aria-label="isLoading ? 'Refreshing' : 'Refresh'"
-            :title="isLoading ? 'Refreshing…' : 'Refresh'"
-            @click="refresh"
-          >
-            <RefreshCw :size="16" :stroke-width="1.75" aria-hidden="true" :class="{ 'is-spinning': isLoading }" />
-          </button>
-          <button
-            v-if="primary"
-            ref="addColumnEl"
-            class="msg-list__column-control msg-list__add-column"
-            type="button"
-            :disabled="!canAddColumn"
-            :title="addColumnTitle"
-            :aria-label="addColumnTitle"
-            @click="emit('add-column')"
-          >
-            <Plus :size="18" :stroke-width="1.75" aria-hidden="true" />
-          </button>
-          <button
-            v-else
-            ref="removeColumnEl"
-            class="msg-list__column-control msg-list__remove-column"
-            type="button"
-            title="Remove column"
-            :aria-label="removeColumnTitle"
-            @click="emit('remove-column')"
-          >
-            <X :size="18" :stroke-width="1.75" aria-hidden="true" />
-          </button>
-        </template>
-        <MessageListMoreMenu
-          v-if="showsMoreMenu"
-          ref="moreMenuEl"
-          :groups="moreMenuGroups"
-          :label="`More actions for column ${columnIndex}`"
+      <template #tag="{ item }">
+        <TagPickerDropdown
+          :targets="selectedRows"
+          :definitions="tagDefinitions"
+          :label="item.ariaLabel"
+          :title="item.title"
+          trigger-class="msg-list__bulk-action msg-list__bulk-action--tag"
+          @toggle="(keyword, on) => applyTagToggle([...selectedIds], keyword, on)"
+          @clear="clearTagsOn([...selectedIds], selectedRows)"
+          @manage="manageTags"
         />
       </template>
-    </SelectableListHeader>
-
-    <!-- Always a grid item (collapsed, not display:none, when idle) so the
-         scroller keeps the stretching third row. -->
-    <p
-      class="msg-list__coverage"
-      :class="{ 'is-idle': !showsTagViewCoverage }"
-      role="status"
-      :aria-hidden="!showsTagViewCoverage"
-      data-tag-view-coverage
-    >
-      <template v-if="showsTagViewCoverage">{{ tagViewNote }}</template>
-    </p>
+    </MessageListToolbar>
 
     <span :id="`${gridId}-instructions`" hidden>
       Use Up and Down arrows to navigate messages, Space to select, and Enter to toggle the message preview.
@@ -1216,7 +1083,7 @@ defineExpose({ focusColumnControl, focusFolderPicker });
   /* The header's nowrap row must never size the column: the track is
      the column's width and the header shrinks into it. */
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   border-right: 1px solid var(--border);
   background: var(--panel);
   min-width: 0;
@@ -1234,88 +1101,6 @@ defineExpose({ focusColumnControl, focusFolderPicker });
 }
 .msg-list.is-drop-invalid {
   box-shadow: inset 0 0 0 2px color-mix(in srgb, #d93025 55%, transparent);
-}
-/* One row at every width: the title at the start is the only flexible
-   item, so the controls after it keep their place; what has no room
-   moves into the More menu (see the tier constants in the script). */
-.msg-list__header {
-  min-width: 0;
-  flex-wrap: nowrap;
-}
-.msg-list__header :deep(.selectable-list-header__normal-actions) {
-  gap: 10px;
-}
-.msg-list__column-control {
-  display: inline-grid;
-  flex: 0 0 auto;
-  place-items: center;
-  width: 32px;
-  height: 32px;
-  padding: 0;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-}
-.msg-list__column-control:hover,
-.msg-list__column-control:focus-visible {
-  background: var(--control-hover-bg);
-  color: var(--text);
-}
-.msg-list__column-control:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-.msg-list__column-control:disabled {
-  cursor: default;
-  opacity: 0.45;
-}
-.msg-list__column-control:disabled:hover {
-  background: transparent;
-  color: var(--muted);
-}
-.msg-list__filters {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-/* Without a title the filters take the row's spare width, keeping the
-   count and the corner controls at the end. */
-.msg-list__filters--lead {
-  flex: 1 1 0;
-  min-width: 0;
-}
-.msg-list__filters--icons .msg-list__filter {
-  display: inline-grid;
-  place-items: center;
-  width: 34px;
-  padding: 0;
-}
-.msg-list__refresh:disabled {
-  cursor: default;
-  opacity: 0.5;
-}
-.msg-list__refresh {
-  background: transparent;
-  border: 0;
-  color: var(--muted);
-  width: 34px;
-  height: 34px;
-  display: grid;
-  place-items: center;
-  border-radius: 8px;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-.msg-list__refresh:hover:where(:not(:disabled)) {
-  background: var(--control-hover-bg);
-  color: var(--text);
-}
-.msg-list__refresh:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
 }
 .is-spinning {
   animation: msg-spin 1.2s linear infinite;
@@ -1388,19 +1173,6 @@ defineExpose({ focusColumnControl, focusFolderPicker });
   to { background-position: -200% 0; }
 }
 
-.msg-list__coverage {
-  margin: 0;
-  padding: 6px 14px;
-  border-bottom: 1px solid var(--border-soft);
-  font-size: 12px;
-  color: var(--muted);
-}
-.msg-list__coverage.is-idle {
-  height: 0;
-  padding: 0;
-  border: 0;
-  overflow: hidden;
-}
 .msg-list__placeholder {
   margin: 0;
   padding: 32px 24px;

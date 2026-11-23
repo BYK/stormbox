@@ -46,8 +46,9 @@ import {
 } from '../utils/message-html';
 import { adaptHtmlForDarkMode } from '../utils/dark-email';
 import { formatAddressList } from '../utils/address-parse';
-import { titleWithShortcut, type ShortcutAction } from '../constants/shortcuts';
+import { resolveShortcut, titleWithShortcut, type ShortcutAction } from '../constants/shortcuts';
 import { gmailLabelTags, imapTagPatch } from '../utils/imap-message-tags';
+import { isComposingKeyEvent, isEditableTarget } from '../utils/keyboard';
 import { plaintextToHtml } from '../utils/plaintext-html';
 import { printMessage } from '../utils/message-print';
 import { shortFrom } from '../utils/sender-avatar';
@@ -162,17 +163,29 @@ const authStore = useAuthStore();
 const composeStore = useComposeStore();
 const settingsStore = useSettingsStore();
 const shortcutScheme = computed(() => settingsStore.get('shortcutScheme'));
+const hasReaderShortcuts = computed(() => props.backLabel != null || props.imap != null);
 /** Toolbar title with the key the active scheme binds, e.g. `Reply (R)`. */
 function actionTitle(label: string, action: ShortcutAction): string {
-  return props.maximized || props.imap ? label : titleWithShortcut(label, action, shortcutScheme.value);
+  return props.maximized && !hasReaderShortcuts.value ? label : titleWithShortcut(label, action, shortcutScheme.value);
 }
 
 function onReadingKeyDown(event: KeyboardEvent) {
-  if (!props.maximized || event.key !== 'Escape' || event.defaultPrevented
+  if (event.defaultPrevented || isComposingKeyEvent(event) || isEditableTarget(event.target)
     || composeStore.isExpanded || tagMenuAnchor.value
     || messageViewEl.value?.querySelector('[role="dialog"], details[open]')) return;
+  if (props.maximized && event.key === 'Escape') {
+    event.preventDefault();
+    void toggleMaximized();
+    return;
+  }
+  // A reader with its own Back action belongs to a view whose list
+  // cannot safely dispatch message shortcuts through the primary column.
+  if (!hasReaderShortcuts.value || !viewMessage.value || isPendingScheduled.value) return;
+  const action = resolveShortcut(event, shortcutScheme.value)?.action;
+  const handler = readerShortcut(action);
+  if (!handler) return;
   event.preventDefault();
-  void toggleMaximized();
+  void handler();
 }
 
 const htmlShellRef = ref(null);
@@ -274,13 +287,18 @@ const messageTags = computed(() => [
   ...keywordTags.value,
   ...gmailTags.value.filter((tag) => tag.applied),
 ]);
-const seenLabel = computed(() => props.imap?.seen ? 'Mark as unread' : 'Mark as read');
+const seen = computed(() => props.imap?.seen ?? Number(message.value?.is_seen) === 1);
+const flagged = computed(() => props.imap?.flagged ?? Number(message.value?.is_flagged) === 1);
+const seenLabel = computed(() => seen.value ? 'Mark as unread' : 'Mark as read');
+const starLabel = computed(() => flagged.value ? 'Unstar' : 'Star');
 const messageTagTargets = computed(() => (viewMessage.value ? [viewMessage.value] : []));
 const canTagMessage = computed(() => !!props.imap || (message.value != null && !isScheduledMessage(message.value)));
 const pickerDefinitions = computed(() => props.imap?.gmailLabels
   ? tagDefinitions.value.filter((definition) => keywordTags.value.some(({ keyword }) => keyword === definition.keyword))
   : tagDefinitions.value);
-const imapCanRespond = computed(() => props.imap?.canSend && bodyLoaded.value && !props.imap.bodyError);
+const actionsDisabled = computed(() => props.imap?.disabled ?? false);
+const canRespond = computed(() => !props.imap || (props.imap.canSend && bodyLoaded.value && !props.imap.bodyError));
+const canDelete = computed(() => props.imap?.canTrash !== false);
 
 // The toolbar's tag stack opens the menu as a popover: the header sits in
 // an overflow-hidden article, which would clip an inline dropdown.
@@ -795,11 +813,25 @@ async function archive() {
   }
 }
 
+async function toggleStar() {
+  if (props.imap) return emit('imapAction', { type: 'star', value: !flagged.value });
+  const row = message.value;
+  if (row) await mailStore.markManyFlagged([row.id], !flagged.value, { ...messageSource.value, rows: [row] });
+}
+
+async function toggleSeen() {
+  if (props.imap) return emit('imapAction', { type: 'seen', value: !seen.value });
+  const row = message.value;
+  if (row) await mailStore.markManySeen([row.id], !seen.value, { ...messageSource.value, rows: [row] });
+}
+
 // Whitelisting only makes sense for messages currently in the Junk
 // folder; the toolbar button is gated on this. Archiving from Archive
 // is a no-op, so that button is gated the same way.
 const isInJunkFolder = computed(() => mailStore.openMessageFolder?.role === 'junk');
 const isInArchiveFolder = computed(() => mailStore.openMessageFolder?.role === 'archive');
+const canArchive = computed(() => props.imap ? props.imap.canArchive !== false : !isInArchiveFolder.value);
+const canJunk = computed(() => props.imap ? props.imap.canJunk !== false : !isInJunkFolder.value);
 const canWhitelistInJunk = computed(() => {
   const current = mailStore.openMessageFolder;
   return current?.role === 'junk'
@@ -902,6 +934,20 @@ async function destroy() {
   }
 }
 
+function readerShortcut(action: ShortcutAction | undefined) {
+  switch (action) {
+    case 'archive': return canArchive.value && !actionsDisabled.value ? archive : undefined;
+    case 'delete': return canDelete.value && !actionsDisabled.value ? destroy : undefined;
+    case 'toggleStar': return !actionsDisabled.value ? toggleStar : undefined;
+    case 'toggleRead': return !actionsDisabled.value ? toggleSeen : undefined;
+    case 'reply': return canRespond.value ? reply : undefined;
+    case 'replyAll': return canRespond.value ? replyAll : undefined;
+    case 'forward': return canRespond.value ? forward : undefined;
+    case 'openTagMenu': return canTagMessage.value && !actionsDisabled.value ? toggleTagMenu : undefined;
+    default: return undefined;
+  }
+}
+
 function closeMessageView() {
   if (props.backLabel) {
     emit('back');
@@ -957,43 +1003,41 @@ function closeMessageView() {
              only Back and the view-mode toggle, and the banner below
              owns Cancel Send. -->
         <template v-if="!isPendingScheduled">
-          <AppIconButton v-if="imap ? imap.canArchive !== false : !isInArchiveFolder" class="message-view__action" :disabled="imap?.disabled" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
+          <AppIconButton v-if="canArchive" class="message-view__action" :disabled="actionsDisabled" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="archiveIcon" />
           </AppIconButton>
-          <AppIconButton v-if="imap ? imap.canJunk !== false : !isInJunkFolder" class="message-view__action" :disabled="imap?.disabled" @click="junk" title="Junk" aria-label="Mark as junk">
+          <AppIconButton v-if="canJunk" class="message-view__action" :disabled="actionsDisabled" @click="junk" title="Junk" aria-label="Mark as junk">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="junkIcon" />
           </AppIconButton>
-          <template v-if="imap">
-            <AppIconButton
-              class="message-view__action"
-              aria-label="Star"
-              :title="imap.flagged ? 'Unstar' : 'Star'"
-              :aria-pressed="imap.flagged"
-              :disabled="imap.disabled"
-              @click="emit('imapAction', { type: 'star', value: !imap.flagged })"
-            >
-              <Star :size="17" :stroke-width="1.75" :fill="imap.flagged ? '#facc15' : 'none'" />
-            </AppIconButton>
-            <AppIconButton
-              class="message-view__action"
-              :aria-label="seenLabel"
-              :title="seenLabel"
-              :disabled="imap.disabled"
-              @click="emit('imapAction', { type: 'seen', value: !imap.seen })"
-            >
-              <component :is="imap.seen ? Mail : MailOpen" :size="17" :stroke-width="1.75" />
-            </AppIconButton>
-          </template>
-          <AppIconButton v-if="imap?.canTrash !== false" class="message-view__action" danger :disabled="imap?.disabled" @click="destroy" :title="imap ? 'Move to Trash' : actionTitle('Delete', 'delete')" aria-label="Delete">
+          <AppIconButton
+            class="message-view__action"
+            aria-label="Star"
+            :title="actionTitle(starLabel, 'toggleStar')"
+            :aria-pressed="flagged"
+            :disabled="actionsDisabled"
+            @click="toggleStar"
+          >
+            <Star :size="17" :stroke-width="1.75" :fill="flagged ? '#facc15' : 'none'" />
+          </AppIconButton>
+          <AppIconButton
+            class="message-view__action"
+            :aria-label="seenLabel"
+            :title="actionTitle(seenLabel, 'toggleRead')"
+            :disabled="actionsDisabled"
+            @click="toggleSeen"
+          >
+            <component :is="seen ? Mail : MailOpen" :size="17" :stroke-width="1.75" />
+          </AppIconButton>
+          <AppIconButton v-if="canDelete" class="message-view__action" danger :disabled="actionsDisabled" @click="destroy" :title="actionTitle('Delete', 'delete')" aria-label="Delete">
             <Trash2 class="message-view__toolbar-icon" :size="18" :stroke-width="1.65" />
           </AppIconButton>
-          <AppIconButton class="message-view__action" :disabled="!!imap && !imapCanRespond" @click="reply" :title="actionTitle('Reply', 'reply')" aria-label="Reply">
+          <AppIconButton class="message-view__action" :disabled="!canRespond" @click="reply" :title="actionTitle('Reply', 'reply')" aria-label="Reply">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="replyIcon" />
           </AppIconButton>
-          <AppIconButton class="message-view__action" :disabled="!!imap && !imapCanRespond" @click="replyAll" :title="actionTitle('Reply All', 'replyAll')" aria-label="Reply All">
+          <AppIconButton class="message-view__action" :disabled="!canRespond" @click="replyAll" :title="actionTitle('Reply All', 'replyAll')" aria-label="Reply All">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="replyAllIcon" />
           </AppIconButton>
-          <AppIconButton class="message-view__action" :disabled="!!imap && !imapCanRespond" @click="forward" :title="actionTitle('Forward', 'forward')" aria-label="Forward">
+          <AppIconButton class="message-view__action" :disabled="!canRespond" @click="forward" :title="actionTitle('Forward', 'forward')" aria-label="Forward">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="forwardIcon" />
           </AppIconButton>
           <!-- The message's tag stack (MK-6.5); opens the tag menu. -->
@@ -1005,7 +1049,7 @@ function closeMessageView() {
             :aria-label="tagStackLabel"
             aria-haspopup="dialog"
             :aria-expanded="tagMenuAnchor !== null"
-            :disabled="imap?.disabled && tagMenuAnchor === null"
+            :disabled="actionsDisabled && tagMenuAnchor === null"
             data-tag-picker-trigger
             @click="toggleTagMenu"
           >
@@ -1017,7 +1061,7 @@ function closeMessageView() {
           :targets="messageTagTargets"
           :definitions="pickerDefinitions"
           :additional-tags="gmailTags"
-          :busy="imap?.disabled"
+          :busy="actionsDisabled"
           :trigger="tagMenuTrigger"
           label="Tags"
           @close="closeTagMenu"

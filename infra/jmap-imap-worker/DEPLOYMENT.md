@@ -139,3 +139,10 @@ mailbox marked `\Trash`. Independent JMAP clients can use
 `/.well-known/jmap` on the `workers.dev` URL emitted by Wrangler with the relay
 access token as a bearer credential. The preview covers mailbox and message
 reads for operator-configured accounts.
+
+A paired browser can discover its linked accounts at `GET /api/imap/v1/jmap/session`.
+The session points to `POST /api/imap/v1/jmap` for mailbox and message methods,
+including `Email/set` updates to `$seen`, `$flagged`, and supported IMAP
+keywords. Send one keyword patch per message and include the paired cookie
+and the webmail origin. Stormbox's offline outbox uses the existing relay
+adapter for mailbox moves and other mail operations.

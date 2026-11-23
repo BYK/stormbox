@@ -44,6 +44,7 @@ vi.mock('@tanstack/vue-virtual', () => ({
 }));
 
 import MessageColumns from '../../../src/components/MessageColumns.vue';
+import MessageListToolbar from '../../../src/components/MessageListToolbar.vue';
 import {
   splitBulkActions,
   useBulkActionItems,
@@ -161,6 +162,32 @@ afterEach(() => {
 });
 
 describe('message list header tiers', () => {
+  it('shows changing sync details in the existing toolbar, including at narrow widths', async () => {
+    const wrapper = mount(MessageListToolbar, {
+      attachTo: document.body,
+      props: {
+        listWidth: 800, folderId: 'INBOX', folderName: 'Inbox', totalCount: 1650,
+        allSelected: false, selectedCount: 0, unreadOnly: false, starredOnly: false,
+        isLoading: false, status: ['50 most recent of 1,650 messages'],
+      },
+    });
+    mounted.push(wrapper);
+    const toolbar = wrapper.get('header').element;
+    expect(wrapper.get('.msg-list__status-label').text()).toBe('50 most recent of 1,650 messages');
+    await wrapper.setProps({ listWidth: 300, status: ['Account sync failed'], statusError: true, refreshDisabled: true });
+    expect(wrapper.get('header').element).toBe(toolbar);
+    expect(wrapper.find('.msg-list__status-label').exists()).toBe(false);
+    expect(wrapper.find('summary[aria-label="Mail status, attention required"]').exists()).toBe(true);
+    expect(wrapper.get('.msg-list__status-panel').text()).toBe('Account sync failed');
+    expect(wrapper.get('[data-more-item="refresh"]').attributes('aria-disabled')).toBe('true');
+    expect(wrapper.find('[data-more-item="add-column"]').exists()).toBe(false);
+
+    (wrapper.get('.msg-list__status-trigger').element as HTMLElement).focus();
+    await wrapper.setProps({ status: [] });
+    await nextTick();
+    expect(document.activeElement).toBe(wrapper.get('[data-more-menu]').element);
+  });
+
   it('shows everything in one row when the column is wide', async () => {
     seedInbox();
     const wrapper = mountAtWidth(600);

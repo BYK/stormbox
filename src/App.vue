@@ -47,6 +47,7 @@ import { onWebPushOpenAttention } from './push/client';
 import LoginGate from './components/LoginGate.vue';
 import PlannedMaintenanceNotice from './components/PlannedMaintenanceNotice.vue';
 import FolderTree from './components/FolderTree.vue';
+import MailAccountLabel from './components/MailAccountLabel.vue';
 import MessageColumns from './components/MessageColumns.vue';
 import MessageView from './components/MessageView.vue';
 import ComposeManager from './components/ComposeManager.vue';
@@ -92,6 +93,7 @@ const googleReturningToMail = initialQuery.has('google_imap')
 const space = ref<AppSpace>(initialQuery.get('view') === 'attention' && !googleReturningToMail ? 'attention' : 'mail');
 const imapMail = ref<InstanceType<typeof ImapMail>>();
 const imapFolderNav = ref<HTMLElement | null>(null);
+const unifiedInboxNav = ref<HTMLElement | null>(null);
 const imapFolderSelected = ref(false);
 const imapDetailVisible = ref(false);
 
@@ -887,11 +889,9 @@ function unwatchSystemTheme() {
           </AppButton>
         </header>
 
-        <div class="sidebar__account">
-          <span class="sidebar__account-name">{{ accountLabel }}</span>
-        </div>
-
         <FolderTree :external-folder-selected="imapFolderSelected" @pick-primary="imapMail?.clearFolder()">
+          <template #unified-inbox><div ref="unifiedInboxNav" /></template>
+          <template #primary-account><MailAccountLabel :address="accountLabel" /></template>
           <template #connected-accounts><div ref="imapFolderNav" /></template>
         </FolderTree>
 
@@ -933,6 +933,8 @@ function unwatchSystemTheme() {
         ref="imapMail"
         :owner-id="authStore.accountId"
         :folder-target="imapFolderNav"
+        :unified-target="unifiedInboxNav"
+        :unread-count="inboxUnread"
         :search="quickFilterQuery"
         @folder-selected="selectImapFolder"
         @detail-visible="imapDetailVisible = $event"
@@ -1483,7 +1485,7 @@ body.spotlighting .folder-subs {
 }
 .sidebar {
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   background: var(--folder-list-bg);
   width: var(--folder-list-width, 240px);
   min-width: 0;
@@ -1502,7 +1504,7 @@ body.spotlighting .folder-subs {
 .sidebar > * {
   min-width: 0;
 }
-.sidebar > :nth-child(3) { min-height: 0; overflow-y: auto; }
+.sidebar > nav { min-height: 0; overflow-y: auto; }
 .sidebar__header {
   min-width: 0;
   padding: 12px 12px 10px;
@@ -1514,29 +1516,6 @@ body.spotlighting .folder-subs {
   width: 100%;
   max-width: 100%;
 }
-.sidebar__account {
-  padding: 10px 14px 4px;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.sidebar__account-name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  text-transform: none;
-  letter-spacing: normal;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text);
-}
-
 .sidebar__footer {
   margin-top: auto;
   padding: 8px;

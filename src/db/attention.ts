@@ -48,7 +48,12 @@ const UPSERT_ACCOUNT = `INSERT INTO attention_imap_accounts (owner_account_id, r
   VALUES (?, ?, ?, ?) ON CONFLICT (owner_account_id, relay_id) DO UPDATE SET
     address = excluded.address, name = excluded.name`;
 
-type ImapActionRequest = { location: ImapMessageLocation; action: ImapAttentionAction; cancelled?: number };
+export interface ImapActionRequest {
+  location: ImapMessageLocation;
+  action: ImapAttentionAction;
+}
+
+type PendingImapAction = ImapActionRequest & { cancelled?: number };
 type Connection = Pick<Engine, 'all'>;
 
 function isMove(action: ImapAttentionAction) {
@@ -75,9 +80,9 @@ async function pendingActions(db: Connection, ownerId: number) {
     WHERE account_id = ? AND mutation_type = ? AND local_status IN ('pending', 'retry', 'in_flight')
       AND json_valid(request_json)
     ORDER BY id`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP]);
-  const byFolder = new Map<string, ImapActionRequest[]>();
+  const byFolder = new Map<string, PendingImapAction[]>();
   for (const row of rows) {
-    const request = JSON.parse(String(row.request_json)) as ImapActionRequest | null;
+    const request = JSON.parse(String(row.request_json)) as PendingImapAction | null;
     if (!request || request.cancelled === 1 || !validImapAction(request.location, request.action)) continue;
     const { accountId, mailbox, uidValidity } = request.location;
     const key = folderKey(accountId, mailbox, uidValidity);
@@ -458,34 +463,51 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     if (!authenticationOnly || changes > 0) notifyMutation(ownerId);
   }
 
-  async function enqueueImapAction(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction) {
-    if (!validImapAction(location, action)) throw new Error('The IMAP change is invalid.');
-    const { accountId, mailbox, uidValidity, uid } = location;
-    const mutation = await engine.transaction(async (tx) => {
+  async function enqueueImapActions(ownerId: number, requests: readonly ImapActionRequest[]) {
+    if (!Array.isArray(requests)) throw new Error('The IMAP change is invalid.');
+    if (requests.length === 0) return { mutationIds: [] };
+    const mutationIds = await engine.transaction(async (tx) => {
       const paired = await tx.get('SELECT 1 FROM attention_imap_pairing WHERE owner_account_id = ?', [ownerId]);
       if (!paired) throw new Error('Connect the mail relay to update IMAP mail.');
-      const snapshot = await tx.get(
-        `SELECT messages_json FROM ${folderTable(mailbox)}
-         WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ?`,
-        [ownerId, accountId, mailbox, uidValidity],
-      );
-      if (!snapshot) throw new Error('This mailbox changed. Refresh this folder and reopen the message.');
       const actions = await pendingActions(tx, ownerId);
-      const projected = projectFolder(snapshot, actions.get(folderKey(accountId, mailbox, uidValidity)));
-      const message = projected.messages.find((entry) => entry.uid === uid);
-      if (!message) throw new Error('This message is no longer in this folder.');
-      // Gmail shares flags and labels across mailbox views with different UIDs.
-      const accountScoped = message.gmailLabels === true || Boolean(message.labels?.length);
+      const messagesByFolder = new Map<string, Map<number, RelayMessage>>();
+      const queued: Array<ImapActionRequest & { accountScoped?: true }> = [];
+      for (const request of requests) {
+        if (!request || !validImapAction(request.location, request.action)) throw new Error('The IMAP change is invalid.');
+        const { location, action } = request;
+        const { accountId, mailbox, uidValidity, uid } = location;
+        const key = folderKey(accountId, mailbox, uidValidity);
+        let messages = messagesByFolder.get(key);
+        if (!messages) {
+          const snapshot = await tx.get(
+            `SELECT messages_json FROM ${folderTable(mailbox)}
+             WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ?`,
+            [ownerId, accountId, mailbox, uidValidity],
+          );
+          if (!snapshot) throw new Error('This mailbox changed. Refresh this folder and reopen the message.');
+          const projected = projectFolder(snapshot, actions.get(key));
+          messages = new Map(projected.messages.map((message) => [message.uid, message]));
+          messagesByFolder.set(key, messages);
+        }
+        const message = messages.get(uid);
+        if (!message) throw new Error('This message is no longer in this folder.');
+        // Gmail shares flags and labels across mailbox views with different UIDs.
+        const accountScoped = message.gmailLabels === true || Boolean(message.labels?.length);
+        queued.push({ location, action, ...(accountScoped && { accountScoped }) });
+        if (isMove(action)) messages.delete(uid);
+      }
       const now = Date.now();
-      return tx.run(
+      const rows: { id: number }[] = await tx.all(
         `INSERT INTO pending_mutations (account_id, mutation_type, local_status, request_json, created_at, updated_at)
-         VALUES (?, ?, 'pending', ?, ?, ?)`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP,
-          JSON.stringify({ location, action, ...(accountScoped && { accountScoped }) }), now, now],
+         SELECT ?, ?, 'pending', value, ?, ? FROM json_each(?) ORDER BY CAST(key AS INTEGER)
+         RETURNING id`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP, now, now, JSON.stringify(queued)],
       );
+      return rows.map(({ id }) => Number(id)).sort((a, b) => a - b);
     });
     broadcaster.touch(TABLE_FAMILIES.ATTENTION);
     broadcaster.touch(TABLE_FAMILIES.MUTATIONS);
-    notifyMutation(ownerId, mutation.lastInsertRowid);
+    notifyMutation(ownerId, mutationIds[0]);
+    return { mutationIds };
   }
 
   async function settleImapAction(mutationId: number, error?: { type?: string; message?: string }) {
@@ -738,8 +760,10 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
         notifyMutation(ownerId);
       }),
     [DB_RPC.ATTENTION_BODY]: async ({ ownerId, location, cachedOnly = false }) => readBody(ownerId, location, cachedOnly),
-    [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]: async ({ ownerId, location, action }) =>
-      enqueueImapAction(ownerId, location, action),
+    [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]: async ({ ownerId, location, action }) => {
+      await enqueueImapActions(ownerId, [{ location, action }]);
+    },
+    [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS]: async ({ ownerId, requests }) => enqueueImapActions(ownerId, requests),
     [DB_RPC.ATTENTION_RESUME_IMAP_ACTIONS]: async ({ ownerId }) => resumeImapActions(ownerId),
     [DB_RPC.ATTENTION_SETTLE_IMAP_ACTION]: async ({ mutationId, error }) => settleImapAction(mutationId, error),
     [DB_RPC.ATTENTION_APPLY_IMAP_ACTION]: async ({ ownerId, location, action, mutationId }:

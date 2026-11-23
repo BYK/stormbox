@@ -162,6 +162,8 @@ describe('MessageView with a sparse messages array', () => {
       'Back',
       'Archive (A)',
       'Junk',
+      'Star (S)',
+      'Mark as read (M)',
       'Delete (Del)',
       'Reply (R)',
       'Reply All (Shift+R)',
@@ -172,11 +174,11 @@ describe('MessageView with a sparse messages array', () => {
     ]);
     expect(
       actions.map((button) => button.attributes('aria-label')),
-    ).toEqual(['Back', 'Archive', 'Mark as junk', 'Delete', 'Reply', 'Reply All', 'Forward', 'Tag', 'Print email', 'Maximize message view']);
+    ).toEqual(['Back', 'Archive', 'Mark as junk', 'Star', 'Mark as read', 'Delete', 'Reply', 'Reply All', 'Forward', 'Tag', 'Print email', 'Maximize message view']);
 
     useSettingsStore().settings = { shortcutScheme: 'thunderbird' };
     await nextTick();
-    expect(actions.slice(4).map((button) => button.attributes('title'))).toEqual([
+    expect(actions.slice(6).map((button) => button.attributes('title'))).toEqual([
       'Reply (Ctrl+R)',
       'Reply All (Ctrl+Shift+R)',
       'Forward (Ctrl+L)',
@@ -193,6 +195,54 @@ describe('MessageView with a sparse messages array', () => {
     expect(
       iconActions.every((button) => button.find('svg').exists()),
     ).toBe(true);
+  });
+
+  it('uses the same controls and shortcut keys for both account types in the shared reader', async () => {
+    useAuthStore().accountId = 1;
+    __setRepositoryForTests(makeRepo());
+    const mailStore = useMailStore() as any;
+    await mailStore.attach();
+    mailStore.folders = [{ id: 7, account_id: 1, remote_id: 'inbox', name: 'Inbox', role: 'inbox' }];
+    mailStore.currentFolderId = 7;
+    const row = {
+      id: 42, subject: 'Open message', from_text: 'sender@example.com', received_at: 1,
+      is_seen: 1, is_flagged: 0, keywords_json: '{"$seen":true}',
+    };
+    mailStore.messages = [row];
+    mailStore.selectedMessageId = row.id;
+    const star = vi.spyOn(mailStore, 'markManyFlagged').mockResolvedValue(1);
+    const seen = vi.spyOn(mailStore, 'markManySeen').mockResolvedValue(1);
+    const imap = {
+      ...row, id: 'imap:42', to_text: '', ccText: '', labels: [], knownLabels: [],
+      gmailLabels: false, canSend: true, seen: true, flagged: false, disabled: false,
+      body: { text: 'Body', html: null },
+    };
+    const primary = mount(MessageView, { props: { backLabel: 'Back' } });
+    const connected = mount(MessageView, { props: { backLabel: 'Back', imap } });
+    const controls = (wrapper: typeof primary) => wrapper.findAll('.message-view__header .message-view__action')
+      .map((button) => [button.attributes('aria-label'), button.attributes('title')]);
+
+    try {
+      expect(controls(connected)).toEqual(controls(primary));
+      await primary.get('[aria-label="Star"]').trigger('click');
+      await primary.trigger('keydown', { key: 'm' });
+      expect(star).toHaveBeenCalledWith([42], true, { sourceFolderId: 7, rows: [row] });
+      expect(seen).toHaveBeenCalledWith([42], false, { sourceFolderId: 7, rows: [row] });
+
+      await connected.trigger('keydown', { key: 's' });
+      await connected.get('[aria-label="Mark as unread"]').trigger('click');
+      expect(connected.emitted('imapAction')).toEqual([
+        [{ type: 'star', value: true }], [{ type: 'seen', value: false }],
+      ]);
+      await connected.setProps({ imap: { ...imap, disabled: true, canTrash: false } });
+      await connected.trigger('keydown', { key: 's' });
+      await connected.trigger('keydown', { key: 'Delete' });
+      expect(connected.emitted('imapAction')).toHaveLength(2);
+      expect(connected.find('[aria-label="Delete"]').exists()).toBe(false);
+    } finally {
+      primary.unmount();
+      connected.unmount();
+    }
   });
 
   it('shows neither Junk nor Not junk in a shared Junk folder', async () => {

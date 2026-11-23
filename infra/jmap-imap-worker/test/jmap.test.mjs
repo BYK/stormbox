@@ -77,3 +77,66 @@ test('emits the durable delta provided by the account store', async () => {
   });
   assert.deepEqual(output[0], ['Email/changes', { accountId: 'alpha', ...changes }, 'a']);
 });
+
+test('returns explicit per-message results for paired Email/set keyword writes', async () => {
+  let changed = false;
+  const output = await call([
+    ['Email/set', { accountId: 'alpha', ifInState: '1', update: { newer: { 'keywords/$seen': true } } }, 'stale'],
+    ['Email/set', { accountId: 'alpha', ifInState: '2', create: { draft: {} }, destroy: ['older'], update: {
+      newer: { 'keywords/With~1Slash': true }, gone: { 'keywords/$seen': null },
+      quick: { 'keywords/$seen': true, 'keywords/$flagged': null },
+      move: { 'mailboxIds/archive': true }, junk: { 'keywords/$junk': true },
+    } }, 'write'],
+    ['Email/get', { accountId: 'alpha', ids: ['newer'], properties: ['keywords'] }, 'read'],
+  ], {
+    snapshot: async () => ({ state: changed ? '3' : '2', mailboxes: [mailbox], messages: messages.map((message) =>
+      message.id === 'newer' && changed ? { ...message, keywords: { 'with/slash': true } } : message) }),
+    setKeywords: async (requestedAccount, patches, state) => {
+      assert.equal(requestedAccount.id, 'alpha');
+      if (state !== '2') return null;
+      assert.deepEqual(patches, [{ id: 'newer', keyword: 'with/slash', add: true }, { id: 'gone', keyword: '$seen', add: false }]);
+      changed = true;
+      return { oldState: '2', newState: '3', updated: ['newer'], notUpdated: { gone: 'notFound' } };
+    },
+  });
+  assert.deepEqual(output[0], ['error', { type: 'stateMismatch' }, 'stale']);
+  assert.deepEqual(output[1], ['Email/set', {
+    accountId: 'alpha', oldState: '2', newState: '3', updated: { newer: null },
+    created: null, destroyed: null,
+    notUpdated: {
+      gone: { type: 'notFound' }, quick: { type: 'invalidPatch' },
+      move: { type: 'invalidProperties', properties: ['mailboxIds/archive'] },
+      junk: { type: 'invalidProperties', properties: ['keywords/$junk'] },
+    },
+    notCreated: { draft: { type: 'forbidden' } }, notDestroyed: { older: { type: 'forbidden' } },
+  }, 'write']);
+  assert.deepEqual(output[2][1].list[0].keywords, { 'with/slash': true });
+  assert.equal(output[2][1].state, '3');
+});
+
+test('triggers same-request resync after a possibly applied Email/set and rejects oversized batches', async () => {
+  let loads = 0;
+  let writes = 0;
+  const oversized = Object.fromEntries(Array.from({ length: 100 }, (_, index) => [`id-${index}`, { 'keywords/$seen': true }]));
+  const output = await call([
+    ['Email/set', { accountId: 'alpha', destroy: ['extra'], update: oversized }, 'limit'],
+    ['Email/get', { accountId: 'alpha', ids: ['newer'] }, 'old'],
+    ['Email/set', { accountId: 'alpha', update: { newer: { 'keywords/$seen': true } } }, 'partial'],
+    ['Email/get', { accountId: 'alpha', ids: ['newer'] }, 'new'],
+  ], {
+    snapshot: async () => {
+      loads += 1;
+      return { state: writes ? '3' : '2', mailboxes: [mailbox], messages };
+    },
+    setKeywords: async () => {
+      writes += 1;
+      return { error: 'serverPartialFail' };
+    },
+  });
+  assert.equal(writes, 1);
+  assert.equal(loads, 3);
+  assert.deepEqual(output[0], ['error', { type: 'requestTooLarge' }, 'limit']);
+  assert.equal(output[1][1].state, '2');
+  assert.deepEqual(output[2], ['error', { type: 'serverPartialFail' }, 'partial']);
+  assert.equal(output[3][1].state, '3');
+});

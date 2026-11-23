@@ -10,6 +10,7 @@ import {
   type MessageAddressObject,
 } from 'imapflow';
 import PostalMime from 'postal-mime';
+import { imapFlag, jmapKeywords, type KeywordChange, type KeywordError } from './keywords';
 
 export interface MailConnection {
   host: string;
@@ -84,13 +85,23 @@ export interface ImapTagPatch {
   removeLabels: string[];
 }
 
+export interface ImapKeywordUpdate extends KeywordChange {
+  uid: number;
+}
+
+export interface ImapKeywordResult {
+  uid: number;
+  keywords?: Record<string, true>;
+  error?: KeywordError;
+}
+
 export const MOVE_ROLES = {
   archive: '\\Archive', junk: '\\Junk', trash: '\\Trash',
 } as const;
 export type MoveAction = keyof typeof MOVE_ROLES;
 
 export type MailTransportErrorCode = 'authentication_failed' | 'invalid_message' | 'mailbox_changed'
-  | 'mail_unavailable' | 'message_not_found' | 'message_too_large' | 'move_not_supported'
+  | 'mail_unavailable' | 'keyword_write_unknown' | 'message_not_found' | 'message_too_large' | 'move_not_supported'
   | 'archive_not_configured' | 'archive_requires_inbox' | 'archive_rejected' | 'junk_not_configured' | 'labels_not_supported'
   | 'same_mailbox' | 'trash_not_configured' | 'smtp_not_configured' | 'submission_rejected' | 'submission_unknown';
 
@@ -397,6 +408,46 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     });
   }
 
+  function patchMailboxKeywords(account: MailAccount, mailbox: string, uidValidity: string, updates: ImapKeywordUpdate[]): Promise<ImapKeywordResult[]> {
+    let storeAttempted = false;
+    return withMailbox(account, mailbox, { readOnly: false, uidValidity }, async (client) => {
+      const groups = new Map<string, { flag: string; add: boolean; uids: number[] }>();
+      for (const { uid, keyword, add } of updates) {
+        const flag = imapFlag(keyword);
+        if (!flag) continue;
+        const key = `${add}/${flag}`;
+        const group = groups.get(key) ?? { flag, add, uids: [] };
+        group.uids.push(uid);
+        groups.set(key, group);
+      }
+      for (const { flag, add, uids } of groups.values()) {
+        const sequence = uids.join(',');
+        storeAttempted = true;
+        if (add) await client.messageFlagsAdd(sequence, [flag], { uid: true });
+        else await client.messageFlagsRemove(sequence, [flag], { uid: true });
+      }
+      const confirmed = await client.fetchAll(updates.map(({ uid }) => uid).join(','), { flags: true }, { uid: true });
+      const byUid = new Map(confirmed.map((record) => [record.uid, jmapKeywords({
+        seen: record.flags?.has('\\Seen') ?? false,
+        flagged: record.flags?.has('\\Flagged') ?? false,
+        keywords: messageTagState(record).keywords,
+      })]));
+      const missing = updates.filter(({ uid }) => !byUid.has(uid));
+      if (missing.length) {
+        const present = await client.search({ uid: missing.map(({ uid }) => uid).join(',') }, { uid: true });
+        if (!present || present.length) throw new MailTransportError('mail_unavailable');
+      }
+      return updates.map<ImapKeywordResult>(({ uid, keyword, add }) => {
+        const keywords = byUid.get(uid);
+        if (!keywords) return { uid, error: 'notFound' };
+        return { uid, keywords, ...(imapFlag(keyword) && Object.hasOwn(keywords, keyword) === add ? {} : { error: 'forbidden' }) };
+      });
+    }).catch((error) => {
+      if (storeAttempted) throw new MailTransportError('keyword_write_unknown');
+      throw error;
+    });
+  }
+
   async function moveSelectedMessage(client: ImapFlow, mailbox: string, uid: number, destination: string) {
     if (mailbox === destination) throw new MailTransportError('same_mailbox');
     if (!client.capabilities.has('MOVE')) throw new MailTransportError('move_not_supported');
@@ -484,9 +535,9 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     }
   }
 
-  return { listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessagePreviews, readMessageSource, patchMessage, patchMessageTags, moveMessage, moveToRole, trashMessage, submitMessage };
+  return { listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessagePreviews, readMessageSource, patchMessage, patchMessageTags, patchMailboxKeywords, moveMessage, moveToRole, trashMessage, submitMessage };
 }
 
 export const {
-  listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessagePreviews, readMessageSource, patchMessage, patchMessageTags, moveMessage, moveToRole, trashMessage, submitMessage,
+  listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessagePreviews, readMessageSource, patchMessage, patchMessageTags, patchMailboxKeywords, moveMessage, moveToRole, trashMessage, submitMessage,
 } = createMailTransport();

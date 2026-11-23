@@ -3,7 +3,8 @@ import { canSubmitAttentionMessage, submitAttentionMessage } from './attention-s
 import { GOOGLE_CALLBACK_PATH, GOOGLE_START_PATH, googleOAuthConfiguration } from './google-auth';
 import { cancelGoogleLink, finishGoogleLink, startGoogleLink } from './google-link';
 import { authorization, consumeSessionAssertion, HttpError, json, matchesToken, pairedAuthorization, readJson, sessionCookie } from './http';
-import { jmap, session, type JmapStore } from './jmap';
+import { jmap, session, type JmapAccount, type JmapStore } from './jmap';
+import { isTagKeyword } from './keywords';
 import {
   listMailboxes, listMessages, MailTransportError, MOVE_ROLES, moveToRole, patchMessage, patchMessageTags,
   readMessage, readMessageSource, type ImapTagPatch, type MailAccount, type MoveAction,
@@ -19,23 +20,34 @@ export { PushSubscriptions } from './push';
 
 const RELAY = '/api/imap/v1';
 
-function accountObject(env: Env, account: MailAccount) {
+function accountObject(env: Env, account: JmapAccount) {
   return env.MAILBOXES.getByName(account.id);
 }
 
-function makeStore(env: Env): JmapStore {
+function makeStore(env: Env, configured: readonly MailAccount[], paired = false): JmapStore {
+  const connections = new Map(configured.map((account) => [account.id, account]));
+  async function open(account: JmapAccount): Promise<MailAccount> {
+    const connection = connections.get(account.id) ?? (paired ? await getManagedAccount(env, account.id) : undefined);
+    if (!connection) throw new HttpError(404, 'account_not_found');
+    return connection;
+  }
   return {
     snapshot: async (account) => {
       const state = accountObject(env, account);
-      await state.refresh(account);
-      return state.snapshot({ limit: 5000 });
+      return state.refresh(await open(account));
     },
     changes: (account, type, since, max) => accountObject(env, account).changes(since, type, max),
-    body: (account, { path, uidValidity, uid }) => readMessage(account, path, uidValidity, uid),
+    body: async (account, { path, uidValidity, uid }) => readMessage(await open(account), path, uidValidity, uid),
     source: async (account, id) => {
       const message = await accountObject(env, account).message(id);
-      return message ? readMessageSource(account, message.path, message.uidValidity, message.uid) : null;
+      return message ? readMessageSource(await open(account), message.path, message.uidValidity, message.uid) : null;
     },
+    ...(paired ? {
+      setKeywords: async (account, updates, ifInState) => {
+        const connection = await open(account);
+        return accountObject(env, account).setKeywords(connection, updates, ifInState).catch(() => ({ error: 'serverPartialFail' as const }));
+      },
+    } satisfies Pick<JmapStore, 'setKeywords'> : {}),
   };
 }
 
@@ -61,11 +73,6 @@ function readFlagPatch(input: unknown): { seen?: boolean; flagged?: boolean } {
     throw new HttpError(400, 'invalid_flags');
   }
   return Object.fromEntries(entries);
-}
-
-function isTagKeyword(value: unknown): value is string {
-  return typeof value === 'string' && /^[\x21-\x7e]{1,255}$/.test(value) && !/[(){\]%*"\\]/.test(value)
-    && !/^\$(?:seen|flagged|junk|notjunk|draft|answered|forwarded|deleted|recent|phishing|notphishing)$/i.test(value);
 }
 
 function isCustomLabel(value: unknown): value is string {
@@ -211,7 +218,7 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
   throw new HttpError(405, 'method_not_allowed');
 }
 
-function eventSource(request: Request, accounts: readonly MailAccount[], env: Env): Response {
+function eventSource(request: Request, accounts: readonly JmapAccount[], store: JmapStore): Response {
   let stop: () => void = () => {};
   const readable = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -234,7 +241,7 @@ function eventSource(request: Request, accounts: readonly MailAccount[], env: En
         for (const account of accounts) {
           if (closed) return;
           try {
-            const { state } = await accountObject(env, account).refresh(account);
+            const { state } = await store.snapshot(account);
             if (known.get(account.id) !== state) {
               known.set(account.id, state);
               changed[account.id] = { Email: state, Mailbox: state, Thread: state };
@@ -265,14 +272,29 @@ async function generic(request: Request, url: URL, env: Env): Promise<Response> 
     'WWW-Authenticate': 'Bearer realm="Stormbox gateway"',
   });
   const accounts = mailAccounts(env);
-  if (url.pathname === '/.well-known/jmap' && request.method === 'GET') return json(session(url.origin, accounts));
-  if (url.pathname === '/jmap' && request.method === 'POST') return jmap(request, accounts, makeStore(env));
-  if (url.pathname === '/jmap/eventsource' && request.method === 'GET') return eventSource(request, accounts, env);
-  if (url.pathname.startsWith('/jmap/download/') && request.method === 'GET') {
-    const [accountId, id] = parsedSegments(url.pathname.slice('/jmap/download/'.length));
+  return serveJmap(request, url, accounts, makeStore(env, accounts));
+}
+
+async function pairedJmap(request: Request, url: URL, env: Env): Promise<Response> {
+  if (!managedAuthorized(request, url, env)
+    || (request.method === 'POST' && request.headers.get('Origin') !== env.PUBLIC_ORIGIN)) throw new HttpError(401, 'unauthorized');
+  const configured = mailAccounts(env);
+  const accounts = [...configured, ...await listManagedAccounts(env)];
+  return serveJmap(request, url, accounts, makeStore(env, configured, true), RELAY);
+}
+
+async function serveJmap(request: Request, url: URL, accounts: readonly JmapAccount[], store: JmapStore, prefix = ''): Promise<Response> {
+  const path = url.pathname.slice(prefix.length);
+  if ((path === '/.well-known/jmap' || path === '/jmap/session') && request.method === 'GET') {
+    return json(session(`${url.origin}${prefix}`, accounts, Boolean(store.setKeywords)));
+  }
+  if (path === '/jmap' && request.method === 'POST') return jmap(request, accounts, store);
+  if (path === '/jmap/eventsource' && request.method === 'GET') return eventSource(request, accounts, store);
+  if (path.startsWith('/jmap/download/') && request.method === 'GET') {
+    const [accountId, id] = parsedSegments(path.slice('/jmap/download/'.length));
     const account = accounts.find(({ id }) => id === accountId);
     if (!account) throw new HttpError(404, 'account_not_found');
-    const source = await makeStore(env).source(account, id);
+    const source = await store.source(account, id);
     if (!source) throw new HttpError(404, 'message_not_found');
     return new Response(source.slice().buffer, { headers: {
       'Cache-Control': 'no-store', 'Content-Type': 'message/rfc822',
@@ -320,6 +342,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     try {
+      if (url.pathname === `${RELAY}/jmap` || url.pathname.startsWith(`${RELAY}/jmap/`)) return await pairedJmap(request, url, env);
       if (url.pathname.startsWith(`${RELAY}/`)) return await relay(request, url, env);
       if (url.pathname.startsWith('/api/push/')) {
         const paired = env.RELAY_SESSION_KEY

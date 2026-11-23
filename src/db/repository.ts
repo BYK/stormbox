@@ -7,7 +7,7 @@
  * and shared across all stores.
  */
 
-import type { AttentionCache } from './attention';
+import type { AttentionCache, ImapActionRequest } from './attention';
 import type { AttentionImapDraft, AttentionImapSendResult, ImapAttentionAction, ImapMessageLocation, RelayAccount, RelayAccountInput, RelayAccountSettings, RelayMessageBody } from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
 import type {
@@ -347,6 +347,11 @@ export class Repository {
 
   mutateAttentionImapMessage(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction) {
     return this.call<void>(DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION, { ownerId, location, action });
+  }
+
+  /** Persist an entire selection at once. Reject invalid selections without queuing any changes. */
+  mutateAttentionImapMessages(ownerId: number, requests: readonly ImapActionRequest[]) {
+    return this.call<{ mutationIds: number[] }>(DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS, { ownerId, requests });
   }
 
   resumeAttentionImapActions(ownerId: number) {

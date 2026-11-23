@@ -114,15 +114,15 @@ test('Mail applies IMAP row actions offline and reconciles them when it reconnec
     await expect.poll(serverFlags).toEqual({ seen: false, flagged: false });
 
     await loginViaOidc(page);
-    await page.getByRole('button', { name: 'Manage IMAP accounts' }).click();
+    await page.getByRole('button', { name: 'Manage mail accounts' }).click();
     await page.getByLabel('Mail relay pairing token').fill(pairToken);
     await page.getByRole('button', { name: 'Connect', exact: true }).click();
     await page.getByRole('button', { name: 'Close IMAP accounts' }).click();
 
     const account = page.locator('.imap-nav__account').filter({ hasText: relayEmail });
-    await account.locator('summary').click();
+    await account.locator('.mail-account-label').click();
     await account.getByRole('button', { name: 'Inbox', exact: true }).click();
-    const mail = page.getByRole('region', { name: 'IMAP mail' });
+    const mail = page.locator('.imap-mail');
     await expect(mail.getByRole('status')).toContainText('Last synced');
     const row = mail.getByRole('listitem').filter({ hasText: subject });
     await expect(row).toBeVisible();
@@ -131,12 +131,8 @@ test('Mail applies IMAP row actions offline and reconciles them when it reconnec
     await page.getByRole('searchbox').fill(subject);
     await row.getByRole('button', { name: /^Open message/ }).click();
     await expect(mail.getByText('Please review and send your approval.')).toBeVisible();
-    await mail.getByRole('button', { name: 'Back to folder' }).click();
-    const actions = row.locator('.attention-row-menu').getByRole('group', { name: 'Message actions' });
-    const openActions = async () => {
-      await row.locator('.msg-list__open').hover();
-      await row.getByLabel('Message actions', { exact: true }).and(row.locator('summary')).click();
-    };
+    await mail.getByRole('button', { name: 'Back', exact: true }).click();
+    await expect.poll(serverFlags).toMatchObject({ seen: true });
     await row.locator('.msg-list__open').hover();
     const quickStar = row.locator('.msg-list__actions').getByRole('button', { name: 'Star', exact: true });
     await expect(quickStar).toBeVisible();
@@ -148,17 +144,14 @@ test('Mail applies IMAP row actions offline and reconciles them when it reconnec
     await context.setOffline(false);
     await expect.poll(serverFlags).toMatchObject({ flagged: true });
 
-    await openActions();
-    await actions.getByRole('button', { name: 'Mark as read', exact: true }).click();
-    await openActions();
-    await actions.getByRole('button', { name: 'Mark as unread', exact: true }).click();
-    await openActions();
-    await expect(actions.getByRole('button', { name: 'Mark as read', exact: true })).toBeVisible();
+    await row.locator('.msg-list__open').hover();
+    await row.getByRole('checkbox', { name: /^Select message/ }).check();
+    await mail.getByRole('button', { name: 'Mark as unread', exact: true }).click();
     await expect.poll(cachedMessage).toMatchObject({ seen: false, flagged: true });
     await expect.poll(serverFlags).toEqual({ seen: false, flagged: true });
 
     await context.setOffline(true);
-    await actions.getByRole('button', { name: 'Move to Trash', exact: true }).click();
+    await mail.locator('.msg-list__header').getByRole('button', { name: 'Delete', exact: true }).click();
     await expect(row).toHaveCount(0);
     await expect.poll(cachedMessage).toBeNull();
     expect(await serverFlags()).not.toBeNull();
@@ -166,7 +159,7 @@ test('Mail applies IMAP row actions offline and reconciles them when it reconnec
     await expect.poll(serverFlags).toBeNull();
     await expect.poll(() => withMailbox(trash, (ids) => ids.length)).toBe(1);
     await account.getByRole('button', { name: 'Trash', exact: true }).click();
-    await expect(mail.getByRole('heading', { name: 'Trash' })).toBeVisible();
+    await expect(mail).toHaveAttribute('aria-label', 'Trash');
     await expect(row).toBeVisible();
     await expect.poll(() => page.evaluate(async ({ relayAccountId, trash, subject }) => {
       const repo = globalThis.__repo;
