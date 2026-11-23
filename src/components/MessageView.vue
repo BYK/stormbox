@@ -17,6 +17,7 @@ import {
   Mail,
   MailOpen,
   Moon,
+  Printer,
   Star,
   Sun,
   Trash2,
@@ -47,6 +48,7 @@ import { adaptHtmlForDarkMode } from '../utils/dark-email';
 import { formatAddressList } from '../utils/address-parse';
 import { titleWithShortcut, type ShortcutAction } from '../constants/shortcuts';
 import { plaintextToHtml } from '../utils/plaintext-html';
+import { printMessage } from '../utils/message-print';
 import { shortFrom } from '../utils/sender-avatar';
 import { isScheduledMessage } from '../utils/scheduled-message';
 import archiveIcon from '../assets/icons/tb-folder-archive.svg?raw';
@@ -208,6 +210,9 @@ const body = computed(() => {
 // load completes. Used to show the loading placeholder only while loading,
 // not for a message that has genuinely no body content.
 const bodyLoaded = computed(() => body.value != null);
+const canPrint = computed(() => bodyLoaded.value && (!body.value?.html || cidResolutionSettled.value));
+let sanitizedBodyHtml = '';
+let closePrintFrame: (() => void) | undefined;
 
 // Render plaintext bodies the way Thunderbird Desktop does: keep the
 // original line breaks/whitespace (white-space: pre-wrap), linkify URLs
@@ -473,6 +478,7 @@ async function renderHtmlBody(next, colorScheme) {
   // dark-correct and never flashes the un-themed email (see dark-email.ts).
   const safeHtml = sanitizeMessageDocument(next.html, cidUrls);
   const themedHtml = colorScheme === 'dark' ? adaptHtmlForDarkMode(safeHtml) : safeHtml;
+  sanitizedBodyHtml = safeHtml;
   resolvedCidPartIds.value = partIds;
   cidResolutionSettled.value = true;
   applyHtmlSrcDoc(themedHtml, colorScheme);
@@ -581,6 +587,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  closePrintFrame?.();
   renderToken += 1;
   teardownResizeObserver();
   teardownThemeObservers();
@@ -733,6 +740,27 @@ function fmtDate(ms) {
   if (!ms) return '';
   const d = new Date(Number(ms));
   return Number.isNaN(d.valueOf()) ? '' : d.toLocaleString();
+}
+
+function printOpenMessage() {
+  const selected = viewMessage.value;
+  const loaded = body.value;
+  if (!selected || !loaded || !canPrint.value) return;
+  closePrintFrame?.();
+  closePrintFrame = printMessage({
+    subject: selected.subject || '(no subject)',
+    headers: [
+      ['From', selected.from_text || '(no sender)'],
+      ['To', selected.to_text || ''],
+      ['Cc', ccText.value],
+      ['Bcc', bccText.value],
+      [hasScheduledBanner.value ? 'Send at' : 'Date', fmtDate(hasScheduledBanner.value
+        ? message.value?.sent_at ?? selected.received_at : selected.received_at)],
+      ['Attachments', attachmentRows.value.map(({ part }) => part.name || 'Unnamed attachment').join(', ')],
+    ],
+    sanitizedHtml: loaded.html ? sanitizedBodyHtml : '',
+    text: loaded.text ?? '',
+  });
 }
 
 // The stored body HTML references inline images by cid:, which only
@@ -1007,6 +1035,15 @@ function closeMessageView() {
           @manage="manageTags"
         />
         <div class="message-view__view-actions">
+        <AppIconButton
+          class="message-view__action"
+          aria-label="Print email"
+          title="Print email"
+          :disabled="!canPrint"
+          @click="printOpenMessage"
+        >
+          <Printer :size="17" :stroke-width="1.75" aria-hidden="true" />
+        </AppIconButton>
         <AppIconButton
           v-if="canForceLightBody"
           class="message-view__action message-view__action--view-mode"

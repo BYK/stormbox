@@ -167,11 +167,12 @@ describe('MessageView with a sparse messages array', () => {
       'Reply All (Shift+R)',
       'Forward (F)',
       'Tag (T)',
+      'Print email',
       'Maximize message view',
     ]);
     expect(
       actions.map((button) => button.attributes('aria-label')),
-    ).toEqual(['Back', 'Archive', 'Mark as junk', 'Delete', 'Reply', 'Reply All', 'Forward', 'Tag', 'Maximize message view']);
+    ).toEqual(['Back', 'Archive', 'Mark as junk', 'Delete', 'Reply', 'Reply All', 'Forward', 'Tag', 'Print email', 'Maximize message view']);
 
     useSettingsStore().settings = { shortcutScheme: 'thunderbird' };
     await nextTick();
@@ -181,6 +182,7 @@ describe('MessageView with a sparse messages array', () => {
       'Forward (Ctrl+L)',
       // The Thunderbird scheme leaves T alone (MK-4.2).
       'Tag',
+      'Print email',
       'Maximize message view',
     ]);
     expect(actions.every((button) => button.text() === '')).toBe(true);
@@ -1778,8 +1780,64 @@ describe('MessageView HTML body rendering', () => {
 
     expect(wrapper.find('.message-view__placeholder').exists()).toBe(true);
     expect(wrapper.text()).toContain('Loading message');
+    expect(wrapper.get<HTMLButtonElement>('[aria-label="Print email"]').element.disabled).toBe(true);
 
     wrapper.unmount();
+  });
+
+  it('prints the sanitized email and its headers in a separate document', async () => {
+    setDocumentTheme('dark');
+    await makeSelectedMessage({
+      text: 'Plain fallback',
+      html: '<html><body><p onclick="malicious()">Invoice body</p><script>malicious()</script></body></html>',
+      attachments: [],
+    });
+    const wrapper = mount(MessageView, { attachTo: document.body });
+    try {
+      await flushPromises();
+      await wrapper.get('[aria-label="Print email"]').trigger('click');
+      const frame = document.querySelector<HTMLIFrameElement>('iframe[title="Print email"]')!;
+      const printDoc = new DOMParser().parseFromString(frame.srcdoc, 'text/html');
+      expect(printDoc.title).toBe('Wide marketing email');
+      expect(printDoc.documentElement.style.colorScheme).toBe('light');
+      expect(printDoc.querySelector('h1')?.textContent).toBe('Wide marketing email');
+      expect(printDoc.querySelector('dl')?.textContent).toContain('From: newsletter@example.com');
+      expect(printDoc.querySelector('p')?.textContent).toBe('Invoice body');
+      expect(printDoc.querySelector('script, [onclick]')).toBeNull();
+      const policy = printDoc.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute('content');
+      expect(policy).toContain("default-src 'none'");
+      expect(policy).toContain("font-src 'none'");
+      expect(frame.getAttribute('sandbox')).toBe('allow-same-origin allow-modals');
+
+      const printWindow = Object.assign(new EventTarget(), { print: vi.fn() });
+      Object.defineProperty(frame, 'contentWindow', { value: printWindow });
+      frame.dispatchEvent(new Event('load'));
+      expect(printWindow.print).toHaveBeenCalledOnce();
+      printWindow.dispatchEvent(new Event('afterprint'));
+      expect(frame.isConnected).toBe(false);
+    } finally {
+      wrapper.unmount();
+    }
+  });
+
+  it('prints IMAP plaintext literally and includes Cc', async () => {
+    const wrapper = mount(MessageView, { props: { imap: {
+      id: 'imap-1', subject: '<draft>', from_text: 'sender@example.com', to_text: 'to@example.com',
+      ccText: 'cc@example.com', received_at: 1_700_000_000_000, keywords_json: '{}', labels: [], knownLabels: [],
+      gmailLabels: false, canSend: false, seen: true, flagged: false, disabled: false,
+      body: { html: null, text: 'Line one\n<img src="test" />' },
+    } } });
+    try {
+      await wrapper.get('[aria-label="Print email"]').trigger('click');
+      const frame = document.querySelector<HTMLIFrameElement>('iframe[title="Print email"]')!;
+      const printDoc = new DOMParser().parseFromString(frame.srcdoc, 'text/html');
+      expect(printDoc.querySelector('h1')?.textContent).toBe('<draft>');
+      expect(printDoc.querySelector('dl')?.textContent).toContain('Cc: cc@example.com');
+      expect(printDoc.querySelector('.stormbox-print-text')?.textContent).toBe('Line one\n<img src="test" />');
+      expect(printDoc.querySelector('img')).toBeNull();
+    } finally {
+      wrapper.unmount();
+    }
   });
 
   it('renders an empty body instead of a perpetual loading state when a loaded message has no content', async () => {
