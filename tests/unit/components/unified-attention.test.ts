@@ -6,6 +6,8 @@ import { watch } from 'vue';
 
 import UnifiedAttention from '../../../src/components/UnifiedAttention.vue';
 import { __resetRepositoryForTests, __setRepositoryForTests } from '../../../src/composables/useRepository';
+import { TABLE_FAMILIES } from '../../../src/db/protocol';
+import { onWebPushRefresh } from '../../../src/push/client';
 import { useAuthStore } from '../../../src/stores/auth-store';
 import { useComposeStore } from '../../../src/stores/compose-store';
 import { useMailStore } from '../../../src/stores/mail-store';
@@ -13,6 +15,85 @@ import type { RelayMessageBody } from '../../../src/sync/backends/imap/attention
 import type { FolderRow } from '../../../src/types';
 
 vi.mock('../../../src/services/auth', () => ({ initOidc: vi.fn(), getOidc: vi.fn() }));
+vi.mock('../../../src/push/client', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../../src/push/client')>(),
+  onWebPushRefresh: vi.fn(() => () => {}),
+}));
+
+it('coalesces arrivals during a refresh and shows the new mail without switching filters', async () => {
+  let finishFirstRefresh!: (result: string[]) => void;
+  const firstRefresh = new Promise<string[]>((resolve) => { finishFirstRefresh = resolve; });
+  const messages: object[] = [];
+  const refreshAttentionRelay = vi.fn()
+    .mockReturnValueOnce(firstRefresh)
+    .mockImplementationOnce(async () => {
+      messages.push({
+        uid: 42, subject: 'Please review the new brief', receivedAt: new Date().toISOString(), seen: false,
+        from: [{ address: 'sender@example.org' }], to: [{ address: 'owner@example.org' }], flagged: true,
+      });
+      return [];
+    });
+  __setRepositoryForTests({
+    subscribe: () => () => {},
+    getAttentionCache: async () => ({ paired: true, accounts: [{
+      relay_id: 'work', address: 'owner@example.org', mailbox: 'INBOX', uid_validity: '3', messages: [...messages],
+    }], states: {} }),
+    folderByRole: async () => undefined,
+    refreshAttentionRelay,
+  });
+  const wrapper = mount(UnifiedAttention, {
+    props: { ownerId: 1, address: 'owner@example.org' },
+    global: { plugins: [createPinia()] },
+  });
+
+  try {
+    await flushPromises();
+    const currentFilter = wrapper.get('.attention-inbox__filter[aria-pressed="true"]');
+    expect(wrapper.get('[aria-label="Refreshing"]').attributes('disabled')).toBe('');
+    const arrival = vi.mocked(onWebPushRefresh).mock.lastCall![0];
+    arrival();
+    arrival();
+    expect(refreshAttentionRelay).toHaveBeenCalledTimes(1);
+
+    finishFirstRefresh([]);
+    await flushPromises();
+    expect(refreshAttentionRelay).toHaveBeenCalledTimes(2);
+    expect(wrapper.text()).toContain('Please review the new brief');
+    expect(wrapper.get('.attention-inbox__filter[aria-pressed="true"]').element).toBe(currentFilter.element);
+    expect(wrapper.get('[aria-label="Refresh"]').attributes('disabled')).toBeUndefined();
+  } finally {
+    wrapper.unmount();
+    __resetRepositoryForTests();
+  }
+});
+
+it('refreshes a JMAP Inbox discovered after Smart Inbox opens', async () => {
+  let inbox: FolderRow | undefined;
+  let announce!: (tables: string[]) => void;
+  const ensureFolderWindow = vi.fn(async () => {});
+  __setRepositoryForTests({
+    subscribe: (callback: typeof announce) => { announce = callback; return () => {}; },
+    getAttentionCache: async () => ({ paired: false, accounts: [], states: {} }),
+    folderByRole: async () => inbox,
+    listMessagesForView: async () => [],
+    ensureFolderWindow,
+  });
+  const wrapper = mount(UnifiedAttention, {
+    props: { ownerId: 1, address: 'owner@example.org' },
+    global: { plugins: [createPinia()] },
+  });
+  try {
+    await flushPromises();
+    expect(ensureFolderWindow).not.toHaveBeenCalled();
+    inbox = { id: 10, role: 'inbox' } as FolderRow;
+    announce([TABLE_FAMILIES.FOLDERS]);
+    await flushPromises();
+    expect(ensureFolderWindow).toHaveBeenCalledExactlyOnceWith(1, 10, { limit: 100 });
+  } finally {
+    wrapper.unmount();
+    __resetRepositoryForTests();
+  }
+});
 
 it('reopens account management once on return from Google', async () => {
   const before = window.location.href;

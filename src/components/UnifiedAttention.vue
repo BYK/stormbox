@@ -61,6 +61,7 @@ let removePushRefresh: (() => void) | undefined;
 let heartbeat: number;
 let active = true;
 let loadSequence = 0;
+let refreshRequested = false;
 const localModelEnabled = useStorage('stormbox.attention.use-local-model', false);
 const modelScores = shallowRef(new Map<string, TriageClassification>());
 const modelProgress = ref<BrowserTriageProgress>();
@@ -197,9 +198,11 @@ async function loadCache() {
     accountId: props.ownerId, folderId: folder.id, limit: WINDOW_SIZE,
   }) : [];
   if (!active || request !== loadSequence) return;
+  const inboxDiscovered = folder != null && folder.id !== jmapFolder.value?.id;
   cache.value = nextCache;
   jmapFolder.value = folder;
   jmapRows.value = rows;
+  if (inboxDiscovered && !loading.value) requestRefresh();
 }
 
 function report(cause: unknown) {
@@ -211,22 +214,33 @@ function showFailedAccounts(accounts: string[]) {
 }
 
 async function refresh() {
-  if (!repo || busy.value || !online.value) return;
+  if (!active || !repo || busy.value || !online.value) return;
   busy.value = true;
-  error.value = '';
   try {
-    const jobs: Promise<unknown>[] = [];
-    if (jmapFolder.value) jobs.push(repo.ensureFolderWindow(props.ownerId, jmapFolder.value.id, { limit: WINDOW_SIZE }));
-    if (cache.value.paired) jobs.push(repo.refreshAttentionRelay(props.ownerId).then(showFailedAccounts));
-    for (const result of await Promise.allSettled(jobs)) {
-      if (result.status === 'rejected') report(result.reason);
-    }
-    await loadCache();
-  } catch (cause) {
-    report(cause);
+    do {
+      refreshRequested = false;
+      clock.value = Date.now();
+      error.value = '';
+      try {
+        const jobs: Promise<unknown>[] = [];
+        if (jmapFolder.value) jobs.push(repo.ensureFolderWindow(props.ownerId, jmapFolder.value.id, { limit: WINDOW_SIZE }));
+        if (cache.value.paired) jobs.push(repo.refreshAttentionRelay(props.ownerId).then(showFailedAccounts));
+        for (const result of await Promise.allSettled(jobs)) {
+          if (result.status === 'rejected') report(result.reason);
+        }
+        if (active) await loadCache();
+      } catch (cause) {
+        report(cause);
+      }
+    } while (refreshRequested && active && online.value);
   } finally {
     busy.value = false;
   }
+}
+
+function requestRefresh() {
+  refreshRequested = true;
+  void refresh();
 }
 
 async function prepareWebPush() {
@@ -399,7 +413,7 @@ onMounted(async () => {
   try {
     repo = await getRepositoryAsync();
     if (!active) return;
-    removePushRefresh = onWebPushRefresh(() => { void refresh(); });
+    removePushRefresh = onWebPushRefresh(requestRefresh);
     unsubscribe = repo.subscribe((tables) => {
       if (online.value && tables.includes(TABLE_FAMILIES.IMAP_MUTATIONS)) void refreshAfterAccountChange();
       if ([TABLE_FAMILIES.MESSAGES, TABLE_FAMILIES.FOLDERS, TABLE_FAMILIES.ATTENTION].some((table) => tables.includes(table))) {
@@ -418,7 +432,7 @@ onMounted(async () => {
     }
     void refresh();
     if (cache.value.paired) void prepareWebPush();
-    window.addEventListener('online', onVisible);
+    window.addEventListener('online', requestRefresh);
     document.addEventListener('visibilitychange', onVisible);
     heartbeat = window.setInterval(onVisible, REFRESH_INTERVAL);
   } catch (cause) {
@@ -434,7 +448,7 @@ onBeforeUnmount(() => {
   removePushRefresh?.();
   ranker?.dispose();
   ranker = undefined;
-  window.removeEventListener('online', onVisible);
+  window.removeEventListener('online', requestRefresh);
   document.removeEventListener('visibilitychange', onVisible);
   window.clearInterval(heartbeat);
 });
@@ -464,8 +478,13 @@ onBeforeUnmount(() => {
       >
         <template #actions>
           <div class="unified-attention__tools">
-            <AppIconButton :disabled="busy || loading || !online" aria-label="Refresh" title="Refresh" @click="refresh">
-              <RefreshCw :size="16" :stroke-width="1.75" aria-hidden="true" />
+            <AppIconButton
+              :disabled="busy || loading || !online"
+              :aria-label="busy ? 'Refreshing' : 'Refresh'"
+              :title="busy ? 'Refreshing…' : 'Refresh'"
+              @click="refresh"
+            >
+              <RefreshCw :size="16" :stroke-width="1.75" :class="{ 'unified-attention__refresh--busy': busy }" aria-hidden="true" />
             </AppIconButton>
             <AttentionActionMenu label="Smart Inbox options">
               <button
@@ -591,6 +610,12 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 2px;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .unified-attention__refresh--busy { animation: attention-refresh 1.2s linear infinite; }
+}
+@keyframes attention-refresh {
+  to { transform: rotate(360deg); }
 }
 @media (pointer: coarse) {
   .unified-attention__tools .app-icon-button {

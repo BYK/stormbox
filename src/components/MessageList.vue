@@ -1288,33 +1288,6 @@ defineExpose({ focusColumnControl, focusFolderPicker });
   width: 34px;
   padding: 0;
 }
-.msg-list__filter {
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--muted);
-  border-radius: 6px;
-  min-height: 34px;
-  padding: 0 12px;
-  font: inherit;
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 1;
-  cursor: pointer;
-  white-space: nowrap;
-  box-shadow: none;
-}
-.msg-list__filter:hover:where(:not(:disabled)) {
-  background: var(--control-hover-bg);
-  color: var(--text);
-  border-color: color-mix(in srgb, var(--border) 70%, var(--text));
-}
-.msg-list__filter.is-active {
-  background: var(--accent);
-  color: #fff;
-  border-color: color-mix(in srgb, var(--accent) 80%, #000);
-  box-shadow: 0 1px 2px color-mix(in srgb, #000 16%, transparent);
-}
-.msg-list__filter:disabled,
 .msg-list__refresh:disabled {
   cursor: default;
   opacity: 0.5;
@@ -1335,7 +1308,6 @@ defineExpose({ focusColumnControl, focusFolderPicker });
   background: var(--control-hover-bg);
   color: var(--text);
 }
-.msg-list__filter:focus-visible,
 .msg-list__refresh:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;

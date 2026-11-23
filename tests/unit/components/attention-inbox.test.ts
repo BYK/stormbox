@@ -48,6 +48,9 @@ describe('AttentionInbox', () => {
 
     const filters = wrapper.get('[role="group"][aria-label="Smart Inbox filters"]');
     const [attention, updates, handled] = filters.findAll('button');
+    expect(filters.findAll('.attention-inbox__filter-label').map((label) => label.text())).toEqual(['Attention', 'Updates', 'Done']);
+    expect(attention.attributes('aria-label')).toBe('Needs attention, 2 bundles');
+    expect(handled.attributes('aria-label')).toBe('Done & snoozed, 2 bundles');
     expect(attention.attributes('aria-pressed')).toBe('true');
     expect(wrapper.text()).toContain('Approval requested');
     expect(wrapper.text()).toContain('Can you check?');

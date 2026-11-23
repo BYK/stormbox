@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChevronDown } from '@lucide/vue';
+import { Bell, Check, ChevronDown, CircleAlert } from '@lucide/vue';
 import { useElementSize } from '@vueuse/core';
 import { computed, nextTick, ref, useId } from 'vue';
 
@@ -12,6 +12,7 @@ import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, type MessageRowLike } f
 import type { MessageTagDefinition } from '../utils/message-tags';
 import AttentionRowMenu from './AttentionRowMenu.vue';
 import MessageListRow from './MessageListRow.vue';
+import SelectableListHeader from './SelectableListHeader.vue';
 
 const props = withDefaults(defineProps<{
   bundles: readonly TriageBundle[];
@@ -37,9 +38,9 @@ const emit = defineEmits<{
 }>();
 
 const filters = [
-  { key: 'attention', label: 'Needs attention', empty: 'Nothing needs your attention.' },
-  { key: 'updates', label: 'Updates', empty: 'No updates.' },
-  { key: 'handled', label: 'Done & snoozed', empty: 'No done or snoozed mail.' },
+  { key: 'attention', label: 'Attention', name: 'Needs attention', icon: CircleAlert, empty: 'Nothing needs your attention.' },
+  { key: 'updates', label: 'Updates', name: 'Updates', icon: Bell, empty: 'No updates.' },
+  { key: 'handled', label: 'Done', name: 'Done & snoozed', icon: Check, empty: 'No done or snoozed mail.' },
 ] as const;
 
 type Filter = typeof filters[number]['key'];
@@ -74,6 +75,11 @@ const bundlesByFilter = computed(() => {
 });
 const visibleBundles = computed(() => bundlesByFilter.value[selectedFilter.value]);
 const emptyMessage = computed(() => filters.find(({ key }) => key === selectedFilter.value)?.empty);
+
+function filterName(filter: typeof filters[number]): string {
+  const count = bundlesByFilter.value[filter.key].length;
+  return `${filter.name}, ${count} ${count === 1 ? 'bundle' : 'bundles'}`;
+}
 
 function rowFor(message: TriageMessage): MessageRowLike & { id: number | string } {
   return props.rows?.get(browserTriageMessageKey(message)) ?? {
@@ -161,28 +167,37 @@ function applyMessageAction(message: TriageMessage, action: ImapAttentionAction,
 
 <template>
   <section ref="listEl" class="attention-inbox" :class="{ 'msg-list--card': cardLayout }" :aria-labelledby="headingId">
-    <header class="attention-inbox__header">
-      <h2 :id="headingId">Smart Inbox</h2>
-      <slot name="actions" />
-    </header>
-    <div
-      ref="filterBar"
-      class="attention-inbox__filters"
-      role="group"
-      aria-label="Smart Inbox filters"
+    <h2 :id="headingId" class="attention-inbox__heading">Smart Inbox</h2>
+    <SelectableListHeader
+      class="attention-inbox__header"
+      :selectable="false"
+      :all-selected="false"
+      :selected-count="0"
+      :total-count="visibleBundles.length"
+      :show-total-count="false"
+      item-label="bundles"
     >
-      <button
-        v-for="filter in filters"
-        :key="filter.key"
-        class="attention-inbox__filter"
-        type="button"
-        :aria-pressed="selectedFilter === filter.key"
-        @click="selectedFilter = filter.key"
-      >
-        {{ filter.label }}
-        <span class="attention-inbox__count">{{ bundlesByFilter[filter.key].length }}</span>
-      </button>
-    </div>
+      <template #normal-actions>
+        <div ref="filterBar" class="attention-inbox__filters" role="group" aria-label="Smart Inbox filters">
+          <button
+            v-for="filter in filters"
+            :key="filter.key"
+            class="msg-list__filter attention-inbox__filter"
+            :class="{ 'is-active': selectedFilter === filter.key }"
+            type="button"
+            :aria-label="filterName(filter)"
+            :title="filterName(filter)"
+            :aria-pressed="selectedFilter === filter.key"
+            @click="selectedFilter = filter.key"
+          >
+            <component :is="filter.icon" class="attention-inbox__filter-icon" :size="16" :stroke-width="1.75" aria-hidden="true" />
+            <span class="attention-inbox__filter-label">{{ filter.label }}</span>
+            <span class="attention-inbox__count">{{ bundlesByFilter[filter.key].length }}</span>
+          </button>
+        </div>
+      </template>
+      <template #trailing><slot name="actions" /></template>
+    </SelectableListHeader>
     <slot name="progress" />
     <div class="attention-inbox__scroll" :aria-busy="loading">
       <p v-if="error" class="attention-inbox__status attention-inbox__status--error" role="status">
@@ -285,57 +300,55 @@ function applyMessageAction(message: TriageMessage, action: ImapAttentionAction,
   container-type: inline-size;
 }
 
-.attention-inbox__header {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-height: 56px;
-  padding: 8px 18px;
+.attention-inbox__heading {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
-.attention-inbox__header h2 {
-  margin: 0;
-  font-size: 17px;
-  font-weight: 650;
+.attention-inbox__header {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.attention-inbox__header :deep(.selectable-list-header__count--total) {
+  display: none;
 }
 
 .attention-inbox__filters {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
   gap: 4px;
-  padding: 0 14px 10px;
-  border-bottom: 1px solid var(--border);
-}
-
-.attention-inbox__filter {
-  border: 0;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
 }
 
 .attention-inbox__filter {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  min-height: 32px;
-  padding: 4px 7px;
-  border-radius: 6px;
-  font-size: 13px;
+  padding-inline: 8px;
 }
 
-.attention-inbox__filter[aria-pressed='true'] {
-  background: var(--rowActive);
-  font-weight: 650;
+.attention-inbox__filter-icon {
+  display: none;
 }
 
 .attention-inbox__count {
-  color: var(--muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+}
+
+@container (width < 410px) {
+  .attention-inbox__count { display: none; }
+}
+
+@container (width < 340px) {
+  .attention-inbox__filter { justify-content: center; width: 34px; padding: 0; }
+  .attention-inbox__filter-label { display: none; }
+  .attention-inbox__filter-icon { display: block; }
 }
 
 .attention-inbox__scroll {
@@ -359,15 +372,6 @@ function applyMessageAction(message: TriageMessage, action: ImapAttentionAction,
   margin: 0;
   padding: 0;
   list-style: none;
-}
-
-.attention-inbox__filter:hover {
-  background: var(--rowHover);
-}
-
-.attention-inbox__filter:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
 }
 
 .attention-inbox__expand {
@@ -411,7 +415,8 @@ function applyMessageAction(message: TriageMessage, action: ImapAttentionAction,
     justify-content: center;
   }
   .attention-inbox__filter {
-    min-height: 40px;
+    min-width: 44px;
+    min-height: 44px;
   }
 }
 </style>

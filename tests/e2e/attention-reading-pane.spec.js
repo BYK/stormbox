@@ -12,6 +12,41 @@ import { localStackEnabled, selfEmail, skipLocalStackMessage } from './helpers/s
 
 test.skip(!localStackEnabled, skipLocalStackMessage);
 
+test('Smart Inbox updates on new mail and keeps navigation on one row at narrow widths', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await loginViaOidc(page);
+  await page.getByRole('button', { name: 'Attention', exact: true }).click();
+  const header = page.locator('.attention-inbox__header');
+  const attention = header.getByRole('button', { name: /^Needs attention/ });
+  const label = attention.getByText('Attention', { exact: true });
+  const icon = attention.locator('svg');
+  const refresh = header.getByRole('button', { name: /^Refresh/ });
+  await expect(label).toBeVisible();
+  await expect(icon).toBeHidden();
+  await expect(refresh).toBeEnabled();
+
+  const jmap = await connectJmap();
+  const inbox = (await listMailboxes(jmap)).find(({ role }) => role === 'inbox');
+  const subject = `Please review the live Smart Inbox update ${Date.now()}`;
+  const id = await createEmailInMailbox(jmap, {
+    mailboxId: inbox.id, fromEmail: selfEmail(), subject, bodyText: 'Can you review the request?',
+  });
+  try {
+    await expect(page.getByRole('button', { name: new RegExp(`^Open message: ${subject}`) })).toBeVisible({ timeout: 15_000 });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(label).toBeVisible();
+    await page.setViewportSize({ width: 320, height: 844 });
+    await expect(label).toBeHidden();
+    await expect(icon).toBeVisible();
+    const filterBox = await attention.boundingBox();
+    const refreshBox = await refresh.boundingBox();
+    expect(Math.abs(filterBox.y + filterBox.height / 2 - refreshBox.y - refreshBox.height / 2)).toBeLessThan(2);
+    expect(refreshBox.x + refreshBox.width).toBeLessThanOrEqual(320);
+  } finally {
+    await destroyEmail(jmap, id);
+  }
+});
+
 test('Attention keeps the current filter while reading and applies quick actions to the mail server', async ({ page }) => {
   const jmap = await connectJmap();
   const folders = await listMailboxes(jmap);
