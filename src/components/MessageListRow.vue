@@ -35,6 +35,8 @@ const props = withDefaults(defineProps<{
   sort?: JmapViewSort;
   /** False on surfaces without multi-select: no checkbox is rendered. */
   selectable?: boolean;
+  /** For rows without selection, render the unread dot on the avatar. */
+  unreadOnAvatar?: boolean;
   /**
    * Prefix of the row's DOM id (`${domIdPrefix}${message.id}`). Lists
    * that can show one folder side by side pass a per-list prefix so
@@ -101,6 +103,7 @@ const openButton = ref<HTMLButtonElement | null>(null);
 const inFlow = computed(() => props.start === undefined);
 const controlTabIndex = computed(() => inFlow.value ? undefined : -1);
 const isUnread = computed(() => Number(props.message.is_seen) === 0);
+const avatarUnread = computed(() => !props.selectable && props.unreadOnAvatar);
 const isFlagged = computed(() => Number(props.message.is_flagged) === 1);
 const tags = computed(() => resolveMessageTags(props.message.keywords_json, props.tagDefinitions));
 const tagStackLabel = computed(() => (
@@ -153,6 +156,7 @@ const rowLabel = computed(() => [
         'msg-list__item--hover-actions': hoverActions,
         'msg-list__item--row-controls': $slots.controls,
         'msg-list__item--in-flow': inFlow,
+        'msg-list__item--avatar-unread': avatarUnread,
         'has-tag-menu': tagMenuOpen,
       }"
       :role="inFlow ? undefined : 'gridcell'"
@@ -168,10 +172,10 @@ const rowLabel = computed(() => [
         data-message-control
         :tabindex="controlTabIndex"
         :aria-current="inFlow && focused ? true : undefined"
-        :aria-label="`Open message: ${message.subject || '(no subject)'}, ${label}`"
+        :aria-label="`Open message: ${message.subject || '(no subject)'}, ${label}${avatarUnread && isUnread ? ', unread' : ''}`"
         :title="context ? preview : undefined"
       />
-      <div class="msg-list__state">
+      <div v-if="!avatarUnread" class="msg-list__state">
         <label v-if="selectable" class="msg-list__check" draggable="false" @click.stop>
           <input
             type="checkbox"
@@ -190,6 +194,7 @@ const rowLabel = computed(() => [
       </div>
       <div
         class="msg-list__avatar"
+        :class="{ 'msg-list__avatar--unread': avatarUnread && isUnread }"
         :style="avatar.style"
         aria-hidden="true"
       >
@@ -580,6 +585,24 @@ const rowLabel = computed(() => [
   height: 100%;
   object-fit: cover;
 }
+.msg-list__item--avatar-unread .msg-list__avatar {
+  overflow: visible;
+}
+.msg-list__item--avatar-unread .msg-list__avatar-image {
+  border-radius: inherit;
+}
+.msg-list__avatar--unread::after {
+  content: '';
+  position: absolute;
+  inset-inline-end: -1px;
+  inset-block-end: -1px;
+  box-sizing: border-box;
+  width: 11px;
+  height: 11px;
+  border: 2px solid var(--panel);
+  border-radius: 50%;
+  background: var(--accent);
+}
 
 .msg-list__summary {
   display: grid;
@@ -659,6 +682,12 @@ const rowLabel = computed(() => [
 }
 .msg-list--card .msg-list__item--row-controls {
   grid-template-columns: 24px 34px minmax(0, 1fr) auto;
+}
+.msg-list__item.msg-list__item--avatar-unread {
+  grid-template-columns: 34px minmax(0, 1fr);
+}
+.msg-list__item--avatar-unread.msg-list__item--row-controls {
+  grid-template-columns: 34px minmax(0, 1fr) auto;
 }
 .msg-list--card .msg-list__state {
   width: 24px;

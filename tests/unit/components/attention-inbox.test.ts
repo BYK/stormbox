@@ -108,7 +108,9 @@ describe('AttentionInbox', () => {
     expect(row.get('.msg-list__from').text()).toBe('Work sender');
     expect(row.get('.msg-list__subject').text()).toBe('Please review');
     expect(row.get('.msg-list__preview').text()).toContain('Message preview');
-    expect(row.find('.msg-list__avatar').exists()).toBe(true);
+    expect(row.get('.msg-list__avatar').classes()).toContain('msg-list__avatar--unread');
+    expect(row.find('.msg-list__state').exists()).toBe(false);
+    expect(row.get('.msg-list__open').attributes('aria-label')).toMatch(/, unread$/);
 
     const trigger = row.get('summary[aria-label="Message actions"]');
     expect(row.findAll('summary')).toHaveLength(1);

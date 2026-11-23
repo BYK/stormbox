@@ -219,6 +219,7 @@ function applyMessageAction(message: TriageMessage, action: ImapAttentionAction,
           :dom-id-prefix="`${detailId(bundle)}-leader-`"
           :focused="isOpen(bundle.leading.message)"
           :selectable="false"
+          unread-on-avatar
           :draggable="false"
           :context="bundleContext(bundle)"
           :tag-definitions="tagDefinitions"
@@ -265,6 +266,7 @@ function applyMessageAction(message: TriageMessage, action: ImapAttentionAction,
                 :dom-id-prefix="`${detailId(bundle)}-member-`"
                 :focused="isOpen(item.message)"
                 :selectable="false"
+                unread-on-avatar
                 :draggable="false"
                 :context="item.classification.reason"
                 :tag-definitions="tagDefinitions"
