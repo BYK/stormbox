@@ -1,0 +1,52 @@
+{
+  "name": "Stormbox",
+  "packageId": "BYK.Stormbox",
+  "url": "https://webmail.byk.im/?view=attention",
+  "startUrl": "https://webmail.byk.im/?view=attention",
+  "version": "1.0.0",
+  "allowSigning": true,
+  "publisher": {
+    "displayName": "BYK",
+    "commonName": "CN=BYK"
+  },
+  "generateModernPackage": true,
+  "classicPackage": {
+    "generate": false
+  },
+  "edgeHtmlPackage": {
+    "generate": false
+  },
+  "manifestUrl": "https://webmail.byk.im/site.webmanifest",
+  "manifest": {
+    "id": "/",
+    "name": "Stormbox",
+    "short_name": "Stormbox",
+    "start_url": "/?view=attention",
+    "scope": "/",
+    "display": "standalone",
+    "background_color": "#ffffff",
+    "icons": [
+      {
+        "src": "https://webmail.byk.im/icon-192.png",
+        "sizes": "192x192",
+        "type": "image/png"
+      },
+      {
+        "src": "https://webmail.byk.im/icon-512.png",
+        "sizes": "512x512",
+        "type": "image/png"
+      }
+    ]
+  },
+  "images": {
+    "baseImage": "https://webmail.byk.im/icon-512.png",
+    "backgroundColor": "transparent",
+    "padding": 0
+  },
+  "resourceLanguage": "en-US",
+  "targetDeviceFamilies": [
+    "Desktop"
+  ],
+  "enableWebAppWidgets": false,
+  "usePWABuilderWithCustomManifest": true
+}

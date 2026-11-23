@@ -1,7 +1,9 @@
 <script setup lang="ts">
+import { AtSign, Bell, BellOff, RefreshCw, Sparkles } from '@lucide/vue';
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowReactive, shallowRef, watch } from 'vue';
 import { useOnline, useStorage } from '@vueuse/core';
-import AppButton from './AppButton.vue';
+import AppIconButton from './AppIconButton.vue';
+import AttentionActionMenu from './AttentionActionMenu.vue';
 import AttentionInbox from './AttentionInbox.vue';
 import ImapAccountsDialog from './ImapAccountsDialog.vue';
 import MessageView from './MessageView.vue';
@@ -21,6 +23,7 @@ import { disableWebPush, enableWebPush, getWebPushPublicKey, isWebPushEnabled, o
 import type { MessageRow, FolderRow } from '../types';
 import { parseAddressList } from '../utils/address-list';
 import { formatAddressList } from '../utils/address-parse';
+import { closeContainingDropdown } from '../utils/dropdown';
 import type { MessageRowLike } from '../utils/message-row-presentation';
 
 const props = defineProps<{
@@ -266,23 +269,25 @@ async function prepareWebPush() {
       navigator.serviceWorker.ready,
       getWebPushPublicKey(),
     ]);
+    const enabled = await isWebPushEnabled(registration, key).catch(() => false);
     if (!active) return;
+    pushEnabled.value = enabled;
     pushRegistration.value = registration;
     pushKey.value = key;
-    pushEnabled.value = await isWebPushEnabled(registration);
   } catch {
     // Push is optional for a deployment that only configures mail sync.
   }
 }
 
 async function togglePush() {
-  if (!pushRegistration.value || !pushKey.value) return;
+  if (pushBusy.value || !pushRegistration.value || !pushKey.value) return;
   pushBusy.value = true;
   error.value = '';
+  const enabling = !pushEnabled.value;
   try {
-    if (pushEnabled.value) await disableWebPush(pushRegistration.value);
-    else await enableWebPush({ registration: pushRegistration.value, publicKey: pushKey.value });
-    pushEnabled.value = !pushEnabled.value;
+    if (enabling) await enableWebPush({ registration: pushRegistration.value, publicKey: pushKey.value });
+    else await disableWebPush(pushRegistration.value);
+    if (active) pushEnabled.value = enabling;
   } catch (cause) {
     report(cause);
   } finally {
@@ -524,25 +529,49 @@ onBeforeUnmount(() => {
         @restore="(bundle) => saveState(bundle, null)"
       >
         <template #actions>
-          <AppButton :disabled="loading || !online" @click="manageImap = true">
-            {{ cache.paired ? 'Manage IMAP accounts' : 'Connect IMAP accounts' }}
-          </AppButton>
-          <AppButton v-if="cache.paired && pushKey" :disabled="pushBusy || !online" @click="togglePush">
-            {{ pushEnabled ? 'Disable notifications' : 'Enable notifications' }}
-          </AppButton>
-          <AppButton :disabled="busy || loading || !online" @click="refresh">Refresh</AppButton>
-          <AppButton
-            variant="outline"
-            :title="localModelEnabled ? 'Use rules only' : 'Download multilingual E5 and rank on this device'"
-            :aria-pressed="localModelEnabled"
-            @click="localModelEnabled = !localModelEnabled"
-          >{{ localModelEnabled ? 'Turn off local model' : 'Use local model' }}</AppButton>
-          <span v-if="modelProgress" role="status" class="unified-attention__progress">
+          <div class="unified-attention__tools">
+            <AppIconButton :disabled="busy || loading || !online" aria-label="Refresh" title="Refresh" @click="refresh">
+              <RefreshCw :size="16" :stroke-width="1.75" aria-hidden="true" />
+            </AppIconButton>
+            <AttentionActionMenu label="Smart Inbox options">
+              <button
+                class="app-dropdown__item"
+                type="button"
+                :disabled="loading || !online"
+                @click="closeContainingDropdown($event, true); manageImap = true"
+              >
+                <AtSign :size="16" aria-hidden="true" />
+                {{ cache.paired ? 'Manage IMAP accounts' : 'Connect IMAP accounts' }}
+              </button>
+              <button
+                v-if="cache.paired && pushKey"
+                class="app-dropdown__item"
+                type="button"
+                :disabled="pushBusy || !online"
+                @click="closeContainingDropdown($event, true); togglePush()"
+              >
+                <component :is="pushEnabled ? BellOff : Bell" :size="16" aria-hidden="true" />
+                {{ pushEnabled ? 'Disable notifications' : 'Enable notifications' }}
+              </button>
+              <button
+                class="app-dropdown__item"
+                type="button"
+                :title="localModelEnabled ? 'Use rules only' : 'Download multilingual E5 and rank on this device'"
+                @click="closeContainingDropdown($event, true); localModelEnabled = !localModelEnabled"
+              >
+                <Sparkles :size="16" aria-hidden="true" />
+                {{ localModelEnabled ? 'Turn off local model' : 'Use local model' }}
+              </button>
+            </AttentionActionMenu>
+          </div>
+        </template>
+        <template #progress>
+          <p v-if="modelProgress" role="status" class="unified-attention__progress">
             {{ modelProgress.phase === 'preparing' ? 'Preparing local model…' : 'Ranking mail locally…' }}
-          </span>
-          <span v-else-if="localModelEnabled && modelFailed" role="status" class="unified-attention__progress">
+          </p>
+          <p v-else-if="localModelEnabled && modelFailed" role="status" class="unified-attention__progress">
             Local model unavailable. Showing rules-based rankings.
-          </span>
+          </p>
         </template>
       </AttentionInbox>
     </div>
@@ -619,7 +648,21 @@ onBeforeUnmount(() => {
   }
 }
 .unified-attention__progress {
+  margin: 0;
+  padding: 8px 18px;
   color: var(--muted);
   font-size: .8rem;
+}
+.unified-attention__tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+@media (pointer: coarse) {
+  .unified-attention__tools .app-icon-button {
+    width: 44px;
+    height: 44px;
+    flex-basis: 44px;
+  }
 }
 </style>

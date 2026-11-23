@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Check, ChevronDown, Clock, RotateCcw } from '@lucide/vue';
+import { ChevronDown } from '@lucide/vue';
 import { useElementSize } from '@vueuse/core';
 import { computed, nextTick, ref, useId } from 'vue';
 
@@ -10,7 +10,7 @@ import type { TriageBundle, TriageMessage } from '../triage/smart-sort';
 import { closeContainingDropdown } from '../utils/dropdown';
 import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, type MessageRowLike } from '../utils/message-row-presentation';
 import type { MessageTagDefinition } from '../utils/message-tags';
-import AppDropdown from './AppDropdown.vue';
+import AttentionRowMenu from './AttentionRowMenu.vue';
 import MessageListRow from './MessageListRow.vue';
 
 const props = withDefaults(defineProps<{
@@ -90,8 +90,8 @@ function isOpen(message: TriageMessage): boolean {
   return props.openMessage?.id === message.id && props.openMessage?.accountId === message.accountId;
 }
 
-function inlineActions(message: TriageMessage) {
-  return { disabled: props.disabledActions?.has(browserTriageMessageKey(message)) ?? false };
+function actionDisabled(message: TriageMessage): boolean {
+  return props.disabledActions?.has(browserTriageMessageKey(message)) ?? false;
 }
 
 function bundleContext(bundle: TriageBundle): string {
@@ -127,13 +127,6 @@ function snoozeLabel(until: number | undefined): string {
   return `Snoozed until ${formatted}`;
 }
 
-function tomorrowMorning(): number {
-  const date = new Date();
-  date.setDate(date.getDate() + 1);
-  date.setHours(9, 0, 0, 0);
-  return date.getTime();
-}
-
 async function keepFilterFocus(source: EventTarget | null): Promise<void> {
   if (!(source instanceof HTMLElement)) return;
   await nextTick();
@@ -143,11 +136,13 @@ async function keepFilterFocus(source: EventTarget | null): Promise<void> {
 }
 
 function complete(bundle: TriageBundle, event: MouseEvent): void {
+  closeContainingDropdown(event);
   emit('done', bundle);
   void keepFilterFocus(event.currentTarget);
 }
 
 function restore(bundle: TriageBundle, event: MouseEvent): void {
+  closeContainingDropdown(event);
   emit('restore', bundle);
   void keepFilterFocus(event.currentTarget);
 }
@@ -156,6 +151,11 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
   closeContainingDropdown(event);
   emit('snooze', bundle, until);
   void keepFilterFocus(event.currentTarget);
+}
+
+function applyMessageAction(message: TriageMessage, action: ImapAttentionAction, event: MouseEvent): void {
+  emit('message-action', message, action);
+  if (action.type === 'trash') void keepFilterFocus(event.currentTarget);
 }
 </script>
 
@@ -183,6 +183,7 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
         <span class="attention-inbox__count">{{ bundlesByFilter[filter.key].length }}</span>
       </button>
     </div>
+    <slot name="progress" />
     <div class="attention-inbox__scroll" :aria-busy="loading">
       <p v-if="error" class="attention-inbox__status attention-inbox__status--error" role="status">
         {{ error }}
@@ -204,70 +205,34 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
           :focused="isOpen(bundle.leading.message)"
           :selectable="false"
           :draggable="false"
-          :inline-actions="inlineActions(bundle.leading.message)"
           :context="bundleContext(bundle)"
           :tag-definitions="tagDefinitions"
           @row-click="(_event, trigger) => emit('open', bundle.leading.message, trigger)"
-          @star="(value) => emit('message-action', bundle.leading.message, { type: 'star', value })"
-          @seen="(value) => emit('message-action', bundle.leading.message, { type: 'seen', value })"
-          @delete="emit('message-action', bundle.leading.message, { type: 'trash' })"
         >
-          <template #actions>
-            <button
-              v-if="bundle.messages.length > 1"
-              class="msg-list__action attention-inbox__expand"
-              type="button"
-              :aria-expanded="expandedBundles.has(bundle.id)"
-              :aria-controls="detailId(bundle)"
-              :aria-label="`${expandedBundles.has(bundle.id) ? 'Hide' : 'Show'} ${bundle.messages.length} messages`"
-              @click="toggleBundle(bundle)"
-            >
-              {{ bundle.messages.length }}
-              <ChevronDown :size="14" aria-hidden="true" />
-            </button>
-            <template v-if="bundle.status === 'done' || bundle.status === 'snoozed'">
+          <template #controls>
+            <div class="msg-list__row-controls" draggable="false" @click.stop>
               <button
+                v-if="bundle.messages.length > 1"
+                class="attention-inbox__expand"
                 type="button"
-                class="msg-list__action"
-                :aria-label="bundle.status === 'snoozed' ? 'Cancel snooze' : 'Restore bundle'"
-                :title="bundle.status === 'snoozed' ? 'Cancel snooze' : 'Restore bundle'"
-                @click="restore(bundle, $event)"
+                :aria-expanded="expandedBundles.has(bundle.id)"
+                :aria-controls="detailId(bundle)"
+                :aria-label="`${expandedBundles.has(bundle.id) ? 'Hide' : 'Show'} ${bundle.messages.length} messages`"
+                @click="toggleBundle(bundle)"
               >
-                <RotateCcw :size="17" :stroke-width="1.75" aria-hidden="true" />
+                {{ bundle.messages.length }}
+                <ChevronDown :size="14" aria-hidden="true" />
               </button>
-            </template>
-            <template v-else>
-              <AppDropdown class="attention-inbox__snooze">
-                <summary
-                  class="app-dropdown__summary msg-list__action attention-inbox__snooze-trigger"
-                  aria-label="Snooze bundle"
-                  title="Snooze"
-                >
-                  <Clock :size="17" :stroke-width="1.75" aria-hidden="true" />
-                </summary>
-                <div class="app-dropdown__menu attention-inbox__snooze-menu" role="group" aria-label="Snooze until">
-                  <button
-                    class="app-dropdown__item"
-                    type="button"
-                    @click="snooze(bundle, Date.now() + 60 * 60 * 1000, $event)"
-                  >
-                    <Clock :size="15" aria-hidden="true" />
-                    In one hour
-                  </button>
-                  <button
-                    class="app-dropdown__item"
-                    type="button"
-                    @click="snooze(bundle, tomorrowMorning(), $event)"
-                  >
-                    <Clock :size="15" aria-hidden="true" />
-                    Tomorrow at 9 AM
-                  </button>
-                </div>
-              </AppDropdown>
-              <button class="msg-list__action" type="button" aria-label="Mark bundle done" title="Done" @click="complete(bundle, $event)">
-                <Check :size="17" :stroke-width="1.75" aria-hidden="true" />
-              </button>
-            </template>
+              <AttentionRowMenu
+                :row="rowFor(bundle.leading.message)"
+                :bundle="bundle"
+                :disabled="actionDisabled(bundle.leading.message)"
+                @action="(action, event) => applyMessageAction(bundle.leading.message, action, event)"
+                @done="complete"
+                @restore="restore"
+                @snooze="snooze"
+              />
+            </div>
           </template>
           <template #after-row>
             <ul
@@ -286,14 +251,20 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
                 :focused="isOpen(item.message)"
                 :selectable="false"
                 :draggable="false"
-                :inline-actions="inlineActions(item.message)"
                 :context="item.classification.reason"
                 :tag-definitions="tagDefinitions"
                 @row-click="(_event, trigger) => emit('open', item.message, trigger)"
-                @star="(value) => emit('message-action', item.message, { type: 'star', value })"
-                @seen="(value) => emit('message-action', item.message, { type: 'seen', value })"
-                @delete="emit('message-action', item.message, { type: 'trash' })"
-              />
+              >
+                <template #controls>
+                  <div class="msg-list__row-controls" draggable="false" @click.stop>
+                    <AttentionRowMenu
+                      :row="rowFor(item.message)"
+                      :disabled="actionDisabled(item.message)"
+                      @action="(action, event) => applyMessageAction(item.message, action, event)"
+                    />
+                  </div>
+                </template>
+              </MessageListRow>
             </ul>
           </template>
         </MessageListRow>
@@ -318,8 +289,8 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 12px;
+  justify-content: space-between;
+  gap: 8px;
   min-height: 56px;
   padding: 8px 18px;
 }
@@ -400,24 +371,39 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
 }
 
 .attention-inbox__expand {
-  grid-auto-flow: column;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 34px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.attention-inbox__expand:hover {
+  background: var(--control-hover-bg);
+  color: var(--text);
+}
+
+.attention-inbox__expand:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .attention-inbox__expand[aria-expanded='true'] svg {
   transform: rotate(180deg);
 }
 
-.attention-inbox__snooze-trigger::after {
-  display: none;
-}
-
-.attention-inbox__snooze-menu {
-  right: 0;
-  left: auto;
-  background: var(--panel);
-  pointer-events: auto;
+@media (hover: hover) and (pointer: fine) {
+  .attention-inbox__bundles :deep(.msg-list__item:not(:hover, :focus-within) .attention-row-menu:not([open])) {
+    opacity: 0;
+    pointer-events: none;
+  }
 }
 
 .attention-inbox__messages {
@@ -426,6 +412,11 @@ function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
 }
 
 @media (pointer: coarse) {
+  .attention-inbox__expand {
+    min-width: 44px;
+    min-height: 44px;
+    justify-content: center;
+  }
   .attention-inbox__filter {
     min-height: 40px;
   }

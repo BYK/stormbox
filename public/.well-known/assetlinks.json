@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "im.byk.stormbox",
+      "sha256_cert_fingerprints": [
+        "94:9D:CC:60:B3:4C:A0:0E:F3:97:82:D5:C0:E4:B1:47:E7:6A:41:73:D4:95:DB:85:3D:F8:94:C9:E5:44:95:8A"
+      ]
+    }
+  }
+]

@@ -30,7 +30,11 @@ test('Attention keeps the current filter while reading and applies quick actions
     const row = page.locator('.attention-inbox__bundle').filter({ hasText: subject });
     const trigger = row.locator('.msg-list__open');
     const handled = page.getByRole('button', { name: /^Done & snoozed/ });
-    await trigger.hover();
+    const openActions = async () => {
+      await trigger.hover();
+      await row.getByLabel('Message actions', { exact: true }).and(row.locator('summary')).click();
+    };
+    await openActions();
     await row.getByRole('button', { name: 'Mark bundle done' }).click();
     await handled.click();
     await trigger.click();
@@ -50,13 +54,16 @@ test('Attention keeps the current filter while reading and applies quick actions
     await expect(trigger).toBeFocused();
 
     const star = row.getByRole('button', { name: 'Star', exact: true });
+    await openActions();
     await star.click();
+    await openActions();
     await expect(star).toHaveAttribute('aria-pressed', 'true');
     await expect.poll(async () => (await getEmailKeywords(jmap, id))?.$flagged).toBe(true);
     await row.getByRole('button', { name: 'Mark as unread' }).click();
+    await openActions();
     await expect(row.getByRole('button', { name: 'Mark as read' })).toBeVisible();
     await expect.poll(async () => Boolean((await getEmailKeywords(jmap, id))?.$seen)).toBe(false);
-    await row.getByRole('button', { name: 'Delete', exact: true }).click();
+    await row.getByRole('button', { name: 'Move to Trash', exact: true }).click();
     await expect(row).toHaveCount(0);
     await expect.poll(() => getEmailMailboxIds(jmap, id)).toEqual({ [trash.id]: true });
   } finally {

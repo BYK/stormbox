@@ -107,11 +107,18 @@ describe('AttentionInbox', () => {
     expect(row.get('.msg-list__preview').text()).toContain('Message preview');
     expect(row.find('.msg-list__avatar').exists()).toBe(true);
 
-    const star = row.get('.msg-list__action[aria-label="Star"]');
+    const trigger = row.get('summary[aria-label="Message actions"]');
+    expect(row.findAll('summary')).toHaveLength(1);
+    expect(row.findAll('.msg-list__star')).toHaveLength(1);
+    expect(row.find('.msg-list__actions').exists()).toBe(false);
+    await trigger.trigger('click');
+    const star = row.get('button[aria-label="Star"]');
     expect(star.attributes('aria-pressed')).toBe('true');
     await star.trigger('click');
-    await row.get('.msg-list__action[aria-label="Mark as read"]').trigger('click');
-    await row.get('.msg-list__action[aria-label="Delete"]').trigger('click');
+    await trigger.trigger('click');
+    await row.findAll('button').find((button) => button.text() === 'Mark as read')?.trigger('click');
+    await trigger.trigger('click');
+    await row.findAll('button').find((button) => button.text() === 'Move to Trash')?.trigger('click');
     expect(wrapper.emitted('message-action')).toEqual([
       [message, { type: 'star', value: false }],
       [message, { type: 'seen', value: true }],
@@ -120,7 +127,7 @@ describe('AttentionInbox', () => {
     expect(wrapper.emitted('open')).toBeUndefined();
     await wrapper.setProps({ disabledActions: new Set([key]) });
     expect(star.attributes('disabled')).toBe('');
-    expect(row.get('[aria-label="Mark bundle done"]').attributes('disabled')).toBeUndefined();
+    expect(row.findAll('button').find((button) => button.text() === 'Mark bundle done')?.attributes('disabled')).toBeUndefined();
     wrapper.unmount();
   });
 
@@ -138,11 +145,11 @@ describe('AttentionInbox', () => {
       },
     });
 
-    const summary = wrapper.get('[aria-label="Snooze bundle"]');
+    const summary = wrapper.get('summary[aria-label="Message actions"]');
     const dropdown = summary.element.closest('details');
     if (!(dropdown instanceof HTMLDetailsElement)) throw new Error('Missing snooze dropdown');
     dropdown.open = true;
-    const firstOption = wrapper.get<HTMLButtonElement>('[aria-label="Snooze until"] button');
+    const firstOption = wrapper.findAll<HTMLButtonElement>('button').find((button) => button.text() === 'Snooze for one hour')!;
     firstOption.element.focus();
     await firstOption.trigger('click');
     await nextTick();
@@ -152,7 +159,8 @@ describe('AttentionInbox', () => {
 
     await wrapper.get('[aria-label="Smart Inbox filters"]').findAll('button')[2].trigger('click');
     expect(wrapper.text()).toContain('Snoozed until');
-    await wrapper.get('[aria-label="Cancel snooze"]').trigger('click');
+    await wrapper.get('summary[aria-label="Message actions"]').trigger('click');
+    await wrapper.findAll('button').find((button) => button.text() === 'Cancel snooze')?.trigger('click');
     expect(wrapper.emitted('restore')).toEqual([[{ ...request, status: 'snoozed', snoozedUntil: receivedAt + 60 * 60 * 1000 }]]);
     wrapper.unmount();
   });

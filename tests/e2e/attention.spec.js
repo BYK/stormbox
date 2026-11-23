@@ -31,6 +31,7 @@ test('Attention reads JMAP and IMAP and retains triage state and a downloaded bo
     await loginViaOidc(page);
     await page.getByRole('button', { name: 'Attention', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Smart Inbox' })).toBeVisible();
+    await page.getByLabel('Smart Inbox options', { exact: true }).and(page.locator('summary')).click();
     await page.getByRole('button', { name: 'Connect IMAP accounts' }).click();
     await page.getByLabel('Mail relay pairing token').fill(pairToken);
     await page.getByRole('button', { name: 'Connect', exact: true }).click();
@@ -46,6 +47,7 @@ test('Attention reads JMAP and IMAP and retains triage state and a downloaded bo
     await expect(page.getByText(imapText)).toBeVisible();
     await page.getByRole('button', { name: 'Back to Attention' }).click();
     await jmapRow.locator('.msg-list__open').hover();
+    await jmapRow.getByLabel('Message actions', { exact: true }).and(jmapRow.locator('summary')).click();
     await jmapRow.getByRole('button', { name: 'Mark bundle done' }).click();
     await expect(jmapRow).toHaveCount(0);
 
@@ -113,6 +115,7 @@ test('Attention applies IMAP star, read state and Trash to the row, local cache 
 
     await loginViaOidc(page);
     await page.getByRole('button', { name: 'Attention', exact: true }).click();
+    await page.getByLabel('Smart Inbox options', { exact: true }).and(page.locator('summary')).click();
     await page.getByRole('button', { name: 'Connect IMAP accounts' }).click();
     await page.getByLabel('Mail relay pairing token').fill(pairToken);
     await page.getByRole('button', { name: 'Connect', exact: true }).click();
@@ -121,19 +124,26 @@ test('Attention applies IMAP star, read state and Trash to the row, local cache 
     const actions = row.getByRole('group', { name: 'Message actions' }).first();
     const star = actions.getByRole('button', { name: 'Star', exact: true });
 
-    await row.locator('.msg-list__open').hover();
+    const openActions = async () => {
+      await row.locator('.msg-list__open').hover();
+      await row.getByLabel('Message actions', { exact: true }).and(row.locator('summary')).click();
+    };
+    await openActions();
     await star.click();
+    await openActions();
     await expect(star).toHaveAttribute('aria-pressed', 'true');
     await expect.poll(cachedMessage).toMatchObject({ flagged: true });
     await expect.poll(serverFlags).toMatchObject({ flagged: true });
 
     await actions.getByRole('button', { name: 'Mark as read', exact: true }).click();
+    await openActions();
     await actions.getByRole('button', { name: 'Mark as unread', exact: true }).click();
+    await openActions();
     await expect(actions.getByRole('button', { name: 'Mark as read', exact: true })).toBeVisible();
     await expect.poll(cachedMessage).toMatchObject({ seen: false, flagged: true });
     await expect.poll(serverFlags).toEqual({ seen: false, flagged: true });
 
-    await actions.getByRole('button', { name: 'Delete', exact: true }).click();
+    await actions.getByRole('button', { name: 'Move to Trash', exact: true }).click();
     await expect(row).toHaveCount(0);
     await expect.poll(cachedMessage).toBeNull();
     await expect.poll(serverFlags).toBeNull();

@@ -81,6 +81,23 @@ unit suite and typecheck, builds the SPA with the production variables
 above, and emits a dry-run Wrangler bundle. It never receives the
 Cloudflare token.
 
+## Android and Windows packages
+
+The [Android](../packaging/android/pwabuilder.json) and
+[Windows](../packaging/windows/pwabuilder.json) PWABuilder requests package
+the deployed site and launch Attention. Both use its browser cache and
+Web Push subscription.
+
+Sign the Android APK with the distribution keystore. The SHA-256
+fingerprint of the certificate used to sign the APK must appear in
+[`assetlinks.json`](../public/.well-known/assetlinks.json) on the Pages
+deployment. Use the Play App Signing certificate fingerprint for a
+Play-distributed build. Keep signing keys outside the repository.
+
+For a Windows preview, extract the PWABuilder sideload ZIP and run
+`install.ps1` with Windows PowerShell. The preview uses Microsoft Edge
+Stable. Store distribution requires a separate Microsoft Store submission.
+
 ## Smoke checks
 
 An unauthenticated session request should reach Thundermail and return

@@ -6,9 +6,7 @@
  * is emitted back to the owner.
  */
 import { computed, ref } from 'vue';
-import {
-  Mail, MailOpen, Paperclip, Star, Trash2,
-} from '@lucide/vue';
+import { Paperclip, Star, Trash2 } from '@lucide/vue';
 
 import archiveIcon from '../assets/icons/tb-folder-archive.svg?raw';
 import type { JmapViewSort } from '../constants/states';
@@ -53,8 +51,6 @@ const props = withDefaults(defineProps<{
    * (set or not) and never tag, archive or delete.
    */
   hoverActions?: boolean;
-  /** Show star, read state and delete for a list with independent row controls. */
-  inlineActions?: { disabled: boolean };
   context?: string;
   /** False where archiving is a no-op (the Archive folder): the overlay drops its Archive button. */
   archiveAction?: boolean;
@@ -92,7 +88,6 @@ const emit = defineEmits<{
   (e: 'dragstart', event: DragEvent): void;
   (e: 'dragend', event: DragEvent): void;
   (e: 'star', flagged: boolean): void;
-  (e: 'seen', seen: boolean): void;
   /** Open the tag menu for this row, anchored to the button that raised it. */
   (e: 'tag', event: MouseEvent): void;
   /** A chip was clicked: the owner filters the list to that tag. */
@@ -115,9 +110,6 @@ const correspondent = computed(() => rowCorrespondent(props.message, props.shows
 const avatar = computed(() => senderAvatar(correspondent.value));
 const label = computed(() => correspondentLabel(props.message, props.showsRecipients));
 const dateText = computed(() => fmtDate(rowTimestamp(props.message, props.sort)));
-const secondaryActionLabel = computed(() => props.inlineActions
-  ? (isUnread.value ? 'Mark as read' : 'Mark as unread')
-  : 'Archive');
 const preview = computed(() => [props.context, props.message.preview].filter(Boolean).join(' · '));
 const rowLabel = computed(() => [
   label.value,
@@ -159,7 +151,7 @@ const rowLabel = computed(() => [
       class="msg-list__item"
       :class="{
         'msg-list__item--hover-actions': hoverActions,
-        'msg-list__item--inline-actions': inlineActions,
+        'msg-list__item--row-controls': $slots.controls,
         'msg-list__item--in-flow': inFlow,
         'has-tag-menu': tagMenuOpen,
       }"
@@ -229,10 +221,8 @@ const rowLabel = computed(() => [
           </span>
           <span class="msg-list__date">{{ dateText }}</span>
           <div
-            v-if="hoverActions || inlineActions"
+            v-if="hoverActions"
             class="msg-list__actions"
-            :role="inlineActions ? 'group' : undefined"
-            :aria-label="inlineActions ? 'Message actions' : undefined"
             draggable="false"
             @click.stop
           >
@@ -262,26 +252,23 @@ const rowLabel = computed(() => [
               :tabindex="controlTabIndex"
               data-message-control
               :title="isFlagged ? 'Unstar' : 'Star'"
-              :aria-label="isFlagged && !inlineActions ? 'Unstar' : 'Star'"
+              :aria-label="isFlagged ? 'Unstar' : 'Star'"
               :aria-pressed="isFlagged"
-              :disabled="inlineActions?.disabled"
               @click="emit('star', !isFlagged)"
             >
               <Star :size="17" :stroke-width="1.75" :fill="isFlagged ? '#facc15' : 'none'" />
             </button>
             <button
-              v-if="inlineActions || archiveAction"
+              v-if="archiveAction"
               type="button"
               class="msg-list__action"
               :tabindex="controlTabIndex"
               data-message-control
-              :title="secondaryActionLabel"
-              :aria-label="secondaryActionLabel"
-              :disabled="inlineActions?.disabled"
-              @click="inlineActions ? emit('seen', isUnread) : emit('archive')"
+              title="Archive"
+              aria-label="Archive"
+              @click="emit('archive')"
             >
-              <component v-if="inlineActions" :is="isUnread ? MailOpen : Mail" :size="17" :stroke-width="1.75" aria-hidden="true" />
-              <span v-else class="msg-list__action-icon--folder" aria-hidden="true" v-html="archiveIcon" />
+              <span class="msg-list__action-icon--folder" aria-hidden="true" v-html="archiveIcon" />
             </button>
             <button
               v-if="deleteAction"
@@ -289,9 +276,8 @@ const rowLabel = computed(() => [
               class="msg-list__action msg-list__action--danger"
               :tabindex="controlTabIndex"
               data-message-control
-              :title="inlineActions ? 'Move to Trash' : 'Delete'"
+              title="Delete"
               aria-label="Delete"
-              :disabled="inlineActions?.disabled"
               @click="emit('delete')"
             >
               <Trash2 :size="18" :stroke-width="1.65" />
@@ -303,6 +289,7 @@ const rowLabel = computed(() => [
           {{ preview }}
         </p>
       </div>
+      <slot name="controls" />
     </div>
     <slot name="after-row" />
   </li>
@@ -500,39 +487,12 @@ const rowLabel = computed(() => [
   opacity: 0.35;
   cursor: default;
 }
-.msg-list__item--inline-actions .msg-list__actions {
-  position: static;
-  transform: none;
-  grid-column: 1 / -1;
-  justify-self: end;
-  justify-content: end;
-  flex-wrap: wrap;
-}
-.msg-list__item--inline-actions .msg-list__actions :deep(.msg-list__action) {
-  display: inline-grid;
-  visibility: visible;
-}
-@media (min-width: 640px) and (hover: hover) {
-  @container (min-width: 480px) {
-    .msg-list__item--inline-actions .msg-list__summary {
-      position: relative;
-    }
-    .msg-list__item--inline-actions .msg-list__actions {
-      position: absolute;
-      transform: translateY(-50%);
-      opacity: 0;
-    }
-    .msg-list__item--inline-actions:not(:hover, :focus-within, :has(details[open])) .msg-list__actions :deep(.msg-list__action) {
-      pointer-events: none;
-    }
-    .msg-list__item--inline-actions :is(.msg-list__content, .msg-list__summary, .msg-list__actions) {
-      background: inherit;
-    }
-    .msg-list__item--inline-actions:is(:hover, :focus-within, :has(details[open])) .msg-list__actions {
-      opacity: 1;
-      z-index: 1;
-    }
-  }
+:slotted(.msg-list__row-controls) {
+  position: relative;
+  display: flex;
+  align-self: center;
+  align-items: center;
+  gap: 4px;
 }
 .msg-list__action-icon--folder {
   display: block;
@@ -693,6 +653,12 @@ const rowLabel = computed(() => [
   align-items: start;
   column-gap: 9px;
   padding: 10px 12px;
+}
+.msg-list__item--row-controls {
+  grid-template-columns: 34px 34px minmax(0, 1fr) auto;
+}
+.msg-list--card .msg-list__item--row-controls {
+  grid-template-columns: 24px 34px minmax(0, 1fr) auto;
 }
 .msg-list--card .msg-list__state {
   width: 24px;

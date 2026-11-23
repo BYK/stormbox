@@ -38,7 +38,10 @@ it('reopens account management once on return from Google', async () => {
     expect(window.location.search).toBe('?view=attention');
     expect(refreshAttentionRelay).toHaveBeenCalledWith(1);
     await wrapper.get('[aria-label="Close IMAP accounts"]').trigger('click');
+    const options = wrapper.get('summary[aria-label="Smart Inbox options"]');
     const manage = wrapper.findAll('button').find((button) => button.text() === 'Manage IMAP accounts');
+    expect(options.element.closest('details')?.contains(manage!.element)).toBe(true);
+    await options.trigger('click');
     await manage!.trigger('click');
     await flushPromises();
     expect(wrapper.get('[role="dialog"]').text()).not.toContain('Google account connected.');
@@ -97,6 +100,7 @@ it('opens the regular JMAP reader in Attention and keeps the filter and focus on
     expect(updates.attributes('aria-pressed')).toBe('true');
     expect(document.activeElement).toBe(preview.element);
 
+    await wrapper.get('summary[aria-label="Message actions"]').trigger('click');
     const starButton = wrapper.get('[aria-label="Star"]');
     await starButton.trigger('click');
     await flushPromises();

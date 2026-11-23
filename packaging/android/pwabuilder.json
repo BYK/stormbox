@@ -1,0 +1,23 @@
+{
+  "analysisId": null,
+  "appVersion": "0.1.0",
+  "appVersionCode": 1,
+  "backgroundColor": "#FFFFFF",
+  "display": "standalone",
+  "enableNotifications": true,
+  "fallbackType": "customtabs",
+  "host": "webmail.byk.im",
+  "iconUrl": "https://webmail.byk.im/icon-512.png",
+  "includeSourceCode": true,
+  "launcherName": "Stormbox",
+  "name": "Stormbox",
+  "navigationColor": "#FFFFFF",
+  "orientation": "default",
+  "packageId": "im.byk.stormbox",
+  "signingMode": "none",
+  "splashScreenFadeOutDuration": 300,
+  "startUrl": "/?view=attention",
+  "themeColor": "#FFFFFF",
+  "webManifestUrl": "https://webmail.byk.im/site.webmanifest",
+  "pwaUrl": "https://webmail.byk.im/"
+}
