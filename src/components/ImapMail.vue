@@ -237,8 +237,9 @@ const filteredThreads = computed(() => {
   if (!terms.length && !unreadOnly.value && !starredOnly.value) return threads.value;
   return threads.value.filter((thread) => {
     const members = threadEntries(thread);
-    if (unreadOnly.value && members.every(({ row }) => row.is_seen !== 0)) return false;
-    if (starredOnly.value && members.every(({ row }) => row.is_flagged !== 1)) return false;
+    const readingMember = inlineReading.value && members.some(({ key }) => key === activeMessageKey.value);
+    if (!readingMember && unreadOnly.value && members.every(({ row }) => row.is_seen !== 0)) return false;
+    if (!readingMember && starredOnly.value && members.every(({ row }) => row.is_flagged !== 1)) return false;
     return !terms.length || members.some(({ row }) => {
       const haystack = [row.from_text, row.to_text, row.subject, row.preview].join(' ').toLowerCase();
       return terms.every((term) => haystack.includes(term));

@@ -8,6 +8,7 @@ import type { CachedImapAccount } from '../../../src/db/attention';
 import { TABLE_FAMILIES } from '../../../src/db/protocol';
 import { useAuthStore } from '../../../src/stores/auth-store';
 import { useMailStore } from '../../../src/stores/mail-store';
+import type { ImapAttentionAction, ImapMessageLocation } from '../../../src/sync/backends/imap/attention-relay';
 import type { FolderRow } from '../../../src/types/db';
 
 vi.mock('../../../src/services/auth', () => ({ initOidc: async () => null, getOidc: () => null }));
@@ -25,7 +26,10 @@ it('shows a failed Google account in Mail and makes its messages available after
   };
   const body = vi.fn(async () => ({ text: 'Work message body.', html: '' }));
   const refresh = vi.fn(async () => []);
-  const mutate = vi.fn(async () => {});
+  const mutate = vi.fn(async (_owner: number, location: ImapMessageLocation, action: ImapAttentionAction) => {
+    if (action.type === 'seen') account.messages = account.messages.map((item) =>
+      item.uid === location.uid ? { ...item, seen: action.value } : item);
+  });
   const batch = vi.fn(async () => ({ mutationIds: [1, 2] }));
   const target = document.createElement('div');
   document.body.append(target);
@@ -106,6 +110,17 @@ it('shows a failed Google account in Mail and makes its messages available after
     await row.get('button[aria-label="Collapse message"]').trigger('click');
     expect(row.find('[data-inline-mail-reader]').exists()).toBe(false);
     expect(document.activeElement).toBe(row.get('.msg-list__open').element);
+
+    account.messages[0].seen = false;
+    await wrapper.get('button[aria-label="Refresh"]').trigger('click');
+    await flushPromises();
+    await wrapper.get('button[aria-label="Unread"]').trigger('click');
+    await row.get('.msg-list__open').trigger('click');
+    await flushPromises();
+    expect(row.classes()).not.toContain('is-unread');
+    expect(row.get('[data-inline-mail-reader]').text()).toContain('Work message body.');
+    await row.get('button[aria-label="Collapse message"]').trigger('click');
+    expect(wrapper.find('.imap-mail__rows > li').exists()).toBe(false);
   } finally {
     wrapper.unmount();
     target.remove();

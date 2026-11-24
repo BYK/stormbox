@@ -151,6 +151,48 @@ describe('Attention cache', () => {
     }
   });
 
+  it('refreshes only the affected Inbox after an obsolete UID is rejected without Retry', async () => {
+    const { handlers, server, fetcher } = fakeRelay();
+    const allHandlers = { ...makeHandlers(engine, { touch: vi.fn() }), ...handlers };
+    const runner = new OutboxRunner({
+      accountId: ownerId, handlers: allHandlers,
+      processRow: (row) => processMutationRow({ account: { id: ownerId }, transport: null, handlers: allHandlers, row }),
+    });
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    let release!: () => void;
+    server.workWindowGate = new Promise<void>((resolve) => { release = resolve; });
+    const windows = (account: string) => fetcher.mock.calls.filter(([url]) => url.includes(`/${account}/messages?`));
+    const refresh = handlers[DB_RPC.ATTENTION_REFRESH]({ ownerId });
+    try {
+      await vi.waitFor(() => expect(windows('work')).toHaveLength(2));
+      server.uidValidity = '4';
+      server.actionFailure = 409;
+      server.actionFailureCode = 'mailbox_changed';
+      for (const value of [true, false]) {
+        await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]({
+          ownerId, location: workMessage, action: { type: 'star', value },
+        });
+      }
+      await runner.drain();
+      expect(await engine.all(`SELECT json_extract(error_json, '$.type') AS type FROM pending_mutations`))
+        .toEqual([{ type: 'imapMailboxChanged' }, { type: 'imapMailboxChanged' }]);
+      expect(await handlers[DB_RPC.ATTENTION_IMAP_ACTION_FAILURES]({ ownerId }))
+        .toMatchObject([{ canRetry: false }, { canRetry: false }]);
+      expect(windows('work')).toHaveLength(2);
+      release();
+      await refresh;
+      await vi.waitFor(async () => expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts
+        .find(({ relay_id }) => relay_id === 'work')?.uid_validity).toBe('4'));
+      expect(windows('work')).toHaveLength(3);
+      expect(windows('home')).toHaveLength(2);
+      await handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: { ...workMessage, uidValidity: '4' } });
+    } finally {
+      release();
+      await refresh;
+      await runner.stop();
+    }
+  });
+
   it('persists scoped account settings before a slow inbox sync completes', async () => {
     const google = {
       id: 'work', email: 'work@example.com', name: 'Work', managed: true, host: 'imap.gmail.com', auth: 'google-oauth',
