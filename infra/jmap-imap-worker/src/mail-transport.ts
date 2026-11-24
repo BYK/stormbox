@@ -327,6 +327,8 @@ export function createMailTransport(openSocket: SmtpConnect = connect, {
       }, syncTimeout);
     } catch (error) {
       if (!(error instanceof MailTransportError && error.code === 'mail_timeout' && attempted > 0)) throw error;
+      // Give the unfinished folder a fresh budget when this scan already returned a window.
+      if (windows.length > 0) attempted -= 1;
     }
     const nextFolder = attempted < selectedCount ? (offset + attempted) % selectedCount : 0;
     return { folders, windows, failedFolders: [...failedFolders], nextFolder };

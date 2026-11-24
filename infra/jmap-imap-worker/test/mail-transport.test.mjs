@@ -256,6 +256,21 @@ test('a stalled Inbox leaves the other folders eligible on the next scan', { tim
   assert.deepEqual(resumed.failedFolders, ['INBOX']);
 });
 
+test('aggregate deadlines resume at the unfinished folder after making progress', { timeout: 4000 }, async () => {
+  let selections = 0;
+  const fixture = makeImapSocket({ trash: true, junk: true, stall: (command) => /^EXAMINE /.test(command) && ++selections % 2 === 0 });
+  const transport = createMailTransport(fixture.connect, { syncTimeout: 200, folderTimeout: 1000 });
+  let resumeAt = 0;
+  const completed = new Set();
+  for (let pass = 0; pass < 4; pass++) {
+    const result = await transport.listMailboxWindows(account, 10, 8, resumeAt);
+    assert.equal(result.windows.length, 1);
+    completed.add(result.windows[0].mailbox);
+    resumeAt = result.nextFolder;
+  }
+  assert.deepEqual(completed, new Set(['INBOX', 'Archive', 'Deleted items', 'Spam folder']));
+});
+
 test('a deadline after issuing UID STORE preserves the uncertain write outcome', { timeout: 3000 }, async () => {
   const fixture = makeImapSocket({ stall: (command) => /^UID STORE /.test(command) });
   const transport = createMailTransport(fixture.connect, { operationTimeout: 100 });
