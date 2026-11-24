@@ -165,17 +165,23 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     const headCheckbox = wrapper.get<HTMLInputElement>('input[aria-label^="Select conversation: Re: Planning"]');
     await headCheckbox.trigger('click');
     expect(wrapper.get('.msg-list__header').text()).toContain('3 selected');
-    await wrapper.get('button[aria-label="Show 2 earlier messages"]').trigger('click');
-    expect(wrapper.findAll('.imap-mail__rows > li')).toHaveLength(3);
+    await wrapper.get('button[aria-label="Show 3 messages"]').trigger('click');
+    expect(wrapper.findAll('.imap-mail__rows > li')).toHaveLength(4);
+    const newest = wrapper.get<HTMLInputElement>('input[aria-label^="Select message: Re: Planning"]');
+    await newest.trigger('click');
+    expect(headCheckbox.element.indeterminate).toBe(true);
+    expect(newest.element.checked).toBe(false);
+    await newest.trigger('click');
+    expect(headCheckbox.element.checked).toBe(true);
     await wrapper.get('input[aria-label^="Select message: Planning"]').trigger('click');
     expect(headCheckbox.element.indeterminate).toBe(true);
     expect(wrapper.get('.msg-list__header').text()).toContain('2 selected');
-    await wrapper.get('button[aria-label="Hide 2 earlier messages"]').trigger('click');
+    await wrapper.get('button[aria-label="Hide 3 messages"]').trigger('click');
     expect(wrapper.get('.msg-list__header').text()).toContain('2 selected');
     await wrapper.get('button[aria-label="Clear selection"]').trigger('click');
     expect(body).not.toHaveBeenCalled();
 
-    await wrapper.get('button[aria-label="Show 2 earlier messages"]').trigger('click');
+    await wrapper.get('button[aria-label="Show 3 messages"]').trigger('click');
     await wrapper.get('button[aria-label^="Open message: Planning"]').trigger('click');
     expect(wrapper.find('ol[aria-label="Messages in conversation"]').exists()).toBe(false);
     await wrapper.get('button[aria-label="Back"]').trigger('click');

@@ -50,7 +50,7 @@ type ThreadEntry = ThreadMessage & (
   | { kind: 'imap'; entry: ImapEntry; row: ImapEntry['presentation'] }
   | { kind: 'jmap'; folder: InboxFolder; row: MessageRow }
 );
-type ListRow = { entry: ThreadEntry; targets: ThreadEntry[]; stack?: MailThread<ThreadEntry>; nested: boolean };
+type ListRow = { key: string; entry: ThreadEntry; targets: ThreadEntry[]; stack?: MailThread<ThreadEntry>; nested: boolean };
 type SavedView = { kind: 'unified' } | { kind: 'imap'; accountId: string; path: string };
 
 const PAGE_SIZE = 120;
@@ -240,13 +240,18 @@ const filteredThreads = computed(() => {
   });
 });
 const visibleThreads = computed(() => filteredThreads.value.slice(0, visibleThreadLimit.value));
-const visibleRows = computed<ListRow[]>(() => visibleThreads.value.flatMap((thread) => [
-  { entry: thread.newest, targets: threadEntries(thread), stack: thread.previous.length ? thread : undefined, nested: false },
-  ...(expandedThreads.value.has(thread.key) ? thread.previous.map((entry) => ({ entry, targets: [entry], nested: true })) : []),
-]));
+const visibleRows = computed<ListRow[]>(() => visibleThreads.value.flatMap((thread) => {
+  const targets = threadEntries(thread);
+  const stack = targets.length > 1 ? thread : undefined;
+  return [
+    { key: stack ? `conversation:${thread.key}` : thread.newest.key, entry: thread.newest, targets, stack, nested: false },
+    ...(stack && expandedThreads.value.has(thread.key)
+      ? targets.map((entry) => ({ key: entry.key, entry, targets: [entry], nested: true })) : []),
+  ];
+}));
 const selectableEntries = computed(() => visibleThreads.value.flatMap(threadEntries));
 const selection = useListSelection({
-  rows: visibleRows, total: computed(() => visibleRows.value.length), getKey: ({ entry }) => entry.key,
+  rows: visibleRows, total: computed(() => visibleRows.value.length), getKey: ({ key }) => key,
   getSelectionKeys: ({ targets }) => targets.map(({ key }) => key),
 });
 const { selectionCount, focusedId } = selection;
@@ -360,8 +365,8 @@ function rowMixed(row: ListRow) {
   return !rowChecked(row) && row.targets.some(({ key }) => selection.isSelected(key));
 }
 
-function rowFocused({ entry, nested }: ListRow) {
-  if (!openedThread.value) return activeMessageKey.value === entry.key;
+function rowFocused({ entry, nested, stack }: ListRow) {
+  if (!openedThread.value) return !stack && activeMessageKey.value === entry.key;
   return !nested && conversationEntries.value.some(({ key }) => key === entry.key);
 }
 function tagPickerFor(targets: readonly ThreadEntry[]) {
@@ -782,8 +787,8 @@ function showMessage(entry: ThreadEntry) {
   }
 }
 
-function openRow({ entry, nested }: ListRow, button: HTMLElement | null) {
-  focusedId.value = entry.key;
+function openRow({ entry, nested, key }: ListRow, button: HTMLElement | null) {
+  focusedId.value = key;
   openedThread.value = showThreads.value && !nested ? threadByMember.value.get(entry.key) : undefined;
   showMessage(entry);
   openingButton = button;
@@ -804,7 +809,7 @@ function clickRow(row: ListRow, index: number, event: MouseEvent, button: HTMLEl
   }
   const wasSelecting = selection.hasSelection.value;
   selection.selectNone();
-  focusedId.value = row.entry.key;
+  focusedId.value = row.key;
   const isOpen = rowFocused(row);
   if (!wasSelecting && isOpen) closeReader();
   else openRow(row, button);
@@ -850,7 +855,7 @@ function startCompose() {
 
 function openTagMenu(row: ListRow | undefined, trigger: EventTarget | null | undefined) {
   if (!(trigger instanceof HTMLElement)) return;
-  const key = row?.entry.key;
+  const key = row?.key;
   if (tagPopover.value && tagPopover.value.key === key && tagPopover.value.trigger === trigger) {
     closeTagMenu();
     return;
@@ -1031,10 +1036,11 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
       <div ref="scroller" class="imap-mail__scroll msg-list__scroller" role="region" aria-label="Messages"
         tabindex="0" @keydown="onListKeydown">
         <ul v-if="visibleRows.length" class="imap-mail__rows msg-list__items" aria-label="Messages">
-          <MessageListRow v-for="(item, index) in visibleRows" :key="item.entry.key"
+          <MessageListRow v-for="(item, index) in visibleRows" :key="item.key"
             :message="rowPresentation(item)" :index="index" :size="cardLayout ? CARD_ROW_HEIGHT : ROW_HEIGHT"
-            :class="{ 'imap-mail__nested': item.nested }" :context="rowContext(item.entry)" dom-id-prefix="account-mail-row-"
-            :focused="rowFocused(item)" :cursor="focusedId === item.entry.key" :selected="rowChecked(item)"
+            :class="{ 'imap-mail__nested': item.nested }" :context="rowContext(item.entry)"
+            :dom-id-prefix="item.stack ? 'account-mail-conversation-' : 'account-mail-row-'"
+            :focused="rowFocused(item)" :cursor="focusedId === item.key" :selected="rowChecked(item)"
             :selection-mixed="rowMixed(item)" :conversation-count="item.stack ? item.targets.length : undefined" :draggable="false"
             :shows-recipients="folderShowsRecipients({ role })"
             :sort="item.entry.kind === 'jmap' ? mailStore.sortForFolder(item.entry.folder.id) : 'received'"
@@ -1042,7 +1048,7 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
             :additional-tags="rowAdditionalTags(item.targets)"
             :hover-actions="!item.targets.some((target) => target.kind === 'jmap' && isScheduledMessage(target.row))"
             :archive-action="item.targets.every(canArchiveEntry)"
-            :delete-action="item.targets.every(canDeleteEntry)" :tag-menu-open="tagPopover?.key === item.entry.key"
+            :delete-action="item.targets.every(canDeleteEntry)" :tag-menu-open="tagPopover?.key === item.key"
             @row-click="(event, button) => clickRow(item, index, event, button)"
             @checkbox-click="selection.handleCheckboxClick(index, $event, 0)"
             @tag="openTagMenu(item, $event.currentTarget)"
@@ -1053,7 +1059,7 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
             <template v-if="item.stack" #controls>
               <div class="msg-list__row-controls" @click.stop>
                 <button type="button" class="imap-mail__stack" :aria-expanded="expandedThreads.has(item.stack.key)"
-                  :aria-label="`${expandedThreads.has(item.stack.key) ? 'Hide' : 'Show'} ${item.stack.previous.length} earlier ${item.stack.previous.length === 1 ? 'message' : 'messages'}`"
+                  :aria-label="`${expandedThreads.has(item.stack.key) ? 'Hide' : 'Show'} ${item.targets.length} messages`"
                   @click.stop="toggleThread(item.stack.key)">
                   +{{ item.stack.previous.length }} <ChevronDown :size="14" aria-hidden="true" />
                 </button>
