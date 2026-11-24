@@ -348,6 +348,28 @@ describe('Attention cache', () => {
     }
   });
 
+  it('holds each IMAP action until the shared deadline and cancels only unclaimed actions', async () => {
+    const { handlers } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const undoExpiresAt = Date.now() + MAIL_UNDO_MS / 2;
+    const { mutationIds } = await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS]({ ownerId, undoable: true, undoExpiresAt,
+      requests: [
+        { location: workMessage, action: { type: 'trash' } },
+        { location: { ...workMessage, accountId: 'home' }, action: { type: 'seen', value: false } },
+      ],
+    });
+    const [claimed, pending] = mutationIds;
+    const rows = await engine.all('SELECT not_before FROM pending_mutations ORDER BY id');
+    expect(rows.map(({ not_before }) => not_before)).toEqual([undoExpiresAt, undoExpiresAt]);
+    await engine.run("UPDATE pending_mutations SET local_status = 'in_flight', attempts = 1 WHERE id = ?", [claimed]);
+    await expect(handlers[DB_RPC.ATTENTION_UNDO_IMAP_ACTIONS]({ ownerId, mutationIds, allowPartial: true }))
+      .resolves.toEqual({ canceledIds: [pending] });
+    expect(await engine.all('SELECT id FROM pending_mutations')).toEqual([{ id: claimed }]);
+    expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts).toMatchObject([
+      { relay_id: 'home', messages: [{ seen: true }] }, { relay_id: 'work', messages: [] },
+    ]);
+  });
+
   it('retries an unsuperseded failure as a fresh edit and refuses stale retries after a newer edit', async () => {
     const { handlers } = fakeRelay();
     await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });

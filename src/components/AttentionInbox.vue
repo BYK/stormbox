@@ -1,15 +1,17 @@
 <script setup lang="ts">
-import { Bell, Check, ChevronDown, CircleAlert } from '@lucide/vue';
+import { Bell, Check, ChevronDown, CircleAlert, Mail, MailOpen, Star, Trash2 } from '@lucide/vue';
 import { useElementSize } from '@vueuse/core';
-import { computed, nextTick, ref, useId } from 'vue';
+import { computed, nextTick, ref, useId, watch } from 'vue';
 
+import { useListSelection } from '../composables/useListSelection';
 import { provideSenderAvatars } from '../composables/useSenderAvatars';
 import type { ImapAttentionAction } from '../sync/backends/imap/attention-relay';
 import { browserTriageMessageKey } from '../triage/browser-model';
 import type { TriageBundle, TriageMessage } from '../triage/smart-sort';
 import { closeContainingDropdown } from '../utils/dropdown';
-import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, type MessageRowLike } from '../utils/message-row-presentation';
+import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, conversationRow, type MessageRowLike } from '../utils/message-row-presentation';
 import type { MessageTagDefinition } from '../utils/message-tags';
+import AppIconButton from './AppIconButton.vue';
 import AttentionRowMenu from './AttentionRowMenu.vue';
 import MessageListRow from './MessageListRow.vue';
 import SelectableListHeader from './SelectableListHeader.vue';
@@ -19,6 +21,7 @@ const props = withDefaults(defineProps<{
   accountLabels?: Readonly<Record<string, string>>;
   loading?: boolean;
   error?: string | null;
+  openBundleId?: string;
   openMessage?: TriageMessage;
   rows?: ReadonlyMap<string, MessageRowLike & { id: number | string }>;
   disabledActions?: ReadonlySet<string>;
@@ -30,8 +33,11 @@ const props = withDefaults(defineProps<{
 });
 
 const emit = defineEmits<{
+  'open-bundle': [bundle: TriageBundle, trigger: EventTarget | null];
   open: [message: TriageMessage, trigger: EventTarget | null];
+  'bundle-action': [bundle: TriageBundle, action: ImapAttentionAction];
   'message-action': [message: TriageMessage, action: ImapAttentionAction];
+  'selection-action': [messages: TriageMessage[], action: ImapAttentionAction];
   done: [bundle: TriageBundle];
   snooze: [bundle: TriageBundle, until: number];
   restore: [bundle: TriageBundle];
@@ -74,7 +80,66 @@ const bundlesByFilter = computed(() => {
   return groups;
 });
 const visibleBundles = computed(() => bundlesByFilter.value[selectedFilter.value]);
+const visibleMessages = computed(() => visibleBundles.value.flatMap(({ messages }) => messages.map(({ message }) => message)));
+const selectionRows = computed(() => visibleBundles.value.flatMap((bundle) => [
+  { key: `bundle:${bundle.id}`, row: bundle, messages: bundle.messages.map(({ message }) => message) },
+  ...(expandedBundles.value.has(bundle.id) && bundle.messages.length > 1
+    ? bundle.messages.map(({ message }) => ({ key: `message:${browserTriageMessageKey(message)}`, row: message, messages: [message] })) : []),
+]));
+const selectionIndex = computed(() => new Map(selectionRows.value.map(({ row }, index) => [row, index])));
+const selection = useListSelection({
+  rows: selectionRows,
+  total: computed(() => selectionRows.value.length),
+  getKey: ({ key }) => key,
+  getSelectionKeys: ({ messages }) => messages.map(browserTriageMessageKey),
+});
+const { selectionCount, hasSelection } = selection;
+const selectedMessages = computed(() => visibleMessages.value.filter(messageChecked));
+const allSelected = computed(() => hasSelection.value && selectionCount.value === visibleMessages.value.length);
+const selectionUnread = computed(() => selectedMessages.value.some((message) => Number(rowFor(message).is_seen) === 0));
+const selectionStarred = computed(() => selectedMessages.value.some((message) => Number(rowFor(message).is_flagged) === 1));
+const selectionDisabled = computed(() => selectedMessages.value.some(actionDisabled));
+watch(visibleMessages, (messages) => selection.retainOnly(messages.map(browserTriageMessageKey)));
+watch(hasSelection, (hasSelection, hadSelection) => {
+  if (hasSelection || !hadSelection) return;
+  const focus = document.activeElement;
+  if (listEl.value?.contains(focus) && focus?.closest('.attention-inbox__header')) void keepFilterFocus(focus);
+});
 const emptyMessage = computed(() => filters.find(({ key }) => key === selectedFilter.value)?.empty);
+
+function messageChecked(message: TriageMessage): boolean {
+  return selection.isSelected(browserTriageMessageKey(message));
+}
+
+function bundleChecked(bundle: TriageBundle): boolean {
+  return bundle.messages.every(({ message }) => messageChecked(message));
+}
+
+function bundleMixed(bundle: TriageBundle): boolean {
+  return !bundleChecked(bundle) && bundle.messages.some(({ message }) => messageChecked(message));
+}
+
+function toggleSelection(row: TriageBundle | TriageMessage, event: MouseEvent) {
+  const index = selectionIndex.value.get(row);
+  if (index != null) selection.handleCheckboxClick(index, event, 0);
+}
+
+function toggleAll() {
+  if (allSelected.value) selection.selectNone();
+  else selection.selectAllLoaded();
+}
+
+function selectionKeydown(event: KeyboardEvent) {
+  if (event.defaultPrevented) return;
+  if (event.key === 'Escape' || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a')) {
+    selection.handleKeyDown(event);
+  }
+}
+
+function applySelectionAction(action: ImapAttentionAction, event: MouseEvent) {
+  emit('selection-action', selectedMessages.value, action);
+  if (action.type === 'trash') void keepFilterFocus(event.currentTarget);
+}
 
 function filterName(filter: typeof filters[number]): string {
   const count = bundlesByFilter.value[filter.key].length;
@@ -90,6 +155,10 @@ function rowFor(message: TriageMessage): MessageRowLike & { id: number | string 
     received_at: message.receivedAt,
     is_flagged: Number(message.isFlagged ?? false),
   };
+}
+
+function bundleRow(bundle: TriageBundle) {
+  return conversationRow(rowFor(bundle.leading.message), bundle.messages.map(({ message }) => rowFor(message)));
 }
 
 function isOpen(message: TriageMessage): boolean {
@@ -163,19 +232,27 @@ function applyMessageAction(message: TriageMessage, action: ImapAttentionAction,
   emit('message-action', message, action);
   if (action.type === 'trash') void keepFilterFocus(event.currentTarget);
 }
+
+function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, event: MouseEvent): void {
+  emit('bundle-action', bundle, action);
+  if (action.type === 'trash') void keepFilterFocus(event.currentTarget);
+}
 </script>
 
 <template>
-  <section ref="listEl" class="attention-inbox" :class="{ 'msg-list--card': cardLayout }" :aria-labelledby="headingId">
+  <section ref="listEl" class="attention-inbox" :class="{ 'msg-list--card': cardLayout }"
+    :aria-labelledby="headingId" @keydown="selectionKeydown">
     <h2 :id="headingId" class="attention-inbox__heading">Smart Inbox</h2>
     <SelectableListHeader
       class="attention-inbox__header"
-      :selectable="false"
-      :all-selected="false"
-      :selected-count="0"
-      :total-count="visibleBundles.length"
+      :selectable="hasSelection"
+      :all-selected="allSelected"
+      :selected-count="selectionCount"
+      :total-count="visibleMessages.length"
       :show-total-count="false"
-      item-label="bundles"
+      item-label="messages"
+      @toggle-all="toggleAll"
+      @clear-selection="selection.selectNone"
     >
       <template #normal-actions>
         <div ref="filterBar" class="attention-inbox__filters" role="group" aria-label="Smart Inbox filters">
@@ -196,7 +273,22 @@ function applyMessageAction(message: TriageMessage, action: ImapAttentionAction,
           </button>
         </div>
       </template>
-      <template #trailing><slot name="actions" /></template>
+      <template #selection-actions>
+        <AppIconButton :title="selectionStarred ? 'Unstar' : 'Star'" :aria-label="selectionStarred ? 'Unstar' : 'Star'"
+          :disabled="selectionDisabled" @click="applySelectionAction({ type: 'star', value: !selectionStarred }, $event)">
+          <Star :size="16" :fill="selectionStarred ? 'currentColor' : 'none'" aria-hidden="true" />
+        </AppIconButton>
+        <AppIconButton :title="selectionUnread ? 'Mark as read' : 'Mark as unread'"
+          :aria-label="selectionUnread ? 'Mark as read' : 'Mark as unread'" :disabled="selectionDisabled"
+          @click="applySelectionAction({ type: 'seen', value: selectionUnread }, $event)">
+          <component :is="selectionUnread ? MailOpen : Mail" :size="16" aria-hidden="true" />
+        </AppIconButton>
+        <AppIconButton title="Move to Trash" aria-label="Move to Trash" danger :disabled="selectionDisabled"
+          @click="applySelectionAction({ type: 'trash' }, $event)">
+          <Trash2 :size="16" aria-hidden="true" />
+        </AppIconButton>
+      </template>
+      <template #trailing><slot v-if="!hasSelection" name="actions" /></template>
     </SelectableListHeader>
     <slot name="progress" />
     <div class="attention-inbox__scroll" :aria-busy="loading">
@@ -214,16 +306,19 @@ function applyMessageAction(message: TriageMessage, action: ImapAttentionAction,
           v-for="bundle in visibleBundles"
           :key="bundle.id"
           class="attention-inbox__bundle"
-          :message="rowFor(bundle.leading.message)"
+          :message="bundleRow(bundle)"
+          :conversation-count="bundle.messages.length"
           :size="rowHeight"
           :dom-id-prefix="`${detailId(bundle)}-leader-`"
-          :focused="isOpen(bundle.leading.message)"
-          :selectable="false"
+          :focused="openBundleId === bundle.id"
+          :selected="bundleChecked(bundle)"
+          :selection-mixed="bundleMixed(bundle)"
           unread-on-avatar
           :draggable="false"
           :context="bundleContext(bundle)"
           :tag-definitions="tagDefinitions"
-          @row-click="(_event, trigger) => emit('open', bundle.leading.message, trigger)"
+          @row-click="(_event, trigger) => emit('open-bundle', bundle, trigger)"
+          @checkbox-click="toggleSelection(bundle, $event)"
         >
           <template #controls>
             <div class="msg-list__row-controls" draggable="false" @click.stop>
@@ -240,10 +335,11 @@ function applyMessageAction(message: TriageMessage, action: ImapAttentionAction,
                 <ChevronDown :size="14" aria-hidden="true" />
               </button>
               <AttentionRowMenu
-                :row="rowFor(bundle.leading.message)"
+                :row="bundleRow(bundle)"
                 :bundle="bundle"
-                :disabled="actionDisabled(bundle.leading.message)"
-                @action="(action, event) => applyMessageAction(bundle.leading.message, action, event)"
+                :label="bundle.messages.length > 1 ? 'Conversation actions' : undefined"
+                :disabled="bundle.messages.some(({ message }) => actionDisabled(message))"
+                @action="(action, event) => applyBundleAction(bundle, action, event)"
                 @done="complete"
                 @restore="restore"
                 @snooze="snooze"
@@ -264,13 +360,14 @@ function applyMessageAction(message: TriageMessage, action: ImapAttentionAction,
                 :message="rowFor(item.message)"
                 :size="rowHeight"
                 :dom-id-prefix="`${detailId(bundle)}-member-`"
-                :focused="isOpen(item.message)"
-                :selectable="false"
+                :focused="!openBundleId && isOpen(item.message)"
+                :selected="messageChecked(item.message)"
                 unread-on-avatar
                 :draggable="false"
                 :context="item.classification.reason"
                 :tag-definitions="tagDefinitions"
                 @row-click="(_event, trigger) => emit('open', item.message, trigger)"
+                @checkbox-click="toggleSelection(item.message, $event)"
               >
                 <template #controls>
                   <div class="msg-list__row-controls" draggable="false" @click.stop>

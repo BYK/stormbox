@@ -1,5 +1,6 @@
 import type { Repository } from '../db/repository';
 import { useImapOptimisticActions } from '../stores/imap-optimistic-actions-store';
+import { useMailActionFeedbackStore, type MailUndoGroup } from '../stores/mail-action-feedback-store';
 import { useMailStore } from '../stores/mail-store';
 import type { ImapAttentionAction } from '../sync/backends/imap/attention-relay';
 import type { FolderRow, MessageRow } from '../types/db';
@@ -52,10 +53,11 @@ function imapAction(source: ImapSource, action: MailListAction, definitions: Rea
 export function useMailListActions(ownerId: () => number, repository: () => Repository, refreshImap: () => Promise<void>) {
   const mail = useMailStore();
   const optimistic = useImapOptimisticActions();
+  const feedback = useMailActionFeedbackStore();
 
-  async function runJmap(folderId: number, rows: MessageRow[], action: MailListAction) {
+  async function runJmap(folderId: number, rows: MessageRow[], action: MailListAction, undoGroup?: MailUndoGroup) {
     const ids = rows.map(({ id }) => id);
-    const source = { sourceFolderId: folderId, rows };
+    const source = { sourceFolderId: folderId, rows, ...(undoGroup && { undoGroup }) };
     switch (action.type) {
       case 'star': return mail.markManyFlagged(ids, action.value, source);
       case 'seen': return mail.markManySeen(ids, action.value, source);
@@ -67,7 +69,9 @@ export function useMailListActions(ownerId: () => number, repository: () => Repo
     }
   }
 
-  async function run(sources: readonly MailListSource[], action: MailListAction, definitions: ReadonlyArray<MessageTagDefinition>) {
+  async function run(sources: readonly MailListSource[], action: MailListAction, definitions: ReadonlyArray<MessageTagDefinition>,
+    { undoLabel }: { undoLabel?: string } = {}) {
+    if (sources.length === 0) return;
     const folders = new Map<number, MessageRow[]>();
     const imap = [];
     for (const source of sources) {
@@ -79,18 +83,19 @@ export function useMailListActions(ownerId: () => number, repository: () => Repo
         folders.set(source.folder.id, rows);
       }
     }
-    const errors: unknown[] = [];
-    const imapResult = imap.length ? Promise.allSettled([
-      optimistic.run(ownerId(), repository(), imap, { refresh: refreshImap }),
-    ]) : [];
-    for (const [folderId, rows] of folders) {
-      try { await runJmap(folderId, rows, action); } catch (cause) { errors.push(cause); }
+    const owner = ownerId();
+    const repo = repository();
+    const group = undoLabel ? feedback.createUndoGroup(undoLabel, () => ownerId() === owner && repository() === repo) : undefined;
+    try {
+      const tasks: Promise<unknown>[] = [...folders].map(([folderId, rows]) => runJmap(folderId, rows, action, group));
+      if (imap.length) tasks.push(optimistic.run(owner, repo, imap, { ...(group && { group }), refresh: refreshImap }));
+      const results = await Promise.allSettled(tasks);
+      const errors = results.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+      if (errors.length === 1) throw errors[0];
+      if (errors.length) throw new AggregateError(errors, 'Some accounts could not save the change.');
+    } finally {
+      group?.finish();
     }
-    for (const result of await imapResult) {
-      if (result.status === 'rejected') errors.push(result.reason);
-    }
-    if (errors.length === 1) throw errors[0];
-    if (errors.length) throw new AggregateError(errors, 'Some accounts could not save the change.');
   }
 
   return run;

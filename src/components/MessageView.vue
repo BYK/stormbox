@@ -76,6 +76,7 @@ const MIN_EMAIL_LAYOUT_WIDTH = 400;
 
 const props = withDefaults(defineProps<{
   maximized?: boolean;
+  showBack?: boolean;
   backLabel?: string;
   imap?: {
     id: string;
@@ -99,7 +100,7 @@ const props = withDefaults(defineProps<{
     bodyError?: string;
     actionError?: string;
   };
-}>(), { maximized: false });
+}>(), { maximized: false, showBack: true });
 const emit = defineEmits<{
   toggleMaximized: [];
   back: [];
@@ -978,6 +979,7 @@ function closeMessageView() {
     <article v-else class="message-view__article">
       <header ref="toolbarEl" class="message-view__header">
         <AppIconButton
+          v-if="showBack"
           class="message-view__action message-view__action--back"
           :title="backLabel ?? 'Back'"
           :aria-label="backLabel ?? 'Back'"

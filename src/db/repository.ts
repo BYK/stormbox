@@ -346,17 +346,21 @@ export class Repository {
     return this.call<RelayMessageBody | null>(DB_RPC.ATTENTION_BODY, { ownerId, location, cachedOnly });
   }
 
-  mutateAttentionImapMessage(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction, undoable = false) {
-    return this.call<{ mutationIds: number[] }>(DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION, { ownerId, location, action, undoable });
+  mutateAttentionImapMessage(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction, undoable = false,
+    undoExpiresAt?: number) {
+    return this.call<{ mutationIds: number[] }>(DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION,
+      { ownerId, location, action, undoable, ...(undoExpiresAt !== undefined && { undoExpiresAt }) });
   }
 
   /** Persist an entire selection at once. Reject invalid selections without queuing any changes. */
-  mutateAttentionImapMessages(ownerId: number, requests: readonly ImapActionRequest[], undoable = false) {
-    return this.call<{ mutationIds: number[] }>(DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS, { ownerId, requests, undoable });
+  mutateAttentionImapMessages(ownerId: number, requests: readonly ImapActionRequest[], undoable = false, undoExpiresAt?: number) {
+    return this.call<{ mutationIds: number[] }>(DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS,
+      { ownerId, requests, undoable, ...(undoExpiresAt !== undefined && { undoExpiresAt }) });
   }
 
-  undoAttentionImapActions(ownerId: number, mutationIds: readonly number[]) {
-    return this.call<void>(DB_RPC.ATTENTION_UNDO_IMAP_ACTIONS, { ownerId, mutationIds });
+  undoAttentionImapActions(ownerId: number, mutationIds: readonly number[], allowPartial = false) {
+    return this.call<{ canceledIds: number[] }>(DB_RPC.ATTENTION_UNDO_IMAP_ACTIONS,
+      { ownerId, mutationIds, ...(allowPartial && { allowPartial }) });
   }
 
   getAttentionImapActionFailures(ownerId: number) {
@@ -513,6 +517,10 @@ export class Repository {
 
   listMessagesForThread(threadId) {
     return this.call(DB_RPC.MESSAGE_LIST_FOR_THREAD, { threadId });
+  }
+
+  listMessagesForFolderThreads(accountId: number, folderId: number, threadIds: number[]) {
+    return this.call(DB_RPC.MESSAGE_LIST_FOR_FOLDER_THREADS, { accountId, folderId, threadIds });
   }
 
   findMessageByRfc822MessageId(accountId, rfc822MessageId) {

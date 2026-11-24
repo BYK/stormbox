@@ -10,6 +10,7 @@ import AttentionActionMenu from './AttentionActionMenu.vue';
 
 const props = withDefaults(defineProps<{
   row: MessageRowLike;
+  label?: string;
   bundle?: TriageBundle;
   disabled?: boolean;
   canTrash?: boolean;
@@ -49,7 +50,7 @@ function snoozeUntilTomorrow(): number {
 </script>
 
 <template>
-  <AttentionActionMenu class="attention-row-menu" label="Message actions">
+  <AttentionActionMenu class="attention-row-menu" :label="label ?? 'Message actions'">
     <button
       class="app-dropdown__item"
       type="button"

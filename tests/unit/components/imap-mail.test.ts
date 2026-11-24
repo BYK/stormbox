@@ -5,8 +5,10 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import ImapMail from '../../../src/components/ImapMail.vue';
 import { __resetRepositoryForTests, __setRepositoryForTests } from '../../../src/composables/useRepository';
 import type { CachedImapAccount } from '../../../src/db/attention';
+import { TABLE_FAMILIES } from '../../../src/db/protocol';
 import { useAuthStore } from '../../../src/stores/auth-store';
 import { useMailStore } from '../../../src/stores/mail-store';
+import type { FolderRow } from '../../../src/types/db';
 
 vi.mock('../../../src/services/auth', () => ({ initOidc: async () => null, getOidc: () => null }));
 
@@ -99,7 +101,7 @@ it('shows a failed Google account in Mail and makes its messages available after
   }
 });
 
-it('restores the Unified Inbox from saved mail and expands a conversation across providers while sync is pending', async () => {
+it('treats a Unified Inbox conversation as one unit while sync is pending', async () => {
   const account: CachedImapAccount = {
     relay_id: 'work', address: 'work@example.org', name: 'Work', mailbox: 'INBOX', uid_validity: '7',
     messages: [{
@@ -108,34 +110,43 @@ it('restores the Unified Inbox from saved mail and expands a conversation across
       from: [{ name: 'First sender', address: 'sender@example.org' }], to: [],
     }],
   };
-  const primaryInbox = { id: 23, role: 'inbox', account_id: 1, name: 'Inbox', total_emails: 1 };
+  const primaryInbox = { id: 23, role: 'inbox', account_id: 1, name: 'Inbox', total_emails: 2 };
   const reply = {
-    id: 42, account_id: 1, subject: 'Re: Planning', rfc822_message_id: 'reply@example.org',
+    id: 42, account_id: 1, thread_id: 111, subject: 'Re: Planning', rfc822_message_id: 'reply@example.org',
     references_json: '["start@example.org"]', received_at: Date.parse('2026-11-23T10:00:00Z'),
     from_text: 'Reply sender <reply@example.org>', is_seen: 1, is_flagged: 0,
   };
+  const older = { ...reply, id: 40, rfc822_message_id: 'older@example.org', references_json: '[]',
+    received_at: Date.parse('2026-11-23T08:00:00Z'), from_text: 'Earlier sender <early@example.org>' };
   const body = vi.fn(async () => ({ text: 'Saved IMAP message body.', html: '' }));
   let finishSync!: (result: []) => void;
   const pendingSync = new Promise<[]>((resolve) => { finishSync = resolve; });
   const refresh = vi.fn(() => pendingSync);
   const refreshJmap = vi.fn(async () => {});
   const mutateImap = vi.fn(async () => {});
+  let jmapRows = [reply];
+  let cachedThread = [older, reply];
+  const imapMessage = account.messages[0];
+  const listCachedThread = vi.fn(async () => cachedThread);
+  let notify!: (tables: string[]) => void;
   const target = document.createElement('div');
   document.body.append(target);
   localStorage.setItem('stormbox:mail-view:1', '{"kind":"unified"}');
   __setRepositoryForTests({
-    subscribe: () => () => {},
+    subscribe: (callback) => { notify = callback; return () => {}; },
     getAttentionCache: async () => ({ paired: true, accounts: [account], states: {} }),
     refreshAttentionRelay: refresh,
     readAttentionImapMessage: body,
     mutateAttentionImapMessage: mutateImap,
     folderByRole: async () => primaryInbox,
-    listMessagesForView: async () => [reply],
+    listMessagesForView: async () => jmapRows,
+    listMessagesForFolderThreads: listCachedThread,
     ensureFolderWindow: refreshJmap,
   });
   const pinia = createPinia();
   const auth = useAuthStore(pinia);
-  const destroyJmap = vi.spyOn(useMailStore(pinia), 'destroyMessages');
+  const mailStore = useMailStore(pinia);
+  const destroyJmap = vi.spyOn(mailStore, 'destroyMessages');
   auth.isOfflineSession = true;
   const wrapper = mount(ImapMail, { props: { ownerId: 1, search: '', folderTarget: target }, global: { plugins: [pinia] } });
   try {
@@ -143,24 +154,61 @@ it('restores the Unified Inbox from saved mail and expands a conversation across
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(refreshJmap).not.toHaveBeenCalled();
     expect(wrapper.get('h2').text()).toBe('Unified Inbox');
-    expect(wrapper.findAll('ul li')).toHaveLength(1);
-    expect(wrapper.find('button[aria-label^="Open message: Re: Planning"]').exists()).toBe(true);
-    await wrapper.get('button[aria-label="Show 1 earlier messages"]').trigger('click');
-    expect(wrapper.findAll('ul li')).toHaveLength(2);
-    await wrapper.get('button[aria-label^="Open message: Re: Planning"]').trigger('click', { ctrlKey: true });
-    expect(wrapper.get('.msg-list__header').text()).toContain('1 selected');
+    expect(listCachedThread).toHaveBeenCalledWith(1, 23, [111]);
+    expect(wrapper.findAll('.imap-mail__rows > li')).toHaveLength(1);
+    expect(wrapper.find('.imap-mail__rows button[aria-label="Delete"]').exists()).toBe(false);
+    mailStore.folders = [
+      { ...primaryInbox, may_read_items: 1, may_remove_items: 1 },
+      { id: 24, name: 'Trash', role: 'trash', account_id: 1, may_add_items: 1 },
+    ] as FolderRow[];
+    await wrapper.setProps({ search: 'first sender' });
+    const headCheckbox = wrapper.get<HTMLInputElement>('input[aria-label^="Select conversation: Re: Planning"]');
+    await headCheckbox.trigger('click');
+    expect(wrapper.get('.msg-list__header').text()).toContain('3 selected');
+    await wrapper.get('button[aria-label="Show 2 earlier messages"]').trigger('click');
+    expect(wrapper.findAll('.imap-mail__rows > li')).toHaveLength(3);
+    await wrapper.get('input[aria-label^="Select message: Planning"]').trigger('click');
+    expect(headCheckbox.element.indeterminate).toBe(true);
+    expect(wrapper.get('.msg-list__header').text()).toContain('2 selected');
+    await wrapper.get('button[aria-label="Hide 2 earlier messages"]').trigger('click');
+    expect(wrapper.get('.msg-list__header').text()).toContain('2 selected');
+    await wrapper.get('button[aria-label="Clear selection"]').trigger('click');
     expect(body).not.toHaveBeenCalled();
+
+    await wrapper.get('button[aria-label="Show 2 earlier messages"]').trigger('click');
     await wrapper.get('button[aria-label^="Open message: Planning"]').trigger('click');
+    expect(wrapper.find('ol[aria-label="Messages in conversation"]').exists()).toBe(false);
+    await wrapper.get('button[aria-label="Back"]').trigger('click');
+
+    await wrapper.get('button[aria-label^="Open conversation: Re: Planning"]').trigger('click');
+    const thread = wrapper.get('ol[aria-label="Messages in conversation"]');
+    expect(thread.findAll('li')).toHaveLength(3);
+    const firstSender = thread.findAll('button.conversation-reader__summary').find((button) => button.text().includes('First sender'))!;
+    await firstSender.trigger('click');
     await flushPromises();
     expect(body).toHaveBeenCalledWith(1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 41 }, true);
+    expect(thread.text()).toContain('Saved IMAP message body.');
+
+    jmapRows = cachedThread = [older];
+    notify([TABLE_FAMILIES.MESSAGES]);
+    await flushPromises();
+    expect(wrapper.find('ol[aria-label="Messages in conversation"]').exists()).toBe(false);
     expect(wrapper.text()).toContain('Saved IMAP message body.');
-    await wrapper.get('button[aria-label="Unread"]').trigger('click');
-    expect(wrapper.findAll('ul li')).toHaveLength(1);
-    expect(wrapper.find('button[aria-label^="Open message: Re: Planning"]').exists()).toBe(false);
-    await wrapper.get('.msg-list__select-all input').trigger('change');
-    await wrapper.get('[data-bulk-action="delete"]').trigger('click');
-    expect(mutateImap).toHaveBeenLastCalledWith(1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 41 }, { type: 'trash' }, true);
-    expect(destroyJmap).not.toHaveBeenCalled();
+    account.messages = [];
+    notify([TABLE_FAMILIES.ATTENTION]);
+    await flushPromises();
+    expect(wrapper.find('.imap-mail__reader').exists()).toBe(false);
+
+    jmapRows = [reply];
+    cachedThread = [older, reply];
+    account.messages = [imapMessage];
+    notify([TABLE_FAMILIES.MESSAGES, TABLE_FAMILIES.ATTENTION]);
+    await flushPromises();
+    await wrapper.get('button[aria-label^="Open conversation: Re: Planning"]').trigger('click');
+    await wrapper.get('button[aria-label="Delete conversation"]').trigger('click');
+    expect(mutateImap).toHaveBeenLastCalledWith(1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 41 },
+      { type: 'trash' }, true, expect.any(Number));
+    expect(destroyJmap).toHaveBeenCalledWith([40, 42], expect.objectContaining({ sourceFolderId: 23 }));
     auth.isOfflineSession = false;
     await flushPromises();
     expect(refreshJmap).toHaveBeenCalledWith(1, primaryInbox.id, expect.objectContaining({ offset: 0 }));

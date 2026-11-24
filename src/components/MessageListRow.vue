@@ -30,12 +30,14 @@ const props = withDefaults(defineProps<{
   focused?: boolean;
   cursor?: boolean;
   selected?: boolean;
+  selectionMixed?: boolean;
+  conversationCount?: number;
   dragging?: boolean;
   showsRecipients?: boolean;
   sort?: JmapViewSort;
   /** False on surfaces without multi-select: no checkbox is rendered. */
   selectable?: boolean;
-  /** For rows without selection, render the unread dot on the avatar. */
+  /** Keep the unread and optional checkbox in the avatar column. */
   unreadOnAvatar?: boolean;
   /**
    * Prefix of the row's DOM id (`${domIdPrefix}${message.id}`). Lists
@@ -106,7 +108,7 @@ const openButton = ref<HTMLButtonElement | null>(null);
 const inFlow = computed(() => props.start === undefined);
 const controlTabIndex = computed(() => inFlow.value ? undefined : -1);
 const isUnread = computed(() => Number(props.message.is_seen) === 0);
-const avatarUnread = computed(() => !props.selectable && props.unreadOnAvatar);
+const avatarUnread = computed(() => props.unreadOnAvatar);
 const isFlagged = computed(() => Number(props.message.is_flagged) === 1);
 const tags = computed(() => [
   ...resolveMessageTags(props.message.keywords_json, props.tagDefinitions),
@@ -120,6 +122,7 @@ const avatar = computed(() => senderAvatar(correspondent.value));
 const label = computed(() => correspondentLabel(props.message, props.showsRecipients));
 const dateText = computed(() => fmtDate(rowTimestamp(props.message, props.sort)));
 const preview = computed(() => [props.context, props.message.preview].filter(Boolean).join(' · '));
+const rowKind = computed(() => props.conversationCount && props.conversationCount > 1 ? 'conversation' : 'message');
 const rowLabel = computed(() => [
   label.value,
   props.message.subject || '(no subject)',
@@ -143,6 +146,7 @@ const rowLabel = computed(() => [
       'is-focused': focused,
       'is-cursor': cursor,
       'is-selected': selected,
+      'is-partially-selected': selectionMixed,
       'is-dragging': dragging,
       'is-unread': isUnread,
       'is-unselectable': !selectable,
@@ -163,6 +167,7 @@ const rowLabel = computed(() => [
         'msg-list__item--row-controls': $slots.controls,
         'msg-list__item--in-flow': inFlow,
         'msg-list__item--avatar-unread': avatarUnread,
+        'msg-list__item--avatar-selection': avatarUnread && selectable,
         'has-tag-menu': tagMenuOpen,
       }"
       :role="inFlow ? undefined : 'gridcell'"
@@ -178,22 +183,23 @@ const rowLabel = computed(() => [
         data-message-control
         :tabindex="controlTabIndex"
         :aria-current="inFlow && focused ? true : undefined"
-        :aria-label="`Open message: ${message.subject || '(no subject)'}, ${label}${avatarUnread && isUnread ? ', unread' : ''}`"
+        :aria-label="`Open ${rowKind}: ${message.subject || '(no subject)'}, ${label}${avatarUnread && isUnread ? ', unread' : ''}`"
         :title="context ? preview : undefined"
       />
-      <div v-if="!avatarUnread" class="msg-list__state">
+      <div v-if="selectable || !avatarUnread" class="msg-list__state">
         <label v-if="selectable" class="msg-list__check" draggable="false" @click.stop>
           <input
             type="checkbox"
             data-message-control
             :tabindex="controlTabIndex"
-            :aria-label="`Select message: ${message.subject || '(no subject)'}, ${label}`"
+            :aria-label="`Select ${rowKind}: ${message.subject || '(no subject)'}, ${label}`"
             :checked="selected"
+            :indeterminate.prop="Boolean(selectionMixed)"
             @click="emit('checkbox-click', $event)"
           />
         </label>
         <span
-          v-if="isUnread"
+          v-if="isUnread && !avatarUnread"
           class="msg-list__unread-dot"
           aria-hidden="true"
         />
@@ -563,7 +569,8 @@ const rowLabel = computed(() => [
   pointer-events: none;
 }
 .msg-list__item:hover .msg-list__check,
-.msg-list__items li.is-selected > .msg-list__item .msg-list__check {
+.msg-list__items li.is-selected > .msg-list__item .msg-list__check,
+.msg-list__items li.is-partially-selected > .msg-list__item .msg-list__check {
   opacity: 1;
 }
 .msg-list__item:hover .msg-list__unread-dot,
@@ -701,6 +708,24 @@ const rowLabel = computed(() => [
 }
 .msg-list--card .msg-list__state {
   width: 24px;
+}
+.msg-list__item--avatar-selection .msg-list__state,
+.msg-list__item--avatar-selection .msg-list__avatar {
+  grid-area: 1 / 1;
+  width: 34px;
+}
+.msg-list__item--avatar-selection .msg-list__state { z-index: 1; }
+.msg-list__item--avatar-selection .msg-list__check input { justify-self: end; align-self: end; }
+@media (hover: hover) and (min-width: 640px) {
+  .msg-list__item--avatar-selection .msg-list__check input { justify-self: center; align-self: center; }
+  .msg-list__item--avatar-selection:hover .msg-list__avatar,
+  .msg-list__item--avatar-selection:focus-within .msg-list__avatar,
+  li:is(.is-selected, .is-partially-selected) .msg-list__item--avatar-selection .msg-list__avatar {
+    opacity: 0.2;
+  }
+}
+@media (hover: none) {
+  .msg-list__item--avatar-selection .msg-list__check { opacity: 1; }
 }
 .msg-list--card .msg-list__summary {
   grid-template-columns: minmax(0, 1fr) auto auto;

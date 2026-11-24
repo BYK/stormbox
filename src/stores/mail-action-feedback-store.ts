@@ -1,10 +1,19 @@
 import { defineStore } from 'pinia';
-import { shallowRef } from 'vue';
+import { shallowRef, watch } from 'vue';
 import { MAIL_UNDO_MS } from '../constants/mail-actions';
+import { useAuthStore } from './auth-store';
 
 export { MAIL_UNDO_MS };
 
 type Callback = () => void | Promise<void>;
+export type MailUndoResult = { canceled: number; failed: number };
+type UndoChange = () => Promise<MailUndoResult>;
+
+export interface MailUndoGroup {
+  expiresAt: number;
+  isCanceled: () => boolean;
+  register: (change: UndoChange) => () => void;
+}
 
 interface MailActionFeedback {
   id: number;
@@ -16,6 +25,7 @@ interface MailActionFeedback {
 }
 
 export const useMailActionFeedbackStore = defineStore('mail-action-feedback', () => {
+  const auth = useAuthStore();
   const entries = shallowRef<readonly MailActionFeedback[]>([]);
   const timers = new Map<number, ReturnType<typeof setTimeout>>();
   let nextId = 0;
@@ -45,6 +55,52 @@ export const useMailActionFeedbackStore = defineStore('mail-action-feedback', ()
     return add({ kind: 'error', message, action: retry ? 'Retry' : undefined, run: retry });
   }
 
+  function createUndoGroup(message: string, isCurrent: () => boolean): MailUndoGroup & { finish: () => void } {
+    const createdIn = generation;
+    const expiresAt = Date.now() + MAIL_UNDO_MS;
+    const changes = new Set<UndoChange>();
+    let canceled = false;
+    let finished = false;
+    const active = () => generation === createdIn && isCurrent();
+
+    async function undo() {
+      if (!active()) return;
+      canceled = true;
+      const results = await Promise.allSettled([...changes].map(async (change) => change()));
+      if (!active()) return;
+      let count = 0;
+      let failed = 0;
+      for (const result of results) {
+        if (result.status === 'rejected') failed += 1;
+        else {
+          count += result.value.canceled;
+          failed += result.value.failed;
+        }
+      }
+      if (failed) showFailure(count ? 'Couldn’t undo every message in this action.' : 'Couldn’t undo this conversation action.');
+    }
+
+    const toast = showUndo(message, undo, expiresAt);
+    const dismissIfEmpty = () => {
+      if (finished && changes.size === 0) dismiss(toast);
+    };
+    return {
+      expiresAt,
+      isCanceled: () => canceled || !active(),
+      register(change) {
+        changes.add(change);
+        return () => {
+          changes.delete(change);
+          dismissIfEmpty();
+        };
+      },
+      finish() {
+        finished = true;
+        dismissIfEmpty();
+      },
+    };
+  }
+
   async function run(id: number) {
     const entry = entries.value.find((item) => item.id === id);
     if (!entry?.run) return;
@@ -72,5 +128,9 @@ export const useMailActionFeedbackStore = defineStore('mail-action-feedback', ()
     entries.value = [];
   }
 
-  return { entries, dismiss, latestUndo, showUndo, showFailure, run, $reset };
+  watch(() => auth.accountId, (_, previous) => {
+    if (previous != null) $reset();
+  }, { flush: 'sync' });
+
+  return { entries, dismiss, latestUndo, showUndo, showFailure, createUndoGroup, run, $reset };
 });

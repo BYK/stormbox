@@ -31,6 +31,20 @@ function makeHarness(count: number, opts?: { holes?: number[] }) {
   return { rows, total, selectedIds, sel };
 }
 
+it('anchors a conversation range to the same row when an earlier group expands', () => {
+  const a = { id: 'a', members: ['a', 'a1'] };
+  const b = { id: 'b', members: ['b', 'b1'] };
+  const c = { id: 'c', members: ['c', 'c1'] };
+  const rows = ref([a, b, c]);
+  const selection = useListSelection({ rows, total: ref(4), getKey: (row) => row.id, getSelectionKeys: (row) => row.members });
+
+  selection.toggleAt(1);
+  rows.value = [a, { id: 'a1', members: ['a1'] }, b, c];
+  selection.extendRange(3);
+
+  expect([...selection.selectedIds.value]).toEqual(['b', 'b1', 'c', 'c1']);
+});
+
 function ids(set: Set<unknown>) {
   return [...set].sort();
 }

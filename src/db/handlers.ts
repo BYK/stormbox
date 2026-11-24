@@ -2556,6 +2556,17 @@ export function makeHandlers(engine: any, broadcaster: any = noopBroadcaster(), 
         [threadId],
       ),
 
+    [DB_RPC.MESSAGE_LIST_FOR_FOLDER_THREADS]: async ({ accountId, folderId, threadIds }) => {
+      const ids = numericUnique(threadIds);
+      if (!ids.length) return [];
+      return engine.all(
+        `SELECT m.* FROM messages m
+           JOIN folder_messages fm ON fm.message_id = m.id AND fm.folder_id = ?
+          WHERE m.account_id = ? AND m.thread_id IN (SELECT value FROM json_each(?))`,
+        [folderId, accountId, JSON.stringify(ids)],
+      );
+    },
+
     [DB_RPC.MESSAGE_BODY_READ]: async ({ messageId }) => {
       // Join the part's media type so display classification follows the
       // actual content type rather than the stored `kind`. A plaintext-

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChevronDown, Layers, List } from '@lucide/vue';
+import { Archive, ChevronDown, Layers, List, Mail, MailOpen, Star, Trash2 } from '@lucide/vue';
 import { useElementSize, useMediaQuery, useOnline } from '@vueuse/core';
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import type { MailboxRole } from '../constants/states';
@@ -24,12 +24,15 @@ import { useMailActionFeedbackStore } from '../stores/mail-action-feedback-store
 import { useMailStore } from '../stores/mail-store';
 import { GOOGLE_IMAP_RESULTS, GOOGLE_IMAP_RETURN_SPACE, type GoogleImapResult, type RelayFolder } from '../sync/backends/imap/attention-relay';
 import type { FolderRow, MessageRow } from '../types/db';
+import { folderCapabilities } from '../utils/folder-capabilities';
 import { folderCompare, folderPresentation } from '../utils/folder-presentation';
 import { gmailLabelTags } from '../utils/imap-message-tags';
-import { groupMailThreads, parseThreadHeaders, type ThreadMessage } from '../utils/mail-threads';
-import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, folderShowsRecipients } from '../utils/message-row-presentation';
+import { groupMailThreads, parseThreadHeaders, type MailThread, type ThreadMessage } from '../utils/mail-threads';
+import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, conversationRow, correspondentLabel, folderShowsRecipients } from '../utils/message-row-presentation';
 import { tagKeywordsOf } from '../utils/message-tags';
 import { isScheduledMessage } from '../utils/scheduled-message';
+import AppIconButton from './AppIconButton.vue';
+import ConversationReader from './ConversationReader.vue';
 import FolderNode from './FolderNode.vue';
 import FolderTreeHeading from './FolderTreeHeading.vue';
 import ImapAccountsDialog from './ImapAccountsDialog.vue';
@@ -47,6 +50,7 @@ type ThreadEntry = ThreadMessage & (
   | { kind: 'imap'; entry: ImapEntry; row: ImapEntry['presentation'] }
   | { kind: 'jmap'; folder: InboxFolder; row: MessageRow }
 );
+type ListRow = { entry: ThreadEntry; targets: ThreadEntry[]; stack?: MailThread<ThreadEntry>; nested: boolean };
 type SavedView = { kind: 'unified' } | { kind: 'imap'; accountId: string; path: string };
 
 const PAGE_SIZE = 120;
@@ -89,12 +93,14 @@ const jmapError = ref('');
 const jmapMessages = shallowRef<Array<{ folder: InboxFolder; row: MessageRow }>>([]);
 const jmapLimit = ref(PAGE_SIZE);
 const jmapReading = shallowRef<{ id: number; folderId: number }>();
+const activeMessageKey = ref<string>();
+const openedThread = shallowRef<MailThread<ThreadEntry>>();
 const unreadOnly = ref(false);
 const starredOnly = ref(false);
 const imapThreaded = ref(false);
 const expandedThreads = ref(new Set<string>());
 const visibleThreadLimit = ref(THREAD_PAGE_SIZE);
-const tagPopover = shallowRef<{ key?: string; trigger: HTMLElement; anchor: PopoverAnchor }>();
+const tagPopover = shallowRef<{ key?: string; targets?: string[]; trigger: HTMLElement; anchor: PopoverAnchor }>();
 const accountError = ref('');
 const folderError = ref('');
 const listHeading = ref<HTMLElement>();
@@ -211,38 +217,48 @@ const showThreads = computed(() => unified.value || threadedFolder.value != null
 const threads = computed(() => showThreads.value ? groupMailThreads(entries.value) : entries.value.map((newest) => ({
   key: newest.key, newest, previous: [],
 })));
+const entriesByKey = computed(() => new Map(entries.value.map((entry) => [entry.key, entry])));
+
+function threadEntries(thread: MailThread<ThreadEntry>) {
+  return [...thread.previous, thread.newest];
+}
+
+const threadByMember = computed(() => new Map(threads.value.flatMap((thread) =>
+  threadEntries(thread).map(({ key }) => [key, thread] as const))));
+
 const filteredThreads = computed(() => {
   const terms = props.search.toLowerCase().split(/\s+/).filter(Boolean);
   if (!terms.length && !unreadOnly.value && !starredOnly.value) return threads.value;
-  const matches = ({ row }: ThreadEntry) => {
-    if (unreadOnly.value && row.is_seen !== 0) return false;
-    if (starredOnly.value && row.is_flagged !== 1) return false;
-    const haystack = [row.from_text, row.to_text, row.subject, row.preview].join(' ').toLowerCase();
-    return terms.every((term) => haystack.includes(term));
-  };
-  return threads.value.flatMap(({ key, newest, previous }) => {
-    const rows = [...previous, newest].filter(matches);
-    const latest = rows.pop();
-    return latest ? [{ key, newest: latest, previous: rows }] : [];
-  }).sort((a, b) => b.newest.receivedAt - a.newest.receivedAt || a.key.localeCompare(b.key));
+  return threads.value.filter((thread) => {
+    const members = threadEntries(thread);
+    if (unreadOnly.value && members.every(({ row }) => row.is_seen !== 0)) return false;
+    if (starredOnly.value && members.every(({ row }) => row.is_flagged !== 1)) return false;
+    return !terms.length || members.some(({ row }) => {
+      const haystack = [row.from_text, row.to_text, row.subject, row.preview].join(' ').toLowerCase();
+      return terms.every((term) => haystack.includes(term));
+    });
+  });
 });
-const visibleRows = computed(() => filteredThreads.value.slice(0, visibleThreadLimit.value).flatMap((thread) => [
-  { entry: thread.newest, stack: thread.previous.length ? thread : undefined, nested: false },
-  ...(expandedThreads.value.has(thread.key) ? thread.previous.map((entry) => ({ entry, stack: undefined, nested: true })) : []),
+const visibleThreads = computed(() => filteredThreads.value.slice(0, visibleThreadLimit.value));
+const visibleRows = computed<ListRow[]>(() => visibleThreads.value.flatMap((thread) => [
+  { entry: thread.newest, targets: threadEntries(thread), stack: thread.previous.length ? thread : undefined, nested: false },
+  ...(expandedThreads.value.has(thread.key) ? thread.previous.map((entry) => ({ entry, targets: [entry], nested: true })) : []),
 ]));
-const selectableRows = computed(() => visibleRows.value.map(({ entry }) => entry));
-const visibleCount = computed(() => selectableRows.value.length);
-const selection = useListSelection({ rows: selectableRows, total: visibleCount, getKey: (entry) => entry.key });
+const selectableEntries = computed(() => visibleThreads.value.flatMap(threadEntries));
+const selection = useListSelection({
+  rows: visibleRows, total: computed(() => visibleRows.value.length), getKey: ({ entry }) => entry.key,
+  getSelectionKeys: ({ targets }) => targets.map(({ key }) => key),
+});
 const { selectionCount, focusedId } = selection;
-const allSelected = computed(() => visibleCount.value > 0 && selectionCount.value === visibleCount.value);
-const selectedEntries = computed(() => selectableRows.value.filter(({ key }) => selection.isSelected(key)));
-watch(selectableRows, (rows) => selection.retainOnly(rows.map(({ key }) => key)));
+const allSelected = computed(() => selectableEntries.value.length > 0 && selectionCount.value === selectableEntries.value.length);
+const selectedEntries = computed(() => selectableEntries.value.filter(({ key }) => selection.isSelected(key)));
+watch(selectableEntries, (rows) => selection.retainOnly(rows.map(({ key }) => key)));
 const imapById = computed(() => new Map(imapEntries.value.map((entry) => [entry.id, entry])));
 const jmapById = computed(() => new Map(projectedJmapMessages.value.map(({ row }) => [row.id, row])));
 const tagEntries = computed(() => {
   if (!tagPopover.value) return [];
-  const { key } = tagPopover.value;
-  return key == null ? selectedEntries.value : entries.value.filter((entry) => entry.key === key);
+  const { targets } = tagPopover.value;
+  return targets == null ? selectedEntries.value : targets.flatMap((key) => entriesByKey.value.get(key) ?? []);
 });
 const listActions = useMailListActions(() => props.ownerId, () => repo, refreshLocalImap);
 const reader = useImapReader(() => props.ownerId, () => repo, (id) => imapById.value.get(id), refreshLocalImap);
@@ -252,7 +268,28 @@ const readerProps = computed(() => reader.view.value && {
   canJunk: role.value !== 'junk',
   canTrash: role.value !== 'trash',
 });
-const reading = computed(() => !selectionCount.value && Boolean(readerProps.value || jmapReading.value));
+const activeThread = computed(() => activeMessageKey.value ? threadByMember.value.get(activeMessageKey.value) : undefined);
+watch(activeThread, (thread) => {
+  if (openedThread.value && thread) openedThread.value = thread;
+});
+const conversationEntries = computed(() => {
+  const saved = openedThread.value;
+  if (!saved) return [];
+  if (activeThread.value) return threadEntries(activeThread.value);
+  const surviving = threads.value.find(({ key }) => key === saved.key)
+    ?? threadEntries(saved).reverse().map(({ key }) => threadByMember.value.get(key)).find(Boolean);
+  return surviving ? threadEntries(surviving) : [];
+});
+const threadReaderOpen = computed(() => Boolean(openedThread.value
+  && (openedThread.value.previous.length || conversationEntries.value.length > 1)));
+const conversationMessages = computed(() => conversationEntries.value.map((entry) => ({
+  key: entry.key,
+  sender: correspondentLabel(entry.row, folderShowsRecipients({ role: role.value })),
+  preview: entry.row.preview,
+  timestamp: entry.receivedAt,
+  unread: entry.row.is_seen === 0,
+})));
+const reading = computed(() => !selectionCount.value && Boolean(activeMessageKey.value));
 const canCompose = computed(() => unified.value || threadedFolder.value != null || account.value?.can_send === true);
 const heading = computed(() => unified.value ? 'Unified Inbox' : threadedFolder.value?.name ?? folder.value?.name ?? selected.value?.path ?? '');
 const jmapFolders = computed<InboxFolder[]>(() => {
@@ -298,6 +335,35 @@ const viewActions = computed<MoreMenuItem[]>(() => {
 const additionalTagsByEntry = computed(() => new Map(imapEntries.value.map((entry) => [
   entry.id, gmailLabelTags(entry.row.labels ?? [], definitions.value),
 ])));
+
+function rowPresentation({ entry, stack, targets }: ListRow) {
+  if (!stack) return entry.row;
+  const members = targets.map(({ row }) => row);
+  const tags = new Set(members.flatMap(({ keywords_json }) => tagKeywordsOf(keywords_json, definitions.value)));
+  return {
+    ...conversationRow(entry.row, members),
+    has_attachment: Number(members.some(({ has_attachment }) => has_attachment === 1)),
+    keywords_json: JSON.stringify(Object.fromEntries([...tags].map((keyword) => [keyword, true]))),
+  };
+}
+
+function rowAdditionalTags(targets: readonly ThreadEntry[]) {
+  const tags = targets.flatMap((entry) => entry.kind === 'imap' ? additionalTagsByEntry.value.get(entry.entry.id) ?? [] : []);
+  return [...new Map(tags.map((tag) => [tag.keyword, tag])).values()];
+}
+
+function rowChecked({ targets }: ListRow) {
+  return targets.every(({ key }) => selection.isSelected(key));
+}
+
+function rowMixed(row: ListRow) {
+  return !rowChecked(row) && row.targets.some(({ key }) => selection.isSelected(key));
+}
+
+function rowFocused({ entry, nested }: ListRow) {
+  if (!openedThread.value) return activeMessageKey.value === entry.key;
+  return !nested && conversationEntries.value.some(({ key }) => key === entry.key);
+}
 function tagPickerFor(targets: readonly ThreadEntry[]) {
   const imap = targets.filter((entry): entry is Extract<ThreadEntry, { kind: 'imap' }> => usesGmailLabels(entry));
   if (!imap.length || imap.length !== targets.length) return {
@@ -343,19 +409,31 @@ const availableBulkActions = useBulkActionItems({
 const bulkActionItems = computed(() => availableBulkActions.value.filter(({ id }) => {
   if (id === 'archive') return selectedEntries.value.every(canArchiveEntry);
   if (id === 'delete') return selectedEntries.value.every(canDeleteEntry);
+  if (id === 'junk') return selectedEntries.value.every((entry) => entry.kind === 'imap' || canFileJmap(entry, 'junk'));
   return true;
 }));
 
+function canFileJmap(entry: Extract<ThreadEntry, { kind: 'jmap' }>, destination: 'archive' | 'trash' | 'junk') {
+  const source = mailStore.folders.find(({ id }) => id === entry.folder.id);
+  if (!source || !folderCapabilities(source, props.ownerId).mayRemoveItems) return false;
+  if (source.role === destination) return destination === 'trash';
+  const target = mailStore.folders.find((folder) => folder.account_id === source.account_id && folder.role === destination);
+  return Boolean(target && folderCapabilities(target, props.ownerId).mayAddItems);
+}
+
 function canArchiveEntry(entry: ThreadEntry) {
-  return role.value !== 'archive' && (!usesGmailLabels(entry) || entry.entry.location.mailbox === inbox.path);
+  if (role.value === 'archive') return false;
+  return entry.kind === 'jmap' ? canFileJmap(entry, 'archive')
+    : !usesGmailLabels(entry) || entry.entry.location.mailbox === inbox.path;
 }
 
 function canDeleteEntry(entry: ThreadEntry) {
-  return entry.kind === 'jmap' || role.value !== 'trash';
+  return entry.kind === 'jmap' ? canFileJmap(entry, 'trash') : role.value !== 'trash';
 }
 
 function toggleImapThreads() {
   imapThreaded.value = !imapThreaded.value;
+  closeReader();
   expandedThreads.value.clear();
   selection.selectNone();
 }
@@ -414,7 +492,11 @@ async function loadJmap() {
     const rows: MessageRow[] = await repo.listMessagesForView({
       accountId: folder.account_id, folderId: folder.id, sort: mailStore.sortForFolder(folder.id), limit: jmapLimit.value,
     });
-    return rows.map((row) => ({ folder, row }));
+    const threadIds = [...new Set(rows.flatMap(({ thread_id }) => thread_id == null ? [] : [thread_id]))];
+    if (!threadIds.length) return rows.map((row) => ({ folder, row }));
+    const cached: MessageRow[] = await repo.listMessagesForFolderThreads(folder.account_id, folder.id, threadIds);
+    const listed = new Set(rows.map(({ id }) => id));
+    return [...rows, ...cached.filter(({ id }) => !listed.has(id))].map((row) => ({ folder, row }));
   }));
   if (!mounted || sequence !== jmapSequence) return;
   const messages: typeof jmapMessages.value = [];
@@ -598,12 +680,18 @@ function restoreMailView() {
   }
 }
 
-function closeReader() {
+function releaseJmapMessage() {
   const current = jmapReading.value;
   jmapReading.value = undefined;
   if (current && mailStore.selectedMessageId === current.id && mailStore.selectedMessageFolderId === current.folderId) {
     mailStore.selectMessage(null);
   }
+}
+
+function closeReader() {
+  openedThread.value = undefined;
+  activeMessageKey.value = undefined;
+  releaseJmapMessage();
   reader.close();
 }
 
@@ -680,11 +768,11 @@ async function pickFolder(accountId: string, path: string, focus = true) {
   if (selected.value === current) void refreshFolder();
 }
 
-function openMessage(entry: ThreadEntry, button: HTMLElement | null) {
-  focusedId.value = entry.key;
-  openingButton = button;
+function showMessage(entry: ThreadEntry) {
+  if (activeMessageKey.value === entry.key) return;
+  activeMessageKey.value = entry.key;
   if (entry.kind === 'imap') {
-    if (jmapReading.value) closeReader();
+    releaseJmapMessage();
     void reader.open(entry.entry);
     if (!entry.entry.row.seen) void reader.runAction(entry.entry, { type: 'seen', value: true }, { undo: false });
   } else {
@@ -692,12 +780,22 @@ function openMessage(entry: ThreadEntry, button: HTMLElement | null) {
     jmapReading.value = { id: entry.row.id, folderId: entry.folder.id };
     mailStore.selectMessage(entry.row.id, entry.folder.id, () => jmapById.value.get(entry.row.id));
   }
-  openingButton = button;
-  if (singlePane.value) void nextTick(() => (readerPane.value?.querySelector<HTMLElement>('.message-view') ?? readerPane.value)
-    ?.focus({ preventScroll: true }));
 }
 
-function clickRow(entry: ThreadEntry, index: number, event: MouseEvent, button: HTMLElement | null) {
+function openRow({ entry, nested }: ListRow, button: HTMLElement | null) {
+  focusedId.value = entry.key;
+  openedThread.value = showThreads.value && !nested ? threadByMember.value.get(entry.key) : undefined;
+  showMessage(entry);
+  openingButton = button;
+  if (singlePane.value) void nextTick(() => readerPane.value?.focus({ preventScroll: true }));
+}
+
+function openThreadMessage(key: string) {
+  const entry = conversationEntries.value.find((candidate) => candidate.key === key);
+  if (entry) showMessage(entry);
+}
+
+function clickRow(row: ListRow, index: number, event: MouseEvent, button: HTMLElement | null) {
   scroller.value?.focus({ preventScroll: true });
   if (event.shiftKey || event.ctrlKey || event.metaKey) {
     event.preventDefault();
@@ -706,15 +804,22 @@ function clickRow(entry: ThreadEntry, index: number, event: MouseEvent, button: 
   }
   const wasSelecting = selection.hasSelection.value;
   selection.selectNone();
-  focusedId.value = entry.key;
-  const isOpen = entry.kind === 'imap' ? readerProps.value?.id === entry.entry.id : jmapReading.value?.id === entry.row.id;
+  focusedId.value = row.entry.key;
+  const isOpen = rowFocused(row);
   if (!wasSelecting && isOpen) closeReader();
-  else openMessage(entry, button);
+  else openRow(row, button);
 }
 
-watch([() => mailStore.selectedMessageId, () => mailStore.selectedMessageFolderId, jmapById], ([id, folderId]) => {
+watch([() => mailStore.selectedMessageId, () => mailStore.selectedMessageFolderId, entriesByKey], ([id, folderId, entries]) => {
+  const key = activeMessageKey.value;
+  if (key && !entries.has(key)) {
+    const remaining = conversationEntries.value.at(-1);
+    if (remaining) showMessage(remaining);
+    else closeReader();
+    return;
+  }
   const current = jmapReading.value;
-  if (current && (current.id !== id || current.folderId !== folderId || !jmapById.value.has(current.id))) closeReader();
+  if (current && (current.id !== id || current.folderId !== folderId)) closeReader();
 });
 
 watch(reading, (next) => {
@@ -743,14 +848,15 @@ function startCompose() {
   } });
 }
 
-function openTagMenu(entry: ThreadEntry | undefined, trigger: EventTarget | null | undefined) {
+function openTagMenu(row: ListRow | undefined, trigger: EventTarget | null | undefined) {
   if (!(trigger instanceof HTMLElement)) return;
-  if (tagPopover.value && tagPopover.value.key === entry?.key && tagPopover.value.trigger === trigger) {
+  const key = row?.entry.key;
+  if (tagPopover.value && tagPopover.value.key === key && tagPopover.value.trigger === trigger) {
     closeTagMenu();
     return;
   }
   const { top, left, width, height } = trigger.getBoundingClientRect();
-  tagPopover.value = { key: entry?.key, trigger, anchor: { top, left, width, height } };
+  tagPopover.value = { key, targets: row?.targets.map((entry) => entry.key), trigger, anchor: { top, left, width, height } };
 }
 
 function closeTagMenu() {
@@ -761,7 +867,9 @@ function closeTagMenu() {
 async function runActions(targets: readonly ThreadEntry[], action: MailListAction) {
   if (!targets.length) return;
   try {
-    await listActions(targets, action, definitions.value);
+    const undoLabel = showThreads.value && targets.length > 1
+      ? `${action.type === 'delete' ? 'Delete' : action.type === 'archive' ? 'Archive' : 'Update'} ${targets.length} messages` : undefined;
+    await listActions(targets, action, definitions.value, { undoLabel });
   } catch (cause) {
     feedback.showFailure(errorMessage(cause));
   }
@@ -772,7 +880,7 @@ function runSelected(action: MailListAction) {
 }
 
 function toggleSelectAll() {
-  if (selection.hasSelection.value) selection.selectNone();
+  if (allSelected.value) selection.selectNone();
   else selection.selectAllLoaded();
 }
 
@@ -782,10 +890,10 @@ function onListKeydown(event: KeyboardEvent) {
   const result = selection.handleKeyDown(event);
   if (result.focusChanged) {
     const index = selection.focusedIndex.value;
-    const entry = selectableRows.value[index];
+    const item = visibleRows.value[index];
     const row = scroller.value?.querySelector<HTMLElement>(`[data-index="${index}"]`);
     row?.scrollIntoView({ block: 'nearest' });
-    if (entry && !event.shiftKey) openMessage(entry, row?.querySelector('.msg-list__open') ?? null);
+    if (item && !event.shiftKey) openRow(item, row?.querySelector('.msg-list__open') ?? null);
   } else if (event.key === 'Enter' && !result.consumed && event.target === scroller.value) {
     scroller.value?.querySelector<HTMLButtonElement>(`[data-index="${Math.max(0, selection.focusedIndex.value)}"] .msg-list__open`)?.click();
   }
@@ -923,30 +1031,31 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
       <div ref="scroller" class="imap-mail__scroll msg-list__scroller" role="region" aria-label="Messages"
         tabindex="0" @keydown="onListKeydown">
         <ul v-if="visibleRows.length" class="imap-mail__rows msg-list__items" aria-label="Messages">
-          <MessageListRow v-for="({ entry, stack, nested }, index) in visibleRows" :key="entry.key"
-            :message="entry.row" :index="index" :size="cardLayout ? CARD_ROW_HEIGHT : ROW_HEIGHT"
-            :class="{ 'imap-mail__nested': nested }" :context="rowContext(entry)" dom-id-prefix="account-mail-row-"
-            :focused="entry.kind === 'imap' ? readerProps?.id === entry.entry.id : jmapReading?.id === entry.row.id"
-            :cursor="focusedId === entry.key" :selected="selection.isSelected(entry.key)" :draggable="false"
+          <MessageListRow v-for="(item, index) in visibleRows" :key="item.entry.key"
+            :message="rowPresentation(item)" :index="index" :size="cardLayout ? CARD_ROW_HEIGHT : ROW_HEIGHT"
+            :class="{ 'imap-mail__nested': item.nested }" :context="rowContext(item.entry)" dom-id-prefix="account-mail-row-"
+            :focused="rowFocused(item)" :cursor="focusedId === item.entry.key" :selected="rowChecked(item)"
+            :selection-mixed="rowMixed(item)" :conversation-count="item.stack ? item.targets.length : undefined" :draggable="false"
             :shows-recipients="folderShowsRecipients({ role })"
-            :sort="entry.kind === 'jmap' ? mailStore.sortForFolder(entry.folder.id) : 'received'"
+            :sort="item.entry.kind === 'jmap' ? mailStore.sortForFolder(item.entry.folder.id) : 'received'"
             :tag-definitions="definitions"
-            :additional-tags="entry.kind === 'imap' ? additionalTagsByEntry.get(entry.entry.id) : undefined"
-            :hover-actions="!isScheduledMessage(entry.row)" :archive-action="canArchiveEntry(entry)"
-            :delete-action="canDeleteEntry(entry)" :tag-menu-open="tagPopover?.key === entry.key"
-            @row-click="(event, button) => clickRow(entry, index, event, button)"
+            :additional-tags="rowAdditionalTags(item.targets)"
+            :hover-actions="!item.targets.some((target) => target.kind === 'jmap' && isScheduledMessage(target.row))"
+            :archive-action="item.targets.every(canArchiveEntry)"
+            :delete-action="item.targets.every(canDeleteEntry)" :tag-menu-open="tagPopover?.key === item.entry.key"
+            @row-click="(event, button) => clickRow(item, index, event, button)"
             @checkbox-click="selection.handleCheckboxClick(index, $event, 0)"
-            @tag="openTagMenu(entry, $event.currentTarget)"
-            @star="runActions([entry], { type: 'star', value: $event })"
-            @archive="runActions([entry], { type: 'archive' })"
-            @delete="runActions([entry], { type: 'delete' })"
+            @tag="openTagMenu(item, $event.currentTarget)"
+            @star="runActions(item.targets, { type: 'star', value: $event })"
+            @archive="runActions(item.targets, { type: 'archive' })"
+            @delete="runActions(item.targets, { type: 'delete' })"
           >
-            <template v-if="stack" #controls>
+            <template v-if="item.stack" #controls>
               <div class="msg-list__row-controls" @click.stop>
-                <button type="button" class="imap-mail__stack" :aria-expanded="expandedThreads.has(stack.key)"
-                  :aria-label="`${expandedThreads.has(stack.key) ? 'Hide' : 'Show'} ${stack.previous.length} earlier messages`"
-                  @click.stop="toggleThread(stack.key)">
-                  +{{ stack.previous.length }} <ChevronDown :size="14" aria-hidden="true" />
+                <button type="button" class="imap-mail__stack" :aria-expanded="expandedThreads.has(item.stack.key)"
+                  :aria-label="`${expandedThreads.has(item.stack.key) ? 'Hide' : 'Show'} ${item.stack.previous.length} earlier ${item.stack.previous.length === 1 ? 'message' : 'messages'}`"
+                  @click.stop="toggleThread(item.stack.key)">
+                  +{{ item.stack.previous.length }} <ChevronDown :size="14" aria-hidden="true" />
                 </button>
               </div>
             </template>
@@ -961,10 +1070,30 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
       </div>
     </div>
     <div v-if="reading" ref="readerPane" class="imap-mail__reader" tabindex="-1">
-      <MessageView :imap="readerProps" :maximized="maximized" back-label="Back"
-        @back="closeReader" @toggle-maximized="maximized = !maximized"
-        @imap-action="reader.current.value && reader.runAction(reader.current.value, $event)"
-        @imap-compose="reader.composeResponse" />
+      <component :is="threadReaderOpen ? ConversationReader : 'div'" class="imap-mail__reader-content"
+        v-bind="threadReaderOpen ? { subject: conversationEntries.at(-1)?.subject, messages: conversationMessages, activeKey: activeMessageKey } : {}"
+        @select="openThreadMessage" @back="closeReader">
+        <template v-if="threadReaderOpen" #actions>
+          <AppIconButton v-if="conversationEntries.some(({ row }) => row.is_seen === 0)"
+            title="Mark conversation as read" aria-label="Mark conversation as read"
+            @click="runActions(conversationEntries, { type: 'seen', value: true })"><MailOpen :size="18" /></AppIconButton>
+          <AppIconButton v-else title="Mark conversation as unread" aria-label="Mark conversation as unread"
+            @click="runActions(conversationEntries, { type: 'seen', value: false })"><Mail :size="18" /></AppIconButton>
+          <AppIconButton v-if="conversationEntries.some(({ row }) => row.is_flagged === 1)"
+            title="Unstar conversation" aria-label="Unstar conversation"
+            @click="runActions(conversationEntries, { type: 'star', value: false })"><Star :size="18" fill="#facc15" /></AppIconButton>
+          <AppIconButton v-else title="Star conversation" aria-label="Star conversation"
+            @click="runActions(conversationEntries, { type: 'star', value: true })"><Star :size="18" /></AppIconButton>
+          <AppIconButton v-if="conversationEntries.every(canArchiveEntry)" title="Archive conversation" aria-label="Archive conversation"
+            @click="runActions(conversationEntries, { type: 'archive' })"><Archive :size="18" /></AppIconButton>
+          <AppIconButton v-if="conversationEntries.every(canDeleteEntry)" danger title="Delete conversation" aria-label="Delete conversation"
+            @click="runActions(conversationEntries, { type: 'delete' })"><Trash2 :size="18" /></AppIconButton>
+        </template>
+        <MessageView :imap="readerProps" :maximized="maximized" back-label="Back" :show-back="!threadReaderOpen"
+          @back="closeReader" @toggle-maximized="maximized = !maximized"
+          @imap-action="reader.current.value && reader.runAction(reader.current.value, $event)"
+          @imap-compose="reader.composeResponse" />
+      </component>
     </div>
     <TagPickerPopover :anchor="tagPopover?.anchor ?? null" :trigger="tagPopover?.trigger ?? null"
       :return-focus="tagPopover?.trigger ?? null" :targets="rowTagPicker.rows"
@@ -1000,6 +1129,7 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
 .imap-mail__rows { padding: 0; margin: 0; list-style: none; }
 .imap-mail__nested { margin-inline-start: 14px; border-inline-start: 2px solid var(--border); }
 .imap-mail__reader { min-height: 0; min-width: 0; border-inline-start: 1px solid var(--border); outline: none; }
+.imap-mail__reader-content { height: 100%; min-height: 0; }
 .imap-mail__reader :deep(.message-view) { height: 100%; }
 .imap-mail--maximized .imap-mail__reader { position: fixed; inset: 0; z-index: 45; }
 @media (pointer: coarse) {

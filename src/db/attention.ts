@@ -496,7 +496,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
   }
 
   async function enqueueImapActions(ownerId: number, requests: readonly ImapActionRequest[],
-    { undoable = false, retryOf }: { undoable?: boolean; retryOf?: number } = {}) {
+    { undoable = false, undoExpiresAt, retryOf }: { undoable?: boolean; undoExpiresAt?: number; retryOf?: number } = {}) {
     if (!Array.isArray(requests)) throw new Error('The IMAP change is invalid.');
     if (requests.length === 0 && retryOf == null) return { mutationIds: [] };
     const mutationIds = await engine.transaction(async (tx) => {
@@ -542,10 +542,12 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
         if (isImapMove(action)) messages.delete(uid);
       }
       const now = Date.now();
+      const expiresAt = typeof undoExpiresAt === 'number' && Number.isSafeInteger(undoExpiresAt)
+        ? Math.min(now + MAIL_UNDO_MS, undoExpiresAt) : now + MAIL_UNDO_MS;
       const rows: { id: number }[] = await tx.all(
         `INSERT INTO pending_mutations (account_id, mutation_type, local_status, request_json, created_at, updated_at, not_before)
          SELECT ?, ?, 'pending', value, ?, ?, ? FROM json_each(?) ORDER BY CAST(key AS INTEGER)
-         RETURNING id`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP, now, now, undoable ? now + MAIL_UNDO_MS : null, JSON.stringify(queued)],
+         RETURNING id`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP, now, now, undoable ? expiresAt : null, JSON.stringify(queued)],
       );
       if (retryOf != null) await tx.run('DELETE FROM pending_mutations WHERE id = ?', [retryOf]);
       return rows.map(({ id }) => Number(id)).sort((a, b) => a - b);
@@ -556,21 +558,23 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     return { mutationIds };
   }
 
-  async function undoImapActions(ownerId: number, mutationIds: readonly number[]) {
+  async function undoImapActions(ownerId: number, mutationIds: readonly number[], allowPartial = false) {
     if (!Array.isArray(mutationIds) || !mutationIds.length || !mutationIds.every((id) => Number.isSafeInteger(id) && id > 0)) {
       throw new Error('This mail change cannot be undone.');
     }
     const ids = [...new Set(mutationIds)];
-    await engine.transaction(async (tx) => {
-      const result = await tx.run(`DELETE FROM pending_mutations
+    const canceledIds = await engine.transaction(async (tx) => {
+      const removed: { id: number }[] = await tx.all(`DELETE FROM pending_mutations
         WHERE account_id = ? AND mutation_type = ? AND local_status = 'pending' AND attempts = 0
           AND json_extract(request_json, '$.undoable') = 1 AND json_extract(request_json, '$.cancelled') IS NOT 1
-          AND id IN (SELECT value FROM json_each(?))`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP, JSON.stringify(ids)]);
-      if (result.changes !== ids.length) throw new Error('This mail change has already started syncing.');
+          AND id IN (SELECT value FROM json_each(?)) RETURNING id`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP, JSON.stringify(ids)]);
+      if (!allowPartial && removed.length !== ids.length) throw new Error('This mail change has already started syncing.');
+      return removed.map(({ id }) => Number(id));
     });
     broadcaster.touch(TABLE_FAMILIES.ATTENTION);
     broadcaster.touch(TABLE_FAMILIES.MUTATIONS);
     notifyMutation(ownerId);
+    return { canceledIds };
   }
 
   async function settleImapAction(mutationId: number, error?: { type?: string; message?: string }) {
@@ -823,11 +827,12 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
         notifyMutation(ownerId);
       }),
     [DB_RPC.ATTENTION_BODY]: async ({ ownerId, location, cachedOnly = false }) => readBody(ownerId, location, cachedOnly),
-    [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]: async ({ ownerId, location, action, undoable = false }) =>
-      enqueueImapActions(ownerId, [{ location, action }], { undoable: undoable === true }),
-    [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS]: async ({ ownerId, requests, undoable = false }) =>
-      enqueueImapActions(ownerId, requests, { undoable: undoable === true }),
-    [DB_RPC.ATTENTION_UNDO_IMAP_ACTIONS]: async ({ ownerId, mutationIds }) => undoImapActions(ownerId, mutationIds),
+    [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]: async ({ ownerId, location, action, undoable = false, undoExpiresAt = undefined }) =>
+      enqueueImapActions(ownerId, [{ location, action }], { undoable: undoable === true, undoExpiresAt }),
+    [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS]: async ({ ownerId, requests, undoable = false, undoExpiresAt = undefined }) =>
+      enqueueImapActions(ownerId, requests, { undoable: undoable === true, undoExpiresAt }),
+    [DB_RPC.ATTENTION_UNDO_IMAP_ACTIONS]: async ({ ownerId, mutationIds, allowPartial = false }) =>
+      undoImapActions(ownerId, mutationIds, allowPartial),
     [DB_RPC.ATTENTION_IMAP_ACTION_FAILURES]: async ({ ownerId }) => readImapActionFailures(engine, ownerId, 20),
     [DB_RPC.ATTENTION_RETRY_IMAP_ACTION]: async ({ ownerId, mutationId }) =>
       enqueueImapActions(ownerId, [], { retryOf: mutationId }),

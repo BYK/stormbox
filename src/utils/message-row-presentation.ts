@@ -26,6 +26,15 @@ export interface MessageRowLike {
   scheduled_undo_status?: string | null;
 }
 
+/** Give a conversation row the unread and starred state of its members. */
+export function conversationRow<T extends MessageRowLike>(leading: T, members: readonly MessageRowLike[]): T {
+  return {
+    ...leading,
+    is_seen: Number(members.every((row) => Number(row.is_seen) !== 0)),
+    is_flagged: Number(members.some((row) => Number(row.is_flagged) === 1)),
+  };
+}
+
 /** Sent and Drafts list the people you wrote to, not yourself (Fixes #98). */
 export function folderShowsRecipients(
   folder: { role?: string | null } | null | undefined,

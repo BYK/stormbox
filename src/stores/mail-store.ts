@@ -47,7 +47,7 @@ import {
   tagKeywordsOf,
 } from '../utils/message-tags';
 import { useSettingsStore } from './settings-store';
-import { useMailActionFeedbackStore } from './mail-action-feedback-store';
+import { useMailActionFeedbackStore, type MailUndoGroup } from './mail-action-feedback-store';
 import { useJmapMailActions } from './jmap-mail-actions';
 import type { MailActionPatch } from '../types/mail-action';
 import { createContactUid } from '../utils/contact-uid';
@@ -2004,6 +2004,7 @@ export const useMailStore = defineStore('mail', () => {
     sourceFolderId?: number | null;
     rows?: ReadonlyArray<CachedRow | undefined>;
     undoable?: boolean;
+    undoGroup?: MailUndoGroup;
   }
 
   /**
@@ -2110,7 +2111,7 @@ export const useMailStore = defineStore('mail', () => {
         requestJson: JSON.stringify({ messageIds: changedIds, add, remove: [...removeOnWire] }),
       }, { mailAction: true, messageIds: changedIds, label, failureAction, add, remove,
         subject: changedIds.length === 1 ? rowFor(changedIds[0])?.subject?.slice(0, 120) : undefined,
-      }, options.undoable !== false);
+      }, options.undoable !== false, options.undoGroup);
       return accepted ? changedIds.length : 0;
     }
     const optimisticPatch: Partial<Record<'is_seen' | 'is_flagged' | 'is_junk', 0 | 1>> = {};
@@ -2661,11 +2662,12 @@ export const useMailStore = defineStore('mail', () => {
    */
   async function destroyMessages(
     ids: number[],
-    { permanent = false, sourceFolderId, rows }: { permanent?: boolean } & BulkSourceOptions = {},
+    { permanent = false, ...options }: { permanent?: boolean } & BulkSourceOptions = {},
   ) {
+    const { sourceFolderId } = options;
     if (!repo || authStore.accountId == null) return;
     if (isTagViewId(sourceFolderId ?? currentFolderId.value) && !permanent) {
-      return fileTagMessages(ids, 'trash', { sourceFolderId, rows });
+      return fileTagMessages(ids, 'trash', options);
     }
     if (rejectTagViewSource(sourceFolderId ?? currentFolderId.value, 'delete')) return;
     if (!Array.isArray(ids) || ids.length === 0) return;
@@ -2726,7 +2728,7 @@ export const useMailStore = defineStore('mail', () => {
         removeFrom: destroying ? 'all' : 'source', excludeFromTags: true,
         destinationFolderId: destroying ? undefined : trashTarget?.id,
         label: destroying ? 'Deleted permanently' : 'Moved to Trash', failureAction: 'delete',
-      }, { rows });
+      }, options);
       return;
     }
     const finalize = (succeeded: number[]) => (
@@ -2903,6 +2905,7 @@ export const useMailStore = defineStore('mail', () => {
   }
 
   function stageTransfer(input: PendingMutationInsert, patch: MailActionPatch, options: BulkSourceOptions = {}) {
+    if (options.undoGroup?.isCanceled()) return Promise.resolve(false);
     const folderId = patch.sourceFolderId ?? null;
     const supplied = new Map(options.rows?.flatMap((row) => row ? [[row.id, row] as const] : []));
     const open = openMessageRef.value.getRow?.();
@@ -2923,7 +2926,7 @@ export const useMailStore = defineStore('mail', () => {
     const first = patch.messageIds[0];
     const subject = patch.messageIds.length === 1 ? (supplied.get(first) ?? findLoadedRow(first, folderId))?.subject : undefined;
     const preview = patch.removeFrom ? nextPreviewIdAfterRemoval(patch.messageIds, rowsForFolder(folderId), folderId) : undefined;
-    const staged = mailActions.stage(input, { ...patch, subject: subject?.slice(0, 120) }, options.undoable);
+    const staged = mailActions.stage(input, { ...patch, subject: subject?.slice(0, 120) }, options.undoable, options.undoGroup);
     if (patch.removeFrom) clearSelectionFor(patch.messageIds);
     applyPreviewAfterRemoval(preview, folderId);
     return staged;

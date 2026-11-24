@@ -36,6 +36,7 @@ import {
   computed,
   ref,
   shallowRef,
+  watch,
   type Ref,
 } from 'vue';
 
@@ -44,6 +45,7 @@ type SelectionRows<Row> = Readonly<Ref<readonly (Row | undefined)[]>>;
 export interface UseListSelectionOptions<Row, Key> {
   focusedId?: Ref<Key | null>;
   getKey?: (row: Row) => Key | null | undefined;
+  getSelectionKeys?: (row: Row) => readonly Key[];
   rows: SelectionRows<Row>;
   selectedIds?: Ref<Set<Key>>;
   total: Readonly<Ref<number>>;
@@ -84,6 +86,15 @@ export function useListSelection<Row, Key = unknown>(
         row !== undefined && getKey(row) === focusedId.value)));
   const anchorIndex = ref(-1);
 
+  if (options.getSelectionKeys) {
+    watch(rows, (next, previous) => {
+      const anchored = previous[anchorIndex.value];
+      if (anchored === undefined) return;
+      const key = getKey(anchored);
+      anchorIndex.value = key == null ? -1 : next.findIndex((row) => row !== undefined && getKey(row) === key);
+    }, { flush: 'sync' });
+  }
+
   const selectionCount = computed(() => selectedIds.value.size);
   const hasSelection = computed(() => selectionCount.value > 0);
 
@@ -94,6 +105,14 @@ export function useListSelection<Row, Key = unknown>(
   function _idAt(index: number): Key | null {
     const row = rows.value[index];
     return row === undefined ? null : getKey(row) ?? null;
+  }
+
+  function keysAt(index: number): readonly Key[] {
+    const row = rows.value[index];
+    if (row === undefined) return [];
+    if (options.getSelectionKeys) return options.getSelectionKeys(row);
+    const id = getKey(row);
+    return id == null ? [] : [id];
   }
 
   /**
@@ -115,13 +134,13 @@ export function useListSelection<Row, Key = unknown>(
    * viewer.
    */
   function toggleAt(index: number): void {
-    const id = _idAt(index);
-    if (id == null) return;
+    const keys = keysAt(index);
+    if (!keys.length) return;
     const next = new Set(selectedIds.value);
-    if (next.has(id)) {
-      next.delete(id);
-    } else {
-      next.add(id);
+    const clear = keys.every((key) => next.has(key));
+    for (const key of keys) {
+      if (clear) next.delete(key);
+      else next.add(key);
     }
     anchorIndex.value = index;
     selectedIds.value = next;
@@ -145,8 +164,7 @@ export function useListSelection<Row, Key = unknown>(
     const next = new Set<Key>();
     const upper = Math.min(rows.value.length, hi);
     for (let i = Math.max(0, lo); i < upper; i += 1) {
-      const id = _idAt(i);
-      if (id != null) next.add(id);
+      for (const key of keysAt(i)) next.add(key);
     }
     selectedIds.value = next;
     if (!hadAnchor) anchorIndex.value = anchor;
@@ -243,15 +261,10 @@ export function useListSelection<Row, Key = unknown>(
   function selectAllLoaded(): void {
     const upper = Math.min(rows.value.length, total.value || rows.value.length);
     const next = new Set(selectedIds.value);
-    let changed = 0;
     for (let i = 0; i < upper; i += 1) {
-      const id = _idAt(i);
-      if (id != null && !next.has(id)) {
-        next.add(id);
-        changed += 1;
-      }
+      for (const key of keysAt(i)) next.add(key);
     }
-    if (changed) selectedIds.value = next;
+    if (next.size !== selectedIds.value.size) selectedIds.value = next;
     if (upper > 0) anchorIndex.value = 0;
   }
 

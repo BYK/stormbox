@@ -16,6 +16,8 @@ export async function sendSmtpMessage({
   to = TEST_THUNDERMAIL,
   subject,
   text = 'e2e message',
+  messageId = `${Date.now()}.${Math.random().toString(16).slice(2)}@stormbox-e2e.local`,
+  inReplyTo,
 }) {
   const socket = tls.connect({
     host: SMTP_HOST,
@@ -62,7 +64,8 @@ export async function sendSmtpMessage({
       `From: ${from}`,
       `To: ${to}`,
       `Subject: ${subject}`,
-      `Message-ID: <${Date.now()}.${Math.random().toString(16).slice(2)}@stormbox-e2e.local>`,
+      `Message-ID: <${messageId}>`,
+      ...(inReplyTo ? [`In-Reply-To: <${inReplyTo}>`, `References: <${inReplyTo}>`] : []),
       '',
       dotStuff(text),
       '.',

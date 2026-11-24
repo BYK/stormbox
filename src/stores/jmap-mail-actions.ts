@@ -2,7 +2,7 @@ import { computed, shallowReactive } from 'vue';
 import type { MutationType } from '../constants/states';
 import type { Repository } from '../db/repository';
 import { mailActionPatch, type MailActionPatch, type MailActionRow } from '../types/mail-action';
-import { MAIL_UNDO_MS, useMailActionFeedbackStore } from './mail-action-feedback-store';
+import { MAIL_UNDO_MS, useMailActionFeedbackStore, type MailUndoGroup, type MailUndoResult } from './mail-action-feedback-store';
 
 type DisplayRow = { id: number; keywords_json?: string | null; is_seen?: number | null; is_flagged?: number | null; is_junk?: number | null };
 type OutboxInput = {
@@ -155,17 +155,21 @@ export function useJmapMailActions({ repository, account, publish, reload, showN
     feedback.showFailure((scheduleError && detail.description) || `Couldn’t ${patch.failureAction} ${object}.`, retry);
   }
 
-  async function cancelPending(repo: Repository, ownerId: number, id: number, current: () => boolean) {
-    if (!current()) return;
+  async function cancelPending(repo: Repository, ownerId: number, id: number, current: () => boolean,
+    aggregate = false): Promise<MailUndoResult> {
+    if (!current()) return { canceled: 0, failed: 0 };
     canceling.add(id);
     publish();
     try {
       const result = await repo.cancelMailAction(ownerId, id);
-      if (!current()) return;
+      if (!current()) return { canceled: 0, failed: 0 };
       if (result.canceled) rows.delete(id);
-      else feedback.showFailure('This change already started syncing.');
+      else if (!aggregate) feedback.showFailure('This change already started syncing.');
+      return result.canceled ? { canceled: 1, failed: 0 } : { canceled: 0, failed: 1 };
     } catch {
-      if (current()) feedback.showFailure('Couldn’t undo this change.', () => cancelPending(repo, ownerId, id, current));
+      if (!current()) return { canceled: 0, failed: 0 };
+      if (!aggregate) feedback.showFailure('Couldn’t undo this change.', async () => { await cancelPending(repo, ownerId, id, current); });
+      return { canceled: 0, failed: 1 };
     } finally {
       if (current()) {
         canceling.delete(id);
@@ -199,10 +203,10 @@ export function useJmapMailActions({ repository, account, publish, reload, showN
         else {
           pending.set(item.id, patch);
           const deadline = Number(item.not_before);
-          if (!preparing.size && item.local_status === 'pending' && deadline > Date.now() && !undoToasts.has(item.id)) {
+          if (!patch.groupedUndo && !preparing.size && item.local_status === 'pending' && deadline > Date.now() && !undoToasts.has(item.id)) {
             const hasSameAccount = () => generation === gen && account() === ownerId && repository() === repo;
             undoToasts.set(item.id, feedback.showUndo(patch.label,
-              () => cancelPending(repo, ownerId, item.id, hasSameAccount), deadline));
+              async () => { await cancelPending(repo, ownerId, item.id, hasSameAccount); }, deadline));
           }
         }
       }
@@ -223,14 +227,14 @@ export function useJmapMailActions({ repository, account, publish, reload, showN
     }
   }
 
-  async function stage(input: OutboxInput, patch: MailActionPatch, undoable = true): Promise<boolean> {
+  async function stage(input: OutboxInput, patch: MailActionPatch, undoable = true, group?: MailUndoGroup): Promise<boolean> {
     const repo = repository();
     const ownerId = account();
-    if (!repo || ownerId == null) return false;
+    if (!repo || ownerId == null || group?.isCanceled()) return false;
     const gen = generation;
     const localId = ++temporaryId;
-    if (!undoable) patch = { ...patch, undoable: false };
-    const deadline = Date.now() + MAIL_UNDO_MS;
+    patch = { ...patch, undoable: undoable ? undefined : false, groupedUndo: group ? true : undefined };
+    const deadline = group?.expiresAt ?? Date.now() + MAIL_UNDO_MS;
     const current = () => generation === gen && repository() === repo && account() === ownerId;
     preparing.set(localId, patch);
     for (const id of patch.messageIds) lastIntentByMessage.set(id, localId);
@@ -239,21 +243,28 @@ export function useJmapMailActions({ repository, account, publish, reload, showN
       ...input, optimisticPatchJson: JSON.stringify(patch), notBefore: undoable ? deadline : null,
     });
     let toast: number | undefined;
+    let committedId: number | undefined;
     let undoRequested = false;
-    const undo = async () => {
-      if (!current()) return;
+    const undo = async (): Promise<MailUndoResult> => {
+      if (!current()) return { canceled: 0, failed: 0 };
       undoRequested = true;
+      if (committedId != null) return cancelPending(repo, input.accountId, committedId, current, Boolean(group));
       // An Undo can arrive before the insert returns from the worker.
       preparing.delete(localId);
       publish();
       const committed = await write.catch(() => null);
-      if (!committed || !current()) return;
-      await cancelPending(repo, input.accountId, committed.id, current);
+      if (!committed || !current()) return { canceled: 0, failed: 0 };
+      return cancelPending(repo, input.accountId, committed.id, current, Boolean(group));
     };
-    if (undoable) toast = feedback.showUndo(patch.label, undo, deadline);
+    let unregister: (() => void) | undefined;
+    if (undoable) {
+      if (group) unregister = group.register(undo);
+      else toast = feedback.showUndo(patch.label, async () => { await undo(); }, deadline);
+    }
     try {
       const { id } = await write;
       if (!current()) return true;
+      committedId = id;
       revision += 1;
       preparing.delete(localId);
       rows.set(id, patch);
@@ -266,6 +277,7 @@ export function useJmapMailActions({ repository, account, publish, reload, showN
     } catch {
       if (!current()) return false;
       if (toast != null) feedback.dismiss(toast);
+      unregister?.();
       preparing.delete(localId);
       publish();
       if (!undoRequested) {

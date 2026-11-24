@@ -5,8 +5,11 @@ import {
   createDraft,
   createEmailInMailbox,
   getEmailMailboxIds,
+  jmapRequest,
   listMailboxes,
   mailboxByRole,
+  pickResponse,
+  sweepOrphanTestMessages,
 } from './helpers/jmap-client.js';
 import {
   attachConsoleTail,
@@ -27,6 +30,7 @@ import {
   readViewCacheForFolderRole,
 } from './helpers/ui.js';
 import { discardCompose } from './helpers/compose.js';
+import { sendSmtpMessage } from './helpers/smtp-client.js';
 
 test.skip(!localStackEnabled, skipLocalStackMessage);
 
@@ -155,4 +159,65 @@ test.describe('Delete message e2e', () => {
       }
     });
   }
+
+  test('a Unified Inbox conversation deletes and undoes both messages together', async ({ sharedPage: page }) => {
+    const jmap = await connectJmap();
+    const mailboxes = await listMailboxes(jmap);
+    const source = mailboxByRole(mailboxes, 'inbox');
+    const trash = mailboxByRole(mailboxes, 'trash');
+    const nonce = `${Date.now()}`;
+    const subject = `Delete thread e2e ${nonce}`;
+    const messageId = `${nonce}@stormbox-e2e.local`;
+    let ids = [];
+    const serverLocations = () => Promise.all(ids.map(async (id) =>
+      classifyMailboxState(await getEmailMailboxIds(jmap, id), { source, trash })));
+
+    try {
+      await sendSmtpMessage({ to: selfEmail(), subject, messageId, text: 'First message in the conversation.' });
+      await sendSmtpMessage({ to: selfEmail(), subject: `Re: ${subject}`, inReplyTo: messageId, text: 'Second message in the conversation.' });
+      await expect.poll(async () => {
+        const response = await jmapRequest(jmap, [['Email/query', {
+          accountId: jmap.accountId,
+          filter: { inMailbox: source.id, subject },
+        }, 'q1']]);
+        ids = pickResponse(response, 'Email/query')?.ids ?? [];
+        return ids.length;
+      }).toBe(2);
+
+      await clickFolder(page, source.name);
+      await expectRowSoon(page, subject);
+      await clickFolder(page, 'Unified Inbox');
+      await page.getByRole('searchbox').fill(subject);
+      const mail = page.getByRole('region', { name: 'Unified Inbox' });
+      const head = mail.getByRole('button', { name: new RegExp(`^Open conversation: .*${subject}`) });
+      await head.click();
+      const conversation = mail.getByRole('list', { name: 'Messages in conversation' });
+      await expect(conversation.getByRole('listitem')).toHaveCount(2);
+      await mail.getByRole('button', { name: 'Back to messages' }).click();
+
+      const select = mail.getByRole('checkbox', { name: new RegExp(`^Select conversation: .*${subject}`) });
+      await head.hover();
+      await select.check();
+      await expect(mail.getByText('2 selected')).toBeVisible();
+      const remove = mail.locator('.msg-list__header').getByRole('button', { name: 'Delete', exact: true });
+      await remove.click();
+      await expect(head).toHaveCount(0);
+      expect(await serverLocations()).toEqual(['source', 'source']);
+      await page.getByRole('button', { name: 'Undo Delete 2 messages' }).click();
+      await expect(head).toBeVisible();
+      expect(await serverLocations()).toEqual(['source', 'source']);
+
+      await head.hover();
+      await select.check();
+      await remove.click();
+      await expect.poll(serverLocations, { timeout: 20_000 }).toEqual(['trash', 'trash']);
+      await expect.poll(async () => {
+        const cache = await readViewCacheForFolderRole(page, 'inbox');
+        return cache ? ids.some((id) => cache.remoteIds.includes(id)) : null;
+      }).toBe(false);
+    } finally {
+      await page.getByRole('searchbox').fill('');
+      await sweepOrphanTestMessages(jmap, { subjectPrefix: subject });
+    }
+  });
 });

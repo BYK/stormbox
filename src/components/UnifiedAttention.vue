@@ -5,9 +5,12 @@ import { useOnline, useStorage } from '@vueuse/core';
 import AppIconButton from './AppIconButton.vue';
 import AttentionActionMenu from './AttentionActionMenu.vue';
 import AttentionInbox from './AttentionInbox.vue';
+import AttentionRowMenu from './AttentionRowMenu.vue';
+import ConversationReader from './ConversationReader.vue';
 import ImapAccountsDialog from './ImapAccountsDialog.vue';
 import MessageView from './MessageView.vue';
 import { imapEntry, useImapReader } from '../composables/useImapReader';
+import { useMailListActions, type MailListSource } from '../composables/useMailListActions';
 import { useMessageTags } from '../composables/useMessageTags';
 import { getRepositoryAsync } from '../composables/useRepository';
 import { TABLE_FAMILIES } from '../db/protocol';
@@ -21,12 +24,12 @@ import { useMailStore } from '../stores/mail-store';
 import { browserSessionEnabled } from '../services/browser-session';
 import { GOOGLE_IMAP_RESULTS, type GoogleImapResult, type ImapAttentionAction } from '../sync/backends/imap/attention-relay';
 import { browserTriageMessageKey, createBrowserTriageRanker, type BrowserTriageProgress } from '../triage/browser-model';
-import { buildTriageBundles, type TriageClassification, type TriageMessage } from '../triage/smart-sort';
+import { buildTriageBundles, type TriageBundle, type TriageClassification, type TriageMessage } from '../triage/smart-sort';
 import { disableWebPush, enableWebPush, getWebPushPublicKey, isWebPushEnabled, onWebPushRefresh } from '../push/client';
 import type { MessageRow, FolderRow } from '../types';
 import { parseAddressList } from '../utils/address-list';
 import { closeContainingDropdown } from '../utils/dropdown';
-import type { MessageRowLike } from '../utils/message-row-presentation';
+import { conversationRow, correspondentLabel, type MessageRowLike } from '../utils/message-row-presentation';
 
 const props = defineProps<{
   ownerId: number;
@@ -54,6 +57,8 @@ const authStore = useAuthStore();
 const bundleActions = useAttentionBundleActionsStore().forOwner(props.ownerId);
 const { definitions: tagDefinitions } = useMessageTags();
 const reading = shallowRef<Reading>();
+const openedBundle = shallowRef<TriageBundle>();
+const showConversation = ref(false);
 const reader = ref<HTMLElement>();
 const list = ref<HTMLElement>();
 const maximized = ref(false);
@@ -128,8 +133,10 @@ const imap = computed(() => cache.value.accounts.flatMap((account) => {
   });
 }));
 const imapById = computed(() => new Map(imap.value.map((entry) => [entry.id, entry])));
+const imapByMessage = computed(() => new Map(imap.value.map((entry) => [browserTriageMessageKey(entry.message), entry])));
 const imapReading = useImapReader(() => props.ownerId, () => repo, (id) => imapById.value.get(id), loadCache);
 const imapReader = imapReading.view;
+const runListAction = useMailListActions(() => props.ownerId, () => repo, loadCache);
 const jmapRowsById = computed(() => new Map(jmapRows.value.map((row) => [row.id, row])));
 const rows = computed(() => new Map<string, MessageRowLike & { id: number | string }>([
   ...jmapRows.value.map((row) => [
@@ -144,18 +151,50 @@ const accountLabels = computed(() => Object.fromEntries([
   ...cache.value.accounts.map((account) => [`imap:${account.relay_id}`, account.address]),
 ]));
 const baseMessages = computed(() => [...jmapRows.value.map(jmapMessage), ...imap.value.map(({ message }) => message)]);
-const bundles = computed(() => {
+const unfilteredBundles = computed(() => {
   const messages = baseMessages.value.map((message) => ({
     ...message, classification: modelScores.value.get(browserTriageMessageKey(message)),
   }));
+  return buildTriageBundles(messages, bundleActions.states.value, clock.value);
+});
+const bundles = computed(() => {
   const query = props.search?.trim().toLowerCase();
-  return buildTriageBundles(messages, bundleActions.states.value, clock.value).filter((bundle) =>
-    !query || bundle.messages.some(({ message }) =>
+  return query ? unfilteredBundles.value.filter((bundle) =>
+    bundle.messages.some(({ message }) =>
       [message.subject, message.sender, message.preview, accountLabels.value[String(message.accountId)]]
-        .some((value) => value?.toLowerCase().includes(query))),
-  );
+        .some((value) => value?.toLowerCase().includes(query)))) : unfilteredBundles.value;
 });
 
+const activeMessageKey = computed(() => reading.value && browserTriageMessageKey(reading.value.message));
+const activeBundle = computed(() => {
+  const previous = openedBundle.value;
+  if (!previous) return undefined;
+  const memberKeys = new Set(previous.messages.map(({ message }) => browserTriageMessageKey(message)));
+  return unfilteredBundles.value.find((bundle) =>
+    bundle.messages.some(({ message }) => browserTriageMessageKey(message) === activeMessageKey.value))
+    ?? unfilteredBundles.value.find((bundle) => bundle.id === previous.id)
+    ?? unfilteredBundles.value.find((bundle) =>
+      bundle.messages.some(({ message }) => memberKeys.has(browserTriageMessageKey(message))));
+});
+const conversationMessages = computed(() => activeBundle.value?.messages.map(({ message }) => {
+  const key = browserTriageMessageKey(message);
+  const row = rows.value.get(key);
+  return {
+    key,
+    sender: correspondentLabel(row ?? { from_text: message.sender }, false),
+    preview: message.preview,
+    timestamp: message.receivedAt,
+    unread: Number(row?.is_seen) === 0,
+  };
+}) ?? []);
+const activeBundleRow = computed(() => {
+  const bundle = activeBundle.value;
+  if (!bundle) return {};
+  return conversationRow(
+    rows.value.get(browserTriageMessageKey(bundle.leading.message)) ?? {},
+    bundle.messages.flatMap(({ message }) => rows.value.get(browserTriageMessageKey(message)) ?? []),
+  );
+});
 
 async function runLocalModel() {
   modelNeedsPass = true;
@@ -202,16 +241,21 @@ async function loadCache() {
     repo.getAttentionCache(props.ownerId),
     repo.folderByRole(props.ownerId, 'inbox'),
   ]);
-  const rows = folder ? await repo.listMessagesForView({
+  const rows: MessageRow[] = folder ? await repo.listMessagesForView({
     accountId: props.ownerId, folderId: folder.id, limit: WINDOW_SIZE,
   }) : [];
+  if (!active || request !== loadSequence) return;
+  const threadIds = [...new Set(rows.flatMap(({ thread_id }) => thread_id == null ? [] : [thread_id]))];
+  const cachedThreadRows: MessageRow[] = folder && threadIds.length
+    ? await repo.listMessagesForFolderThreads(folder.account_id, folder.id, threadIds) : [];
   if (!active || request !== loadSequence) return;
   const inboxDiscovered = folder != null && folder.id !== jmapFolder.value?.id;
   bundleActions.observe(bundleRevision, nextCache.states);
   cache.value = nextCache;
   imapActions.reconcileCache(props.ownerId, checkpoint, 'INBOX');
   jmapFolder.value = folder;
-  cachedJmapRows.value = rows;
+  const listed = new Set(rows.map(({ id }) => id));
+  cachedJmapRows.value = [...rows, ...cachedThreadRows.filter(({ id }) => !listed.has(id))];
   if (inboxDiscovered && !loading.value) requestRefresh();
 }
 
@@ -339,6 +383,8 @@ function releaseJmapReader(previous?: Reading) {
 async function closeReader() {
   const previous = reading.value;
   reading.value = undefined;
+  openedBundle.value = undefined;
+  showConversation.value = false;
   imapReading.close();
   maximized.value = false;
   releaseJmapReader(previous);
@@ -351,27 +397,84 @@ async function closeReader() {
 }
 
 function findImapMessage(message: TriageMessage) {
-  return imap.value.find(({ message: candidate }) =>
-    candidate.id === message.id && candidate.accountId === message.accountId);
+  return imapByMessage.value.get(browserTriageMessageKey(message));
 }
 
-async function openMessage(message: TriageMessage, trigger: EventTarget | null) {
-  if (trigger instanceof HTMLElement) openingButton = trigger;
+function readMessage(message: TriageMessage) {
   const messageId = message.id;
   if (typeof messageId === 'number' && jmapFolder.value) {
     imapReading.close();
     reading.value = { kind: 'jmap', message };
     mailStore.selectMessage(messageId, jmapFolder.value.id, () => jmapRowsById.value.get(messageId));
-    await nextTick();
-    reader.value?.focus({ preventScroll: true });
     return;
   }
   const row = findImapMessage(message);
   if (!row) return;
   releaseJmapReader(reading.value);
   reading.value = { kind: 'imap', message };
+  void imapReading.open(row);
+}
+
+function focusReader(trigger: EventTarget | null) {
+  openingButton = trigger instanceof HTMLElement ? trigger : undefined;
   void nextTick(() => reader.value?.focus({ preventScroll: true }));
-  await imapReading.open(row);
+}
+
+function openMessage(message: TriageMessage, trigger: EventTarget | null) {
+  openedBundle.value = undefined;
+  showConversation.value = false;
+  readMessage(message);
+  focusReader(trigger);
+}
+
+function openBundle(bundle: TriageBundle, trigger: EventTarget | null) {
+  openedBundle.value = bundle;
+  showConversation.value = bundle.messages.length > 1;
+  readMessage(bundle.leading.message);
+  focusReader(trigger);
+}
+
+function selectConversationMessage(key: string) {
+  const item = activeBundle.value?.messages.find(({ message }) => browserTriageMessageKey(message) === key);
+  if (item && key !== activeMessageKey.value) readMessage(item.message);
+}
+
+async function runBatchAction(messages: readonly TriageMessage[], action: ImapAttentionAction, undoLabel?: string) {
+  if (action.type === 'tags') return;
+  const targets: MailListSource[] = [];
+  for (const message of messages) {
+    if (typeof message.id === 'number') {
+      const row = jmapRowsById.value.get(message.id);
+      if (row && jmapFolder.value) targets.push({ kind: 'jmap', row, folder: jmapFolder.value });
+    } else {
+      const entry = findImapMessage(message);
+      if (entry) targets.push({ kind: 'imap', entry });
+    }
+  }
+  const listAction = action.type === 'trash' ? { type: 'delete' as const } : action;
+  error.value = '';
+  try {
+    await runListAction(targets, listAction, tagDefinitions.value, { undoLabel: targets.length > 1 ? undoLabel : undefined });
+  } catch (cause) {
+    report(cause);
+  }
+}
+
+function runBundleAction(bundle: TriageBundle, action: ImapAttentionAction) {
+  if (action.type === 'tags') return;
+  const undoLabels = {
+    star: action.type === 'star' && action.value ? 'Star conversation' : 'Unstar conversation',
+    seen: action.type === 'seen' && action.value ? 'Mark conversation as read' : 'Mark conversation as unread',
+    archive: 'Archive conversation',
+    junk: 'Move conversation to Junk',
+    trash: 'Move conversation to Trash',
+  };
+  return runBatchAction(bundle.messages.map(({ message }) => message), action, undoLabels[action.type]);
+}
+
+function runSelectionAction(messages: TriageMessage[], action: ImapAttentionAction) {
+  const label = action.type === 'trash' ? `Move ${messages.length} messages to Trash` : `Update ${messages.length} messages`;
+  return runBatchAction(messages, action, label);
 }
 
 async function runMessageAction(message: TriageMessage, action: ImapAttentionAction) {
@@ -394,15 +497,38 @@ async function runMessageAction(message: TriageMessage, action: ImapAttentionAct
   }
 }
 
-watch([() => mailStore.selectedMessageId, jmapRowsById, imap], () => {
+watch([() => mailStore.selectedMessageId, jmapRowsById, imap, activeBundle], () => {
   const current = reading.value;
-  if (current?.kind === 'jmap'
-    && (mailStore.selectedMessageId !== current.message.id || !jmapRowsById.value.has(Number(current.message.id)))) {
-    void closeReader();
-  } else if (current?.kind === 'imap' && !findImapMessage(current.message)) {
+  if (!current) return;
+  const bundle = activeBundle.value;
+  if (bundle && bundle !== openedBundle.value) openedBundle.value = bundle;
+  const available = current.kind === 'imap'
+    ? Boolean(findImapMessage(current.message))
+    : jmapRowsById.value.has(Number(current.message.id));
+  if (!available && bundle) {
+    readMessage(bundle.leading.message);
+  } else if (!available || (current.kind === 'jmap' && mailStore.selectedMessageId !== current.message.id)) {
     void closeReader();
   }
 });
+
+function setBundleDisposition(bundle: TriageBundle, disposition: Parameters<typeof bundleActions.save>[2], event?: MouseEvent) {
+  if (event) closeContainingDropdown(event, true);
+  return bundleActions.save(repo, bundle, disposition);
+}
+
+const readerProps = computed(() => ({
+  backLabel: 'Back to Attention',
+  maximized: maximized.value,
+  imap: imapReader.value,
+}));
+const readerEvents = {
+  back: closeReader,
+  toggleMaximized: () => { maximized.value = !maximized.value; },
+  imapAction: (action: ImapAttentionAction) =>
+    reading.value?.kind === 'imap' && runMessageAction(reading.value.message, action),
+  imapCompose: imapReading.composeResponse,
+};
 
 function onVisible() {
   if (document.visibilityState === 'visible') {
@@ -467,14 +593,18 @@ onBeforeUnmount(() => {
         :account-labels="accountLabels"
         :loading="loading"
         :error="error"
+        :open-bundle-id="activeBundle?.id"
         :open-message="reading?.message"
         :rows="rows"
         :tag-definitions="tagDefinitions"
+        @open-bundle="openBundle"
         @open="openMessage"
+        @bundle-action="runBundleAction"
         @message-action="runMessageAction"
-        @done="(bundle) => bundleActions.save(repo, bundle, 'done')"
-        @snooze="(bundle, until) => bundleActions.save(repo, bundle, { snoozeUntil: until })"
-        @restore="(bundle) => bundleActions.save(repo, bundle, 'restore')"
+        @selection-action="runSelectionAction"
+        @done="(bundle) => setBundleDisposition(bundle, 'done')"
+        @snooze="(bundle, until) => setBundleDisposition(bundle, { snoozeUntil: until })"
+        @restore="(bundle) => setBundleDisposition(bundle, 'restore')"
       >
         <template #actions>
           <div class="unified-attention__tools">
@@ -540,15 +670,37 @@ onBeforeUnmount(() => {
       @close="manageImap = false; googleImapResult = undefined"
     />
     <div ref="reader" class="unified-attention__reader" tabindex="-1">
-      <MessageView
-        v-if="reading?.kind === 'jmap' || imapReader"
+      <ConversationReader
+        v-if="showConversation && activeBundle && activeMessageKey"
+        :subject="activeBundle.leading.message.subject ?? ''"
+        :messages="conversationMessages"
+        :active-key="activeMessageKey"
         back-label="Back to Attention"
-        :maximized="maximized"
-        :imap="imapReader"
+        @select="selectConversationMessage"
         @back="closeReader"
-        @toggle-maximized="maximized = !maximized"
-        @imap-action="(action) => reading?.kind === 'imap' && runMessageAction(reading.message, action)"
-        @imap-compose="imapReading.composeResponse"
+      >
+        <template #actions>
+          <AttentionRowMenu
+            :row="activeBundleRow"
+            :bundle="activeBundle"
+            label="Conversation actions"
+            @action="(action) => activeBundle && runBundleAction(activeBundle, action)"
+            @done="(bundle, event) => setBundleDisposition(bundle, 'done', event)"
+            @snooze="(bundle, until, event) => setBundleDisposition(bundle, { snoozeUntil: until }, event)"
+            @restore="(bundle, event) => setBundleDisposition(bundle, 'restore', event)"
+          />
+        </template>
+        <MessageView
+          v-if="reading?.kind === 'jmap' || imapReader"
+          v-bind="readerProps"
+          :show-back="false"
+          v-on="readerEvents"
+        />
+      </ConversationReader>
+      <MessageView
+        v-else-if="reading?.kind === 'jmap' || imapReader"
+        v-bind="readerProps"
+        v-on="readerEvents"
       />
       <p v-else class="unified-attention__empty">Select a message to read it.</p>
     </div>

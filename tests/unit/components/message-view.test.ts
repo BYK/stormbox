@@ -195,6 +195,12 @@ describe('MessageView with a sparse messages array', () => {
     expect(
       iconActions.every((button) => button.find('svg').exists()),
     ).toBe(true);
+
+    const toolbar = wrapper.get('.message-view__header').element;
+    await wrapper.setProps({ showBack: false });
+    expect(wrapper.get('.message-view__header').element).toBe(toolbar);
+    expect(wrapper.find('button[aria-label="Back"]').exists()).toBe(false);
+    expect(wrapper.find('button[aria-label="Reply"]').exists()).toBe(true);
   });
 
   it('uses the same controls and shortcut keys for both account types in the shared reader', async () => {

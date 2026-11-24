@@ -27,6 +27,10 @@ import {
   __setRepositoryForTests,
   __resetRepositoryForTests,
 } from '../../../src/composables/useRepository';
+import { imapEntry } from '../../../src/composables/useImapReader';
+import { useMailListActions, type MailListSource } from '../../../src/composables/useMailListActions';
+import type { Repository } from '../../../src/db/repository';
+import { useImapOptimisticActions } from '../../../src/stores/imap-optimistic-actions-store';
 import { DB_RPC, TABLE_FAMILIES } from '../../../src/db/protocol';
 import { MUTATION_TYPE } from '../../../src/constants/states';
 import { bootTestEngine } from '../../../src/db/bootstrap-memory';
@@ -345,6 +349,132 @@ afterEach(() => {
 });
 
 describe('staged JMAP actions', () => {
+  function relaySource(uid: number): Extract<MailListSource, { kind: 'imap' }> {
+    return { kind: 'imap', entry: imapEntry({
+      relay_id: 'work', address: 'work@example.com', name: 'Work', mailbox: 'INBOX', uid_validity: '2', messages: [],
+    }, 'INBOX', '2', {
+      uid, subject: 'Planning', receivedAt: '2026-11-23T09:00:00Z', seen: false, flagged: false,
+      messageId: `<planning-${uid}@example.com>`, references: [], inReplyTo: null, from: [], to: [],
+    }) };
+  }
+
+  it('shares one Undo deadline across native folders and an IMAP batch, reporting partial cancellation once', async () => {
+    const inbox = [makeRow(1), makeRow(2)] as MessageRow[];
+    const more = [makeRow(3)] as MessageRow[];
+    const { mailStore, authStore, repo } = await setupStore({
+      folders: [makeFolder(1, { total_emails: 2 }), makeFolder(2, { total_emails: 1 })],
+      views: { 1: { rows: inbox, total: 2 }, 2: { rows: more, total: 1 } },
+    });
+    await mailStore.ensureLoaded(0, 2);
+    const releaseColumn = mailStore.bindFolderView(2);
+    await flush();
+    const queued = [];
+    repo.listMailActions = async () => queued.slice();
+    repo.insertPendingMutation = vi.fn(async (input) => {
+      const row = { id: queued.length + 1, request_json: input.requestJson, mutation_type: input.mutationType,
+        optimistic_patch_json: input.optimisticPatchJson, local_status: 'pending', not_before: input.notBefore, error_json: null };
+      queued.push(row);
+      return row;
+    });
+    repo.cancelMailAction = vi.fn(async (_, id: number) => {
+      queued.splice(queued.findIndex((item) => item.id === id), 1);
+      return { canceled: true };
+    });
+    repo.mutateAttentionImapMessages = vi.fn(async () => ({ mutationIds: [101, 102] }));
+    repo.undoAttentionImapActions = vi.fn(async () => ({ canceledIds: [101] }));
+    const relay = [relaySource(12), relaySource(13)];
+    const listActions = useMailListActions(() => authStore.accountId, () => repo as unknown as Repository, vi.fn());
+    const feedback = useMailActionFeedbackStore();
+    const optimistic = useImapOptimisticActions();
+    const project = () => optimistic.projectFolder(1, 'work', 'INBOX', '2', relay.map(({ entry }) => entry.row));
+
+    await listActions([
+      ...inbox.map((row): MailListSource => ({ kind: 'jmap', folder: { id: 1 }, row })),
+      { kind: 'jmap', folder: { id: 2 }, row: more[0] }, ...relay,
+    ], { type: 'star', value: true }, [], { undoLabel: 'Starred conversation' });
+    expect(feedback.entries).toHaveLength(1);
+    expect(feedback.entries[0]).toMatchObject({ message: 'Starred conversation', action: 'Undo' });
+    const deadline = feedback.entries[0].expiresAt;
+    expect(queued.map((item) => item.not_before)).toEqual([deadline, deadline]);
+    expect(queued.map((item) => JSON.parse(item.request_json).messageIds)).toEqual([[1, 2], [3]]);
+    expect(repo.mutateAttentionImapMessages).toHaveBeenCalledWith(1, expect.any(Array), true, deadline);
+    expect(project().map(({ flagged }) => flagged)).toEqual([true, true]);
+    expect(mailStore.messages.map((row) => row?.is_flagged)).toEqual([1, 1]);
+    expect(mailStore.folderView(2).messages[0]?.is_flagged).toBe(1);
+
+    const undo = feedback.run(feedback.entries[0].id);
+    expect(project().map(({ flagged }) => flagged)).toEqual([false, false]);
+    expect(mailStore.messages.map((row) => row?.is_flagged)).toEqual([0, 0]);
+    expect(mailStore.folderView(2).messages[0]?.is_flagged).toBe(0);
+    await undo;
+    expect(repo.cancelMailAction).toHaveBeenCalledTimes(2);
+    expect(repo.undoAttentionImapActions).toHaveBeenCalledWith(1, [101, 102], true);
+    expect(project().map(({ flagged }) => flagged)).toEqual([false, true]);
+    expect(feedback.entries).toMatchObject([{ kind: 'error', message: 'Couldn’t undo every message in this action.' }]);
+    releaseColumn();
+    feedback.$reset();
+  });
+
+  it('skips native work still in validation when the group is undone', async () => {
+    const jmap = makeRow(1) as MessageRow;
+    const { mailStore, authStore, repo } = await setupStore({
+      folders: [makeFolder(1, { total_emails: 1 })],
+      views: { 1: { rows: [jmap], total: 1 } },
+    });
+    let validate!: () => void;
+    const gate = new Promise<void>((resolve) => { validate = resolve; });
+    const filter = repo.filterExistingMessageIds;
+    repo.filterExistingMessageIds = async (...args) => { await gate; return filter(...args); };
+    repo.listMailActions = async () => [];
+    repo.insertPendingMutation = vi.fn();
+    repo.cancelMailAction = vi.fn();
+    repo.mutateAttentionImapMessage = vi.fn(async () => ({ mutationIds: [101] }));
+    repo.undoAttentionImapActions = vi.fn(async () => ({ canceledIds: [101] }));
+    const listActions = useMailListActions(() => authStore.accountId, () => repo as unknown as Repository, vi.fn());
+    const feedback = useMailActionFeedbackStore();
+    const marking = listActions([{ kind: 'jmap', folder: { id: 1 }, row: jmap }, relaySource(12)],
+      { type: 'star', value: true }, [], { undoLabel: 'Starred conversation' });
+    await vi.waitFor(() => expect(repo.mutateAttentionImapMessage).toHaveBeenCalledTimes(1));
+    await feedback.run(feedback.entries[0].id);
+    validate();
+    await marking;
+    expect(repo.insertPendingMutation).not.toHaveBeenCalled();
+    expect(mailStore.messages[0]?.is_flagged).toBe(0);
+    expect(feedback.entries).toHaveLength(0);
+  });
+
+  it('offers Undo while every native conversation message is still in validation', async () => {
+    const rows = [makeRow(1), makeRow(2)] as MessageRow[];
+    const { mailStore, authStore, repo } = await setupStore({
+      folders: [makeFolder(1, { total_emails: 2 })],
+      views: { 1: { rows, total: 2 } },
+    });
+    let release!: () => void;
+    const validation = new Promise<void>((resolve) => { release = resolve; });
+    const filter = repo.filterExistingMessageIds;
+    repo.filterExistingMessageIds = async (...args) => { await validation; return filter(...args); };
+    repo.listMailActions = async () => [];
+    repo.insertPendingMutation = vi.fn();
+    repo.cancelMailAction = vi.fn();
+    const listActions = useMailListActions(() => authStore.accountId, () => repo as unknown as Repository, vi.fn());
+    const feedback = useMailActionFeedbackStore();
+    const marking = listActions(rows.map((row) => ({ kind: 'jmap', folder: { id: 1 }, row })),
+      { type: 'star', value: true }, [], { undoLabel: 'Starred conversation' });
+
+    expect(feedback.entries).toMatchObject([{ message: 'Starred conversation', action: 'Undo' }]);
+    expect(repo.insertPendingMutation).not.toHaveBeenCalled();
+    await feedback.run(feedback.entries[0].id);
+    release();
+    await marking;
+    expect(repo.insertPendingMutation).not.toHaveBeenCalled();
+    expect(mailStore.messages.map((row) => row?.is_flagged)).toEqual([0, 0]);
+    expect(feedback.entries).toHaveLength(0);
+
+    await listActions(rows.map((row) => ({ kind: 'jmap', folder: { id: 1 }, row })),
+      { type: 'star', value: false }, [], { undoLabel: 'Unstarred conversation' });
+    expect(feedback.entries).toHaveLength(0);
+  });
+
   it('hides a deleted row and can undo it while its local insert is pending', async () => {
     const { mailStore, repo } = await setupStore({
       folders: [makeFolder(1, { total_emails: 2 }), makeFolder(2, { role: 'trash', name: 'Trash', total_emails: 2 })],

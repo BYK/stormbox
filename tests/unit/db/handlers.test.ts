@@ -529,6 +529,23 @@ describe('thread + message + membership handlers', () => {
     expect(rows.map((m) => m.remote_id)).toEqual(['a', 'b']);
   });
 
+  it('includes cached thread members only in the requested mailbox and account', async () => {
+    const account = await seedAccount();
+    const inbox = await seedFolder(account.id);
+    const sent = await seedFolder(account.id, { role: 'sent' });
+    const other = await seedAccount({ remoteAccountId: 'other' });
+    const otherInbox = await seedFolder(other.id);
+    const first = await seedMessage(account.id, inbox.id, { remoteId: 'a', remoteThreadId: 'shared' });
+    await seedMessage(account.id, inbox.id, { remoteId: 'b', remoteThreadId: 'shared' });
+    await seedMessage(account.id, sent.id, { remoteId: 'sent', remoteThreadId: 'shared' });
+    const external = await seedMessage(other.id, otherInbox.id, { remoteId: 'elsewhere', remoteThreadId: 'shared' });
+
+    const rows = await h[DB_RPC.MESSAGE_LIST_FOR_FOLDER_THREADS]({
+      accountId: account.id, folderId: inbox.id, threadIds: [first.threadId, external.threadId],
+    });
+    expect(rows.map(({ remote_id }) => remote_id).sort()).toEqual(['a', 'b']);
+  });
+
   it('MESSAGE_BODY_READ returns stored text, html, and attachments', async () => {
     const account = await seedAccount();
     const inbox = await seedFolder(account.id);

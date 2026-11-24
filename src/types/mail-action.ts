@@ -12,6 +12,7 @@ export interface MailActionPatch {
   failureAction: string;
   successNotice?: string;
   undoable?: false;
+  groupedUndo?: true;
 }
 
 export interface MailActionRow {

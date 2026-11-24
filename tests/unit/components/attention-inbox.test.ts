@@ -66,25 +66,25 @@ describe('AttentionInbox', () => {
     expect(wrapper.get('[aria-label="Smart Inbox filters"]').element).toBe(filters.element);
   });
 
-  it('opens the outstanding message or a specific member of an expanded bundle', async () => {
+  it('opens a conversation from its head and just one message from an expanded child', async () => {
     const request = bundle('req', 'action', 'Review these changes');
     const followup = bundle('progress', 'update', 'Progress update').leading;
     request.messages.push(followup);
     const wrapper = mount(AttentionInbox, { attachTo: document.body, props: { bundles: [request] } });
 
-    await wrapper.get('.attention-inbox__bundle > .msg-list__item .msg-list__open').trigger('click');
+    const head = wrapper.get('[aria-label^="Open conversation"]');
+    await head.trigger('click');
     const expand = wrapper.get('[aria-expanded="false"]');
     const members = wrapper.get('[aria-label="Messages in bundle"]');
     expect(members.isVisible()).toBe(false);
     await expand.trigger('click');
     expect(expand.attributes('aria-expanded')).toBe('true');
     expect(members.isVisible()).toBe(true);
-    await members.findAll('.msg-list__open')[1].trigger('click');
+    const child = members.findAll('[aria-label^="Open message"]')[1];
+    await child.trigger('click');
 
-    expect(wrapper.emitted('open')).toEqual([
-      [request.leading.message, wrapper.get('.attention-inbox__bundle > .msg-list__item .msg-list__open').element],
-      [followup.message, members.findAll('.msg-list__open')[1].element],
-    ]);
+    expect(wrapper.emitted('open-bundle')).toEqual([[request, head.element]]);
+    expect(wrapper.emitted('open')).toEqual([[followup.message, child.element]]);
     wrapper.unmount();
   });
 
@@ -109,7 +109,8 @@ describe('AttentionInbox', () => {
     expect(row.get('.msg-list__subject').text()).toBe('Please review');
     expect(row.get('.msg-list__preview').text()).toContain('Message preview');
     expect(row.get('.msg-list__avatar').classes()).toContain('msg-list__avatar--unread');
-    expect(row.find('.msg-list__state').exists()).toBe(false);
+    expect(row.get('.msg-list__item').classes()).toContain('msg-list__item--avatar-selection');
+    expect(row.find('.msg-list__unread-dot').exists()).toBe(false);
     expect(row.get('.msg-list__open').attributes('aria-label')).toMatch(/, unread$/);
 
     const trigger = row.get('summary[aria-label="Message actions"]');
@@ -124,15 +125,97 @@ describe('AttentionInbox', () => {
     await row.findAll('button').find((button) => button.text() === 'Mark as read')?.trigger('click');
     await trigger.trigger('click');
     await row.findAll('button').find((button) => button.text() === 'Move to Trash')?.trigger('click');
-    expect(wrapper.emitted('message-action')).toEqual([
-      [message, { type: 'star', value: false }],
-      [message, { type: 'seen', value: true }],
-      [message, { type: 'trash' }],
+    expect(wrapper.emitted('bundle-action')).toEqual([
+      [request, { type: 'star', value: false }],
+      [request, { type: 'seen', value: true }],
+      [request, { type: 'trash' }],
     ]);
     expect(wrapper.emitted('open')).toBeUndefined();
     await wrapper.setProps({ disabledActions: new Set([key]) });
     expect(star.attributes('disabled')).toBe('');
     expect(row.findAll('button').find((button) => button.text() === 'Mark bundle done')?.attributes('disabled')).toBeUndefined();
+    wrapper.unmount();
+  });
+
+  it('reflects member flags on the head and leaves expanded actions scoped to one message', async () => {
+    const request = bundle('req', 'action', 'Please review');
+    const followup = bundle('progress', 'update', 'Progress').leading;
+    request.messages.push(followup);
+    const wrapper = mount(AttentionInbox, {
+      props: {
+        bundles: [request],
+        rows: new Map(request.messages.map(({ message }, index) => [browserTriageMessageKey(message), {
+          id: message.id, subject: message.subject, is_seen: 1 - index, is_flagged: index,
+        }])),
+      },
+    });
+    const head = wrapper.get('.attention-inbox__bundle > .msg-list__item');
+    expect(wrapper.get('.attention-inbox__bundle').classes()).toContain('is-unread');
+    expect(head.get('[aria-label="Star"]').attributes('aria-pressed')).toBe('true');
+    const markRead = head.findAll('button').find((button) => button.text() === 'Mark as read')!;
+    await markRead.trigger('click');
+    await head.get('[aria-expanded="false"]').trigger('click');
+    const child = wrapper.get('[aria-label="Messages in bundle"]').findAll('.msg-list__item')[0];
+    await child.get('[aria-label="Star"]').trigger('click');
+
+    expect(wrapper.emitted('bundle-action')).toEqual([[request, { type: 'seen', value: true }]]);
+    expect(wrapper.emitted('message-action')).toEqual([[request.leading.message, { type: 'star', value: true }]]);
+    wrapper.unmount();
+  });
+
+  it('selects a whole bundle, keeps a child deselected when collapsed, and scopes bulk actions to the other message', async () => {
+    const request = bundle('req', 'action', 'Please review');
+    const followup = bundle('progress', 'update', 'Follow-up').leading;
+    request.messages.push(followup);
+    const wrapper = mount(AttentionInbox, { props: { bundles: [request] } });
+
+    const head = wrapper.get<HTMLInputElement>('input[aria-label^="Select conversation"]');
+    await head.trigger('click');
+    expect(head.element.checked).toBe(true);
+    expect(wrapper.text()).toContain('2 selected');
+    expect(wrapper.emitted('open-bundle')).toBeUndefined();
+
+    const expander = wrapper.get('button[aria-controls]');
+    await expander.trigger('click');
+    const children = wrapper.get('[aria-label="Messages in bundle"]');
+    const member = children.findAll<HTMLInputElement>('input[aria-label^="Select message"]')[1];
+    await member.trigger('click');
+    expect(head.element.checked).toBe(false);
+    expect(head.element.indeterminate).toBe(true);
+    expect(member.element.checked).toBe(false);
+    await expander.trigger('click');
+    await expander.trigger('click');
+    expect(member.element.checked).toBe(false);
+    expect(wrapper.text()).toContain('1 selected');
+
+    const actions = wrapper.get('[aria-label="Selection actions"]');
+    await actions.get('[aria-label="Star"]').trigger('click');
+    await actions.get('[aria-label="Mark as unread"]').trigger('click');
+    await actions.get('[aria-label="Move to Trash"]').trigger('click');
+    expect(wrapper.emitted('selection-action')).toEqual([
+      [[request.leading.message], { type: 'star', value: true }],
+      [[request.leading.message], { type: 'seen', value: false }],
+      [[request.leading.message], { type: 'trash' }],
+    ]);
+    await actions.get('[aria-label="Clear selection"]').trigger('click');
+    expect(head.element.indeterminate).toBe(false);
+    expect(wrapper.find('[aria-label="Smart Inbox filters"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('preserves the selection anchor when a preceding bundle expands', async () => {
+    const first = bundle('first', 'action', 'Earlier conversation');
+    first.messages.push(bundle('reply', 'action', 'Earlier reply').leading);
+    const anchor = bundle('anchor', 'action', 'Anchor');
+    const last = bundle('last', 'action', 'Last');
+    const wrapper = mount(AttentionInbox, { props: { bundles: [first, anchor, last] } });
+
+    await wrapper.get('input[aria-label^="Select message: Anchor"]').trigger('click');
+    await wrapper.get('button[aria-controls]').trigger('click');
+    await wrapper.get('input[aria-label^="Select message: Last"]').trigger('click', { shiftKey: true });
+    await wrapper.get('[aria-label="Selection actions"] [aria-label="Move to Trash"]').trigger('click');
+
+    expect(wrapper.emitted('selection-action')).toEqual([[[anchor.leading.message, last.leading.message], { type: 'trash' }]]);
     wrapper.unmount();
   });
 

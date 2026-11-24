@@ -2,7 +2,7 @@
 import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia } from 'pinia';
 import { expect, it, vi } from 'vitest';
-import { watch } from 'vue';
+import { shallowRef, watch } from 'vue';
 
 import UnifiedAttention from '../../../src/components/UnifiedAttention.vue';
 import { __resetRepositoryForTests, __setRepositoryForTests } from '../../../src/composables/useRepository';
@@ -12,7 +12,7 @@ import { useAuthStore } from '../../../src/stores/auth-store';
 import { useComposeStore } from '../../../src/stores/compose-store';
 import { useMailStore } from '../../../src/stores/mail-store';
 import { useMailActionFeedbackStore } from '../../../src/stores/mail-action-feedback-store';
-import type { RelayMessageBody } from '../../../src/sync/backends/imap/attention-relay';
+import type { ImapAttentionAction, ImapMessageLocation, RelayMessageBody } from '../../../src/sync/backends/imap/attention-relay';
 import { matchingBundleStates, replaceBundleStates, type BundleStates } from '../../../src/triage/bundle-state-edits';
 import type { FolderRow } from '../../../src/types';
 
@@ -446,6 +446,260 @@ it('keeps the shared reader mounted while loading IMAP HTML and sends its toolba
     expect(wrapper.find('.message-view').exists()).toBe(false);
   } finally {
     wrapper.unmount();
+    __resetRepositoryForTests();
+  }
+});
+
+it('batches a conversation action and advances the stacked reader after deleting just one member', async () => {
+  const pinia = createPinia();
+  const gate = deferred();
+  const latest = Date.now();
+  const originalId = '<review@example.org>';
+  let states: BundleStates = {};
+  let messages = [
+    {
+      uid: 17, subject: 'Please review the project', receivedAt: new Date(latest - 60_000).toISOString(),
+      messageId: originalId, seen: true, flagged: false,
+      from: [{ name: 'Original sender', address: 'original@example.org' }],
+      to: [{ address: 'owner@example.org' }],
+    },
+    {
+      uid: 18, subject: 'Re: Please review the project', receivedAt: new Date(latest).toISOString(),
+      messageId: '<followup@example.org>', references: [originalId], seen: true, flagged: true,
+      from: [{ name: 'Follow-up sender', address: 'followup@example.org' }],
+      to: [{ address: 'owner@example.org' }],
+    },
+  ];
+  const mutateAttentionImapMessages = vi.fn(async (
+    _owner: number, edits: { location: ImapMessageLocation; action: ImapAttentionAction }[],
+  ) => {
+    for (const { action, location } of edits) {
+      const message = messages.find(({ uid }) => uid === location.uid);
+      if (message && action.type === 'star') message.flagged = action.value;
+    }
+    return { mutationIds: [1, 2] };
+  });
+  const mutateAttentionImapMessage = vi.fn(async (_owner, location, action) => {
+    await gate.promise;
+    if (action.type === 'trash') messages = messages.filter(({ uid }) => uid !== location.uid);
+    return { mutationIds: [3] };
+  });
+  const readAttentionImapMessage = vi.fn(async (_owner, location) =>
+    ({ text: `Body of message ${location.uid}`, html: '' }));
+  const changeAttentionBundleStates = vi.fn(async (_owner, aliases: string[], replacements: BundleStates) => {
+    const previous = matchingBundleStates(states, aliases);
+    states = replaceBundleStates(states, aliases, replacements);
+    return { applied: true, previous };
+  });
+  __setRepositoryForTests({
+    subscribe: () => () => {},
+    getAttentionCache: async () => ({ paired: true, accounts: [{
+      relay_id: 'work', address: 'owner@example.org', mailbox: 'INBOX', uid_validity: '3', messages,
+    }], states }),
+    folderByRole: async () => undefined,
+    refreshAttentionRelay: async () => [],
+    readAttentionImapMessage,
+    mutateAttentionImapMessage,
+    mutateAttentionImapMessages,
+    changeAttentionBundleStates,
+  });
+  const wrapper = mount(UnifiedAttention, {
+    attachTo: document.body,
+    props: { ownerId: 1, address: 'owner@example.org' },
+    global: { plugins: [pinia] },
+  });
+  const feedback = useMailActionFeedbackStore(pinia);
+
+  try {
+    await flushPromises();
+    const head = wrapper.get('.attention-inbox__bundle > .msg-list__item');
+    await head.get('[aria-label^="Open conversation"]').trigger('click');
+    await flushPromises();
+    const stack = wrapper.get('[aria-label="Messages in conversation"]');
+    const summaries = stack.findAll('.conversation-reader__summary');
+    expect(summaries.map((button) => button.attributes('aria-expanded'))).toEqual(['false', 'true']);
+    const toolbar = wrapper.get('.conversation-reader__toolbar');
+    const chooseAction = async (label: string) => {
+      await toolbar.get('summary[aria-label="Conversation actions"]').trigger('click');
+      await toolbar.findAll('button').find((button) => button.text() === label)!.trigger('click');
+      await flushPromises();
+    };
+    expect(toolbar.text()).toContain('Mark bundle done');
+    expect(toolbar.text()).toContain('Snooze for one hour');
+    await chooseAction('Snooze for one hour');
+    expect(changeAttentionBundleStates).toHaveBeenCalledOnce();
+    expect(Object.values(states)[0]).toMatchObject({ disposition: 'snoozed', observed: expect.any(Array) });
+    expect(Object.values(states)[0].observed).toHaveLength(2);
+    expect(wrapper.get('[aria-label="Messages in conversation"]').element).toBe(stack.element);
+    await chooseAction('Cancel snooze');
+    await chooseAction('Mark bundle done');
+    expect(changeAttentionBundleStates).toHaveBeenCalledTimes(3);
+    expect(Object.values(states)[0]).toMatchObject({ disposition: 'done', resolved: expect.any(Array) });
+    expect(Object.values(states)[0].resolved).toHaveLength(2);
+    await chooseAction('Unstar');
+    expect(mutateAttentionImapMessages).toHaveBeenCalledOnce();
+    expect(mutateAttentionImapMessages.mock.calls[0][1]).toEqual([
+      { location: { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid: 18 }, action: { type: 'star', value: false } },
+      { location: { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid: 17 }, action: { type: 'star', value: false } },
+    ]);
+    expect(mutateAttentionImapMessage).not.toHaveBeenCalled();
+
+    await summaries[0].trigger('click');
+    await flushPromises();
+    const individual = stack.get('[aria-expanded="true"]');
+    expect(individual.text()).toContain('Original sender');
+    await stack.get('[aria-label="Delete"]').trigger('click');
+    await flushPromises();
+    expect(mutateAttentionImapMessage).toHaveBeenCalledExactlyOnceWith(
+      1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid: 17 }, { type: 'trash' }, true,
+    );
+    expect(messages.map(({ uid }) => uid)).toEqual([17, 18]);
+    expect(stack.findAll('.conversation-reader__summary')).toHaveLength(1);
+    expect(stack.get('[aria-expanded="true"]').text()).toContain('Follow-up sender');
+    expect(wrapper.find('[aria-label="Message header"]').text()).toContain('Follow-up sender');
+
+    gate.resolve();
+    await flushPromises();
+    await toolbar.get('[aria-label="Back to Attention"]').trigger('click');
+    expect(wrapper.find('[aria-label="Messages in conversation"]').exists()).toBe(false);
+  } finally {
+    gate.resolve();
+    wrapper.unmount();
+    feedback.$reset();
+    __resetRepositoryForTests();
+  }
+});
+
+it('keeps native conversation selection within the remaining messages and closes when they all move', async () => {
+  const pinia = createPinia();
+  const auth = useAuthStore(pinia);
+  const mail = useMailStore(pinia);
+  const folder = { id: 10, account_id: 1, role: 'inbox' } as FolderRow;
+  const latest = Date.now();
+  const rows = [17, 18, 19].map((id) => ({
+    id, thread_id: 5, account_id: 1, is_seen: 1, is_flagged: 0, received_at: latest + id,
+    subject: 'Please review this change', preview: `Update from sender ${id}`,
+    from_text: `Sender ${id} <sender${id}@example.org>`, to_text: 'owner@example.org',
+  }));
+  const removed = shallowRef(new Set<number>());
+  vi.spyOn(mail, 'projectMailRows').mockImplementation((_folder, current) =>
+    current.filter((row) => !removed.value.has(row.id)));
+  const move = vi.spyOn(mail, 'destroyMessages').mockImplementation(async (ids) => {
+    removed.value = new Set([...removed.value, ...ids]);
+    if (mail.selectedMessageId != null && ids.includes(mail.selectedMessageId)) mail.selectMessage(null);
+    return { succeeded: ids.length, failed: 0, skipped: 0 };
+  });
+  vi.spyOn(mail, 'destroyMessage').mockImplementation((id, options) => mail.destroyMessages([id], options));
+  const stop = watch(() => mail.selectedMessageId, (id) => {
+    if (id) mail.messageBody = { text: `Body of native message ${id}` } as typeof mail.messageBody;
+  });
+  const listMessagesForFolderThreads = vi.fn(async () => [rows[0], rows[2]]);
+  __setRepositoryForTests({
+    subscribe: () => () => {},
+    getAttentionCache: async () => ({ paired: false, accounts: [], states: {} }),
+    folderByRole: async () => folder,
+    listMessagesForView: async () => rows.slice(1),
+    listMessagesForFolderThreads,
+    ensureFolderWindow: async () => {},
+  });
+  auth.accountId = 1;
+  mail.folders = [folder];
+  const wrapper = mount(UnifiedAttention, {
+    attachTo: document.body,
+    props: { ownerId: 1, address: 'owner@example.org' },
+    global: { plugins: [pinia] },
+  });
+
+  try {
+    await flushPromises();
+    expect(listMessagesForFolderThreads).toHaveBeenCalledWith(1, 10, [5]);
+    await wrapper.get('[aria-label^="Open conversation"]').trigger('click');
+    await flushPromises();
+    expect(mail.selectedMessageId).toBe(19);
+    const stack = wrapper.get('[aria-label="Messages in conversation"]');
+    expect(stack.findAll('.conversation-reader__summary')).toHaveLength(3);
+    await stack.get('[aria-label="Delete"]').trigger('click');
+    await flushPromises();
+    expect(move.mock.calls[0][0]).toEqual([19]);
+    expect(mail.selectedMessageId).toBe(18);
+    expect(stack.get('[aria-expanded="true"]').text()).toContain('Sender 18');
+    expect(stack.text()).toContain('Body of native message 18');
+
+    const toolbar = wrapper.get('.conversation-reader__toolbar');
+    await toolbar.get('summary[aria-label="Conversation actions"]').trigger('click');
+    await toolbar.findAll('button').find((button) => button.text() === 'Move to Trash')!.trigger('click');
+    await flushPromises();
+    expect(move.mock.calls[1][0]).toEqual([18, 17]);
+    expect(mail.selectedMessageId).toBeNull();
+    expect(wrapper.find('[aria-label="Messages in conversation"]').exists()).toBe(false);
+  } finally {
+    wrapper.unmount();
+    stop();
+    __resetRepositoryForTests();
+  }
+});
+
+it('trashes only the checked members of a bundle in one optimistic batch with one Undo', async () => {
+  const pinia = createPinia();
+  const gate = deferred();
+  const latest = Date.now();
+  const messages = [17, 18, 19].map((uid) => ({
+    uid, subject: `Please review message ${uid}`, receivedAt: new Date(latest + uid).toISOString(),
+    messageId: `<review-${uid}@example.org>`, references: ['<thread@example.org>'],
+    seen: true, flagged: false,
+    from: [{ address: 'sender@example.org' }], to: [{ address: 'owner@example.org' }],
+  }));
+  const mutateAttentionImapMessages = vi.fn(async (
+    _owner: number, _edits: { location: ImapMessageLocation; action: ImapAttentionAction }[],
+  ) => {
+    await gate.promise;
+    return { mutationIds: [1, 2] };
+  });
+  const undoAttentionImapActions = vi.fn(async () => ({ canceledIds: [1, 2] }));
+  __setRepositoryForTests({
+    subscribe: () => () => {},
+    getAttentionCache: async () => ({ paired: true, accounts: [{
+      relay_id: 'work', address: 'owner@example.org', mailbox: 'INBOX', uid_validity: '3', messages,
+    }], states: {} }),
+    folderByRole: async () => undefined,
+    refreshAttentionRelay: async () => [],
+    mutateAttentionImapMessages,
+    undoAttentionImapActions,
+  });
+  const wrapper = mount(UnifiedAttention, {
+    attachTo: document.body,
+    props: { ownerId: 1, address: 'owner@example.org' },
+    global: { plugins: [pinia] },
+  });
+  const feedback = useMailActionFeedbackStore(pinia);
+
+  try {
+    await flushPromises();
+    await wrapper.get('[aria-label^="Select conversation"]').trigger('click');
+    await wrapper.get('[aria-label="Show 3 messages"]').trigger('click');
+    await wrapper.get('[aria-label^="Select message: Please review message 18"]').trigger('click');
+    expect(wrapper.text()).toContain('2 selected');
+    await wrapper.get('[aria-label="Selection actions"]').get('[aria-label="Move to Trash"]').trigger('click');
+    await flushPromises();
+    expect(mutateAttentionImapMessages).toHaveBeenCalledOnce();
+    expect(mutateAttentionImapMessages.mock.calls[0][1]).toEqual([19, 17].map((uid) => ({
+      location: { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid },
+      action: { type: 'trash' },
+    })));
+    expect(wrapper.findAll('.msg-list__subject').map((node) => node.text())).toEqual(['Please review message 18']);
+
+    const undo = feedback.entries.filter(({ action }) => action === 'Undo');
+    expect(undo).toHaveLength(1);
+    const undoing = feedback.run(undo[0].id);
+    await flushPromises();
+    expect(wrapper.find('[aria-label^="Open conversation"]').exists()).toBe(true);
+    gate.resolve();
+    await undoing;
+    expect(undoAttentionImapActions).toHaveBeenCalledExactlyOnceWith(1, [1, 2], true);
+  } finally {
+    gate.resolve();
+    wrapper.unmount();
+    feedback.$reset();
     __resetRepositoryForTests();
   }
 });

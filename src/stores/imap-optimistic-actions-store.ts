@@ -5,7 +5,7 @@ import type { Repository } from '../db/repository';
 import type { ImapAttentionAction, ImapMessageLocation, RelayMessage } from '../sync/backends/imap/attention-relay';
 import { describeImapAction, imapActionFields, isImapMove, projectImapAction, revertImapProjection } from '../sync/backends/imap/project-action';
 import { useAuthStore } from './auth-store';
-import { useMailActionFeedbackStore } from './mail-action-feedback-store';
+import { useMailActionFeedbackStore, type MailUndoGroup, type MailUndoResult } from './mail-action-feedback-store';
 
 interface ImapEdit {
   entry: { location: ImapMessageLocation; row: RelayMessage };
@@ -17,6 +17,7 @@ interface Projection {
   ownerId: number;
   edits: readonly ImapEdit[];
   undo: boolean;
+  undone?: ReadonlySet<number>;
   revision: number | null;
   reconciled: ReadonlySet<number>;
   expiresAt: number;
@@ -24,6 +25,7 @@ interface Projection {
 
 interface EditOptions {
   undo?: boolean;
+  group?: MailUndoGroup;
   refresh: () => void | Promise<void>;
 }
 
@@ -115,11 +117,12 @@ export const useImapOptimisticActions = defineStore('imap-optimistic-actions', (
       for (const [index, { entry: { location, row }, action }] of item.edits.entries()) {
         const { uid } = location;
         if (location.accountId !== accountId || location.mailbox !== mailbox || location.uidValidity !== uidValidity) continue;
-        if (item.reconciled.has(index) && (item.undo || !undone.has(uid))) continue;
+        const reversing = item.undo && (!item.undone || item.undone.has(index));
+        if (item.reconciled.has(index) && (reversing || !undone.has(uid))) continue;
         projected ??= new Map(messages.map((message) => [message.uid, message]));
         const current = projected.get(uid);
         let next: RelayMessage | null | undefined;
-        if (item.undo) {
+        if (reversing) {
           const fields = undone.get(uid) ?? new Set<string>();
           next = revertImapProjection(current, row, action, fields);
           for (const field of imapActionFields(action)) fields.add(field);
@@ -150,10 +153,10 @@ export const useImapOptimisticActions = defineStore('imap-optimistic-actions', (
   }
 
   async function run(ownerId: number, repo: Repository, edits: readonly ImapEdit[],
-    { undo: undoable = true, refresh }: EditOptions): Promise<boolean> {
-    if (!edits.length) return false;
+    { undo: undoable = true, group, refresh }: EditOptions): Promise<boolean> {
+    if (!edits.length || group?.isCanceled()) return false;
     const generation = session;
-    const expiresAt = undoable ? Date.now() + MAIL_UNDO_MS : 0;
+    const expiresAt = undoable ? (group?.expiresAt ?? Date.now() + MAIL_UNDO_MS) : 0;
     const item: Projection = { id: ++nextId, ownerId, edits, undo: false, revision: null, reconciled: new Set(), expiresAt };
     supersedeLocalRetries(item);
     store(item);
@@ -163,37 +166,54 @@ export const useImapOptimisticActions = defineStore('imap-optimistic-actions', (
     let enqueueFailed = false;
     const refreshLocal = () => { void Promise.resolve().then(refresh).catch(() => {}); };
     const requests = edits.map(({ entry, action }) => ({ location: entry.location, action }));
+    const undoArgs: [undoable?: boolean, expiresAt?: number] = undoable ? (group ? [true, expiresAt] : [true]) : [];
     const enqueue = persist(ownerId, () => {
       if (session !== generation) throw new Error('The mail session changed.');
+      if (group?.isCanceled()) return Promise.resolve({ mutationIds: [] });
       if (requests.length === 1) {
         const { location, action } = requests[0];
-        return undoable ? repo.mutateAttentionImapMessage(ownerId, location, action, true)
-          : repo.mutateAttentionImapMessage(ownerId, location, action);
+        return repo.mutateAttentionImapMessage(ownerId, location, action, ...undoArgs);
       }
-      return undoable ? repo.mutateAttentionImapMessages(ownerId, requests, true) : repo.mutateAttentionImapMessages(ownerId, requests);
+      return repo.mutateAttentionImapMessages(ownerId, requests, ...undoArgs);
     });
 
-    const toast = undoable ? feedback.showUndo(success, async () => {
-      if (session !== generation) return;
+    const reverse = async (): Promise<MailUndoResult> => {
+      if (session !== generation) return { canceled: 0, failed: 0 };
       undoStarted = true;
       store({ ...item, undo: true });
       try {
-        await persist(ownerId, async () => {
+        const outcome = await persist(ownerId, async () => {
           const { mutationIds } = await enqueue;
-          if (session === generation) await repo.undoAttentionImapActions(ownerId, mutationIds);
+          if (session !== generation || mutationIds.length === 0) return null;
+          const result = group ? await repo.undoAttentionImapActions(ownerId, mutationIds, true)
+            : await repo.undoAttentionImapActions(ownerId, mutationIds);
+          return { mutationIds, canceledIds: new Set(result?.canceledIds ?? mutationIds) };
         });
-        if (session === generation) store({ ...item, undo: true, revision: ++revision });
+        if (session !== generation) return { canceled: 0, failed: 0 };
+        if (!outcome) {
+          projections.value = projections.value.filter(({ id }) => id !== item.id);
+          return { canceled: 0, failed: 0 };
+        }
+        const { mutationIds, canceledIds } = outcome;
+        const all = canceledIds.size === mutationIds.length;
+        const partial = all ? undefined : new Set(mutationIds.flatMap((id, index) => canceledIds.has(id) ? [index] : []));
+        store({ ...item, undo: canceledIds.size > 0, undone: partial, revision: ++revision });
+        return { canceled: canceledIds.size, failed: mutationIds.length - canceledIds.size };
       } catch (cause) {
         if (!enqueueFailed && session === generation) {
           projections.value = projections.value.filter(({ id }) => id !== item.id);
-          throw cause;
+          if (!group) throw cause;
+          return { canceled: 0, failed: edits.length };
         }
+        return { canceled: 0, failed: 0 };
       } finally {
         if (session === generation) refreshLocal();
       }
-    }, expiresAt) : undefined;
+    };
+    const unregister = undoable && group ? group.register(reverse) : undefined;
+    const toast = undoable && !group ? feedback.showUndo(success, async () => { await reverse(); }, expiresAt) : undefined;
 
-    if (undoable) setTimeout(prune, MAIL_UNDO_MS);
+    if (undoable) setTimeout(prune, Math.max(0, expiresAt - Date.now()));
     try {
       await enqueue;
       if (session === generation && !undoStarted) store({ ...item, revision: ++revision });
@@ -202,7 +222,9 @@ export const useImapOptimisticActions = defineStore('imap-optimistic-actions', (
       enqueueFailed = true;
       if (session === generation) {
         projections.value = projections.value.filter(({ id }) => id !== item.id);
+        unregister?.();
         if (toast !== undefined) feedback.dismiss(toast);
+        if (undoStarted) return false;
         const detail = cause instanceof Error ? ` ${cause.message}` : '';
         const message = `Couldn’t ${attempt}.${detail}`;
         if (projections.value.some((later) => projectsOver(item, later))) feedback.showFailure(message);
