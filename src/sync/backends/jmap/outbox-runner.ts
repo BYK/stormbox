@@ -72,9 +72,10 @@ const REPLAYABLE_MAIL_ACTIONS = new Set<string>([
   MUTATION_TYPE.CANCEL_SCHEDULED_SEND,
 ]);
 
-// An older retry must keep later edits to the same IMAP message from
-// overtaking it. Gmail shares message state across mailboxes, so its edits
-// stay ordered across the whole relay account.
+const imapMessageIdentity = (alias: string) => `NULLIF(lower(trim(json_extract(${alias}.request_json, '$.messageId'), ' <>')), '')`;
+
+// Gmail aliases share state across mailboxes. Distinct known identities
+// can run together; a missing identity keeps account-wide ordering.
 const IMAP_ACTION_IS_NEXT = `(mutation.mutation_type != '${MUTATION_TYPE.ATTENTION_IMAP}' OR NOT EXISTS (
   SELECT 1 FROM pending_mutations earlier
   WHERE earlier.account_id = mutation.account_id
@@ -83,12 +84,15 @@ const IMAP_ACTION_IS_NEXT = `(mutation.mutation_type != '${MUTATION_TYPE.ATTENTI
     AND earlier.local_status IN ('pending', 'retry', 'in_flight')
     AND json_extract(earlier.request_json, '$.location.accountId') = json_extract(mutation.request_json, '$.location.accountId')
     AND (
-      json_extract(earlier.request_json, '$.accountScoped') = 1
-      OR json_extract(mutation.request_json, '$.accountScoped') = 1
-      OR (
+      (
         json_extract(earlier.request_json, '$.location.mailbox') = json_extract(mutation.request_json, '$.location.mailbox')
         AND json_extract(earlier.request_json, '$.location.uidValidity') = json_extract(mutation.request_json, '$.location.uidValidity')
         AND json_extract(earlier.request_json, '$.location.uid') = json_extract(mutation.request_json, '$.location.uid')
+      )
+      OR (
+        (json_extract(earlier.request_json, '$.accountScoped') = 1 OR json_extract(mutation.request_json, '$.accountScoped') = 1)
+        AND (${imapMessageIdentity('earlier')} IS NULL OR ${imapMessageIdentity('mutation')} IS NULL
+          OR ${imapMessageIdentity('earlier')} = ${imapMessageIdentity('mutation')})
       )
     )
 ))`;

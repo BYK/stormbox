@@ -120,6 +120,45 @@ test('paired same-origin API lists accounts without exposing credentials', async
   assert.equal((await request(`${messagePath}/trash?uidValidity=0`, { method: 'POST', headers })).status, 400);
 });
 
+test('relay batches enforce direct route authorization and return ordered per-item errors', async () => {
+  const batch = (requests, headers) => request(`${api}/batch`, {
+    method: 'POST', headers, body: JSON.stringify({ requests }),
+  });
+  const read = { method: 'GET', path: '/accounts/missing/messages?mailbox=INBOX' };
+  const patch = { method: 'PATCH', path: '/accounts/alpha/messages/44?uidValidity=7', body: { deleted: true } };
+  assert.equal((await batch([read])).status, 401);
+  const bearer = await batch([patch, read], { Authorization: `Bearer ${accessToken}` });
+  assert.equal(bearer.status, 200);
+  assert.deepEqual((await bearer.json()).responses, [
+    { status: 401, body: { error: 'unauthorized' } },
+    { status: 404, body: { error: 'account_not_found' } },
+  ]);
+
+  const paired = await pairBrowser();
+  const Cookie = paired.headers.get('set-cookie').split(';')[0];
+  assert.equal((await batch([read], { Cookie, Origin: 'https://other.example.test' })).status, 401);
+  const headers = { Cookie, Origin: origin };
+  const response = await batch([
+    patch, read,
+    { method: 'POST', path: '/accounts/alpha/send' },
+    { method: 'GET', path: '/accounts/alpha/%2e%2e/messages' },
+    { method: 'GET', path: '//other.example.test/accounts/alpha/mailboxes' },
+    { method: 'GET', path: '/accounts/alpha/messages/44?uidValidity=7&uidValidity=8' },
+    { method: 'GET', path: '/accounts/alpha/messages/44?uidValidity=0' },
+    { method: 'GET', path: '/accounts/missing/mailboxes' },
+  ], headers);
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).responses, [
+    { status: 400, body: { error: 'invalid_flags' } },
+    { status: 404, body: { error: 'account_not_found' } },
+    ...Array.from({ length: 4 }, () => ({ status: 400, body: { error: 'invalid_batch_path' } })),
+    { status: 400, body: { error: 'invalid_number' } },
+    { status: 404, body: { error: 'account_not_found' } },
+  ]);
+  assert.equal((await batch([], headers)).status, 400);
+  assert.equal((await batch(Array(9).fill(read), headers)).status, 413);
+});
+
 test('generic JMAP requires its bearer token and supports Core/echo', async () => {
   assert.equal((await request('/.well-known/jmap')).status, 401);
   const headers = { Authorization: `Bearer ${accessToken}`, Origin: origin };

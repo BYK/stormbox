@@ -77,13 +77,14 @@ const sample = [
 
 function makeImapSocket({
   mailboxSize = 1, trash = false, junk = false, archive = true, supportsMove = true, oauth = false, gmail = false,
-  keywordsAllowed = true, rejectLabelUpdate = false, omitKeywordFetch = false, stall = () => false,
+  keywordsAllowed = true, rejectLabelUpdate = false, omitKeywordFetch = false, stall = () => false, additionalUid, rejectFlagUid,
 } = {}) {
   const calls = [];
   const sockets = [];
   let connections = 0;
   let moved = false;
-  const flags = new Set(['\\Seen', 'localtriage-category-newsletter']);
+  const flags = new Map([[44, new Set(['\\Seen', 'localtriage-category-newsletter'])]]);
+  if (additionalUid) flags.set(additionalUid, new Set());
   const labels = new Set(['\\Inbox', 'Read later']);
   const customLabels = new Set(['Read later']);
   function connect(address, options) {
@@ -137,12 +138,16 @@ function makeImapSocket({
         ok(`OK [${command.startsWith('SELECT') ? 'READ-WRITE' : 'READ-ONLY'}] selected`);
       } else if (/^UID STORE [\d,:]+ ([+-])FLAGS/i.test(command)) {
         const [, range, sign, values] = /^UID STORE ([\d,:]+) ([+-])FLAGS(?:\.SILENT)? \((.*)\)/i.exec(command);
-        if (range.split(',').includes('44')) {
-          for (const flag of values.split(' ')) {
-            if (sign === '+') flags.add(flag);
-            else flags.delete([...flags].find((value) => value.toLowerCase() === flag.toLowerCase()));
+        for (const [uid, currentFlags] of flags) {
+          if (range.split(',').includes(String(uid))) {
+            if (uid !== rejectFlagUid) {
+              for (const flag of values.split(' ')) {
+                if (sign === '+') currentFlags.add(flag);
+                else currentFlags.delete([...currentFlags].find((value) => value.toLowerCase() === flag.toLowerCase()));
+              }
+            }
+            write(`* 1 FETCH (UID ${uid} FLAGS (${[...currentFlags].join(' ')}))\r\n`);
           }
-          write(`* 1 FETCH (UID 44 FLAGS (${[...flags].join(' ')}))\r\n`);
         }
         ok();
       } else if (/^CREATE /i.test(command)) {
@@ -171,20 +176,25 @@ function makeImapSocket({
         write('* 1 EXPUNGE\r\n');
         ok('OK [COPYUID 8 44 45] moved');
       } else if (/^UID SEARCH UID /i.test(command)) {
-        const includesUid = command.slice('UID SEARCH UID '.length).split(',').includes('44');
-        write(`* SEARCH${!moved && includesUid ? ' 44' : ''}\r\n`);
+        const requested = command.slice('UID SEARCH UID '.length).split(',').map(Number);
+        const found = moved ? [] : requested.filter((uid) => flags.has(uid));
+        write(`* SEARCH${found.map((uid) => ` ${uid}`).join('')}\r\n`);
         ok();
       } else if (/^(UID )?FETCH /i.test(command)) {
         if (moved || (omitKeywordFetch && /^UID FETCH [\d,:]+ \(FLAGS UID\)$/i.test(command))) return ok();
-        if (/BODY\.PEEK\[\]<0\./i.test(command)) {
-          write(`* 1 FETCH (UID 44 BODY[]<0> {${encoder.encode(sample).byteLength}}\r\n${sample})\r\n`);
-        } else {
-          const date = '"Fri, 20 Nov 2026 00:00:00 +0000"';
-          const from = '(("Alice" NIL "alice" "example.test"))';
-          const to = '((NIL NIL "me" "example.test"))';
-          const envelope = `(${date} "A test message" ${from} NIL NIL ${to} NIL NIL "<first@example.test>" "<reply@example.test>")`;
-          const gmailLabels = /X-GM-LABELS/.test(command) ? ` X-GM-LABELS (${[...labels].map((label) => JSON.stringify(label)).join(' ')})` : '';
-          write(`* 1 FETCH (UID 44 FLAGS (${[...flags].join(' ')}) INTERNALDATE "20-Nov-2026 00:00:00 +0000" RFC822.SIZE ${encoder.encode(sample).byteLength} ENVELOPE ${envelope}${gmailLabels})\r\n`);
+        const requested = /^UID FETCH ([\d,]+) /i.exec(command)?.[1].split(',').map(Number);
+        for (const [uid, currentFlags] of flags) {
+          if (requested && !requested.includes(uid)) continue;
+          if (/BODY\.PEEK\[\]<0\./i.test(command)) {
+            write(`* 1 FETCH (UID ${uid} BODY[]<0> {${encoder.encode(sample).byteLength}}\r\n${sample})\r\n`);
+          } else {
+            const date = '"Fri, 20 Nov 2026 00:00:00 +0000"';
+            const from = '(("Alice" NIL "alice" "example.test"))';
+            const to = '((NIL NIL "me" "example.test"))';
+            const envelope = `(${date} "A test message" ${from} NIL NIL ${to} NIL NIL "<first@example.test>" "<reply@example.test>")`;
+            const gmailLabels = /X-GM-LABELS/.test(command) ? ` X-GM-LABELS (${[...labels].map((label) => JSON.stringify(label)).join(' ')})` : '';
+            write(`* 1 FETCH (UID ${uid} FLAGS (${[...currentFlags].join(' ')}) INTERNALDATE "20-Nov-2026 00:00:00 +0000" RFC822.SIZE ${encoder.encode(sample).byteLength} ENVELOPE ${envelope}${gmailLabels})\r\n`);
+          }
         }
         ok();
       } else {
@@ -278,6 +288,71 @@ test('a deadline after issuing UID STORE preserves the uncertain write outcome',
     { code: 'keyword_write_unknown' });
   assert.equal(fixture.calls.filter((line) => / UID STORE /.test(line)).length, 1);
   await fixture.sockets[0].closed;
+});
+
+test('batched bodies share one selected mailbox and preserve missing and oversized positions', async () => {
+  const fixture = makeImapSocket({ additionalUid: 56 });
+  const transport = createMailTransport(fixture.connect);
+  const requests = [44, 56, 99].map((uid) => ({ type: 'read', uid }));
+  const budget = { bodyBytes: encoder.encode(sample).byteLength };
+  const [first, oversized, missing] = await transport.runMessageBatch(account, 'INBOX', '7', requests, budget);
+  assert.match(first.value.text, /Hi from IMAP!/);
+  assert.deepEqual(oversized, { error: 'batch_body_limit' });
+  assert.deepEqual(missing, { error: 'message_not_found' });
+  assert.equal(fixture.connections(), 1);
+  assert.equal(fixture.calls.filter((line) => / EXAMINE /.test(line)).length, 1);
+  assert.equal(fixture.calls.filter((line) => / UID FETCH 44,56,99 /.test(line)).length, 1);
+  assert.equal(fixture.calls.filter((line) => /BODY\.PEEK\[\]</.test(line)).length, 1);
+});
+
+test('a batch groups compatible flags by UID and preserves a later conflicting write', async () => {
+  const fixture = makeImapSocket({ additionalUid: 56 });
+  const transport = createMailTransport(fixture.connect);
+  const requests = [44, 56, 99].map((uid) => ({ type: 'flags', uid, flags: { flagged: true } }));
+  requests.push({ type: 'flags', uid: 44, flags: { flagged: false } });
+  const result = await transport.runMessageBatch(account, 'INBOX', '7', requests, { bodyBytes: 1024 });
+  assert.deepEqual(result, [
+    { value: { uid: 44, seen: true, flagged: true } },
+    { value: { uid: 56, seen: false, flagged: true } },
+    { error: 'message_not_found' },
+    { value: { uid: 44, seen: true, flagged: false } },
+  ]);
+  const stores = fixture.calls.filter((line) => / UID STORE /.test(line));
+  assert.equal(stores.length, 2);
+  assert.match(stores[0], /UID STORE 44,56 \+FLAGS/);
+  assert.match(stores[1], /UID STORE 44 -FLAGS/);
+  assert.equal(fixture.connections(), 1);
+});
+
+test('a grouped STORE returns the actual flags when one requested change is refused', async () => {
+  const fixture = makeImapSocket({ additionalUid: 56, rejectFlagUid: 56 });
+  const transport = createMailTransport(fixture.connect);
+  const requests = [44, 56].map((uid) => ({ type: 'flags', uid, flags: { flagged: true } }));
+  const result = await transport.runMessageBatch(account, 'INBOX', '7', requests, { bodyBytes: 1024 });
+  assert.deepEqual(result, [
+    { value: { uid: 44, seen: true, flagged: true } },
+    { value: { uid: 56, seen: false, flagged: false } },
+  ]);
+  assert.equal(fixture.calls.filter((line) => / UID STORE 44,56 \+FLAGS/.test(line)).length, 1);
+});
+
+test('batched writes retain confirmed outcomes when the next operation times out', { timeout: 3000 }, async () => {
+  const fixture = makeImapSocket({ stall: (command) => /^UID STORE 44 -FLAGS/.test(command) });
+  const transport = createMailTransport(fixture.connect, { operationTimeout: 150 });
+  const requests = [true, false].map((flagged) => ({ type: 'flags', uid: 44, flags: { flagged } }));
+  const result = await transport.runMessageBatch(account, 'INBOX', '7', requests, { bodyBytes: 1024 });
+  assert.deepEqual(result, [{ value: { uid: 44, seen: true, flagged: true } }, { error: 'mail_timeout' }]);
+  await fixture.sockets[0].closed;
+});
+
+test('batched writes wait behind an unresolved edit to the same UID', async () => {
+  const fixture = makeImapSocket({ omitKeywordFetch: true });
+  const transport = createMailTransport(fixture.connect);
+  const requests = [true, false].map((flagged) => ({ type: 'flags', uid: 44, flags: { flagged } }));
+  const result = await transport.runMessageBatch(account, 'INBOX', '7', requests, { bodyBytes: 1024 });
+  assert.deepEqual(result, [{ error: 'mail_unavailable' }, { error: 'mail_unavailable' }]);
+  assert.equal(fixture.calls.filter((line) => / UID SEARCH UID 44$/.test(line)).length, 1);
+  assert.equal(fixture.calls.filter((line) => / UID STORE /.test(line)).length, 0);
 });
 
 test('applies compatible JMAP keyword updates in a single batched UID STORE', async () => {

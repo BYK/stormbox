@@ -24,6 +24,7 @@ import {
   MUTATION_TYPE,
 } from '../../../src/constants/states';
 import { bootTestEngine } from '../../../src/db/bootstrap-memory';
+import { makeAttentionHandlers } from '../../../src/db/attention';
 import { makeHandlers } from '../../../src/db/handlers';
 import { DB_RPC } from '../../../src/db/protocol';
 import { OutboxRunner } from '../../../src/sync/backends/jmap/outbox-runner';
@@ -149,6 +150,50 @@ afterEach(async () => {
 });
 
 describe('OutboxRunner auto-drain', () => {
+  it('runs distinct Gmail messages together while preserving alias order and the unknown-identity barrier', async () => {
+    async function stage(mailbox: string, uid: number, messageId?: string) {
+      const { id } = await handlers[DB_RPC.PENDING_MUTATION_INSERT]({
+        accountId, mutationType: MUTATION_TYPE.ATTENTION_IMAP,
+        requestJson: JSON.stringify({ location: { accountId: 'gmail', mailbox, uidValidity: '2', uid },
+          action: { type: 'star', value: true }, accountScoped: true, messageId }),
+      });
+      return id;
+    }
+    const first = await stage('INBOX', 12, '<shared@example.org>');
+    const alias = await stage('Projects', 4, ' SHARED@example.org ');
+    const same = await stage('INBOX', 12, '<shared@example.org>');
+    const distinct = await stage('INBOX', 13, '<distinct@example.org>');
+    const unknown = await stage('Archive', 55);
+    const later = await stage('INBOX', 14, '<later@example.org>');
+    const initialGate = deferred();
+    const unknownGate = deferred();
+    const started: number[] = [];
+    const runner = new OutboxRunner({
+      accountId, handlers: { ...handlers, ...makeAttentionHandlers(engine, { touch: vi.fn() }) },
+      processRow: async (row) => {
+        started.push(row.id);
+        if (row.id === first) await initialGate.promise;
+        if (row.id === unknown) await unknownGate.promise;
+        return { ok: true };
+      },
+    });
+    try {
+      const draining = runner.drain();
+      await waitFor(() => started.includes(distinct));
+      expect(started).toEqual([first, distinct]);
+      initialGate.resolve(null);
+      await waitFor(() => started.includes(unknown));
+      expect(started).toEqual([first, distinct, alias, same, unknown]);
+      unknownGate.resolve(null);
+      await draining;
+      expect(started.at(-1)).toBe(later);
+    } finally {
+      initialGate.resolve(null);
+      unknownGate.resolve(null);
+      await runner.stop();
+    }
+  });
+
   it('holds a staged action and overlapping changes until Undo or the deadline', async () => {
     const first = await seedMessage('first');
     const second = await seedMessage('second');

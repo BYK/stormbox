@@ -85,6 +85,14 @@ export interface ImapTagPatch {
   removeLabels: string[];
 }
 
+type FlagPatch = { seen?: boolean; flagged?: boolean };
+
+export type ImapBatchOperation = { uid: number } & (
+  { type: 'read' } | { type: 'flags'; flags: FlagPatch } | { type: 'tags'; tags: ImapTagPatch } | { type: 'move'; role: MoveAction }
+);
+export interface ImapBatchBudget { bodyBytes: number }
+type ImapBatchResult = { value: unknown } | { error: MailTransportErrorCode };
+
 export interface ImapKeywordUpdate extends KeywordChange {
   uid: number;
 }
@@ -101,7 +109,7 @@ export const MOVE_ROLES = {
 export type MoveAction = keyof typeof MOVE_ROLES;
 
 export type MailTransportErrorCode = 'authentication_failed' | 'invalid_message' | 'mailbox_changed'
-  | 'mail_unavailable' | 'mail_timeout' | 'keyword_write_unknown' | 'message_not_found' | 'message_too_large' | 'move_not_supported'
+  | 'mail_unavailable' | 'mail_timeout' | 'keyword_write_unknown' | 'message_not_found' | 'message_too_large' | 'batch_body_limit' | 'move_not_supported'
   | 'archive_not_configured' | 'archive_requires_inbox' | 'archive_rejected' | 'junk_not_configured' | 'labels_not_supported'
   | 'same_mailbox' | 'trash_not_configured' | 'smtp_not_configured' | 'submission_rejected' | 'submission_unknown';
 
@@ -168,11 +176,16 @@ function envelope(message: FetchMessageObject): ImapMessage {
   };
 }
 
-async function fetchSource(client: ImapFlow, uid: number, size: number | undefined) {
+async function fetchSource(client: ImapFlow, uid: number, size: number | undefined, budget?: ImapBatchBudget) {
   if ((size ?? 0) > MAX_MESSAGE_BYTES) throw new MailTransportError('message_too_large');
-  const raw = await client.fetchOne(uid, { source: { start: 0, maxLength: MAX_MESSAGE_BYTES + 1 } }, { uid: true });
+  const maximum = budget ? Math.min(MAX_MESSAGE_BYTES, budget.bodyBytes) : MAX_MESSAGE_BYTES;
+  if (maximum <= 0 || (size ?? 0) > maximum) throw new MailTransportError('batch_body_limit');
+  const reserved = budget ? size || maximum : maximum;
+  if (budget) budget.bodyBytes -= reserved;
+  const raw = await client.fetchOne(uid, { source: { start: 0, maxLength: reserved + 1 } }, { uid: true });
   if (!raw || !raw.source) throw new MailTransportError('message_not_found');
-  if (raw.source.length > MAX_MESSAGE_BYTES) throw new MailTransportError('message_too_large');
+  if (raw.source.length > reserved) throw new MailTransportError(budget ? 'batch_body_limit' : 'message_too_large');
+  if (budget) budget.bodyBytes += reserved - raw.source.length;
   return raw.source;
 }
 
@@ -260,8 +273,8 @@ export function createMailTransport(openSocket: SmtpConnect = connect, {
       }));
   }
 
-  function listMailboxes(account: MailAccount): Promise<ImapFolder[]> {
-    return withClient(account.imap, readFolders);
+  function listMailboxes(account: MailAccount, timeout = operationTimeout): Promise<ImapFolder[]> {
+    return withClient(account.imap, readFolders, Math.min(timeout, operationTimeout));
   }
 
   async function verifyImapAccount(account: MailAccount): Promise<void> {
@@ -342,17 +355,22 @@ export function createMailTransport(openSocket: SmtpConnect = connect, {
     });
   }
 
+  async function messageBody(client: ImapFlow, mailbox: string, uidValidity: string, message: FetchMessageObject,
+    budget?: ImapBatchBudget): Promise<ImapMessageBody> {
+    const source = await fetchSource(client, message.uid, message.size, budget);
+    try {
+      const parsed = await PostalMime.parse(source, { maxNestingDepth: 64, maxHeadersSize: 128 * 1024 });
+      return { ...envelope(message), mailbox, uidValidity, text: parsed.text ?? '', html: parsed.html ?? '' };
+    } catch {
+      throw new MailTransportError('invalid_message');
+    }
+  }
+
   function readMessage(account: MailAccount, mailbox: string, uidValidity: string, uid: number): Promise<ImapMessageBody> {
     return withMailbox(account, mailbox, { readOnly: true, uidValidity }, async (client) => {
       const message = await client.fetchOne(uid, MESSAGE_QUERY, { uid: true });
       if (!message) throw new MailTransportError('message_not_found');
-      const source = await fetchSource(client, uid, message.size);
-      try {
-        const parsed = await PostalMime.parse(source, { maxNestingDepth: 64, maxHeadersSize: 128 * 1024 });
-        return { ...envelope(message), mailbox, uidValidity, text: parsed.text ?? '', html: parsed.html ?? '' };
-      } catch {
-        throw new MailTransportError('invalid_message');
-      }
+      return messageBody(client, mailbox, uidValidity, message);
     });
   }
 
@@ -377,14 +395,12 @@ export function createMailTransport(openSocket: SmtpConnect = connect, {
 
   function patchMessage(
     account: MailAccount, mailbox: string, uidValidity: string, uid: number,
-    flags: { seen?: boolean; flagged?: boolean },
+    flags: FlagPatch,
   ): Promise<{ uid: number; seen: boolean; flagged: boolean }> {
     return withMailbox(account, mailbox, { readOnly: false, uidValidity }, async (client) => {
       const before = await client.fetchOne(uid, { flags: true }, { uid: true });
       if (!before) throw new MailTransportError('message_not_found');
-      const changes = Object.entries({ '\\Seen': flags.seen, '\\Flagged': flags.flagged });
-      const add = changes.filter(([, value]) => value === true).map(([flag]) => flag);
-      const remove = changes.filter(([, value]) => value === false).map(([flag]) => flag);
+      const { add, remove } = flagChanges(flags);
       if ((add.length && !await client.messageFlagsAdd(uid, add, { uid: true }))
           || (remove.length && !await client.messageFlagsRemove(uid, remove, { uid: true }))) {
         throw new MailTransportError('mail_unavailable');
@@ -395,49 +411,59 @@ export function createMailTransport(openSocket: SmtpConnect = connect, {
     });
   }
 
+  function flagChanges(flags: FlagPatch) {
+    const changes = Object.entries({ '\\Seen': flags.seen, '\\Flagged': flags.flagged });
+    return {
+      add: changes.filter(([, value]) => value === true).map(([flag]) => flag),
+      remove: changes.filter(([, value]) => value === false).map(([flag]) => flag),
+    };
+  }
+
   function patchMessageTags(account: MailAccount, mailbox: string, uidValidity: string, uid: number, patch: ImapTagPatch) {
-    return withMailbox(account, mailbox, { readOnly: false, uidValidity }, async (client) => {
-      const updateLabels = patch.addLabels.length > 0 || patch.removeLabels.length > 0;
-      if (updateLabels && !client.capabilities.has('X-GM-EXT-1')) {
-        throw new MailTransportError('labels_not_supported');
+    return withMailbox(account, mailbox, { readOnly: false, uidValidity }, (client) => patchSelectedTags(client, uid, patch));
+  }
+
+  async function patchSelectedTags(client: ImapFlow, uid: number, patch: ImapTagPatch) {
+    const updateLabels = patch.addLabels.length > 0 || patch.removeLabels.length > 0;
+    if (updateLabels && !client.capabilities.has('X-GM-EXT-1')) {
+      throw new MailTransportError('labels_not_supported');
+    }
+    const query = { flags: true, labels: true };
+    const byUid = { uid: true };
+    const before = await client.fetchOne(uid, query, byUid);
+    if (!before) throw new MailTransportError('message_not_found');
+    const current = messageTagState(before);
+    const keywords = new Set(current.keywords.map((keyword) => keyword.toLowerCase()));
+    const labels = new Set(current.labels);
+    const add = patch.add.filter((keyword) => !keywords.has(keyword.toLowerCase()));
+    const remove = patch.remove.filter((keyword) => keywords.has(keyword.toLowerCase()));
+    const addLabels = patch.addLabels.filter((label) => !labels.has(label));
+    const removeLabels = patch.removeLabels.filter((label) => labels.has(label));
+    if (addLabels.length) {
+      const existing = new Set((await client.list()).map(({ path }) => path));
+      for (const label of addLabels) {
+        // The final FETCH confirms the outcome even if another client created the label first.
+        if (!existing.has(label)) await client.mailboxCreate(label).catch(() => {});
       }
-      const query = { flags: true, labels: true };
-      const byUid = { uid: true };
-      const before = await client.fetchOne(uid, query, byUid);
-      if (!before) throw new MailTransportError('message_not_found');
-      const current = messageTagState(before);
-      const keywords = new Set(current.keywords.map((keyword) => keyword.toLowerCase()));
-      const labels = new Set(current.labels);
-      const add = patch.add.filter((keyword) => !keywords.has(keyword.toLowerCase()));
-      const remove = patch.remove.filter((keyword) => keywords.has(keyword.toLowerCase()));
-      const addLabels = patch.addLabels.filter((label) => !labels.has(label));
-      const removeLabels = patch.removeLabels.filter((label) => labels.has(label));
-      if (addLabels.length) {
-        const existing = new Set((await client.list()).map(({ path }) => path));
-        for (const label of addLabels) {
-          // The final FETCH confirms the outcome even if another client created the label first.
-          if (!existing.has(label)) await client.mailboxCreate(label).catch(() => {});
-        }
-      }
-      if (add.length) await client.messageFlagsAdd(uid, add, byUid);
-      if (remove.length) await client.messageFlagsRemove(uid, remove, byUid);
-      const gmailLabels = { ...byUid, useLabels: true };
-      if (addLabels.length) await client.messageFlagsAdd(uid, addLabels, gmailLabels);
-      if (removeLabels.length) await client.messageFlagsRemove(uid, removeLabels, gmailLabels);
-      const updated = await client.fetchOne(uid, query, byUid);
-      if (!updated) throw new MailTransportError('message_not_found');
-      const state = messageTagState(updated);
-      const newKeywords = new Set(state.keywords.map((keyword) => keyword.toLowerCase()));
-      const newLabels = new Set(state.labels);
-      const tagsApplied = patch.add.every((keyword) => newKeywords.has(keyword.toLowerCase()))
-        && patch.remove.every((keyword) => !newKeywords.has(keyword.toLowerCase()))
-        && patch.addLabels.every((label) => newLabels.has(label))
-        && patch.removeLabels.every((label) => !newLabels.has(label));
-      return {
-        uid, ...state, tagsApplied,
-        seen: updated.flags?.has('\\Seen') ?? false, flagged: updated.flags?.has('\\Flagged') ?? false,
-      };
-    });
+    }
+    if (add.length) await client.messageFlagsAdd(uid, add, byUid);
+    if (remove.length) await client.messageFlagsRemove(uid, remove, byUid);
+    const gmailLabels = { ...byUid, useLabels: true };
+    if (addLabels.length) await client.messageFlagsAdd(uid, addLabels, gmailLabels);
+    if (removeLabels.length) await client.messageFlagsRemove(uid, removeLabels, gmailLabels);
+    const updated = await client.fetchOne(uid, query, byUid);
+    if (!updated) throw new MailTransportError('message_not_found');
+    const state = messageTagState(updated);
+    const newKeywords = new Set(state.keywords.map((keyword) => keyword.toLowerCase()));
+    const newLabels = new Set(state.labels);
+    const tagsApplied = patch.add.every((keyword) => newKeywords.has(keyword.toLowerCase()))
+      && patch.remove.every((keyword) => !newKeywords.has(keyword.toLowerCase()))
+      && patch.addLabels.every((label) => newLabels.has(label))
+      && patch.removeLabels.every((label) => !newLabels.has(label));
+    return {
+      uid, ...state, tagsApplied,
+      seen: updated.flags?.has('\\Seen') ?? false, flagged: updated.flags?.has('\\Flagged') ?? false,
+    };
   }
 
   function patchMailboxKeywords(account: MailAccount, mailbox: string, uidValidity: string, updates: ImapKeywordUpdate[],
@@ -505,30 +531,125 @@ export function createMailTransport(openSocket: SmtpConnect = connect, {
     return moveToRole(account, mailbox, uidValidity, uid, 'trash');
   }
 
+  async function archiveGmailFromSelected(client: ImapFlow, uid: number) {
+    const byUid = { uid: true };
+    if (!await client.fetchOne(uid, byUid, byUid)) return { status: 'absent' as const };
+    // Gmail archive removes Inbox membership while retaining All Mail and every other label.
+    if (!await client.messageFlagsRemove(uid, ['\\Inbox'], { ...byUid, useLabels: true })) {
+      throw new MailTransportError('archive_rejected');
+    }
+    const updated = await client.fetchOne(uid, { labels: true }, byUid);
+    if (updated && (!updated.labels || [...updated.labels].some((label) => label.toLowerCase() === '\\inbox'))) {
+      throw new MailTransportError('archive_rejected');
+    }
+    return { status: 'moved' as const };
+  }
+
+  type FolderList = Awaited<ReturnType<ImapFlow['list']>>;
+
+  function moveDestination(folders: FolderList, action: MoveAction): string {
+    const destination = folders.find(({ flags }) =>
+      flags.has(MOVE_ROLES[action]) && !flags.has('\\Noselect') && !flags.has('\\NonExistent'));
+    if (!destination) throw new MailTransportError(`${action}_not_configured`);
+    return destination.path;
+  }
+
   function moveToRole(account: MailAccount, mailbox: string, uidValidity: string, uid: number, action: MoveAction) {
     return withClient(account.imap, async (client) => {
       if (action === 'archive' && client.capabilities.has('X-GM-EXT-1')) {
         if (mailbox.toUpperCase() !== 'INBOX') throw new MailTransportError('archive_requires_inbox');
-        return withSelectedMailbox(client, mailbox, { readOnly: false, uidValidity }, async () => {
-          const byUid = { uid: true };
-          if (!await client.fetchOne(uid, byUid, byUid)) return { status: 'absent' as const };
-          // Gmail archive removes Inbox membership while retaining All Mail and every other label.
-          if (!await client.messageFlagsRemove(uid, ['\\Inbox'], { ...byUid, useLabels: true })) {
-            throw new MailTransportError('archive_rejected');
-          }
-          const updated = await client.fetchOne(uid, { labels: true }, byUid);
-          if (updated && (!updated.labels || [...updated.labels].some((label) => label.toLowerCase() === '\\inbox'))) {
-            throw new MailTransportError('archive_rejected');
-          }
-          return { status: 'moved' as const };
-        });
+        return withSelectedMailbox(client, mailbox, { readOnly: false, uidValidity }, () => archiveGmailFromSelected(client, uid));
       }
-      const destination = (await client.list()).find(({ flags }) =>
-        flags.has(MOVE_ROLES[action]) && !flags.has('\\Noselect') && !flags.has('\\NonExistent'));
-      if (!destination) throw new MailTransportError(`${action}_not_configured`);
+      const destination = moveDestination(await client.list(), action);
       return withSelectedMailbox(client, mailbox, { readOnly: false, uidValidity }, () =>
-        moveSelectedMessage(client, mailbox, uid, destination.path));
+        moveSelectedMessage(client, mailbox, uid, destination));
     });
+  }
+
+  function batchError(error: unknown): ImapBatchResult {
+    return { error: error instanceof MailTransportError ? error.code : 'mail_unavailable' };
+  }
+
+  async function patchFlagGroup(client: ImapFlow, uids: number[], flags: FlagPatch): Promise<ImapBatchResult[]> {
+    const byUid = { uid: true };
+    const query = { flags: true };
+    const initial = await client.fetchAll(uids.join(','), query, byUid);
+    const observed = new Set(initial.map(({ uid }) => uid));
+    const { add, remove } = flagChanges(flags);
+    const sequence = uids.filter((uid) => observed.has(uid)).join(',');
+    if (sequence && add.length) await client.messageFlagsAdd(sequence, add, byUid);
+    if (sequence && remove.length) await client.messageFlagsRemove(sequence, remove, byUid);
+    const confirmed = sequence ? await client.fetchAll(sequence, query, byUid) : [];
+    const byMessage = new Map(confirmed.flatMap(({ uid, flags }) => flags ? [[uid, flags] as const] : []));
+    const missing = uids.filter((uid) => !byMessage.has(uid));
+    const unresolved = missing.length ? await client.search({ uid: missing.join(',') }, byUid).catch(() => false as const) : [];
+    return uids.map((uid) => {
+      const actual = byMessage.get(uid);
+      if (!actual) return { error: !unresolved || unresolved.includes(uid) ? 'mail_unavailable' : 'message_not_found' };
+      return { value: { uid, seen: actual.has('\\Seen'), flagged: actual.has('\\Flagged') } };
+    });
+  }
+
+  async function runMessageBatch(account: MailAccount, mailbox: string, uidValidity: string, operations: ImapBatchOperation[],
+    budget: ImapBatchBudget, timeout = operationTimeout, deferredWrites = new Set<number>()): Promise<ImapBatchResult[]> {
+    const outcomes: (ImapBatchResult | undefined)[] = Array.from({ length: operations.length });
+    const readOnly = operations.every(({ type }) => type === 'read');
+    function record(position: number, result: ImapBatchResult) {
+      outcomes[position] = result;
+      if (operations[position].type !== 'read' && 'error' in result
+        && (result.error === 'mail_timeout' || result.error === 'mail_unavailable')) deferredWrites.add(operations[position].uid);
+      return result;
+    }
+    try {
+      await withMailbox(account, mailbox, { readOnly, uidValidity }, async (client) => {
+        let folders: FolderList | undefined;
+        for (let index = 0; index < operations.length && client.usable;) {
+          const operation = operations[index];
+          const { uid } = operation;
+          let end = index + 1;
+          try {
+            if (operation.type === 'read') {
+              while (operations[end]?.type === 'read') end += 1;
+              const uids = new Set(operations.slice(index, end).map((entry) => entry.uid));
+              const messages = await client.fetchAll([...uids].join(','), MESSAGE_QUERY, { uid: true });
+              const byUid = new Map(messages.map((message) => [message.uid, message]));
+              for (let item = index; item < end; item += 1) {
+                const message = byUid.get(operations[item].uid);
+                record(item, message ? await messageBody(client, mailbox, uidValidity, message, budget)
+                  .then((value): ImapBatchResult => ({ value }), batchError) : { error: 'message_not_found' });
+              }
+            } else if (deferredWrites.has(uid)) {
+              record(index, { error: 'mail_unavailable' });
+            } else if (operation.type === 'flags') {
+              const uids = new Set([uid]);
+              let next = operations[end];
+              while (next?.type === 'flags' && !uids.has(next.uid) && !deferredWrites.has(next.uid)
+                && next.flags.seen === operation.flags.seen && next.flags.flagged === operation.flags.flagged) {
+                uids.add(next.uid);
+                next = operations[++end];
+              }
+              const results = await patchFlagGroup(client, [...uids], operation.flags);
+              for (const [position, result] of results.entries()) record(index + position, result);
+            } else if (operation.type === 'tags') {
+              record(index, { value: await patchSelectedTags(client, uid, operation.tags) });
+            } else if (operation.role === 'archive' && client.capabilities.has('X-GM-EXT-1')) {
+              if (mailbox.toUpperCase() !== 'INBOX') throw new MailTransportError('archive_requires_inbox');
+              record(index, { value: await archiveGmailFromSelected(client, uid) });
+            } else {
+              folders ??= await client.list();
+              const destination = moveDestination(folders, operation.role);
+              record(index, { value: await moveSelectedMessage(client, mailbox, uid, destination) });
+            }
+          } catch (error) {
+            for (let item = index; item < end; item += 1) if (!outcomes[item]) record(item, batchError(error));
+          }
+          index = end;
+        }
+      }, Math.min(timeout, operationTimeout));
+    } catch (error) {
+      return outcomes.map((result, index) => result ?? record(index, batchError(error)));
+    }
+    return outcomes.map((result, index) => result ?? record(index, { error: 'mail_unavailable' }));
   }
 
   async function submitMessage(account: MailAccount, { to, message }: { to: string[]; message: string | Uint8Array }) {
@@ -568,9 +689,9 @@ export function createMailTransport(openSocket: SmtpConnect = connect, {
     }
   }
 
-  return { listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessagePreviews, readMessageSource, patchMessage, patchMessageTags, patchMailboxKeywords, moveMessage, moveToRole, trashMessage, submitMessage };
+  return { listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessagePreviews, readMessageSource, patchMessage, patchMessageTags, patchMailboxKeywords, moveMessage, moveToRole, trashMessage, submitMessage, runMessageBatch };
 }
 
 export const {
-  listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessagePreviews, readMessageSource, patchMessage, patchMessageTags, patchMailboxKeywords, moveMessage, moveToRole, trashMessage, submitMessage,
+  listMailboxes, verifyImapAccount, listMessages, listMailboxWindows, readMessage, readMessagePreviews, readMessageSource, patchMessage, patchMessageTags, patchMailboxKeywords, moveMessage, moveToRole, trashMessage, submitMessage, runMessageBatch,
 } = createMailTransport();

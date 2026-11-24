@@ -7,7 +7,7 @@ import { jmap, session, type JmapAccount, type JmapStore } from './jmap';
 import { isTagKeyword } from './keywords';
 import {
   listMailboxes, MailTransportError, MOVE_ROLES, moveToRole, patchMessage, patchMessageTags,
-  readMessage, readMessageSource, type ImapTagPatch, type MailAccount, type MoveAction,
+  readMessage, readMessageSource, runMessageBatch, type ImapBatchOperation, type ImapTagPatch, type MailAccount, type MoveAction,
 } from './mail-transport';
 import {
   getManagedAccount, listManagedAccounts, listManagedIds, managedAccountInput, registerManagedAccount, removeManagedAccount,
@@ -19,6 +19,9 @@ export { ManagedAccounts } from './managed-accounts';
 export { PushSubscriptions } from './push';
 
 const RELAY = '/api/imap/v1';
+const MAX_BATCH_ITEMS = 8;
+const BATCH_BODY_BYTES = 8 * 1024 * 1024;
+const BATCH_TIMEOUT = 20_000;
 
 function accountObject(env: Env, account: JmapAccount) {
   return env.MAILBOXES.getByName(account.id);
@@ -98,9 +101,185 @@ function readTagPatch(input: unknown): ImapTagPatch {
   return patch;
 }
 
+function messagePatch(uid: number, input: unknown): Extract<ImapBatchOperation, { type: 'flags' | 'tags' }> {
+  if (input && typeof input === 'object' && Object.hasOwn(input, 'tags')) {
+    if (Object.keys(input).length !== 1) throw new HttpError(400, 'invalid_tags');
+    return { uid, type: 'tags', tags: readTagPatch((input as { tags: unknown }).tags) };
+  }
+  return { uid, type: 'flags', flags: readFlagPatch(input) };
+}
+
+function requestedMailbox(params: URLSearchParams) {
+  const value = params.get('mailbox') ?? 'INBOX';
+  if (!value || value.length > 1024 || /[\0\r\n]/.test(value)) throw new HttpError(400, 'invalid_mailbox');
+  return value.toUpperCase() === 'INBOX' ? 'INBOX' : value;
+}
+
+async function folderWindow(env: Env, account: MailAccount, managed: boolean, mailbox: string, limit: number) {
+  const state = accountObject(env, account);
+  const [window, cached] = await Promise.all([
+    state.liveFolder(account, mailbox, limit),
+    mailbox === 'INBOX' ? state.inboxPreviews().catch(() => null) : null,
+  ]);
+  if ('error' in window) {
+    if (window.error === 'incomplete_window') throw new HttpError(503, window.error);
+    throw new MailTransportError(window.error);
+  }
+  const messages = cached?.uidValidity === window.uidValidity
+    ? window.messages.map((message) => ({ ...message, preview: cached.previews[message.uid] }))
+    : window.messages;
+  return { ...window, messages, canSend: Boolean(env.MANAGED_ACCOUNTS) && managed && canSubmitAttentionMessage(account) };
+}
+
 function managedAuthorized(request: Request, url: URL, env: Env): boolean {
   const origin = request.headers.get('Origin');
   return url.origin === env.PUBLIC_ORIGIN && (!origin || origin === env.PUBLIC_ORIGIN) && pairedAuthorization(request, env);
+}
+
+type BatchItem = { id: string; index: number } & (
+  { kind: 'mailboxes' } | { kind: 'window'; mailbox: string; limit: number }
+  | { kind: 'message'; mailbox: string; uidValidity: string; operation: ImapBatchOperation }
+);
+type BatchResult = { status: number; body: unknown };
+
+function parseBatchItem(input: unknown, index: number, paired: boolean): BatchItem {
+  if (!input || typeof input !== 'object' || Array.isArray(input)
+    || Object.keys(input).some((key) => !['path', 'method', 'body'].includes(key))) throw new HttpError(400, 'invalid_batch_item');
+  const { method, path, body } = input as { method?: unknown; path?: unknown; body?: unknown };
+  if (method !== 'GET' && method !== 'PATCH' && method !== 'POST') throw new HttpError(400, 'invalid_batch_item');
+  if (method !== 'GET' && !paired) throw new HttpError(401, 'unauthorized');
+  if (method !== 'PATCH' && body !== undefined) throw new HttpError(400, 'invalid_batch_item');
+  if (typeof path !== 'string' || !path.startsWith('/accounts/') || path.length > 16_384 || /[\\#\x00-\x20\x7f]/.test(path)) {
+    throw new HttpError(400, 'invalid_batch_path');
+  }
+  const queryStart = path.indexOf('?');
+  const segments = parsedSegments(queryStart < 0 ? path : path.slice(0, queryStart));
+  const [, , id, resource, uid, action] = segments;
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id ?? '')) throw new HttpError(400, 'invalid_batch_path');
+  const params = new URLSearchParams(queryStart < 0 ? '' : path.slice(queryStart + 1));
+  const base = { id, index };
+  if (resource === 'mailboxes' && segments.length === 4 && method === 'GET' && params.size === 0) return { ...base, kind: 'mailboxes' };
+  if (resource !== 'messages') throw new HttpError(400, 'invalid_batch_path');
+  const isWindow = segments.length === 4 && method === 'GET';
+  const isMessage = segments.length === 5 && (method === 'GET' || method === 'PATCH');
+  const isMove = segments.length === 6 && method === 'POST' && Object.hasOwn(MOVE_ROLES, action);
+  if (!(isWindow || isMessage || isMove)) throw new HttpError(400, 'invalid_batch_path');
+  const keys = [...params.keys()];
+  if (new Set(keys).size !== keys.length || keys.some((key) => key !== 'mailbox' && key !== (isWindow ? 'limit' : 'uidValidity'))) {
+    throw new HttpError(400, 'invalid_batch_path');
+  }
+  const mailbox = requestedMailbox(params);
+  if (isWindow) return { ...base, kind: 'window', mailbox, limit: number(params.get('limit') ?? '50', 100) };
+  const messageUid = number(uid, 0xffffffff);
+  const uidValidity = String(number(params.get('uidValidity'), 0xffffffff));
+  const operation = method === 'PATCH' ? messagePatch(messageUid, body)
+    : method === 'GET' ? { uid: messageUid, type: 'read' as const }
+      : { uid: messageUid, type: 'move' as const, role: action as MoveAction };
+  return { ...base, kind: 'message', mailbox, uidValidity, operation };
+}
+
+async function batchRead<T>(task: () => Promise<T>, deadline: number): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new MailTransportError('mail_timeout');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new MailTransportError('mail_timeout')), remaining);
+    });
+    return await Promise.race([timeout, task()]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function batchError(error: unknown): Promise<BatchResult> {
+  const response = errorResponse(error);
+  return { status: response.status, body: await response.json() };
+}
+
+async function relayBatch(request: Request, url: URL, env: Env): Promise<Response> {
+  if (request.method !== 'POST') throw new HttpError(405, 'method_not_allowed');
+  const paired = pairedAuthorization(request, env);
+  if (!paired && !authorization(request, env)) throw new HttpError(401, 'unauthorized');
+  const input: { requests?: unknown } = await readJson(request);
+  if (!input || typeof input !== 'object' || Object.keys(input).some((key) => key !== 'requests')
+    || !Array.isArray(input.requests) || !input.requests.length) throw new HttpError(400, 'invalid_batch');
+  if (input.requests.length > MAX_BATCH_ITEMS) throw new HttpError(413, 'batch_too_large');
+
+  const results: BatchResult[] = new Array(input.requests.length);
+  const byAccount = new Map<string, BatchItem[]>();
+  for (const [index, entry] of input.requests.entries()) {
+    try {
+      const item = parseBatchItem(entry, index, paired);
+      const queue = byAccount.get(item.id) ?? [];
+      queue.push(item);
+      byAccount.set(item.id, queue);
+    } catch (error) {
+      results[index] = await batchError(error);
+    }
+  }
+  const configured = mailAccounts(env);
+  const managed = managedAuthorized(request, url, env);
+  const deadline = Date.now() + BATCH_TIMEOUT;
+  const budget = { bodyBytes: BATCH_BODY_BYTES };
+  const queues = byAccount.values();
+
+  async function execute() {
+    for (const queue of queues) {
+      const id = queue[0].id;
+      let account: MailAccount;
+      try {
+        const connected = configured.find((entry) => entry.id === id)
+          ?? (managed ? await batchRead(() => getManagedAccount(env, id), deadline) : undefined);
+        if (!connected) throw new HttpError(404, 'account_not_found');
+        account = connected;
+      } catch (error) {
+        const result = await batchError(error);
+        for (const { index } of queue) results[index] = result;
+        continue;
+      }
+      const deferredWrites = new Map<string, Set<number>>();
+      for (let position = 0; position < queue.length;) {
+        const item = queue[position];
+        let end = position + 1;
+        try {
+          if (item.kind === 'message') {
+            const operations = [item.operation];
+            let next = queue[end];
+            while (next?.kind === 'message' && next.mailbox === item.mailbox && next.uidValidity === item.uidValidity) {
+              operations.push(next.operation);
+              next = queue[++end];
+            }
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) throw new MailTransportError('mail_timeout');
+            const containsWrite = operations.some(({ type }) => type !== 'read');
+            const location = JSON.stringify([item.mailbox, item.uidValidity]);
+            const priorFailures = deferredWrites.get(location) ?? new Set<number>();
+            deferredWrites.set(location, priorFailures);
+            const outcomes = await runMessageBatch(account, item.mailbox, item.uidValidity, operations, budget, remaining, priorFailures)
+              .finally(() => containsWrite ? accountObject(env, account).invalidateFolders(id).catch(() => {}) : undefined);
+            for (const [offset, outcome] of outcomes.entries()) {
+              results[queue[position + offset].index] = 'error' in outcome
+                ? await batchError(new MailTransportError(outcome.error)) : { status: 200, body: outcome.value };
+            }
+          } else {
+            const body = item.kind === 'mailboxes'
+              ? await batchRead(async () => ({ mailboxes: await listMailboxes(account, deadline - Date.now()) }), deadline)
+              : await batchRead(() => folderWindow(env, account, managed, item.mailbox, item.limit), deadline);
+            results[item.index] = { status: 200, body };
+          }
+        } catch (error) {
+          const result = await batchError(error);
+          for (let pending = position; pending < end; pending += 1) results[queue[pending].index] = result;
+        }
+        position = end;
+      }
+    }
+  }
+
+  // Each folder-window group can open two Durable Object calls concurrently.
+  await Promise.all([execute(), execute()]);
+  return json({ responses: results });
 }
 
 async function relay(request: Request, url: URL, env: Env): Promise<Response> {
@@ -110,6 +289,7 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
   }
   const secret = accessToken(env);
   if (!secret && !env.RELAY_SESSION_KEY) throw new HttpError(503, 'gateway_not_configured');
+  if (parts.length === 1 && parts[0] === 'batch') return relayBatch(request, url, env);
   if (url.pathname === GOOGLE_CALLBACK_PATH && request.method === 'GET') {
     const configured = mailAccounts(env);
     return finishGoogleLink(request, url, env, configured, MAX_IMAP_ACCOUNTS - configured.length);
@@ -180,23 +360,9 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
     return json({ mailboxes: await listMailboxes(account) });
   }
   if (subresource !== 'messages') throw new HttpError(404, 'not_found');
-  const mailboxValue = url.searchParams.get('mailbox') ?? 'INBOX';
-  const mailbox = mailboxValue.toUpperCase() === 'INBOX' ? 'INBOX' : mailboxValue;
-  if (!mailbox || mailbox.length > 1024 || /[\0\r\n]/.test(mailbox)) throw new HttpError(400, 'invalid_mailbox');
+  const mailbox = requestedMailbox(url.searchParams);
   if (parts.length === 3 && request.method === 'GET') {
-    const state = accountObject(env, account);
-    const [window, cached] = await Promise.all([
-      state.liveFolder(account, mailbox, number(url.searchParams.get('limit') ?? '50', 100)),
-      mailbox === 'INBOX' ? state.inboxPreviews().catch(() => null) : null,
-    ]);
-    if ('error' in window) {
-      if (window.error === 'incomplete_window') throw new HttpError(503, window.error);
-      throw new MailTransportError(window.error);
-    }
-    const messages = cached?.uidValidity === window.uidValidity
-      ? window.messages.map((message) => ({ ...message, preview: cached.previews[message.uid] }))
-      : window.messages;
-    return json({ ...window, messages, canSend: Boolean(env.MANAGED_ACCOUNTS) && managed && canSubmitAttentionMessage(account) });
+    return json(await folderWindow(env, account, managed, mailbox, number(url.searchParams.get('limit') ?? '50', 100)));
   }
   const action = parts.length === 5 && Object.hasOwn(MOVE_ROLES, parts[4]) ? parts[4] as MoveAction : null;
   if (parts.length !== 4 && !action) {
@@ -208,14 +374,9 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
     return json(await readMessage(account, mailbox, uidValidity, messageUid));
   }
   if (parts.length === 4 && request.method === 'PATCH') {
-    const input = await readJson(request, 65_536);
-    let mutation;
-    if (input && typeof input === 'object' && Object.hasOwn(input, 'tags')) {
-      if (Object.keys(input).length !== 1) throw new HttpError(400, 'invalid_tags');
-      mutation = patchMessageTags(account, mailbox, uidValidity, messageUid, readTagPatch(input.tags));
-    } else {
-      mutation = patchMessage(account, mailbox, uidValidity, messageUid, readFlagPatch(input));
-    }
+    const patch = messagePatch(messageUid, await readJson(request, 65_536));
+    const mutation = patch.type === 'tags' ? patchMessageTags(account, mailbox, uidValidity, messageUid, patch.tags)
+      : patchMessage(account, mailbox, uidValidity, messageUid, patch.flags);
     return json(await mutation.finally(() => accountObject(env, account).invalidateFolders(id).catch(() => {})));
   }
   if (action && request.method === 'POST') {
@@ -330,7 +491,8 @@ function errorResponse(error: unknown): Response {
     switch (error.code) {
       case 'mailbox_changed': return json({ error: error.code }, 409);
       case 'message_not_found': return json({ error: error.code }, 404);
-      case 'message_too_large': return json({ error: error.code }, 413);
+      case 'message_too_large':
+      case 'batch_body_limit': return json({ error: error.code }, 413);
       case 'mail_timeout': return json({ error: error.code }, 504);
       case 'same_mailbox':
       case 'move_not_supported':

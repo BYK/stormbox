@@ -47,6 +47,7 @@ export interface ImapActionFailure {
 }
 
 const PREFETCH_COUNT = 5;
+const PREFETCH_CONCURRENCY = 3;
 const BODY_CACHE_LIMIT = 100;
 const BODY_CACHE_BYTES = 64 * 1024 * 1024;
 const BODY_CHARACTERS = 512_000;
@@ -66,6 +67,7 @@ export interface ImapActionRequest {
 
 type PendingImapAction = ImapActionRequest & { cancelled?: number };
 type Connection = Pick<Engine, 'all'>;
+type BodyRead = { background: boolean; phase: 'cache' | 'queued' | 'batch' | 'direct' };
 
 const SUPERSEDES_IMAP_EDIT = `
   json_extract(earlier.request_json, '$.location.accountId') = json_extract(later.request_json, '$.location.accountId')
@@ -75,7 +77,8 @@ const SUPERSEDES_IMAP_EDIT = `
       AND json_extract(earlier.request_json, '$.location.uid') = json_extract(later.request_json, '$.location.uid'))
     OR (json_extract(earlier.request_json, '$.accountScoped') = 1
       AND json_extract(later.request_json, '$.accountScoped') = 1
-      AND json_extract(earlier.request_json, '$.messageId') = json_extract(later.request_json, '$.messageId'))
+      AND NULLIF(lower(trim(json_extract(earlier.request_json, '$.messageId'), ' <>')), '')
+        = NULLIF(lower(trim(json_extract(later.request_json, '$.messageId'), ' <>')), ''))
   )
   AND (
     json_extract(earlier.request_json, '$.action.type') = json_extract(later.request_json, '$.action.type')
@@ -189,7 +192,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
   const recoveringFolders = new Set<string>();
   const mailboxActivity = new Map<string, { revision: number; readers: number; writers: number }>();
   const prefetching = new Set<string>();
-  const bodyReads = new Map<string, Promise<RelayMessageBody | null>>();
+  const bodyReads = new Map<string, { read: BodyRead; pending: Promise<RelayMessageBody | null> }>();
   const settingsVersions = new Map<number, number>();
   const loadingSettings = new Map<number, { version: number; pending: Promise<RelayAccountSettings> }>();
 
@@ -256,16 +259,24 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
 
   type BodyKey = [ownerId: number, accountId: string, mailbox: string, uidValidity: string, uid: number];
 
-  function readBody(ownerId: number, location: ImapMessageLocation, cachedOnly = false): Promise<RelayMessageBody | null> {
+  function readBody(ownerId: number, location: ImapMessageLocation, { cachedOnly = false, background = false } = {}): Promise<RelayMessageBody | null> {
     const { accountId, mailbox, uidValidity, uid } = location;
     const key: BodyKey = [ownerId, accountId, mailbox, uidValidity, uid];
     if (cachedOnly) return readCachedBody(key);
     const version = settingsVersion(ownerId);
     const identity = JSON.stringify([version, ...key]);
     const existing = bodyReads.get(identity);
-    if (existing) return existing;
-    const pending = downloadBody(location, key, version).finally(() => bodyReads.delete(identity));
-    bodyReads.set(identity, pending);
+    if (existing && (background || !existing.read.background || existing.read.phase === 'cache' || existing.read.phase === 'direct')) {
+      if (!background) existing.read.background = false;
+      return existing.pending;
+    }
+    // An open message cannot wait for siblings in a prefetch batch. Both
+    // requests are read-only and cache the same UIDVALIDITY-scoped body.
+    const read: BodyRead = { background, phase: 'cache' };
+    const pending = downloadBody(location, key, version, read).finally(() => {
+      if (bodyReads.get(identity)?.pending === pending) bodyReads.delete(identity);
+    });
+    bodyReads.set(identity, { read, pending });
     return pending;
   }
 
@@ -279,7 +290,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     } : null;
   }
 
-  async function downloadBody(location: ImapMessageLocation, key: BodyKey, version: number) {
+  async function downloadBody(location: ImapMessageLocation, key: BodyKey, version: number, read: BodyRead) {
     const [ownerId, accountId, mailbox, , uid] = key;
     const cached = await readCachedBody(key);
     if (cached?.html != null) return cached;
@@ -292,7 +303,8 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     }
     let body: RelayMessageBody;
     try {
-      const downloaded = await relay.body(location);
+      read.phase = 'queued';
+      const downloaded = await relay.body(location, read.background, (mode) => { read.phase = mode; });
       body = { text: downloaded.text.slice(0, BODY_CHARACTERS), html: downloaded.html ?? '' };
     } catch (cause) {
       if (cached) return cached;
@@ -469,15 +481,15 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
   }
 
   async function prefetch(ownerId: number, accountId: string, { mailbox, uidValidity, messages }: RelayWindow, version: number) {
-    for (const { uid } of messages.slice(0, PREFETCH_COUNT)) {
+    const recent = messages.slice(0, PREFETCH_COUNT);
+    for (let start = 0; start < recent.length; start += PREFETCH_CONCURRENCY) {
       if (version !== settingsVersion(ownerId)) break;
-      try {
-        await readBody(ownerId, { accountId, mailbox, uidValidity, uid });
-      } catch (cause) {
-        // Only a missing message is specific to this UID. Leave a failing
-        // account alone until its next refresh.
-        if (!(cause instanceof AttentionRelayError) || cause.code !== 'message_not_found') break;
-      }
+      const results = await Promise.allSettled(recent.slice(start, start + PREFETCH_CONCURRENCY)
+        .map(({ uid }) => readBody(ownerId, { accountId, mailbox, uidValidity, uid }, { background: true })));
+      // Only a missing message is specific to this UID. Leave a failing
+      // account alone until its next refresh.
+      if (results.some((result) => result.status === 'rejected'
+        && (!(result.reason instanceof AttentionRelayError) || result.reason.code !== 'message_not_found'))) break;
     }
   }
 
@@ -928,7 +940,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
         broadcaster.touch(TABLE_FAMILIES.MUTATIONS);
         notifyMutation(ownerId);
       }),
-    [DB_RPC.ATTENTION_BODY]: async ({ ownerId, location, cachedOnly = false }) => readBody(ownerId, location, cachedOnly),
+    [DB_RPC.ATTENTION_BODY]: async ({ ownerId, location, cachedOnly = false }) => readBody(ownerId, location, { cachedOnly }),
     [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]: async ({ ownerId, location, action, undoable = false, undoExpiresAt = undefined }) =>
       enqueueImapActions(ownerId, [{ location, action }], { undoable: undoable === true, undoExpiresAt }),
     [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS]: async ({ ownerId, requests, undoable = false, undoExpiresAt = undefined }) =>
@@ -946,7 +958,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
       if (!validImapAction(location, action)) {
         return terminalImapAction('invalidArguments', 'The pending IMAP change is invalid.');
       }
-      const key = JSON.stringify([ownerId, location.accountId, location.mailbox]);
+      const key = JSON.stringify([ownerId, location.accountId, location.mailbox, location.uidValidity, location.uid]);
       return serializeOperation(folderWrites, key, () => trackMailboxActivity(ownerId, location.accountId, true,
         () => applyImapAction(ownerId, location, action, mutationId)));
     },

@@ -30,6 +30,7 @@ function fakeRelay() {
     sends: [] as { url: string; draft: AttentionImapDraft }[] };
   const fetcher = vi.fn(async (url: string, init: RequestInit) => {
     if (!server.online) throw new TypeError('Offline');
+    if (url.endsWith('/batch')) return Response.json({ error: 'not_found' }, { status: 404 });
     if (url.endsWith('/session')) {
       if (init.method === 'POST') server.lastToken = JSON.parse(String(init.body)).accessToken;
       return new Response(null, { status: 204 });
@@ -93,6 +94,91 @@ const ownerId = 1;
 const workMessage = { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid: 12 };
 
 describe('Attention cache', () => {
+  it('opens a prefetched message without waiting for the rest of its batch', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const sibling = { ...workMessage, uid: 13 };
+    const fetcher = vi.fn<typeof fetch>(async (url, init) => {
+      const path = String(url);
+      if (path.endsWith('/session')) return new Response(null, { status: 204 });
+      if (path.endsWith('/accounts')) return Response.json({ accounts: [{ id: 'work', email: 'work@example.com', name: 'Work' }] });
+      if (path.includes('/messages?')) return Response.json({ mailbox: 'INBOX', uidValidity: '3', messages: [{ uid: 12 }, { uid: 13 }] });
+      if (path.endsWith('/batch')) {
+        const { requests } = JSON.parse(String(init?.body));
+        expect(requests.map(({ path: item }) => item)).toEqual([
+          '/accounts/work/messages/12?mailbox=INBOX&uidValidity=3', '/accounts/work/messages/13?mailbox=INBOX&uidValidity=3',
+        ]);
+        await held;
+        return Response.json({ responses: requests.map(() => ({ status: 200, body: { text: 'prefetched' } })) });
+      }
+      return Response.json({ text: 'opened', html: '<p>opened</p>' });
+    });
+    const handlers = makeAttentionHandlers(engine, { touch: vi.fn() }, fetcher);
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    let foreground: Promise<unknown> | undefined;
+    try {
+      await vi.waitFor(() => expect(fetcher.mock.calls.some(([url]) => String(url).endsWith('/batch'))).toBe(true));
+      const open = () => handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: workMessage });
+      let opened = false;
+      const reads = Promise.all([open(), open()]).then((bodies) => { opened = true; return bodies; });
+      foreground = reads;
+      await vi.waitFor(() => expect(opened).toBe(true));
+      const [first, second] = await reads;
+      expect(first).toEqual({ text: 'opened', html: '<p>opened</p>' });
+      expect(second).toEqual(first);
+      expect(fetcher.mock.calls.filter(([url]) => String(url).includes('/messages/12?'))).toHaveLength(1);
+      expect(await handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: sibling, cachedOnly: true })).toBeNull();
+      release();
+      await vi.waitFor(async () => expect(await handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: sibling, cachedOnly: true }))
+        .toMatchObject({ text: 'prefetched' }));
+      expect(await handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: workMessage, cachedOnly: true })).toEqual(first);
+    } finally {
+      release();
+      await foreground;
+    }
+  });
+
+  it('batches distinct Gmail writes in one folder and settles each confirmed row', async () => {
+    const messages = [12, 13].map((uid) => ({
+      uid, seen: false, flagged: false, gmailLabels: true, messageId: `<message-${uid}@example.com>`, subject: `Message ${uid}`,
+    }));
+    const writeRequests: Array<Array<{ method: string; path: string; body?: { flagged: boolean } }>> = [];
+    const fetcher = vi.fn<typeof fetch>(async (request, init) => {
+      const url = String(request);
+      if (url.endsWith('/session')) return new Response(null, { status: 204 });
+      if (url.endsWith('/accounts')) return Response.json({ accounts: [{ id: 'work', email: 'work@example.com', name: 'Work' }] });
+      if (url.includes('/messages?')) return Response.json({ mailbox: 'INBOX', uidValidity: '3', messages });
+      if (url.includes('/messages/') && init?.method !== 'PATCH') return Response.json({ text: 'Message body' });
+      if (!url.endsWith('/batch')) throw new Error(`Unexpected request ${url}`);
+      const { requests } = JSON.parse(String(init?.body)) as { requests: (typeof writeRequests)[number] };
+      if (requests[0].method === 'PATCH') writeRequests.push(requests);
+      return Response.json({ responses: requests.map(({ path, method, body }) => ({
+        status: 200, body: method === 'PATCH'
+          ? { uid: Number(path.match(/\/messages\/(\d+)/)?.[1]), seen: false, flagged: body?.flagged } : { text: 'Message body' },
+      })) });
+    });
+    const handlers = makeAttentionHandlers(engine, { touch: vi.fn() }, fetcher);
+    const allHandlers = { ...makeHandlers(engine), ...handlers };
+    const runner = new OutboxRunner({ accountId: ownerId, handlers: allHandlers,
+      processRow: (row) => processMutationRow({ account: { id: ownerId }, transport: null, handlers: allHandlers, row }) });
+    try {
+      await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+      await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS]({ ownerId,
+        requests: messages.map(({ uid }) => ({ location: { ...workMessage, uid }, action: { type: 'star', value: true } })),
+      });
+      await runner.drain();
+      expect(writeRequests).toHaveLength(1);
+      expect(writeRequests[0].map(({ path, body }) => [path, body])).toEqual(messages.map(({ uid }) => [
+        `/accounts/work/messages/${uid}?mailbox=INBOX&uidValidity=3`, { flagged: true },
+      ]));
+      expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts[0].messages)
+        .toMatchObject([{ uid: 12, flagged: true }, { uid: 13, flagged: true }]);
+      expect(await engine.get('SELECT 1 FROM pending_mutations')).toBeNull();
+    } finally {
+      await runner.stop();
+    }
+  });
+
   it('shares a foreground body with prefetch without holding up other accounts or cached reads', async () => {
     const { handlers, server, fetcher } = fakeRelay();
     let releaseWork!: () => void;

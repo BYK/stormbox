@@ -3,6 +3,20 @@ import { browserRelayAssertion, browserSessionEnabled } from '../../../services/
 import type { ParsedAddress } from '../../../utils/address-parse';
 
 const API_ROOT = '/api/imap/v1';
+const BATCH_LIMIT = 8;
+const BATCH_WAIT_MS = 8;
+
+type BatchLane = 'mailboxes' | 'bodies' | 'writes' | 'prefetch';
+type DispatchMode = 'batch' | 'direct';
+type BatchRequest = { method: 'GET' | 'PATCH' | 'POST'; path: string; body?: unknown };
+type BatchResponse = { status: number; body: unknown };
+type BatchItem = {
+  request: BatchRequest;
+  resolve: (body: unknown) => void;
+  reject: (error: unknown) => void;
+  onDispatch?: (mode: DispatchMode) => void;
+};
+type BatchQueue = { items: BatchItem[]; timer: ReturnType<typeof setTimeout> };
 
 export interface RelayAccount {
   id: string;
@@ -131,8 +145,15 @@ function messagePath(location: ImapMessageLocation, suffix = '') {
   return `/accounts/${encodeURIComponent(accountId)}/messages/${uid}${suffix}?${new URLSearchParams({ mailbox, uidValidity })}`;
 }
 
+function errorCode(payload: unknown): string | undefined {
+  if (payload && typeof payload === 'object' && 'error' in payload && typeof payload.error === 'string') return payload.error;
+  return undefined;
+}
+
 export class AttentionRelay {
   private browserPairing?: Promise<void>;
+  private readonly queues = new Map<string, BatchQueue>();
+  private batchUnavailable = false;
 
   constructor(private readonly fetcher: typeof globalThis.fetch) {}
 
@@ -203,22 +224,29 @@ export class AttentionRelay {
   }
 
   async folders(accountId: string): Promise<RelayFolder[]> {
-    const { mailboxes } = await this.json<{ mailboxes: RelayFolder[] }>(`/accounts/${encodeURIComponent(accountId)}/mailboxes`);
+    const { mailboxes } = await this.batchedJson<{ mailboxes: RelayFolder[] }>('mailboxes', accountId, {
+      method: 'GET', path: `/accounts/${encodeURIComponent(accountId)}/mailboxes`,
+    });
     if (!Array.isArray(mailboxes)) throw new Error('The mail relay did not return a folder list.');
     return mailboxes;
   }
 
   async folder(accountId: string, mailbox: string, limit = 50): Promise<RelayWindow> {
     const query = new URLSearchParams({ mailbox, limit: String(limit) });
-    const window = await this.json<RelayWindow>(`/accounts/${encodeURIComponent(accountId)}/messages?${query}`);
+    const window = await this.batchedJson<RelayWindow>('mailboxes', accountId, {
+      method: 'GET', path: `/accounts/${encodeURIComponent(accountId)}/messages?${query}`,
+    });
     if (window.complete === false && window.minUid === null) {
       throw new AttentionRelayError(503, 'incomplete_window', 'The folder changed during sync. Try refreshing again.');
     }
     return window;
   }
 
-  async body(location: ImapMessageLocation): Promise<RelayMessageBody> {
-    const body = await this.json<{ text: string; html?: string }>(messagePath(location));
+  async body(location: ImapMessageLocation, background = false, onDispatch?: (mode: DispatchMode) => void): Promise<RelayMessageBody> {
+    const lane = background ? 'prefetch' : 'bodies';
+    const body = await this.batchedJson<{ text: string; html?: string }>(lane, location.accountId, {
+      method: 'GET', path: messagePath(location),
+    }, onDispatch);
     return { text: body.text, html: body.html ?? '' };
   }
 
@@ -226,8 +254,9 @@ export class AttentionRelay {
     (Pick<RelayMessage, 'seen' | 'flagged' | 'keywords' | 'labels'> & { tagsApplied?: boolean }) | null
   > {
     if (action.type === 'trash' || action.type === 'archive' || action.type === 'junk') {
-      const response = await this.request(messagePath(location, `/${action.type}`), { method: 'POST' });
-      const result = await response.json();
+      const result = await this.batchedJson<{ status: string }>('writes', location.accountId, {
+        method: 'POST', path: messagePath(location, `/${action.type}`),
+      });
       if (result?.status !== 'moved' && result?.status !== 'absent') {
         throw new Error('The mail relay did not confirm that the message left the inbox.');
       }
@@ -236,12 +265,10 @@ export class AttentionRelay {
     const patch = action.type === 'tags' ? { tags: action.tags } : {
       [action.type === 'star' ? 'flagged' : 'seen']: action.value,
     };
-    const response = await this.request(messagePath(location), {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
+    const result = await this.batchedJson<Pick<RelayMessage, 'uid' | 'seen' | 'flagged' | 'keywords' | 'labels'>
+      & { tagsApplied?: boolean }>('writes', location.accountId, {
+      method: 'PATCH', path: messagePath(location), body: patch,
     });
-    const result = await response.json();
     if (result?.uid !== location.uid || typeof result.seen !== 'boolean' || typeof result.flagged !== 'boolean') {
       throw new Error('The mail relay did not return updated message flags.');
     }
@@ -266,7 +293,85 @@ export class AttentionRelay {
     return (await this.request(path)).json();
   }
 
-  private async request(path: string, init: RequestInit = {}, timeout = 30_000) {
+  private batchedJson<T>(lane: BatchLane, accountId: string, request: BatchRequest,
+    onDispatch?: (mode: DispatchMode) => void): Promise<T> {
+    if (this.batchUnavailable) {
+      onDispatch?.('direct');
+      return this.singleJson(request);
+    }
+    const key = `${lane}:${accountId}`;
+    return new Promise<unknown>((resolve, reject) => {
+      let queue = this.queues.get(key);
+      if (!queue) {
+        queue = { items: [], timer: setTimeout(() => this.flush(key, lane), BATCH_WAIT_MS) };
+        this.queues.set(key, queue);
+      }
+      queue.items.push({ request, resolve, reject, onDispatch });
+      if (queue.items.length === BATCH_LIMIT) this.flush(key, lane);
+    }) as Promise<T>;
+  }
+
+  private async singleJson<T>({ method, path, body }: BatchRequest): Promise<T> {
+    const init: RequestInit = method === 'GET' ? {} : { method };
+    if (body !== undefined) {
+      init.headers = { 'Content-Type': 'application/json' };
+      init.body = JSON.stringify(body);
+    }
+    return (await this.request(path, init)).json();
+  }
+
+  private flush(key: string, lane: BatchLane) {
+    const queue = this.queues.get(key);
+    if (!queue) return;
+    this.queues.delete(key);
+    clearTimeout(queue.timer);
+    void this.sendBatch(lane, queue.items).catch((error) => {
+      for (const item of queue.items) item.reject(error);
+    });
+  }
+
+  private async sendBatch(lane: BatchLane, items: BatchItem[]) {
+    const sendOne = ({ request, resolve, reject, onDispatch }: BatchItem) => {
+      onDispatch?.('direct');
+      void this.singleJson(request).then(resolve, reject);
+    };
+    if (items.length === 1 || this.batchUnavailable) {
+      items.forEach(sendOne);
+      return;
+    }
+    for (const { onDispatch } of items) onDispatch?.('batch');
+    const response = await this.rawRequest('/batch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requests: items.map(({ request }) => request) }),
+    });
+    if (!response.ok) {
+      const code = errorCode(await response.json().catch(() => null));
+      // Only an explicit response that the endpoint is absent guarantees
+      // no write was attempted. Transport failures can have committed.
+      if ((response.status === 404 && (code === undefined || code === 'not_found'))
+        || (response.status === 405 && (code === undefined || code === 'method_not_allowed'))) {
+        this.batchUnavailable = true;
+        items.forEach(sendOne);
+        return;
+      }
+      throw this.relayError(response.status, code);
+    }
+    const result = await response.json() as { responses?: BatchResponse[] } | null;
+    if (!Array.isArray(result?.responses) || result.responses.length !== items.length
+      || result.responses.some((item) => !item || !Number.isInteger(item.status) || item.status < 200
+        || item.status > 599 || !Object.hasOwn(item, 'body'))) {
+      throw new Error('The mail relay returned an invalid batch response.');
+    }
+    result.responses.forEach(({ status, body }, index) => {
+      const item = items[index];
+      const code = errorCode(body);
+      if (status >= 200 && status < 300) item.resolve(body);
+      else if ((lane === 'bodies' || lane === 'prefetch') && status === 413 && code === 'batch_body_limit') sendOne(item);
+      else item.reject(this.relayError(status, code));
+    });
+  }
+
+  private async rawRequest(path: string, init: RequestInit, timeout = 30_000) {
     const send = () => this.fetcher(`${API_ROOT}${path}`, {
       ...init,
       credentials: 'same-origin',
@@ -278,8 +383,16 @@ export class AttentionRelay {
       await this.pair();
       response = await send();
     }
+    return response;
+  }
+
+  private async request(path: string, init: RequestInit = {}, timeout = 30_000) {
+    const response = await this.rawRequest(path, init, timeout);
     if (response.ok) return response;
-    const { error: code } = await response.json().catch(() => ({})) ?? {};
+    throw this.relayError(response.status, errorCode(await response.json().catch(() => null)));
+  }
+
+  private relayError(status: number, code?: string) {
     const messages: Record<string, string> = {
       trash_not_configured: 'This account does not have an IMAP Trash folder.',
       archive_not_configured: 'This account does not have an IMAP Archive folder.',
@@ -317,11 +430,11 @@ export class AttentionRelay {
       submission_rejected: 'The sending server rejected the message.',
       submission_unknown: 'The relay could not confirm delivery. Check the account’s Sent folder before sending again.',
     };
-    const message = (Object.hasOwn(messages, code) ? messages[code] : undefined)
-      ?? (response.status === 401 ? 'Connect the mail relay to access IMAP mail.'
-        : response.status === 409 ? 'This mailbox changed. Refresh Attention and reopen the message.'
-          : response.status === 404 ? 'The mail relay is unavailable at this address.'
+    const message = (code && Object.hasOwn(messages, code) ? messages[code] : undefined)
+      ?? (status === 401 ? 'Connect the mail relay to access IMAP mail.'
+        : status === 409 ? 'This mailbox changed. Refresh Attention and reopen the message.'
+          : status === 404 ? 'The mail relay is unavailable at this address.'
             : 'The mail relay could not complete the request.');
-    throw new AttentionRelayError(response.status, typeof code === 'string' ? code : 'imap_relay_error', message);
+    return new AttentionRelayError(status, code ?? 'imap_relay_error', message);
   }
 }
