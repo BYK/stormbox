@@ -1083,7 +1083,7 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
             @delete="runActions(item.targets, { type: 'delete' })"
           >
             <template #after-row>
-              <ThreadExpandPill v-if="item.stack" class="imap-mail__thread-pill"
+              <ThreadExpandPill v-if="item.stack"
                 :count="item.targets.length" :expanded="expandedThreads.has(item.stack.key)"
                 @toggle="toggleThread(item.stack.key)" />
               <InlineMailReader v-if="readingInline && inlineAnchorKey === item.key" :id="inlineReaderId">
@@ -1157,8 +1157,6 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
   font: inherit; font-size: .8rem; cursor: pointer;
 }
 .imap-mail__more:hover { background: var(--rowHover); color: var(--text); }
-.imap-mail__thread-pill { --thread-pill-indent: 100px; }
-.msg-list--card .imap-mail__thread-pill { --thread-pill-indent: 88px; }
 .imap-mail__more { display: block; margin: 10px auto; padding: 6px 10px; }
 .imap-mail__more:disabled { cursor: default; opacity: .6; }
 .imap-mail__scroll { flex: 1; min-height: 0; overflow: auto; }
