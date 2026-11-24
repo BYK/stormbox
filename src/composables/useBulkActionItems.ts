@@ -71,8 +71,8 @@ export interface UseBulkActionItemsInput {
 
 /**
  * The bulk actions for a checkbox selection, in display order: "Not junk"
- * inside a Junk folder, archive, junk, delete, star, tag, mark read, mark
- * unread. Archive is not offered inside the Archive folder and Junk not
+ * inside a Junk folder, then tag, star, read/unread, archive, junk, and
+ * delete. Archive is not offered inside the Archive folder and Junk not
  * inside Junk. While any selected row is a pending scheduled send,
  * archive, junk, star and tag are dropped and the delete slot cancels the
  * selected sends instead (SL-5.6). Star is modal (MK-2.4): it unstars
@@ -98,6 +98,54 @@ export function useBulkActionItems(input: UseBulkActionItemsInput) {
         run: input.handlers.whitelist,
       });
     }
+    if (!scheduled) {
+      const starred = input.anyStarred.value;
+      items.push({
+        id: 'tag',
+        label: 'Tag…',
+        title: 'Tag',
+        ariaLabel: 'Tag selected messages',
+        icon: Tag,
+        variant: 'tag',
+        slots: 1,
+        overflowRank: 3,
+        run: input.handlers.tag,
+      });
+      items.push({
+        id: 'toggle-star',
+        label: starred ? 'Unstar' : 'Star',
+        title: starred ? 'Unstar' : 'Star',
+        ariaLabel: starred ? 'Unstar' : 'Star',
+        icon: Star,
+        variant: 'star',
+        pressed: starred,
+        slots: 1,
+        overflowRank: 4,
+        run: input.handlers.toggleStar,
+      });
+    }
+    items.push({
+      id: 'mark-read',
+      label: 'Mark as read',
+      title: 'Mark as read',
+      ariaLabel: 'Mark as read',
+      icon: MailOpen,
+      variant: 'default',
+      slots: 1,
+      overflowRank: 1,
+      run: input.handlers.markRead,
+    });
+    items.push({
+      id: 'mark-unread',
+      label: 'Mark as unread',
+      title: 'Mark as unread',
+      ariaLabel: 'Mark as unread',
+      icon: Mail,
+      variant: 'default',
+      slots: 1,
+      overflowRank: 0,
+      run: input.handlers.markUnread,
+    });
     if (!scheduled && role !== 'archive') {
       items.push({
         id: 'archive',
@@ -151,54 +199,6 @@ export function useBulkActionItems(input: UseBulkActionItemsInput) {
         run: input.handlers.delete,
       });
     }
-    if (!scheduled) {
-      const starred = input.anyStarred.value;
-      items.push({
-        id: 'toggle-star',
-        label: starred ? 'Unstar' : 'Star',
-        title: starred ? 'Unstar' : 'Star',
-        ariaLabel: starred ? 'Unstar' : 'Star',
-        icon: Star,
-        variant: 'star',
-        pressed: starred,
-        slots: 1,
-        overflowRank: 4,
-        run: input.handlers.toggleStar,
-      });
-      items.push({
-        id: 'tag',
-        label: 'Tag…',
-        title: 'Tag',
-        ariaLabel: 'Tag selected messages',
-        icon: Tag,
-        variant: 'tag',
-        slots: 1,
-        overflowRank: 3,
-        run: input.handlers.tag,
-      });
-    }
-    items.push({
-      id: 'mark-read',
-      label: 'Mark as read',
-      title: 'Mark as read',
-      ariaLabel: 'Mark as read',
-      icon: MailOpen,
-      variant: 'default',
-      slots: 1,
-      overflowRank: 1,
-      run: input.handlers.markRead,
-    });
-    items.push({
-      id: 'mark-unread',
-      label: 'Mark as unread',
-      title: 'Mark as unread',
-      ariaLabel: 'Mark as unread',
-      icon: Mail,
-      variant: 'default',
-      slots: 1,
-      overflowRank: 0,
-      run: input.handlers.markUnread,
-    });
     return items;
   });
 }

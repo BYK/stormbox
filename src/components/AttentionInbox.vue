@@ -498,6 +498,7 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
 }
 
 .attention-inbox__scroll {
+  container-type: size;
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;

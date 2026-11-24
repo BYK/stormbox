@@ -168,6 +168,8 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     folderByRole: async () => primaryInbox,
     listMessagesForView: async () => jmapRows,
     listMessagesForFolderThreads: listCachedThread,
+    getMessageBodyForDisplay: async (_accountId, id) => ({ text: `JMAP body ${id}`, html: '', attachments: [] }),
+    listMessageAddresses: async () => [],
     ensureFolderWindow: refreshJmap,
   });
   const pinia = createPinia();
@@ -193,7 +195,7 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     await headCheckbox.trigger('click');
     expect(wrapper.get('.msg-list__header').text()).toContain('3 selected');
     const pill = wrapper.get('.thread-expand__pill');
-    expect(pill.text()).toBe('Show 3 messages');
+    expect(pill.attributes('aria-label')).toBe('Show 3 messages');
     expect(pill.element.closest('.msg-list__item')).toBeNull();
     await pill.trigger('click');
     expect(wrapper.findAll('.imap-mail__rows > li')).toHaveLength(4);
@@ -206,7 +208,7 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     await wrapper.get('input[aria-label^="Select message: Planning"]').trigger('click');
     expect(headCheckbox.element.indeterminate).toBe(true);
     expect(wrapper.get('.msg-list__header').text()).toContain('2 selected');
-    expect(pill.text()).toBe('Hide 3 messages');
+    expect(pill.attributes('aria-label')).toBe('Hide 3 messages');
     await pill.trigger('click');
     expect(wrapper.get('.msg-list__header').text()).toContain('2 selected');
     await wrapper.get('button[aria-label="Clear selection"]').trigger('click');
@@ -225,6 +227,8 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     await flushPromises();
     expect(body).toHaveBeenCalledWith(1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 41 }, true);
     expect(thread.text()).toContain('Saved IMAP message body.');
+    expect(thread.text()).toContain('JMAP body 42');
+    expect(thread.findAll('.conversation-reader__summary[aria-expanded="true"]')).toHaveLength(2);
 
     jmapRows = cachedThread = [older];
     notify([TABLE_FAMILIES.MESSAGES]);

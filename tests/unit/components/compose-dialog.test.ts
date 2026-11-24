@@ -989,7 +989,7 @@ describe('ComposeDialog send control', () => {
     await composeStore.attach();
     await flushPromises();
     const sessionId = composeStore.open({ to: [{ email: 'recipient@example.com' }] });
-    const wrapper = mount(ComposeManager, { attachTo: document.body, global: { stubs: { teleport: true } } });
+    const wrapper = mount(ComposeManager, { attachTo: document.body });
     mountedWrappers.push(wrapper);
     await nextTick();
     // A draft save is on the wire when Send is pressed.

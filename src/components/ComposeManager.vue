@@ -152,11 +152,14 @@ function dockStatus(session: ComposeSession): string | null {
 </script>
 
 <template>
-  <ComposeDialog
+  <Teleport
     v-for="session in composeStore.sessions"
     :key="session.id"
-    :session-id="session.id"
-  />
+    :to="session.inlineTarget ?? undefined"
+    :disabled="!session.inlineTarget"
+  >
+    <ComposeDialog :session-id="session.id" />
+  </Teleport>
 
   <div
     v-if="minimizedSessions.length"

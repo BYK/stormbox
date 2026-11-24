@@ -1161,6 +1161,7 @@ defineExpose({ focusColumnControl, focusFolderPicker, inlineReaderTarget });
 }
 
 .msg-list__scroller {
+  container-type: size;
   position: relative;
   overflow-y: auto;
   overflow-x: hidden;

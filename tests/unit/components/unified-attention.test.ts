@@ -411,7 +411,7 @@ it('keeps the shared reader mounted while loading IMAP HTML and sends its toolba
     }, expect.objectContaining({ addresses: expect.arrayContaining([
       expect.objectContaining({ kind: 'replyTo', email: 'replies@example.org' }),
       expect.objectContaining({ kind: 'cc', email: 'subscriber@example.net' }),
-    ]) }), expect.objectContaining({ html: expect.stringContaining('Formatted newsletter') }));
+    ]) }), expect.objectContaining({ html: expect.stringContaining('Formatted newsletter') }), undefined);
     await reader.get('[aria-label="Forward"]').trigger('click');
     expect(prepare.mock.lastCall?.[0]).toBe('forward');
 
@@ -547,9 +547,10 @@ it('batches a conversation action and advances the stacked reader after deleting
 
     await summaries[0].trigger('click');
     await flushPromises();
-    const individual = stack.get('[aria-expanded="true"]');
-    expect(individual.text()).toContain('Original sender');
-    await stack.get('[aria-label="Delete"]').trigger('click');
+    expect(summaries.map((button) => button.attributes('aria-expanded'))).toEqual(['true', 'true']);
+    const originalPanel = stack.get(`[id="${summaries[0].attributes('aria-controls')}"]`);
+    expect(originalPanel.text()).toContain('Body of message 17');
+    await originalPanel.get('[aria-label="Delete"]').trigger('click');
     await flushPromises();
     expect(mutateAttentionImapMessage).toHaveBeenCalledExactlyOnceWith(
       1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid: 17 }, { type: 'trash' }, true,
@@ -601,6 +602,8 @@ it('keeps native conversation selection within the remaining messages and closes
     folderByRole: async () => folder,
     listMessagesForView: async () => rows.slice(1),
     listMessagesForFolderThreads,
+    getMessageBodyForDisplay: async (_accountId, id) => ({ text: `Body of native message ${id}`, html: '', attachments: [] }),
+    listMessageAddresses: async () => [],
     ensureFolderWindow: async () => {},
   });
   auth.accountId = 1;

@@ -7,7 +7,7 @@
 <style scoped>
 .mail-inline-reader {
   box-sizing: border-box;
-  height: var(--inline-reader-height, clamp(20rem, 60dvh, 36rem));
+  height: var(--inline-reader-height, 65cqh);
   min-width: 0;
   overflow: hidden;
   background: var(--panel);

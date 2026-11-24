@@ -180,7 +180,8 @@ export function useThunderbirdShortcuts({
     if (event.defaultPrevented) return;
     if (isComposingKeyEvent(event)) return;
     if (!enabled.value) return;
-    if (composeStore.isExpanded) {
+    const inlineComposer = composeStore.activeSession?.inlineTarget;
+    if (composeStore.isExpanded && (!inlineComposer || inlineComposer.contains(document.activeElement))) {
       if (event.key === 'Escape') {
         if (composeStore.activeSession?.closePromptOpen) {
           event.preventDefault();

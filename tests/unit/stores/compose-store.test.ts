@@ -297,6 +297,28 @@ describe('compose-store reply and forward prefills', () => {
     expect(composeStore.draft.textBody).not.toContain('From Alice');
   });
 
+  it('keeps the latest inline reply when an earlier quoted body finishes later', async () => {
+    const { composeStore } = await storeWithParentAddresses();
+    const firstTarget = document.createElement('div');
+    const secondTarget = document.createElement('div');
+    document.body.append(firstTarget, secondTarget);
+    let finishQuote!: (body: { text: string }) => void;
+    const pendingQuote = new Promise<{ text: string }>((resolve) => { finishQuote = resolve; });
+    try {
+      const first = composeStore.prepareReplyFromMessage(sourceMessage({ id: 1 }), pendingQuote, firstTarget);
+      await composeStore.prepareReplyAll(sourceMessage({ id: 2 }), { text: 'Second body' }, secondTarget);
+      finishQuote({ text: 'First body' });
+      await first;
+      expect(composeStore.sessions).toHaveLength(1);
+      expect(composeStore.activeSession?.inlineTarget).toBe(secondTarget);
+      expect(composeStore.draft.textBody).toContain('Second body');
+    } finally {
+      firstTarget.remove();
+      secondTarget.remove();
+      composeStore.$reset();
+    }
+  });
+
   it('prepares a forward without recipients and with a forwarded subject', async () => {
     const { composeStore } = await storeWithParentAddresses();
 

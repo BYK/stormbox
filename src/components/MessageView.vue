@@ -2,6 +2,7 @@
 import {
   computed,
   nextTick,
+  onBeforeUnmount,
   onMounted,
   onUnmounted,
   ref,
@@ -32,6 +33,8 @@ import { useComposeStore } from '../stores/compose-store';
 import { useMailStore } from '../stores/mail-store';
 import { useSettingsStore } from '../stores/settings-store';
 import type { ImapAttentionAction, RelayMessageBody } from '../sync/backends/imap/attention-relay';
+import type { MessageBody, MessageRow } from '../types/db';
+import type { MessageAddress } from '../utils/reply';
 import {
   ALLOWED_URI_REGEXP,
   BODY_THEME_COLORS,
@@ -58,6 +61,7 @@ import junkIcon from '../assets/icons/tb-folder-spam.svg?raw';
 import forwardIcon from '../assets/icons/tb-forward.svg?raw';
 import replyIcon from '../assets/icons/tb-reply.svg?raw';
 import replyAllIcon from '../assets/icons/tb-reply-all.svg?raw';
+import AppButton from './AppButton.vue';
 import AppIconButton from './AppIconButton.vue';
 import MaximizeButton from './MaximizeButton.vue';
 import MessageAttachmentBar from './MessageAttachmentBar.vue';
@@ -78,6 +82,8 @@ const props = withDefaults(defineProps<{
   maximized?: boolean;
   showBack?: boolean;
   backLabel?: string;
+  inConversation?: boolean;
+  jmap?: { row: MessageRow; folderId: number; body: MessageBody | null; addresses: MessageAddress[]; error?: string };
   imap?: {
     id: string;
     subject: string;
@@ -105,7 +111,7 @@ const emit = defineEmits<{
   toggleMaximized: [];
   back: [];
   imapAction: [action: ImapAttentionAction];
-  imapCompose: [kind: 'reply' | 'reply-all' | 'forward'];
+  imapCompose: [kind: 'reply' | 'reply-all' | 'forward', inlineTarget?: HTMLElement];
 }>();
 const messageViewEl = ref<HTMLElement | null>(null);
 const { height: messageViewHeight } = useElementSize(messageViewEl, undefined, { box: 'border-box' });
@@ -117,7 +123,7 @@ const { height: scheduledBannerHeight } = useElementSize(scheduledBannerEl, unde
 const { height: attachmentBarHeight } = useElementSize(attachmentBarEl, undefined, { box: 'border-box' });
 const bodyScrollEl = ref<HTMLElement | null>(null);
 watch(() => props.maximized, async (maximized) => {
-  if (!maximized) return;
+  if (!maximized || props.inConversation) return;
   await nextTick();
   if (!messageViewEl.value?.contains(document.activeElement)) {
     messageViewEl.value?.focus({ preventScroll: true });
@@ -145,6 +151,9 @@ async function toggleMaximized() {
   const change = ++sizeChange;
   emit('toggleMaximized');
   await nextTick();
+  if (props.inConversation && props.maximized && !messageViewEl.value?.contains(document.activeElement)) {
+    messageViewEl.value?.focus({ preventScroll: true });
+  }
   fitIframe?.();
   await nextTick();
   window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
@@ -164,15 +173,17 @@ const authStore = useAuthStore();
 const composeStore = useComposeStore();
 const settingsStore = useSettingsStore();
 const shortcutScheme = computed(() => settingsStore.get('shortcutScheme'));
-const hasReaderShortcuts = computed(() => props.backLabel != null || props.imap != null);
+const hasReaderShortcuts = computed(() => props.backLabel != null || props.imap != null || props.inConversation);
 /** Toolbar title with the key the active scheme binds, e.g. `Reply (R)`. */
 function actionTitle(label: string, action: ShortcutAction): string {
   return props.maximized && !hasReaderShortcuts.value ? label : titleWithShortcut(label, action, shortcutScheme.value);
 }
 
 function onReadingKeyDown(event: KeyboardEvent) {
+  const inlineComposer = composeStore.activeSession?.inlineTarget;
   if (event.defaultPrevented || isComposingKeyEvent(event) || isEditableTarget(event.target)
-    || composeStore.isExpanded || tagMenuAnchor.value
+    || (composeStore.isExpanded && (!inlineComposer || inlineComposer.contains(document.activeElement)))
+    || tagMenuAnchor.value
     || messageViewEl.value?.querySelector('[role="dialog"], details[open]')) return;
   if (props.maximized && event.key === 'Escape') {
     event.preventDefault();
@@ -216,7 +227,7 @@ const iframeBackground = computed(() => {
 const isImap = computed(() => props.imap != null);
 const imapBody = computed(() => props.imap?.body);
 const body = computed(() => {
-  if (!isImap.value) return mailStore.messageBody;
+  if (!isImap.value) return props.jmap ? props.jmap.body : mailStore.messageBody;
   const source = imapBody.value;
   return source ? { text: source.text, html: source.html ?? '', attachments: [] } : null;
 });
@@ -243,9 +254,9 @@ const textHtml = computed(() => {
 });
 // The open message is resolved by the store from the folder it was
 // opened in, so a message read from any list column shows here.
-const message = computed(() => props.imap ? null : mailStore.openMessage ?? null);
+const message = computed(() => props.imap ? null : props.jmap?.row ?? mailStore.openMessage ?? null);
 const viewMessage = computed(() => props.imap ?? message.value);
-const selectedMessageId = computed(() => props.imap ? null : mailStore.selectedMessageId);
+const selectedMessageId = computed(() => props.imap ? null : props.jmap?.row.id ?? mailStore.selectedMessageId);
 const viewMessageId = computed(() => props.imap?.id ?? selectedMessageId.value);
 const compactHeader = useMediaQuery('(max-width: 639px)');
 const headerExpanded = ref(false);
@@ -272,7 +283,8 @@ function toggleHeaderDetails() {
   if (metadataEl.value) metadataEl.value.scrollTop = 0;
 }
 /** Folder the open message was opened from; folder-specific actions act on it. */
-const messageSource = computed(() => ({ sourceFolderId: mailStore.openMessageFolderId }));
+const messageSource = computed(() => ({ sourceFolderId: props.jmap?.folderId ?? mailStore.openMessageFolderId }));
+const messageFolder = computed(() => props.jmap ? mailStore.folderById(props.jmap.folderId) : mailStore.openMessageFolder);
 const messageAccountId = computed(() => message.value?.account_id ?? null);
 
 // Tags on the open message (MK-6.5): the tag stack in the toolbar opens
@@ -298,7 +310,7 @@ const pickerDefinitions = computed(() => props.imap?.gmailLabels
   ? tagDefinitions.value.filter((definition) => keywordTags.value.some(({ keyword }) => keyword === definition.keyword))
   : tagDefinitions.value);
 const actionsDisabled = computed(() => props.imap?.disabled ?? false);
-const canRespond = computed(() => !props.imap || (props.imap.canSend && bodyLoaded.value && !props.imap.bodyError));
+const canRespond = computed(() => !props.imap || (props.imap.canSend && bodyLoaded.value));
 const canDelete = computed(() => props.imap?.canTrash !== false);
 
 // The toolbar's tag stack opens the menu as a popover: the header sits in
@@ -384,7 +396,7 @@ watch([attachmentRows, messageViewEl], () => {
  */
 function addressText(kind: 'cc' | 'bcc') {
   return formatAddressList(
-    mailStore.selectedMessageAddresses
+    (props.jmap?.addresses ?? mailStore.selectedMessageAddresses)
       .filter((row) => row.kind === kind && row.email)
       .sort((a, b) => a.position - b.position)
       .map((row) => ({ ...(row.name ? { name: row.name } : {}), email: row.email })),
@@ -504,7 +516,7 @@ watch(viewMessageId, () => {
 
 let openingDraftId: number | null = null;
 watch([message, body], ([selected, selectedBody]) => {
-  if (!selected || Number(selected.is_draft) !== 1 || !selectedBody) return;
+  if (props.inConversation || !selected || Number(selected.is_draft) !== 1 || !selectedBody) return;
   if (openingDraftId === selected.id) return;
   openingDraftId = selected.id;
   void composeStore.prepareDraftFromMessage(selected, selectedBody).then((sessionId) => {
@@ -622,7 +634,7 @@ function onIframeLoad() {
 
   const onIframeKeyDown = (event: KeyboardEvent) => {
     onReadingKeyDown(event);
-    if (!props.imap) invokeThunderbirdShortcut(event);
+    if (!props.imap && !props.inConversation) invokeThunderbirdShortcut(event);
   };
   doc.addEventListener('keydown', onIframeKeyDown, true);
 
@@ -778,30 +790,60 @@ function printOpenMessage() {
 // images as data: URLs in the quote so the compose send pipeline
 // re-uploads them as fresh cid attachments on the new message; otherwise
 // the quoted image is a dangling cid: reference.
-async function quoteBody() {
+function quoteBody() {
   const b = body.value;
   if (!b?.html) return b ?? {};
-  const { urls: cidUrls } = await resolveCidImageUrls(b);
-  if (cidUrls.size === 0) return b;
-  return { ...b, html: sanitizeMessageHtml(b.html, cidUrls) };
+  const resolution = resolveCidImageUrls(b);
+  if (!(resolution instanceof Promise)) return b;
+  return resolution.then(({ urls }) => urls.size ? { ...b, html: sanitizeMessageHtml(b.html, urls) } : b);
 }
 
 async function reply() {
   if (props.imap) return emit('imapCompose', 'reply');
   if (!message.value) return;
-  await composeStore.prepareReplyFromMessage(message.value, await quoteBody());
+  await composeStore.prepareReplyFromMessage(message.value, quoteBody());
 }
 
 async function replyAll() {
   if (props.imap) return emit('imapCompose', 'reply-all');
   if (!message.value) return;
-  await composeStore.prepareReplyAll(message.value, await quoteBody());
+  await composeStore.prepareReplyAll(message.value, quoteBody());
+}
+
+const inlineReplyTarget = ref<HTMLElement | null>(null);
+const quickReplyTrigger = ref<HTMLElement | null>(null);
+const inlineReplyOpen = computed(() => {
+  const target = inlineReplyTarget.value;
+  return target !== null && composeStore.activeSession?.inlineTarget === target;
+});
+watch(inlineReplyTarget, (target, previous) => {
+  if (previous && previous !== target) composeStore.detachInlineReply(previous);
+});
+watch(inlineReplyOpen, async (open) => {
+  if (open || !inlineReplyTarget.value?.contains(document.activeElement)) return;
+  await nextTick();
+  if (!composeStore.isExpanded) quickReplyTrigger.value?.focus({ preventScroll: true });
+}, { flush: 'sync' });
+onBeforeUnmount(() => {
+  if (inlineReplyTarget.value) composeStore.detachInlineReply(inlineReplyTarget.value);
+});
+
+async function quickReply(kind: 'reply' | 'reply-all', event: MouseEvent) {
+  const target = inlineReplyTarget.value;
+  if (!target?.isConnected || inlineReplyOpen.value) return;
+  quickReplyTrigger.value = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+  if (props.imap) return emit('imapCompose', kind, target);
+  const row = message.value;
+  if (!row) return;
+  const quote = quoteBody();
+  if (kind === 'reply') await composeStore.prepareReplyFromMessage(row, quote, target);
+  else await composeStore.prepareReplyAll(row, quote, target);
 }
 
 async function forward() {
   if (props.imap) return emit('imapCompose', 'forward');
   if (!message.value) return;
-  composeStore.prepareForward(message.value, await quoteBody());
+  await composeStore.prepareForward(message.value, quoteBody());
 }
 
 async function archive() {
@@ -829,12 +871,12 @@ async function toggleSeen() {
 // Whitelisting only makes sense for messages currently in the Junk
 // folder; the toolbar button is gated on this. Archiving from Archive
 // is a no-op, so that button is gated the same way.
-const isInJunkFolder = computed(() => mailStore.openMessageFolder?.role === 'junk');
-const isInArchiveFolder = computed(() => mailStore.openMessageFolder?.role === 'archive');
+const isInJunkFolder = computed(() => messageFolder.value?.role === 'junk');
+const isInArchiveFolder = computed(() => messageFolder.value?.role === 'archive');
 const canArchive = computed(() => props.imap ? props.imap.canArchive !== false : !isInArchiveFolder.value);
 const canJunk = computed(() => props.imap ? props.imap.canJunk !== false : !isInJunkFolder.value);
 const canWhitelistInJunk = computed(() => {
-  const current = mailStore.openMessageFolder;
+  const current = messageFolder.value;
   return current?.role === 'junk'
     && mailStore.primaryFolders.some((folder) => folder.id === current.id);
 });
@@ -963,6 +1005,7 @@ function closeMessageView() {
   <section
     ref="messageViewEl"
     class="message-view"
+    :class="{ 'message-view--conversation': inConversation }"
     :style="{
       '--message-view-height': messageViewHeight > 0 ? `${messageViewHeight}px` : undefined,
       '--message-toolbar-height': `${toolbarHeight}px`,
@@ -1005,11 +1048,20 @@ function closeMessageView() {
              only Back and the view-mode toggle, and the banner below
              owns Cancel Send. -->
         <template v-if="!isPendingScheduled">
-          <AppIconButton v-if="canArchive" class="message-view__action" :disabled="actionsDisabled" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
-            <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="archiveIcon" />
-          </AppIconButton>
-          <AppIconButton v-if="canJunk" class="message-view__action" :disabled="actionsDisabled" @click="junk" title="Junk" aria-label="Mark as junk">
-            <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="junkIcon" />
+          <!-- The message's tag stack (MK-6.5); opens the tag menu. -->
+          <AppIconButton
+            v-if="canTagMessage"
+            ref="tagMenuButton"
+            class="message-view__action message-view__action--tags"
+            :title="actionTitle(tagStackLabel, 'openTagMenu')"
+            :aria-label="tagStackLabel"
+            aria-haspopup="dialog"
+            :aria-expanded="tagMenuAnchor !== null"
+            :disabled="actionsDisabled && tagMenuAnchor === null"
+            data-tag-picker-trigger
+            @click="toggleTagMenu"
+          >
+            <MessageTagStack :tags="messageTags" />
           </AppIconButton>
           <AppIconButton
             class="message-view__action"
@@ -1030,6 +1082,12 @@ function closeMessageView() {
           >
             <component :is="seen ? Mail : MailOpen" :size="17" :stroke-width="1.75" />
           </AppIconButton>
+          <AppIconButton v-if="canArchive" class="message-view__action" :disabled="actionsDisabled" @click="archive" :title="actionTitle('Archive', 'archive')" aria-label="Archive">
+            <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="archiveIcon" />
+          </AppIconButton>
+          <AppIconButton v-if="canJunk" class="message-view__action" :disabled="actionsDisabled" @click="junk" title="Junk" aria-label="Mark as junk">
+            <span class="message-view__toolbar-icon message-view__toolbar-icon--folder" aria-hidden="true" v-html="junkIcon" />
+          </AppIconButton>
           <AppIconButton v-if="canDelete" class="message-view__action" danger :disabled="actionsDisabled" @click="destroy" :title="actionTitle('Delete', 'delete')" aria-label="Delete">
             <Trash2 class="message-view__toolbar-icon" :size="18" :stroke-width="1.65" />
           </AppIconButton>
@@ -1041,21 +1099,6 @@ function closeMessageView() {
           </AppIconButton>
           <AppIconButton class="message-view__action" :disabled="!canRespond" @click="forward" :title="actionTitle('Forward', 'forward')" aria-label="Forward">
             <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="forwardIcon" />
-          </AppIconButton>
-          <!-- The message's tag stack (MK-6.5); opens the tag menu. -->
-          <AppIconButton
-            v-if="canTagMessage"
-            ref="tagMenuButton"
-            class="message-view__action message-view__action--tags"
-            :title="actionTitle(tagStackLabel, 'openTagMenu')"
-            :aria-label="tagStackLabel"
-            aria-haspopup="dialog"
-            :aria-expanded="tagMenuAnchor !== null"
-            :disabled="actionsDisabled && tagMenuAnchor === null"
-            data-tag-picker-trigger
-            @click="toggleTagMenu"
-          >
-            <MessageTagStack :tags="messageTags" />
           </AppIconButton>
         </template>
         <TagPickerPopover
@@ -1198,6 +1241,7 @@ function closeMessageView() {
         </div>
         <div v-else-if="textHtml" class="message-view__text" v-html="textHtml" />
         <p v-else-if="imap?.bodyError" class="message-view__placeholder" role="alert">{{ imap.bodyError }}</p>
+        <p v-else-if="jmap?.error" class="message-view__placeholder" role="alert">{{ jmap.error }}</p>
         <p v-else-if="!bodyLoaded" class="message-view__placeholder">
           {{ authStore.isOfflineSession && message?.body_fetched_at == null
             ? 'Reconnect to download this message.'
@@ -1208,6 +1252,20 @@ function closeMessageView() {
           :rows="attachmentRows"
           @preview="previewAttachment"
         />
+        <div v-if="canRespond && bodyLoaded && !isPendingScheduled && !message?.is_draft"
+          :key="viewMessageId" class="message-view__quick-reply">
+          <div v-show="!inlineReplyOpen" class="message-view__quick-reply-actions">
+            <AppButton variant="outline" aria-label="Quick reply" @click="quickReply('reply', $event)">
+              <template #iconLeft><span class="message-view__toolbar-icon" aria-hidden="true" v-html="replyIcon" /></template>
+              Reply
+            </AppButton>
+            <AppButton variant="outline" aria-label="Quick reply all" @click="quickReply('reply-all', $event)">
+              <template #iconLeft><span class="message-view__toolbar-icon" aria-hidden="true" v-html="replyAllIcon" /></template>
+              Reply all
+            </AppButton>
+          </div>
+          <div ref="inlineReplyTarget" />
+        </div>
       </div>
       <MessageAttachmentBar
         :context-key="selectedMessageId"
@@ -1245,6 +1303,10 @@ function closeMessageView() {
   --message-toolbar-edge-inset: 12px;
   --message-header-label-width: 56px;
 }
+.message-view--conversation { height: auto; }
+.message-view--conversation .message-view__body { overflow: clip; }
+.message-view__quick-reply { margin: 12px var(--message-content-trailing-inset) 14px var(--message-content-inset); }
+.message-view__quick-reply-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .message-view__empty {
   display: grid;
   flex: 1 1 auto;

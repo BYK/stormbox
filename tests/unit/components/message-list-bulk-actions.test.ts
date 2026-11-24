@@ -289,13 +289,13 @@ describe('MessageList bulk actions header', () => {
 
     const actions = wrapper.findAll('.msg-list__bulk-actions .msg-list__bulk-action');
     expect(actions.map((button) => button.attributes('title'))).toEqual([
+      'Tag',
+      'Star',
+      'Mark as read',
+      'Mark as unread',
       'Archive',
       'Junk',
       'Delete',
-      'Star',
-      'Tag',
-      'Mark as read',
-      'Mark as unread',
       'Clear selection',
     ]);
     expect(wrapper.find('.msg-list__count').text()).toBe('2 selected');
@@ -312,12 +312,12 @@ describe('MessageList bulk actions header', () => {
     const actions = wrapper.findAll('.msg-list__bulk-actions .msg-list__bulk-action');
     expect(actions.map((button) => button.attributes('title'))).toEqual([
       'Whitelist senders and move to Inbox',
-      'Archive',
-      'Delete',
-      'Star',
       'Tag',
+      'Star',
       'Mark as read',
       'Mark as unread',
+      'Archive',
+      'Delete',
       'Clear selection',
     ]);
     wrapper.unmount();
@@ -333,7 +333,7 @@ describe('MessageList bulk actions header', () => {
     const titles = wrapper
       .findAll('.msg-list__bulk-actions .msg-list__bulk-action')
       .map((button) => button.attributes('title'));
-    expect(titles).toEqual(['Junk', 'Delete', 'Star', 'Tag', 'Mark as read', 'Mark as unread', 'Clear selection']);
+    expect(titles).toEqual(['Tag', 'Star', 'Mark as read', 'Mark as unread', 'Junk', 'Delete', 'Clear selection']);
     wrapper.unmount();
   });
 
@@ -372,9 +372,9 @@ describe('MessageList bulk actions header', () => {
 
     const actions = wrapper.findAll('.msg-list__bulk-actions .msg-list__bulk-action');
     expect(actions.map((button) => button.attributes('title'))).toEqual([
-      'Cancel send',
       'Mark as read',
       'Mark as unread',
+      'Cancel send',
       'Clear selection',
     ]);
 
@@ -401,13 +401,13 @@ describe('MessageList bulk actions header', () => {
 
     const actions = wrapper.findAll('.msg-list__bulk-actions .msg-list__bulk-action');
     expect(actions.map((button) => button.attributes('title'))).toEqual([
+      'Tag',
+      'Star',
+      'Mark as read',
+      'Mark as unread',
       'Archive',
       'Junk',
       'Delete',
-      'Star',
-      'Tag',
-      'Mark as read',
-      'Mark as unread',
       'Clear selection',
     ]);
 

@@ -6,7 +6,7 @@ import { nextTick } from 'vue';
 import ConversationReader, { type ConversationReaderMessage } from '../../../src/components/ConversationReader.vue';
 
 describe('ConversationReader', () => {
-  it('opens conversations in chronological order and keeps the reader mounted when switching messages', async () => {
+  it('keeps multiple readers open in chronological order and collapses them independently', async () => {
     const earlier = { key: 'imap:"First folder":4', sender: 'Ada', preview: 'Earlier reply', timestamp: 1_700_000_000_000, unread: true };
     const later = { key: 'jmap:9', sender: 'Grace', preview: 'Most recent reply', timestamp: 1_700_080_000_000 };
     const messages: ConversationReaderMessage[] = [later, earlier];
@@ -38,14 +38,16 @@ describe('ConversationReader', () => {
 
       first.element.focus();
       await first.trigger('click');
-      expect(wrapper.emitted('select')).toEqual([[earlier.key]]);
-      await wrapper.setProps({ activeKey: earlier.key });
+      expect(first.attributes('aria-expanded')).toBe('true');
+      expect(second.attributes('aria-expanded')).toBe('true');
+      expect(firstPanel?.querySelector('[data-test="message-detail"]')).toBeTruthy();
+      expect(secondPanel?.contains(reader)).toBe(true);
+      expect(document.activeElement).toBe(first.element);
 
+      await second.trigger('click');
+      expect(secondPanel?.contains(reader)).toBe(false);
       expect(first.attributes('aria-expanded')).toBe('true');
       expect(second.attributes('aria-expanded')).toBe('false');
-      expect(firstPanel?.contains(reader)).toBe(true);
-      expect(wrapper.get('[data-test="message-detail"]').element).toBe(reader);
-      expect(document.activeElement).toBe(first.element);
 
       await wrapper.get('button[aria-label="Back to inbox"]').trigger('click');
       expect(wrapper.emitted('back')).toEqual([[]]);
@@ -55,7 +57,7 @@ describe('ConversationReader', () => {
     }
   });
 
-  it('preserves the reader when switching or removing the active message in a detached mount', async () => {
+  it('prunes removed readers and opens the new initial message in a detached mount', async () => {
     const earlier = { key: 'old', sender: 'Ada', timestamp: 1_700_000_000_000 };
     const later = { key: 'new', sender: 'Grace', timestamp: 1_700_080_000_000 };
     const wrapper = mount(ConversationReader, {
@@ -66,19 +68,19 @@ describe('ConversationReader', () => {
     try {
       await nextTick();
       const reader = wrapper.get('[data-test="message-detail"]').element;
-      const activeReader = () => wrapper.get('.conversation-reader__message--active [data-test="message-detail"]').element;
+      const activeReader = () => wrapper.get('.conversation-reader__message--expanded [data-test="message-detail"]').element;
       expect(wrapper.element.isConnected).toBe(false);
       expect(activeReader()).toBe(reader);
 
       await wrapper.setProps({ messages: [earlier], activeKey: earlier.key });
-      expect(activeReader()).toBe(reader);
+      expect(activeReader()).not.toBe(reader);
 
       await wrapper.setProps({ messages: [] });
       expect(wrapper.find('.conversation-reader__message').exists()).toBe(false);
-      expect(reader.parentElement?.hidden).toBe(true);
+      expect(wrapper.element.contains(reader)).toBe(false);
 
       await wrapper.setProps({ messages: [later], activeKey: later.key });
-      expect(activeReader()).toBe(reader);
+      expect(activeReader()).not.toBe(reader);
     } finally {
       wrapper.unmount();
     }

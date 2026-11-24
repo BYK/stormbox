@@ -76,7 +76,7 @@ describe('AttentionInbox', () => {
     await head.trigger('click');
     const expand = wrapper.get('.thread-expand__pill');
     const members = wrapper.get('[aria-label="Messages in bundle"]');
-    expect(expand.text()).toBe('Show 2 messages');
+    expect(expand.attributes('aria-label')).toBe('Show 2 messages');
     expect(expand.find('.lucide-chevron-down').exists()).toBe(true);
     expect(head.element.closest('.msg-list__item')?.nextElementSibling).toBe(expand.element.parentElement);
     expect(expand.element.parentElement?.nextElementSibling).toBe(members.element);
@@ -84,7 +84,7 @@ describe('AttentionInbox', () => {
     expect(members.isVisible()).toBe(false);
     await expand.trigger('click');
     expect(expand.attributes('aria-expanded')).toBe('true');
-    expect(expand.text()).toBe('Hide 2 messages');
+    expect(expand.attributes('aria-label')).toBe('Hide 2 messages');
     expect(expand.find('.lucide-chevron-up').exists()).toBe(true);
     expect(members.isVisible()).toBe(true);
     const child = members.findAll('[aria-label^="Open message"]')[1];

@@ -7,6 +7,7 @@ import AttentionActionMenu from './AttentionActionMenu.vue';
 import AttentionInbox from './AttentionInbox.vue';
 import AttentionRowMenu from './AttentionRowMenu.vue';
 import ConversationReader from './ConversationReader.vue';
+import ConversationMessage, { type ConversationMessageSource } from './ConversationMessage.vue';
 import ImapAccountsDialog from './ImapAccountsDialog.vue';
 import MessageView from './MessageView.vue';
 import { imapEntry, useImapReader } from '../composables/useImapReader';
@@ -193,6 +194,20 @@ const conversationMessages = computed(() => activeBundle.value?.messages.map(({ 
     unread: Number(row?.is_seen) === 0,
   };
 }) ?? []);
+const conversationSources = computed(() => {
+  const sources = new Map<string, ConversationMessageSource>();
+  for (const { message } of activeBundle.value?.messages ?? []) {
+    const key = browserTriageMessageKey(message);
+    if (typeof message.id === 'number') {
+      const row = jmapRowsById.value.get(message.id);
+      if (row && jmapFolder.value) sources.set(key, { kind: 'jmap', row, folderId: jmapFolder.value.id });
+    } else {
+      const entry = imapByMessage.value.get(key);
+      if (entry) sources.set(key, { kind: 'imap', entry });
+    }
+  }
+  return sources;
+});
 const activeBundleRow = computed(() => {
   const bundle = activeBundle.value;
   if (!bundle) return {};
@@ -418,7 +433,7 @@ function readMessage(message: TriageMessage) {
   if (!row) return;
   releaseJmapReader(reading.value);
   reading.value = { kind: 'imap', message };
-  void imapReading.open(row);
+  if (!showConversation.value) void imapReading.open(row);
 }
 
 function focusReader(trigger: EventTarget | null) {
@@ -449,11 +464,6 @@ function openBundle(bundle: TriageBundle, trigger: EventTarget | null) {
   showConversation.value = bundle.messages.length > 1;
   readMessage(bundle.leading.message);
   focusReader(trigger);
-}
-
-function selectConversationMessage(key: string) {
-  const item = activeBundle.value?.messages.find(({ message }) => browserTriageMessageKey(message) === key);
-  if (item && key !== activeMessageKey.value) readMessage(item.message);
 }
 
 async function runBatchAction(messages: readonly TriageMessage[], action: ImapAttentionAction, undoLabel?: string) {
@@ -713,7 +723,6 @@ onBeforeUnmount(() => {
         :messages="conversationMessages"
         :active-key="activeMessageKey"
         :back-label="readerBackLabel"
-        @select="selectConversationMessage"
         @back="closeReader"
       >
         <template #actions>
@@ -727,12 +736,12 @@ onBeforeUnmount(() => {
             @restore="(bundle, event) => setBundleDisposition(bundle, 'restore', event)"
           />
         </template>
-        <MessageView
-          v-if="reading?.kind === 'jmap' || imapReader"
-          v-bind="readerProps"
-          :show-back="false"
-          v-on="readerEvents"
-        />
+        <template #default="{ messageKey }">
+          <ConversationMessage v-if="conversationSources.has(messageKey)"
+            :source="conversationSources.get(messageKey)!" :owner-id="ownerId"
+            :repository="repo" :refresh-imap="loadCache" :maximized="maximized"
+            @toggle-maximized="readerEvents.toggleMaximized" />
+        </template>
       </ConversationReader>
       <MessageView
         v-else-if="reading?.kind === 'jmap' || imapReader"

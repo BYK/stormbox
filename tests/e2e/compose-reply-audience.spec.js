@@ -174,7 +174,7 @@ test.describe('Reply audience, Cc/Bcc and threading', () => {
     await resetSharedSession(sharedPage);
   });
 
-  test('Reply All carries the whole audience and threads to its parent', async ({ sharedPage: page }, testInfo) => {
+  test('Inline Reply All carries the whole audience and threads to its parent', async ({ sharedPage: page }, testInfo) => {
     const consoleLines = consoleLinesFor(page);
     const jmap = await connectJmap();
     const mailboxes = await listMailboxes(jmap);
@@ -220,8 +220,8 @@ test.describe('Reply audience, Cc/Bcc and threading', () => {
       await expect(ccRow, 'the detail view should show Cc').toHaveCount(1);
       await expect(ccRow).toContainText(CC_WATCHER);
 
-      await page.getByRole('button', { name: 'Reply All', exact: true }).first().click();
-      await expect(page.locator('.compose-dialog')).toBeVisible({ timeout: 10_000 });
+      await page.getByRole('button', { name: 'Quick reply all', exact: true }).click();
+      await expect(page.locator('.message-view .compose-dialog--inline')).toBeVisible({ timeout: 10_000 });
       await waitForIdentities(page);
 
       // CS-2.5: Reply-To wins over From, the original To and Cc travel in

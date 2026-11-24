@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
 import {
   Check,
   ChevronDown,
+  Maximize2,
   Minus,
   Paperclip,
   RotateCw,
@@ -76,6 +77,7 @@ const attachmentBusy = computed(() =>
 const fromIdentity = computed(() => composeStore.identityForSession(session.value));
 const isExpanded = computed(() =>
   session.value?.presentation === COMPOSE_PRESENTATION.EXPANDED);
+const inlineTarget = computed(() => session.value?.inlineTarget ?? undefined);
 const isMaximized = ref(false);
 
 function fieldId(field: RecipientField): string {
@@ -121,6 +123,7 @@ const schedulePresets = ref<SchedulePresetResolution[]>(
 let scheduleActionGeneration = 0;
 const closePromptOpen = computed(() => Boolean(session.value?.closePromptOpen));
 useModalFocus(dialogEl, {
+  active: computed(() => isExpanded.value && (!inlineTarget.value || closePromptOpen.value)),
   containTab: true,
   focusOnActivate: false,
   resolveContainer: () => (
@@ -370,6 +373,13 @@ function focusFreshDraft() {
   } else {
     richTextEditorEl.value?.focus();
   }
+  if (inlineTarget.value) {
+    dialogEl.value?.scrollIntoView({ block: 'nearest' });
+    const focused = document.activeElement;
+    if (focused instanceof HTMLElement && dialogEl.value?.contains(focused)) {
+      focused.scrollIntoView({ block: 'nearest' });
+    }
+  }
 }
 
 onMounted(() => {
@@ -408,6 +418,10 @@ watch(isExpanded, (expanded) => {
     customScheduleOpen.value = false;
     closeScheduleMenu();
   }
+});
+
+watch(inlineTarget, (target, previous) => {
+  if (!target && previous && isExpanded.value) void nextTick().then(focusFreshDraft);
 });
 
 watch(
@@ -600,10 +614,11 @@ function identityInitials(id: Pick<IdentityRow, 'name' | 'email'>): string {
       class="compose-dialog"
       :class="{
         'compose-dialog--expanded': isExpanded,
+        'compose-dialog--inline': inlineTarget,
         'compose-dialog--maximized': isMaximized,
       }"
-      role="dialog"
-      aria-modal="true"
+      :role="inlineTarget ? 'region' : 'dialog'"
+      :aria-modal="inlineTarget ? undefined : true"
       :aria-labelledby="dialogTitleId"
       :aria-hidden="customScheduleOpen ? 'true' : undefined"
       tabindex="-1"
@@ -611,7 +626,9 @@ function identityInitials(id: Pick<IdentityRow, 'name' | 'email'>): string {
     >
     <div class="compose-dialog__card">
       <header>
-        <h2 :id="dialogTitleId" :title="draft.subject || 'New Message'">{{ draft.subject || 'New Message' }}</h2>
+        <h2 :id="dialogTitleId" :title="draft.subject || 'New Message'">
+          {{ inlineTarget ? (session.openOrigin === 'reply-all' ? 'Reply all' : 'Reply') : draft.subject || 'New Message' }}
+        </h2>
         <div class="compose-dialog__window-actions">
           <AppIconButton
             class="icon--minimize"
@@ -622,7 +639,11 @@ function identityInitials(id: Pick<IdentityRow, 'name' | 'email'>): string {
           >
             <Minus :size="18" :stroke-width="1.65" aria-hidden="true" />
           </AppIconButton>
-          <MaximizeButton
+          <AppIconButton v-if="inlineTarget" title="Open full composer" aria-label="Open full composer"
+            @click="composeStore.expandInlineReply(session.id)">
+            <Maximize2 :size="18" aria-hidden="true" />
+          </AppIconButton>
+          <MaximizeButton v-else
             :maximized="isMaximized"
             surface="composer"
             @toggle="isMaximized = !isMaximized"
@@ -787,7 +808,7 @@ function identityInitials(id: Pick<IdentityRow, 'name' | 'email'>): string {
         </div>
       </div>
 
-      <div class="row">
+      <div v-show="!inlineTarget" class="row">
         <label :for="subjectInputId">Subject</label>
         <input
           :id="subjectInputId"
@@ -1109,6 +1130,22 @@ function identityInitials(id: Pick<IdentityRow, 'name' | 'email'>): string {
   min-height: 0;
   border-radius: 0;
 }
+.compose-dialog--inline {
+  position: static;
+  display: block;
+  background: none;
+}
+.compose-dialog--inline .compose-dialog__card {
+  box-sizing: border-box;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  padding: 8px 12px;
+  box-shadow: none;
+}
+.compose-dialog--inline :deep(.rich-text-editor) { min-height: 112px; max-height: 15rem; }
+.compose-dialog--inline :deep(.compose-toolbar) { display: none; }
+.compose-dialog--inline :deep([data-stormbox-quoted-content]) { display: none !important; }
 .compose-dialog__card header {
   display: flex;
   justify-content: space-between;

@@ -192,6 +192,7 @@ export type ComposeOpenOrigin =
 export type ComposeOpenOptions = {
   preferredIdentityEmails?: string[];
   imapAccount?: ImapComposeAccount;
+  inlineTarget?: HTMLElement;
 } & (
   | { origin: typeof COMPOSE_OPEN_ORIGIN.NEW }
   | { origin: typeof COMPOSE_OPEN_ORIGIN.REPLY }
@@ -246,6 +247,7 @@ export interface ConfirmedDraftRevision {
 
 export interface ComposeSession {
   id: string;
+  inlineTarget: HTMLElement | null;
   presentation: ComposePresentation;
   status: ComposeState;
   /** Target time of the send in flight; null for a send-now or when idle. */
@@ -1508,7 +1510,7 @@ export const useComposeStore = defineStore('compose', () => {
   ): string {
     prefillGeneration += 1;
     const expanded = activeSession.value;
-    if (expanded) expanded.presentation = COMPOSE_PRESENTATION.MINIMIZED;
+    if (expanded) dock(expanded);
 
     const initialAttachments = [...(prefill.attachments ?? [])];
     const nextDraft = cloneDraft(prefill);
@@ -1527,6 +1529,7 @@ export const useComposeStore = defineStore('compose', () => {
     sessionGeneration += 1;
     const session: ComposeSession = reactive({
       id,
+      inlineTarget: options.inlineTarget ?? null,
       presentation: COMPOSE_PRESENTATION.EXPANDED,
       status: COMPOSE_STATE.EDITING,
       sendingScheduledAt: null,
@@ -1616,8 +1619,22 @@ export const useComposeStore = defineStore('compose', () => {
   }
 
   function dock(session: ComposeSession): void {
+    session.inlineTarget = null;
     session.presentation = COMPOSE_PRESENTATION.MINIMIZED;
     if (activeSessionId.value === session.id) activeSessionId.value = null;
+  }
+
+  function detachInlineReply(target: HTMLElement): void {
+    for (const session of sessions.value) {
+      if (session.inlineTarget !== target) continue;
+      if (isExpandedPresentation(session.presentation)) dock(session);
+      else session.inlineTarget = null;
+    }
+  }
+
+  function expandInlineReply(sessionId: string): void {
+    const session = sessionById(sessionId);
+    if (session) session.inlineTarget = null;
   }
 
   /** Off screen for the send: not expanded, not in the dock; the send toast stands in (CS-1.16). */
@@ -1644,7 +1661,7 @@ export const useComposeStore = defineStore('compose', () => {
     session.dockedSendFailure = false;
     const expanded = activeSession.value;
     if (expanded?.id === session.id) return;
-    if (expanded) expanded.presentation = COMPOSE_PRESENTATION.MINIMIZED;
+    if (expanded) dock(expanded);
     session.presentation = COMPOSE_PRESENTATION.EXPANDED;
     activeSessionId.value = session.id;
   }
@@ -2511,14 +2528,15 @@ export const useComposeStore = defineStore('compose', () => {
       'id' | 'from_text' | 'subject' | 'received_at' | 'rfc822_message_id'
       | 'references_json' | 'in_reply_to_json'
     >,
-    body: { html?: string | null; text?: string | null },
+    body: QuoteContent | Promise<QuoteContent>,
     all: boolean,
+    inlineTarget?: HTMLElement,
   ): Promise<void> {
     const gesture = (prefillGeneration += 1);
-    const addresses = await parentAddresses(message.id);
+    const [addresses, quotedBody] = await Promise.all([parentAddresses(message.id), body]);
     // Another reply, a forward, or a logout happened while this one was
     // reading the parent. Whatever replaced it is what the user asked for.
-    if (gesture !== prefillGeneration) return;
+    if (gesture !== prefillGeneration || (inlineTarget && !inlineTarget.isConnected)) return;
     const audience = addresses
       ? buildReplyAudience({ addresses, ownedEmails: ownedEmails(), all })
       : { to: parseAddressList(message.from_text ?? '').addresses, cc: [] };
@@ -2533,35 +2551,45 @@ export const useComposeStore = defineStore('compose', () => {
       inReplyTo,
       references,
       subject: makeReplySubject(message.subject),
-      ...quoteDraft(message, body),
+      ...quoteDraft(message, quotedBody),
     }, {
       origin: all ? COMPOSE_OPEN_ORIGIN.REPLY_ALL : COMPOSE_OPEN_ORIGIN.REPLY,
       preferredIdentityEmails,
+      inlineTarget,
     });
   }
 
   function prepareReplyFromMessage(
     message: Parameters<typeof prepareReplyToMessage>[0],
-    body: { html?: string | null; text?: string | null } = {},
+    body: QuoteContent | Promise<QuoteContent> = {},
+    inlineTarget?: HTMLElement,
   ): Promise<void> {
-    return prepareReplyToMessage(message, body, false);
+    return prepareReplyToMessage(message, body, false, inlineTarget);
   }
 
   function prepareReplyAll(
     message: Parameters<typeof prepareReplyToMessage>[0],
-    body: { html?: string | null; text?: string | null } = {},
+    body: QuoteContent | Promise<QuoteContent> = {},
+    inlineTarget?: HTMLElement,
   ): Promise<void> {
-    return prepareReplyToMessage(message, body, true);
+    return prepareReplyToMessage(message, body, true, inlineTarget);
   }
 
   function prepareForward(
     message: QuoteSource,
-    body: QuoteContent = {},
-  ): void {
-    open({
+    body: QuoteContent | Promise<QuoteContent> = {},
+  ): void | Promise<void> {
+    const openForward = (quotedBody: QuoteContent) => open({
       subject: makeForwardSubject(message.subject),
-      ...quoteDraft(message, body),
+      ...quoteDraft(message, quotedBody),
     }, { origin: COMPOSE_OPEN_ORIGIN.FORWARD });
+    if (body instanceof Promise) {
+      const gesture = (prefillGeneration += 1);
+      return body.then((quote) => {
+        if (gesture === prefillGeneration) openForward(quote);
+      });
+    }
+    openForward(body);
   }
 
   function prepareImapResponse(
@@ -2571,9 +2599,10 @@ export const useComposeStore = defineStore('compose', () => {
       addresses: readonly MessageAddress[];
     },
     body: QuoteContent = {},
+    inlineTarget?: HTMLElement,
   ): void {
     const ownerId = authStore.accountId;
-    if (ownerId == null) return;
+    if (ownerId == null || (inlineTarget && !inlineTarget.isConnected)) return;
     const html = body.html ? editSafeDraftHtml(body.html) : '';
     const text = body.text || (html ? sanitizeRichTextContent(html).text : '');
     const quote = quoteDraft(message, { html, text });
@@ -2588,7 +2617,7 @@ export const useComposeStore = defineStore('compose', () => {
           ...imapThreadHeaders(message),
           subject: makeReplySubject(message.subject),
         };
-    open({ ...quote, ...prefill }, { origin: kind, imapAccount: { ...account, ownerId } });
+    open({ ...quote, ...prefill }, { origin: kind, imapAccount: { ...account, ownerId }, inlineTarget });
   }
 
   async function editableDraftHtml(
@@ -3285,6 +3314,8 @@ export const useComposeStore = defineStore('compose', () => {
     open,
     close,
     minimize,
+    detachInlineReply,
+    expandInlineReply,
     restore,
     dismissSendFailureNotice,
     isSessionDirty,

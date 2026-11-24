@@ -29,6 +29,8 @@ import { createPinia, setActivePinia } from 'pinia';
 import { nextTick } from 'vue';
 
 import MessageView from '../../../src/components/MessageView.vue';
+import ComposeManager from '../../../src/components/ComposeManager.vue';
+import type { MessageRow } from '../../../src/types/db';
 import { useMailStore } from '../../../src/stores/mail-store';
 import { useAuthStore } from '../../../src/stores/auth-store';
 import { useComposeStore } from '../../../src/stores/compose-store';
@@ -80,6 +82,59 @@ afterEach(() => {
 });
 
 describe('MessageView with a sparse messages array', () => {
+  it('opens a threaded inline reply and keeps the editor and audience when opening the full composer', async () => {
+    useAuthStore().accountId = 1;
+    __setRepositoryForTests(makeRepo({
+      listIdentities: async () => [{ id: 1, email: 'me@example.org' }],
+      ensureIdentities: async () => {},
+      listMessageAddresses: async () => [
+        { kind: 'from', position: 0, email: 'sender@example.org' },
+        { kind: 'replyTo', position: 0, email: 'replies@example.org' },
+        { kind: 'to', position: 0, email: 'me@example.org' },
+        { kind: 'cc', position: 0, email: 'copy@example.org' },
+      ],
+    }));
+    const compose = useComposeStore();
+    await compose.attach();
+    const other = { id: 9, account_id: 1, from_text: 'sender@example.org', subject: 'Plan',
+      rfc822_message_id: 'parent@example.org' } as MessageRow;
+    const jmap = { row: other, folderId: 7, addresses: [], body: { text: 'Quoted body', html: '', attachments: [] } };
+    const reader = mount(MessageView, { attachTo: document.body, props: { jmap, inConversation: true } });
+    const manager = mount(ComposeManager, { attachTo: document.body });
+
+    try {
+      await reader.get('[aria-label="Quick reply all"]').trigger('click');
+      await flushPromises();
+      const inline = reader.get('.compose-dialog--inline');
+      const editor = inline.get('.editor').element;
+      const session = compose.activeSession!;
+      expect(inline.attributes('aria-modal')).toBeUndefined();
+      expect(session.draft.to).toEqual([{ email: 'replies@example.org' }]);
+      expect(session.draft.cc).toEqual([{ email: 'copy@example.org' }]);
+      expect(session.draft.inReplyTo).toEqual(['parent@example.org']);
+      expect(session.draft.textBody).toContain('Quoted body');
+      await inline.get('[aria-label="Open full composer"]').trigger('click');
+      expect(manager.get('.editor').element).toBe(editor);
+      expect(manager.get('.compose-dialog').attributes('aria-modal')).toBe('true');
+      expect(compose.activeSessionId).toBe(session.id);
+      compose.close(session.id);
+      await nextTick();
+
+      await reader.get('[aria-label="Quick reply"]').trigger('click');
+      await flushPromises();
+      const inlineDraft = compose.activeSession!;
+      expect(inlineDraft.draft.cc).toEqual([]);
+      compose.setBodyContent({ html: '<p>My reply</p>', text: 'My reply' }, inlineDraft.id);
+      await reader.setProps({ jmap: { ...jmap, row: { ...other, id: 10 } } });
+      expect(manager.find('.compose-dock__item').exists()).toBe(true);
+      expect(compose.sessionById(inlineDraft.id)?.draft.textBody).toBe('My reply');
+    } finally {
+      reader.unmount();
+      manager.unmount();
+      compose.$reset();
+    }
+  });
+
   it('still renders the selected message when surrounding positions are undefined', async () => {
     const authStore = useAuthStore();
     authStore.accountId = 1;
@@ -160,30 +215,29 @@ describe('MessageView with a sparse messages array', () => {
     // Titles carry the key the active scheme binds (web by default).
     expect(actions.map((button) => button.attributes('title'))).toEqual([
       'Back',
-      'Archive (A)',
-      'Junk',
+      'Tag (T)',
       'Star (S)',
       'Mark as read (M)',
+      'Archive (A)',
+      'Junk',
       'Delete (Del)',
       'Reply (R)',
       'Reply All (Shift+R)',
       'Forward (F)',
-      'Tag (T)',
       'Print email',
       'Maximize message view',
     ]);
     expect(
       actions.map((button) => button.attributes('aria-label')),
-    ).toEqual(['Back', 'Archive', 'Mark as junk', 'Star', 'Mark as read', 'Delete', 'Reply', 'Reply All', 'Forward', 'Tag', 'Print email', 'Maximize message view']);
+    ).toEqual(['Back', 'Tag', 'Star', 'Mark as read', 'Archive', 'Mark as junk', 'Delete', 'Reply', 'Reply All', 'Forward', 'Print email', 'Maximize message view']);
 
     useSettingsStore().settings = { shortcutScheme: 'thunderbird' };
     await nextTick();
-    expect(actions.slice(6).map((button) => button.attributes('title'))).toEqual([
+    expect(actions[1].attributes('title')).toBe('Tag');
+    expect(actions.slice(7).map((button) => button.attributes('title'))).toEqual([
       'Reply (Ctrl+R)',
       'Reply All (Ctrl+Shift+R)',
       'Forward (Ctrl+L)',
-      // The Thunderbird scheme leaves T alone (MK-4.2).
-      'Tag',
       'Print email',
       'Maximize message view',
     ]);
@@ -438,7 +492,7 @@ describe('MessageView with a sparse messages array', () => {
     expect(stack.find('.tag-stack__icon--empty').exists()).toBe(true);
   });
 
-  it('lists the message tags as removable chips, with the tag stack after Forward (MK-6.5)', async () => {
+  it('lists the message tags as removable chips, with the tag stack before Star (MK-6.5)', async () => {
     const authStore = useAuthStore();
     authStore.accountId = 1;
     __setRepositoryForTests(makeRepo());
@@ -461,10 +515,9 @@ describe('MessageView with a sparse messages array', () => {
     const chips = wrapper.findAll('[data-message-tags] .tag-chip');
     expect(chips.map((chip: any) => chip.text())).toEqual(['Work', 'receipts']);
     expect(chips[1].classes()).toContain('tag-chip--undefined');
-    // The tag control is the toolbar's last action, right after Forward.
     const actions = wrapper.findAll('.message-view__header .message-view__action');
     const stackIndex = actions.findIndex((action: any) => action.attributes('data-tag-picker-trigger') !== undefined);
-    expect(actions[stackIndex - 1].attributes('aria-label')).toBe('Forward');
+    expect(actions[stackIndex + 1].attributes('aria-label')).toBe('Star');
     const stack = actions[stackIndex];
     expect(stack.attributes('aria-label')).toBe('Tags: Work, receipts');
     expect(stack.attributes('aria-haspopup')).toBe('dialog');
@@ -1463,7 +1516,7 @@ describe('MessageView HTML body rendering', () => {
     const body = wrapper.find('.message-view__body');
     const previews = body.find('.message-attachment-previews');
     expect(previews.exists()).toBe(true);
-    expect(body.element.lastElementChild).toBe(previews.element);
+    expect(previews.element.nextElementSibling?.classList.contains('message-view__quick-reply')).toBe(true);
     expect(previews.findAll('figure figcaption').map((caption) => caption.text()))
       .toEqual(['first.png', 'second.png']);
     expect(wrapper.findAll('.message-attachment-row')).toHaveLength(2);

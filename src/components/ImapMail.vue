@@ -34,6 +34,7 @@ import { tagKeywordsOf } from '../utils/message-tags';
 import { isScheduledMessage } from '../utils/scheduled-message';
 import AppIconButton from './AppIconButton.vue';
 import ConversationReader from './ConversationReader.vue';
+import ConversationMessage, { type ConversationMessageSource } from './ConversationMessage.vue';
 import FolderNode from './FolderNode.vue';
 import FolderTreeHeading from './FolderTreeHeading.vue';
 import ImapAccountsDialog from './ImapAccountsDialog.vue';
@@ -98,6 +99,7 @@ const jmapMessages = shallowRef<Array<{ folder: InboxFolder; row: MessageRow }>>
 const jmapLimit = ref(PAGE_SIZE);
 const jmapReading = shallowRef<{ id: number; folderId: number }>();
 const activeMessageKey = ref<string>();
+const lastExpandedMessageKey = ref<string>();
 const openedThread = shallowRef<MailThread<ThreadEntry>>();
 const unreadOnly = ref(false);
 const starredOnly = ref(false);
@@ -288,12 +290,20 @@ const conversationEntries = computed(() => {
   const saved = openedThread.value;
   if (!saved) return [];
   if (activeThread.value) return threadEntries(activeThread.value);
-  const surviving = threads.value.find(({ key }) => key === saved.key)
+  const lastExpanded = lastExpandedMessageKey.value;
+  const surviving = (lastExpanded ? threadByMember.value.get(lastExpanded) : undefined)
+    ?? threads.value.find(({ key }) => key === saved.key)
     ?? threadEntries(saved).reverse().map(({ key }) => threadByMember.value.get(key)).find(Boolean);
   return surviving ? threadEntries(surviving) : [];
 });
 const threadReaderOpen = computed(() => Boolean(openedThread.value
   && (openedThread.value.previous.length || conversationEntries.value.length > 1)));
+watch([activeMessageKey, threadReaderOpen], ([key, threaded]) => {
+  const entry = key ? entriesByKey.value.get(key) : undefined;
+  if (threaded || entry?.kind !== 'imap') return reader.close();
+  void reader.open(entry.entry);
+  if (!entry.entry.row.seen) void reader.runAction(entry.entry, { type: 'seen', value: true }, { undo: false });
+});
 const conversationMessages = computed(() => conversationEntries.value.map((entry) => ({
   key: entry.key,
   sender: correspondentLabel(entry.row, folderShowsRecipients({ role: role.value })),
@@ -301,6 +311,12 @@ const conversationMessages = computed(() => conversationEntries.value.map((entry
   timestamp: entry.receivedAt,
   unread: entry.row.is_seen === 0,
 })));
+const conversationSources = computed(() => new Map<string, ConversationMessageSource>(
+  conversationEntries.value.map((entry) => [entry.key, entry.kind === 'jmap'
+    ? { kind: 'jmap', row: entry.row, folderId: entry.folder.id }
+    : { kind: 'imap', entry: entry.entry, canArchive: canArchiveEntry(entry),
+      canJunk: role.value !== 'junk', canTrash: canDeleteEntry(entry) }]),
+));
 const reading = computed(() => !selectionCount.value && Boolean(activeMessageKey.value));
 const inlineAnchorKey = computed(() => inlineReading.value && reading.value
   ? visibleRows.value.find(rowFocused)?.key : undefined);
@@ -714,6 +730,7 @@ function releaseJmapMessage() {
 
 function closeReader() {
   openedThread.value = undefined;
+  lastExpandedMessageKey.value = undefined;
   activeMessageKey.value = undefined;
   releaseJmapMessage();
   reader.close();
@@ -793,12 +810,9 @@ async function pickFolder(accountId: string, path: string, focus = true) {
 }
 
 function showMessage(entry: ThreadEntry) {
-  if (activeMessageKey.value === entry.key) return;
   activeMessageKey.value = entry.key;
   if (entry.kind === 'imap') {
     releaseJmapMessage();
-    void reader.open(entry.entry);
-    if (!entry.entry.row.seen) void reader.runAction(entry.entry, { type: 'seen', value: true }, { undo: false });
   } else {
     reader.close();
     jmapReading.value = { id: entry.row.id, folderId: entry.folder.id };
@@ -808,15 +822,11 @@ function showMessage(entry: ThreadEntry) {
 
 function openRow({ entry, nested, key }: ListRow, button: HTMLElement | null) {
   focusedId.value = key;
+  lastExpandedMessageKey.value = undefined;
   openedThread.value = showThreads.value && !nested ? threadByMember.value.get(entry.key) : undefined;
   showMessage(entry);
   openingButton = button;
   if (singlePane.value && !inlineReading.value) void nextTick(() => readerPane.value?.focus({ preventScroll: true }));
-}
-
-function openThreadMessage(key: string) {
-  const entry = conversationEntries.value.find((candidate) => candidate.key === key);
-  if (entry) showMessage(entry);
 }
 
 function clickRow(row: ListRow, index: number, event: MouseEvent, button: HTMLElement | null) {
@@ -1103,32 +1113,39 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
     <Teleport v-if="reading" :to="inlineTarget" :disabled="!readingInline || !inlineTarget">
     <div v-show="!readingInline || inlineTarget" ref="readerPane" class="imap-mail__reader"
       :class="{ 'imap-mail__reader--inline': readingInline }" tabindex="-1">
-      <component :is="threadReaderOpen ? ConversationReader : 'div'" class="imap-mail__reader-content"
-        v-bind="threadReaderOpen ? { subject: conversationEntries.at(-1)?.subject, messages: conversationMessages, activeKey: activeMessageKey } : {}"
-        :back-label="threadReaderOpen && readingInline ? 'Collapse conversation' : undefined"
-        @select="openThreadMessage" @back="closeReader">
-        <template v-if="threadReaderOpen" #actions>
-          <AppIconButton v-if="conversationEntries.some(({ row }) => row.is_seen === 0)"
-            title="Mark conversation as read" aria-label="Mark conversation as read"
-            @click="runActions(conversationEntries, { type: 'seen', value: true })"><MailOpen :size="18" /></AppIconButton>
-          <AppIconButton v-else title="Mark conversation as unread" aria-label="Mark conversation as unread"
-            @click="runActions(conversationEntries, { type: 'seen', value: false })"><Mail :size="18" /></AppIconButton>
+      <ConversationReader v-if="threadReaderOpen && activeMessageKey" class="imap-mail__reader-content"
+        :subject="conversationEntries.at(-1)?.subject" :messages="conversationMessages" :active-key="activeMessageKey"
+        :back-label="readingInline ? 'Collapse conversation' : undefined"
+        @expand="lastExpandedMessageKey = $event" @back="closeReader">
+        <template #actions>
           <AppIconButton v-if="conversationEntries.some(({ row }) => row.is_flagged === 1)"
             title="Unstar conversation" aria-label="Unstar conversation"
             @click="runActions(conversationEntries, { type: 'star', value: false })"><Star :size="18" fill="#facc15" /></AppIconButton>
           <AppIconButton v-else title="Star conversation" aria-label="Star conversation"
             @click="runActions(conversationEntries, { type: 'star', value: true })"><Star :size="18" /></AppIconButton>
+          <AppIconButton v-if="conversationEntries.some(({ row }) => row.is_seen === 0)"
+            title="Mark conversation as read" aria-label="Mark conversation as read"
+            @click="runActions(conversationEntries, { type: 'seen', value: true })"><MailOpen :size="18" /></AppIconButton>
+          <AppIconButton v-else title="Mark conversation as unread" aria-label="Mark conversation as unread"
+            @click="runActions(conversationEntries, { type: 'seen', value: false })"><Mail :size="18" /></AppIconButton>
           <AppIconButton v-if="conversationEntries.every(canArchiveEntry)" title="Archive conversation" aria-label="Archive conversation"
             @click="runActions(conversationEntries, { type: 'archive' })"><Archive :size="18" /></AppIconButton>
           <AppIconButton v-if="conversationEntries.every(canDeleteEntry)" danger title="Delete conversation" aria-label="Delete conversation"
             @click="runActions(conversationEntries, { type: 'delete' })"><Trash2 :size="18" /></AppIconButton>
         </template>
-        <MessageView :imap="readerProps" :maximized="maximized" :back-label="readingInline ? 'Collapse message' : 'Back'"
-          :show-back="!threadReaderOpen"
+        <template #default="{ messageKey }">
+          <ConversationMessage v-if="conversationSources.has(messageKey)"
+            :source="conversationSources.get(messageKey)!" :owner-id="ownerId"
+            :repository="repo" :refresh-imap="refreshLocalImap" :maximized="maximized"
+            @toggle-maximized="maximized = !maximized" />
+        </template>
+      </ConversationReader>
+      <div v-else class="imap-mail__reader-content">
+        <MessageView v-if="jmapReading || readerProps" :imap="readerProps" :maximized="maximized" :back-label="readingInline ? 'Collapse message' : 'Back'"
           @back="closeReader" @toggle-maximized="maximized = !maximized"
           @imap-action="reader.current.value && reader.runAction(reader.current.value, $event)"
           @imap-compose="reader.composeResponse" />
-      </component>
+      </div>
     </div>
     </Teleport>
     <TagPickerPopover :anchor="tagPopover?.anchor ?? null" :trigger="tagPopover?.trigger ?? null"
@@ -1159,7 +1176,7 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
 .imap-mail__more:hover { background: var(--rowHover); color: var(--text); }
 .imap-mail__more { display: block; margin: 10px auto; padding: 6px 10px; }
 .imap-mail__more:disabled { cursor: default; opacity: .6; }
-.imap-mail__scroll { flex: 1; min-height: 0; overflow: auto; }
+.imap-mail__scroll { container-type: size; flex: 1; min-height: 0; overflow: auto; }
 .imap-mail__rows { padding: 0; margin: 0; list-style: none; }
 .imap-mail__nested { margin-inline-start: 14px; border-inline-start: 2px solid var(--border); }
 .imap-mail__reader { min-height: 0; min-width: 0; border-inline-start: 1px solid var(--border); outline: none; }

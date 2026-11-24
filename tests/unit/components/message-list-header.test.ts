@@ -413,7 +413,7 @@ describe('bulk row overflow', () => {
     expect(head.find('.msg-list__filters').exists()).toBe(false);
 
     expect(moreItems(wrapper)).toEqual([
-      'Archive', 'Mark as junk', 'Star', 'Tag…', 'Mark as read', 'Mark as unread', 'Refresh', 'Add column',
+      'Tag…', 'Star', 'Mark as read', 'Mark as unread', 'Archive', 'Mark as junk', 'Refresh', 'Add column',
     ]);
     expect(wrapper.find('.msg-list__more-heading').text()).toBe('Inbox');
 
@@ -429,8 +429,8 @@ describe('bulk row overflow', () => {
     await wrapper.findAll('.msg-list__check input')[0].trigger('click');
     const inline = header(wrapper).findAll('.msg-list__bulk-actions .msg-list__bulk-action')
       .map((button) => button.attributes('aria-label'));
-    expect(inline).toEqual(['Archive', 'Delete', 'Star', 'Clear selection']);
-    expect(moreItems(wrapper)).toEqual(['Mark as junk', 'Tag…', 'Mark as read', 'Mark as unread', 'Refresh', 'Add column']);
+    expect(inline).toEqual(['Star', 'Archive', 'Delete', 'Clear selection']);
+    expect(moreItems(wrapper)).toEqual(['Tag…', 'Mark as read', 'Mark as unread', 'Mark as junk', 'Refresh', 'Add column']);
   });
 
   it('shows every action inline when the width is unknown or wide', async () => {
@@ -441,7 +441,7 @@ describe('bulk row overflow', () => {
     const inline = header(wrapper).findAll('.msg-list__bulk-actions .msg-list__bulk-action')
       .map((button) => button.attributes('aria-label'));
     expect(inline).toEqual([
-      'Archive', 'Mark as junk', 'Delete', 'Star', 'Tag selected messages', 'Mark as read', 'Mark as unread',
+      'Tag selected messages', 'Star', 'Mark as read', 'Mark as unread', 'Archive', 'Mark as junk', 'Delete',
       'Clear selection',
     ]);
     // Refresh and + still sit in the menu while rows are checked.
@@ -487,7 +487,7 @@ describe('useBulkActionItems in a tag view', () => {
         markRead: noop, markUnread: noop, whitelist: noop,
       },
     });
-    expect(items.value.map((item) => item.id)).toEqual(['archive', 'junk', 'delete', 'toggle-star', 'tag', 'mark-read', 'mark-unread']);
+    expect(items.value.map((item) => item.id)).toEqual(['tag', 'toggle-star', 'mark-read', 'mark-unread', 'archive', 'junk', 'delete']);
   });
 });
 

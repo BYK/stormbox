@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ChevronDown, ChevronUp } from '@lucide/vue';
+import LetterStackIcon from './LetterStackIcon.vue';
 
 defineProps<{ count: number; expanded: boolean; controls?: string }>();
 const emit = defineEmits<{ toggle: [] }>();
@@ -8,9 +9,11 @@ const emit = defineEmits<{ toggle: [] }>();
 <template>
   <div class="thread-expand">
     <button type="button" class="thread-expand__pill" data-message-control
+      :aria-label="`${expanded ? 'Hide' : 'Show'} ${count} ${count === 1 ? 'message' : 'messages'}`"
       :aria-expanded="expanded" :aria-controls="controls" @click.stop="emit('toggle')">
-      {{ expanded ? 'Hide' : 'Show' }} {{ count }} {{ count === 1 ? 'message' : 'messages' }}
-      <component :is="expanded ? ChevronUp : ChevronDown" :size="13" aria-hidden="true" />
+      <LetterStackIcon />
+      <span aria-hidden="true">{{ count }}</span>
+      <component :is="expanded ? ChevronUp : ChevronDown" :size="11" aria-hidden="true" />
     </button>
   </div>
 </template>
@@ -23,7 +26,7 @@ const emit = defineEmits<{ toggle: [] }>();
 }
 .thread-expand__pill {
   position: absolute;
-  inset-block-start: -0.5px;
+  inset-block-start: 0;
   inset-inline: 0;
   inline-size: max-content;
   max-inline-size: calc(100% - 16px);
@@ -31,19 +34,21 @@ const emit = defineEmits<{ toggle: [] }>();
   transform: translateY(-50%);
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  min-block-size: 24px;
-  padding: 1px 9px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
+  justify-content: center;
+  gap: 3px;
+  block-size: 18px;
+  padding-inline: 5px;
+  border: 0;
+  border-radius: 5px;
   background: var(--panel);
   color: var(--muted);
   font: inherit;
-  font-size: .75rem;
-  font-weight: 600;
+  font-size: .6875rem;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
   cursor: pointer;
 }
+.thread-expand__pill::before { content: ''; position: absolute; inset: -3px -5px; }
 .thread-expand__pill:hover,
 .thread-expand__pill[aria-expanded='true'] { background: var(--control-hover-bg); color: var(--text); }
 .thread-expand__pill:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

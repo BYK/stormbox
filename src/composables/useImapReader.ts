@@ -1,5 +1,5 @@
 import { useOnline } from '@vueuse/core';
-import { computed, shallowReactive, shallowRef, watch } from 'vue';
+import { computed, onScopeDispose, shallowReactive, shallowRef, watch } from 'vue';
 import type { CachedImapAccount } from '../db/attention';
 import type { Repository } from '../db/repository';
 import { useComposeStore } from '../stores/compose-store';
@@ -60,6 +60,7 @@ export function useImapReader(
   });
 
   function close() { reading.value = undefined; }
+  onScopeDispose(close);
 
   watch(current, (entry) => {
     if (!entry) close();
@@ -86,7 +87,7 @@ export function useImapReader(
     return optimistic.run(ownerId(), repository(), [{ entry, action }], { undo, refresh });
   }
 
-  function composeResponse(kind: 'reply' | 'reply-all' | 'forward') {
+  function composeResponse(kind: 'reply' | 'reply-all' | 'forward', inlineTarget?: HTMLElement) {
     const entry = current.value;
     const body = reading.value?.body;
     if (!entry?.account.can_send || !body) return;
@@ -99,7 +100,7 @@ export function useImapReader(
       rfc822_message_id: row.messageId,
       references_json: JSON.stringify(row.references ?? []),
       in_reply_to_json: JSON.stringify(row.inReplyTo ? [row.inReplyTo] : []),
-    }, body);
+    }, body, inlineTarget);
   }
 
   return { current, view, open, close, runAction, composeResponse };

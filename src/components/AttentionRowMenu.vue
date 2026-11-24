@@ -52,6 +52,17 @@ function snoozeUntilTomorrow(): number {
 <template>
   <AttentionActionMenu class="attention-row-menu" :label="label ?? 'Message actions'">
     <button
+      v-if="canTag"
+      class="app-dropdown__item"
+      type="button"
+      aria-haspopup="dialog"
+      :disabled="disabled"
+      @click="chooseTag"
+    >
+      <Tags :size="16" aria-hidden="true" />
+      Tags
+    </button>
+    <button
       class="app-dropdown__item"
       type="button"
       aria-label="Star"
@@ -72,17 +83,6 @@ function snoozeUntilTomorrow(): number {
       {{ unread ? 'Mark as read' : 'Mark as unread' }}
     </button>
     <button
-      v-if="canTag"
-      class="app-dropdown__item"
-      type="button"
-      aria-haspopup="dialog"
-      :disabled="disabled"
-      @click="chooseTag"
-    >
-      <Tags :size="16" aria-hidden="true" />
-      Tags
-    </button>
-    <button
       v-if="canArchive"
       class="app-dropdown__item"
       type="button"
@@ -101,6 +101,16 @@ function snoozeUntilTomorrow(): number {
     >
       <Flame :size="16" aria-hidden="true" />
       Move to Junk
+    </button>
+    <button
+      v-if="canTrash"
+      class="app-dropdown__item"
+      type="button"
+      :disabled="disabled"
+      @click="chooseAction($event, { type: 'trash' })"
+    >
+      <Trash2 :size="16" aria-hidden="true" />
+      Move to Trash
     </button>
     <template v-if="bundle">
       <button
@@ -135,16 +145,6 @@ function snoozeUntilTomorrow(): number {
         </button>
       </template>
     </template>
-    <button
-      v-if="canTrash"
-      class="app-dropdown__item"
-      type="button"
-      :disabled="disabled"
-      @click="chooseAction($event, { type: 'trash' })"
-    >
-      <Trash2 :size="16" aria-hidden="true" />
-      Move to Trash
-    </button>
   </AttentionActionMenu>
 </template>
 
