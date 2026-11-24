@@ -32,6 +32,8 @@ export interface UseMessageListViewportInput {
   denseFilterActive: Ref<boolean>;
   /** The keyboard cursor when it belongs to this list. */
   focusedMessageId: Ref<number | null>;
+  inlineMessageId: Ref<number | null>;
+  inlineReaderHeight: Ref<number>;
 }
 
 /**
@@ -46,6 +48,9 @@ export function useMessageListViewport(input: UseMessageListViewportInput) {
   const scrollEl = ref<HTMLElement | null>(null);
   const listWidth = ref(0);
   const cardLayout = computed(() => listWidth.value > 0 && listWidth.value < CARD_LAYOUT_WIDTH);
+  const summaryHeight = computed(() => cardLayout.value ? CARD_ROW_HEIGHT : ROW_HEIGHT);
+  const inlineIndex = computed(() => input.inlineMessageId.value == null ? -1
+    : input.visibleMessages.value.findIndex((row) => row?.id === input.inlineMessageId.value));
   let listResizeObserver: ResizeObserver | null = null;
 
   const virtualizer = useVirtualizer(
@@ -54,7 +59,7 @@ export function useMessageListViewport(input: UseMessageListViewportInput) {
       return {
         count: input.rowCount.value,
         getScrollElement: () => scrollEl.value,
-        estimateSize: () => (cardLayout.value ? CARD_ROW_HEIGHT : ROW_HEIGHT),
+        estimateSize: () => summaryHeight.value,
         overscan: 8,
         // TanStack caches keys lazily; each callback belongs to one row snapshot.
         getItemKey: (i: number) => rows[i]?.id ?? `_ph_${i}`,
@@ -145,9 +150,32 @@ export function useMessageListViewport(input: UseMessageListViewportInput) {
     // Let the row array and the virtualizer count settle (a delete
     // mutates rows in the same tick as the cursor move).
     await nextTick();
-    if (input.focusedMessageId.value !== messageId) return;
+    if (input.focusedMessageId.value !== messageId || input.inlineMessageId.value === messageId) return;
     scrollCursorIntoView(messageId);
   });
+
+  watch([input.inlineMessageId, inlineIndex, input.inlineReaderHeight, summaryHeight],
+    ([id, index, height, rowHeight], [previousId, previousIndex, , previousRowHeight]) => {
+      const instance = virtualizer.value;
+      if (rowHeight !== previousRowHeight) instance.measure();
+      if (previousId != null && (id !== previousId || index < 0) && previousIndex >= 0) {
+        const rows = input.visibleMessages.value;
+        const oldIndex = rows[previousIndex]?.id === previousId ? previousIndex
+          : rows.findIndex((row) => row?.id === previousId);
+        // The size cache follows the row key, including one hidden by a filter.
+        if (oldIndex >= 0) instance.resizeItem(oldIndex, rowHeight);
+        else instance.measure();
+      }
+      if (index < 0) return;
+      instance.resizeItem(index, rowHeight + height);
+
+      const scroll = scrollEl.value;
+      if (!scroll || (id === previousId && previousIndex >= 0)) return;
+      const item = instance.getVirtualItems().find((candidate) => candidate.index === index);
+      if (!item || item.start < scroll.scrollTop || item.start + rowHeight > scroll.scrollTop + scroll.clientHeight / 2) {
+        instance.scrollToIndex(index, { align: 'start' });
+      }
+    }, { flush: 'post' });
 
   // A folder change restores that folder's remembered scroll position;
   // re-picking the primary column's folder in the folder list scrolls
@@ -178,11 +206,6 @@ export function useMessageListViewport(input: UseMessageListViewportInput) {
     { immediate: true },
   );
 
-  watch(cardLayout, async () => {
-    await nextTick();
-    virtualizer.value.measure();
-  });
-
   onMounted(() => {
     if (input.listEl.value) {
       listWidth.value = input.listEl.value.clientWidth;
@@ -209,6 +232,7 @@ export function useMessageListViewport(input: UseMessageListViewportInput) {
     scrollEl,
     listWidth,
     cardLayout,
+    summaryHeight,
     totalSize,
     virtualItems,
     onScroll,

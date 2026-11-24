@@ -20,6 +20,7 @@ import {
 import { useThunderbirdShortcuts } from './composables/useThunderbirdShortcuts';
 import { useImapInboxUnread } from './composables/useImapInboxUnread';
 import { useInboxFavicon } from './composables/useInboxFavicon';
+import { useInlineReading } from './composables/useInlineReading';
 import { getRepositoryAsync } from './composables/useRepository';
 import { CACHED_ACCOUNT_KEY, readCachedAccount } from './pwa/cached-account';
 import { APP_TITLE } from './app-config';
@@ -79,6 +80,8 @@ const contactsStore = useContactsStore();
 const composeStore = useComposeStore();
 const settingsStore = useSettingsStore();
 const beaconStore = useFeatureBeaconsStore();
+const readInPlace = useInlineReading();
+const messageColumns = ref<InstanceType<typeof MessageColumns> | null>(null);
 
 type AppSpace = 'attention' | 'contacts' | 'mail';
 
@@ -254,13 +257,17 @@ const shortcutsEnabled = computed(() =>
 const showFeatureBeacons = computed(() =>
   !showWelcomeModal.value && !showSettingsDialog.value && !showTagManager.value && !showMailRules.value);
 const windowWidth = ref(typeof window === 'undefined' ? COMPACT_READING_WIDTH : window.innerWidth);
-const wantsMessageDetailView = computed(() => !imapFolderSelected.value && mailStore.selectedMessageId != null);
+const wantsMessageDetailView = computed(() =>
+  !imapFolderSelected.value && mailStore.selectedMessageId != null && mailStore.selectedIds.size === 0,
+);
+const showInlineMessageView = computed(() => wantsMessageDetailView.value
+  && readInPlace.value && !messageViewMaximized.value
+  && columnsStore.columns.some((column) => column.folderId != null && column.folderId === mailStore.openMessageFolderId));
+const inlineReaderTarget = computed(() => showInlineMessageView.value ? messageColumns.value?.inlineReaderTarget ?? null : null);
 // Multi-select never opens the message view: the bulk actions live in
 // the message list header, so a checkbox selection hides the reading
 // pane entirely (and works the same in single-column layouts).
-const showMessageView = computed(() =>
-  wantsMessageDetailView.value && mailStore.selectedIds.size === 0,
-);
+const showMessageView = computed(() => wantsMessageDetailView.value && !showInlineMessageView.value);
 const displayedMessageView = ref(
   showMessageView.value && !(space.value === 'mail' && windowWidth.value < COMPACT_READING_WIDTH),
 );
@@ -270,6 +277,12 @@ watch(() => mailStore.selectedMessageId, () => {
 watch(displayedMessageView, (visible) => {
   if (!visible) messageViewMaximized.value = false;
 });
+
+function closeInlineMessage() {
+  const list = inlineReaderTarget.value?.closest<HTMLElement>('.msg-list__scroller');
+  mailStore.selectMessage(null);
+  list?.focus({ preventScroll: true });
+}
 const singleColumnLayout = computed(() => windowWidth.value < SINGLE_COLUMN_WIDTH);
 const shouldUseSingleMailColumn = computed(() =>
   space.value === 'mail'
@@ -631,7 +644,7 @@ function syncDisplayedMessageView({ delayForFolderSlide = false } = {}) {
     return;
   }
 
-  if (!delayForFolderSlide) {
+  if (!delayForFolderSlide || messageViewMaximized.value) {
     displayedMessageView.value = true;
     return;
   }
@@ -942,18 +955,25 @@ function unwatchSystemTheme() {
       />
       <MessageColumns
         v-if="displayedMessageList && !imapFolderSelected"
+        ref="messageColumns"
         :inert="messageViewMaximized"
         :aria-hidden="messageViewMaximized"
         :quick-filter-query="quickFilterQuery"
         :reading-pane-visible="displayedMessageView"
         :enable-threaded-view="Boolean(imapFolderNav)"
+        :inline-reading="showInlineMessageView"
         @show-threads="imapMail?.openJmapFolder($event)"
       />
-      <MessageView
-        v-if="displayedMessageView && !imapFolderSelected"
-        :maximized="messageViewMaximized"
-        @toggle-maximized="messageViewMaximized = !messageViewMaximized"
-      />
+      <Teleport :to="inlineReaderTarget ?? undefined" :disabled="!inlineReaderTarget">
+        <MessageView
+          v-if="(displayedMessageView || showInlineMessageView) && !imapFolderSelected"
+          v-show="displayedMessageView || inlineReaderTarget != null"
+          :back-label="showInlineMessageView ? 'Close message' : undefined"
+          :maximized="messageViewMaximized"
+          @back="closeInlineMessage"
+          @toggle-maximized="messageViewMaximized = !messageViewMaximized"
+        />
+      </Teleport>
     </template>
     <ContactsView
       v-else-if="space === 'contacts'"

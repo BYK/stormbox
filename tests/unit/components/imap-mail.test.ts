@@ -94,6 +94,18 @@ it('shows a failed Google account in Mail and makes its messages available after
     await flushPromises();
     expect(wrapper.text()).toContain('Work message body.');
     expect(mutate).toHaveBeenCalledWith(1, location, { type: 'seen', value: true });
+
+    const reader = wrapper.get('.message-view').element;
+    await wrapper.get('[data-more-menu]').trigger('click');
+    await wrapper.get('[data-more-item="read-inline"]').trigger('click');
+    await flushPromises();
+    const row = wrapper.get('.imap-mail__rows > li');
+    expect(row.get('[data-inline-mail-reader] .message-view').element).toBe(reader);
+    expect(row.get('.msg-list__open').attributes('aria-expanded')).toBe('true');
+    expect(wrapper.classes()).not.toContain('imap-mail--reading');
+    await row.get('button[aria-label="Collapse message"]').trigger('click');
+    expect(row.find('[data-inline-mail-reader]').exists()).toBe(false);
+    expect(document.activeElement).toBe(row.get('.msg-list__open').element);
   } finally {
     wrapper.unmount();
     target.remove();
@@ -165,7 +177,10 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     const headCheckbox = wrapper.get<HTMLInputElement>('input[aria-label^="Select conversation: Re: Planning"]');
     await headCheckbox.trigger('click');
     expect(wrapper.get('.msg-list__header').text()).toContain('3 selected');
-    await wrapper.get('button[aria-label="Show 3 messages"]').trigger('click');
+    const pill = wrapper.get('.thread-expand__pill');
+    expect(pill.text()).toBe('Show 3 messages');
+    expect(pill.element.closest('.msg-list__item')).toBeNull();
+    await pill.trigger('click');
     expect(wrapper.findAll('.imap-mail__rows > li')).toHaveLength(4);
     const newest = wrapper.get<HTMLInputElement>('input[aria-label^="Select message: Re: Planning"]');
     await newest.trigger('click');
@@ -176,12 +191,13 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     await wrapper.get('input[aria-label^="Select message: Planning"]').trigger('click');
     expect(headCheckbox.element.indeterminate).toBe(true);
     expect(wrapper.get('.msg-list__header').text()).toContain('2 selected');
-    await wrapper.get('button[aria-label="Hide 3 messages"]').trigger('click');
+    expect(pill.text()).toBe('Hide 3 messages');
+    await pill.trigger('click');
     expect(wrapper.get('.msg-list__header').text()).toContain('2 selected');
     await wrapper.get('button[aria-label="Clear selection"]').trigger('click');
     expect(body).not.toHaveBeenCalled();
 
-    await wrapper.get('button[aria-label="Show 3 messages"]').trigger('click');
+    await pill.trigger('click');
     await wrapper.get('button[aria-label^="Open message: Planning"]').trigger('click');
     expect(wrapper.find('ol[aria-label="Messages in conversation"]').exists()).toBe(false);
     await wrapper.get('button[aria-label="Back"]').trigger('click');
@@ -211,7 +227,11 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     notify([TABLE_FAMILIES.MESSAGES, TABLE_FAMILIES.ATTENTION]);
     await flushPromises();
     await wrapper.get('button[aria-label^="Open conversation: Re: Planning"]').trigger('click');
-    await wrapper.get('button[aria-label="Delete conversation"]').trigger('click');
+    await wrapper.get('[data-more-item="read-inline"]').trigger('click');
+    await flushPromises();
+    const inline = wrapper.get('[data-inline-mail-reader]');
+    expect(inline.findAll('ol[aria-label="Messages in conversation"] > li')).toHaveLength(3);
+    await inline.get('button[aria-label="Delete conversation"]').trigger('click');
     expect(mutateImap).toHaveBeenLastCalledWith(1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 41 },
       { type: 'trash' }, true, expect.any(Number));
     expect(destroyJmap).toHaveBeenCalledWith([40, 42], expect.objectContaining({ sourceFolderId: 23 }));

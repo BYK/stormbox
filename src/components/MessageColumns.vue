@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  computed, nextTick, onMounted, ref,
+  computed, nextTick, onMounted, ref, shallowReactive,
 } from 'vue';
 
 import { useColumnResize } from '../composables/useColumnResize';
@@ -27,6 +27,7 @@ const props = withDefaults(defineProps<{
   /** Whether the reading pane sits beside the columns; the last handle resizes against it. */
   readingPaneVisible?: boolean;
   enableThreadedView?: boolean;
+  inlineReading?: boolean;
 }>(), {
   quickFilterQuery: '',
   readingPaneVisible: false,
@@ -39,7 +40,16 @@ const mailStore = useMailStore();
 const columns = computed(() => columnsStore.columns);
 
 type MessageListHandle = InstanceType<typeof MessageList>;
-const listHandles = new Map<string, MessageListHandle>();
+const listHandles = shallowReactive(new Map<string, MessageListHandle>());
+const inlineReadingColumn = computed(() => {
+  if (!props.inlineReading || mailStore.openMessageFolderId == null) return undefined;
+  const candidates = columns.value.filter((column) => column.folderId === mailStore.openMessageFolderId);
+  return candidates.find((column) => column.id === columnsStore.lastActiveColumnId) ?? candidates[0];
+});
+const inlineReaderTarget = computed(() => {
+  const column = inlineReadingColumn.value;
+  return column ? listHandles.get(column.id)?.inlineReaderTarget ?? null : null;
+});
 
 function setListHandle(id: string, handle: unknown) {
   if (handle) listHandles.set(id, handle as MessageListHandle);
@@ -113,7 +123,7 @@ onMounted(async () => {
   areaEl.value.scrollLeft = column.offsetLeft - areaEl.value.offsetLeft;
 });
 
-defineExpose({ addColumn, removeColumn });
+defineExpose({ addColumn, removeColumn, inlineReaderTarget });
 </script>
 
 <template>
@@ -140,6 +150,7 @@ defineExpose({ addColumn, removeColumn });
         :quick-filter-query="quickFilterQuery"
         :can-add-column="columnsStore.canAddColumn"
         :enable-threaded-view="enableThreadedView"
+        :inline-reading-column="inlineReadingColumn?.id === column.id"
         @add-column="addColumn"
         @remove-column="removeColumn(column.id)"
         @change-folder="changeFolder(column.id, $event)"

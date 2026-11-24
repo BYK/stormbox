@@ -42,6 +42,8 @@ const wrappers: ReturnType<typeof mount>[] = [];
 
 function setup(initialRows: CachedRow[]) {
   const visibleMessages = shallowRef(initialRows);
+  const inlineMessageId = ref<number | null>(null);
+  const inlineReaderHeight = ref(0);
   const wrapper = mount(defineComponent({
     setup() {
       useMessageListViewport({
@@ -52,12 +54,14 @@ function setup(initialRows: CachedRow[]) {
         rowCount: ref(200),
         denseFilterActive: ref(true),
         focusedMessageId: ref(null),
+        inlineMessageId,
+        inlineReaderHeight,
       });
       return () => h('div');
     },
   }));
   wrappers.push(wrapper);
-  return { visibleMessages, virtualizer: instances.at(-1)! };
+  return { visibleMessages, inlineMessageId, inlineReaderHeight, virtualizer: instances.at(-1)! };
 }
 
 afterEach(() => {
@@ -92,5 +96,30 @@ describe('useMessageListViewport row identity', () => {
     expect(items.map((item) => item.key)).toEqual(
       items.map((item) => visibleMessages.value[item.index]?.id),
     );
+  });
+
+  it('resizes the open row with the reader and clears its height when a filter hides it', async () => {
+    const allRows = rows(1000, 200);
+    const { visibleMessages, inlineMessageId, inlineReaderHeight, virtualizer } = setup(allRows);
+    const item = (key: number) => virtualizer.getVirtualItems().find((row) => row.key === key);
+    expect(item(1041)?.size).toBe(64);
+
+    inlineMessageId.value = 1041;
+    inlineReaderHeight.value = 320;
+    await nextTick();
+    expect(item(1041)?.size).toBe(384);
+
+    inlineReaderHeight.value = 400;
+    await nextTick();
+    expect(item(1042)?.start).toBe(item(1041)?.end);
+    expect(item(1041)?.size).toBe(464);
+
+    visibleMessages.value = allRows.filter((row) => row?.id !== 1041);
+    inlineMessageId.value = 1042;
+    await nextTick();
+    visibleMessages.value = allRows;
+    await nextTick();
+    expect(item(1041)?.size).toBe(64);
+    expect(item(1042)?.size).toBe(464);
   });
 });

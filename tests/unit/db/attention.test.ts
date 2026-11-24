@@ -23,7 +23,9 @@ function fakeRelay() {
   const touch = vi.fn();
   const server = { online: true, uidValidity: '3', accountTwoOnline: true, lastToken: '',
     flags: { seen: true, flagged: false }, trashed: false, archived: false, labels: ['Read later'],
-    homeWindowGate: undefined as Promise<void> | undefined, actionFailure: 0, actionFailureCode: '',
+    homeWindowGate: undefined as Promise<void> | undefined, workWindowGate: undefined as Promise<void> | undefined,
+    workBodyGate: undefined as Promise<void> | undefined, homeActionGate: undefined as Promise<void> | undefined,
+    actionFailure: 0, actionFailureCode: '',
     attemptedPatches: [] as unknown[],
     sends: [] as { url: string; draft: AttentionImapDraft }[] };
   const fetcher = vi.fn(async (url: string, init: RequestInit) => {
@@ -54,6 +56,7 @@ function fakeRelay() {
         expect(init.credentials).toBe('same-origin');
         const patch = JSON.parse(String(init.body));
         server.attemptedPatches.push(patch);
+        if (url.includes('/home/')) await server.homeActionGate;
         if (server.actionFailure) return Response.json({ error: server.actionFailureCode }, { status: server.actionFailure });
         if (patch.tags) {
           server.labels = server.labels.filter((label) => !patch.tags.removeLabels?.includes(label));
@@ -70,14 +73,17 @@ function fakeRelay() {
         server.archived = true;
         return Response.json({ status: 'moved' });
       }
+      if (url.includes('/work/')) await server.workBodyGate;
       const text = `Body from ${url.split('/')[5]}`;
       return Response.json({ text, html: `<p>${text}</p>` });
     }
     if (url.includes('/home/') && !server.accountTwoOnline) return Response.json({}, { status: 502 });
     const work = url.includes('/work/');
     if (!work) await server.homeWindowGate;
-    return Response.json({ mailbox: 'INBOX', uidValidity: server.uidValidity, canSend: work,
-      messages: work && (server.trashed || server.archived) ? [] : [{ uid: 12, subject: url, ...server.flags, labels: server.labels }] });
+    const snapshot = { mailbox: 'INBOX', uidValidity: server.uidValidity, canSend: work,
+      messages: work && (server.trashed || server.archived) ? [] : [{ uid: 12, subject: url, ...server.flags, labels: server.labels }] };
+    if (work) await server.workWindowGate;
+    return Response.json(snapshot);
   });
   const handlers = makeAttentionHandlers(engine, { touch }, fetcher as unknown as typeof fetch, notify);
   return { server, handlers, fetcher, notify, touch };
@@ -87,6 +93,64 @@ const ownerId = 1;
 const workMessage = { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid: 12 };
 
 describe('Attention cache', () => {
+  it('shares a foreground body with prefetch without holding up other accounts or cached reads', async () => {
+    const { handlers, server, fetcher } = fakeRelay();
+    let releaseWork!: () => void;
+    let releaseHome!: () => void;
+    server.workBodyGate = new Promise<void>((resolve) => { releaseWork = resolve; });
+    server.homeWindowGate = new Promise<void>((resolve) => { releaseHome = resolve; });
+    const bodyRequests = (account: string) => fetcher.mock.calls.filter(([url]) =>
+      url.includes(`/${account}/messages/12?`));
+    let refresh: Promise<string[]> | undefined;
+    try {
+      await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test', waitForSync: false });
+      refresh = handlers[DB_RPC.ATTENTION_REFRESH]({ ownerId });
+      await vi.waitFor(() => expect(bodyRequests('work')).toHaveLength(1));
+      const foreground = handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: workMessage });
+      await expect(handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: workMessage, cachedOnly: true })).resolves.toBeNull();
+      releaseHome();
+      await expect(refresh).resolves.toEqual([]);
+      await vi.waitFor(async () => {
+        const cached = await handlers[DB_RPC.ATTENTION_BODY]({ ownerId,
+          location: { ...workMessage, accountId: 'home' }, cachedOnly: true });
+        expect(cached?.text).toBe('Body from home');
+      });
+      expect(bodyRequests('work')).toHaveLength(1);
+      releaseWork();
+      await expect(foreground).resolves.toEqual({ text: 'Body from work', html: '<p>Body from work</p>' });
+      expect(bodyRequests('work')).toHaveLength(1);
+    } finally {
+      releaseHome();
+      releaseWork();
+      await refresh;
+      await handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: workMessage }).catch(() => {});
+    }
+  });
+
+  it('confirms a message action during an inbox refresh and rejects the stale window', async () => {
+    const { handlers, server, fetcher } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    let release!: () => void;
+    server.workWindowGate = new Promise<void>((resolve) => { release = resolve; });
+    const refresh = handlers[DB_RPC.ATTENTION_REFRESH]({ ownerId });
+    try {
+      await vi.waitFor(() => expect(fetcher.mock.calls.filter(([url]) => url.includes('/work/messages?')))
+        .toHaveLength(2));
+      const action = handlers[DB_RPC.ATTENTION_APPLY_IMAP_ACTION]({
+        ownerId, location: workMessage, action: { type: 'star', value: true },
+      });
+      await vi.waitFor(() => expect(server.attemptedPatches).toEqual([{ flagged: true }]));
+      await expect(action).resolves.toMatchObject({ ok: true });
+      release();
+      await expect(refresh).resolves.toEqual([]);
+      const cache = await handlers[DB_RPC.ATTENTION_GET]({ ownerId });
+      expect(cache.accounts.find(({ relay_id }) => relay_id === 'work')?.messages).toMatchObject([{ flagged: true }]);
+    } finally {
+      release();
+      await refresh;
+    }
+  });
+
   it('persists scoped account settings before a slow inbox sync completes', async () => {
     const google = {
       id: 'work', email: 'work@example.com', name: 'Work', managed: true, host: 'imap.gmail.com', auth: 'google-oauth',
@@ -125,6 +189,13 @@ describe('Attention cache', () => {
       mailbox: 'INBOX', uidValidity: '3', messages: [], total: 4, complete: false, minUid: null,
     }));
     await expect(new AttentionRelay(fetcher).inbox('work')).rejects.toMatchObject({ code: 'incomplete_window' });
+  });
+
+  it('surfaces a relay deadline as a retryable IMAP timeout', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ error: 'mail_timeout' }, { status: 504 }));
+    await expect(new AttentionRelay(fetcher).body(workMessage)).rejects.toMatchObject({
+      code: 'mail_timeout', status: 504, message: 'The IMAP server took too long to respond. Try again.',
+    });
   });
 
   it('allows Google authorization redirects only to the Google consent endpoint', async () => {
@@ -188,16 +259,21 @@ describe('Attention cache', () => {
   });
 
   it('keeps folder windows, message bodies and mutations scoped to account and mailbox', async () => {
-    const { handlers, server } = fakeRelay();
+    const { handlers, server, fetcher } = fakeRelay();
     const args = { ownerId, accountId: 'work', mailbox: 'Clients & Projects' };
     const location = { accountId: args.accountId, mailbox: args.mailbox, uidValidity: '9', uid: 12 };
     await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'token' });
     await handlers[DB_RPC.IMAP_FOLDER_LIST_REFRESH](args);
     expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts.find(({ relay_id }) => relay_id === 'work')?.folders)
       .toMatchObject([{ path: args.mailbox }]);
-    expect(await handlers[DB_RPC.IMAP_FOLDER_GET]({ ...args, refresh: true })).toMatchObject({
+    const [folder, concurrent] = await Promise.all([
+      handlers[DB_RPC.IMAP_FOLDER_GET]({ ...args, refresh: true }), handlers[DB_RPC.IMAP_FOLDER_GET]({ ...args, refresh: true }),
+    ]);
+    expect(folder).toMatchObject({
       uidValidity: '9', messages: [{ uid: 12, subject: 'Client update', flagged: false }], total: 1,
     });
+    expect(concurrent).toEqual(folder);
+    expect(fetcher.mock.calls.filter(([url]) => url.includes('/work/messages?mailbox=Clients'))).toHaveLength(1);
     await handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location });
     expect(await handlers[DB_RPC.ATTENTION_APPLY_IMAP_ACTION]({ ownerId, location, action: { type: 'star', value: true } }))
       .toEqual({ ok: true });
@@ -412,6 +488,7 @@ describe('Attention cache', () => {
       options: { maxAttempts: 1, backoffBaseMs: 30_000 },
     });
     let releaseHome = () => {};
+    let releaseAction = () => {};
     let refresh: Promise<string[]> | undefined;
     try {
       await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
@@ -443,17 +520,18 @@ describe('Attention cache', () => {
       await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]({
         ownerId, location: { ...workMessage, accountId: 'home' }, action: { type: 'star', value: true },
       });
+      server.homeActionGate = new Promise<void>((resolve) => { releaseAction = resolve; });
       const finishing = runner.drain();
-      await vi.waitFor(async () => expect(await engine.get('SELECT local_status FROM pending_mutations'))
-        .toMatchObject({ local_status: 'in_flight' }));
+      await vi.waitFor(() => expect(server.attemptedPatches).toHaveLength(4));
       await handlers[DB_RPC.ATTENTION_DISCONNECT]({ ownerId });
+      releaseAction();
       releaseHome();
       await finishing;
-      expect(server.attemptedPatches).toHaveLength(3);
       expect(await engine.all('SELECT id FROM pending_mutations')).toEqual([]);
       expect(await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).toMatchObject({ paired: false, accounts: [] });
       expect(await engine.get('SELECT 1 FROM attention_imap_settings WHERE owner_account_id = ?', [ownerId])).toBeNull();
     } finally {
+      releaseAction();
       releaseHome();
       await refresh;
       await runner.stop();

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { AtSign, Bell, BellOff, RefreshCw, Sparkles } from '@lucide/vue';
+import { AtSign, Bell, BellOff, Check, RefreshCw, Sparkles } from '@lucide/vue';
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import { useOnline, useStorage } from '@vueuse/core';
 import AppIconButton from './AppIconButton.vue';
@@ -10,6 +10,7 @@ import ConversationReader from './ConversationReader.vue';
 import ImapAccountsDialog from './ImapAccountsDialog.vue';
 import MessageView from './MessageView.vue';
 import { imapEntry, useImapReader } from '../composables/useImapReader';
+import { useInlineReading } from '../composables/useInlineReading';
 import { useMailListActions, type MailListSource } from '../composables/useMailListActions';
 import { useMessageTags } from '../composables/useMessageTags';
 import { getRepositoryAsync } from '../composables/useRepository';
@@ -60,8 +61,13 @@ const reading = shallowRef<Reading>();
 const openedBundle = shallowRef<TriageBundle>();
 const showConversation = ref(false);
 const reader = ref<HTMLElement>();
+const inlineTarget = shallowRef<HTMLElement>();
 const list = ref<HTMLElement>();
 const maximized = ref(false);
+const inlineReading = useInlineReading();
+const inPlace = computed(() => inlineReading.value && !maximized.value);
+const readerTarget = computed(() => (inPlace.value && inlineTarget.value) || reader.value);
+const readerBackLabel = computed(() => inPlace.value ? 'Collapse reader' : 'Back to Attention');
 let openingButton: HTMLElement | undefined;
 const pushRegistration = shallowRef<ServiceWorkerRegistration>();
 const pushKey = shallowRef<Uint8Array<ArrayBuffer>>();
@@ -417,10 +423,17 @@ function readMessage(message: TriageMessage) {
 
 function focusReader(trigger: EventTarget | null) {
   openingButton = trigger instanceof HTMLElement ? trigger : undefined;
-  void nextTick(() => reader.value?.focus({ preventScroll: true }));
+  const opened = reading.value;
+  void nextTick(() => {
+    if (reading.value === opened) readerTarget.value?.focus({ preventScroll: true });
+  });
 }
 
 function openMessage(message: TriageMessage, trigger: EventTarget | null) {
+  if (inPlace.value && !openedBundle.value && activeMessageKey.value === browserTriageMessageKey(message)) {
+    void closeReader();
+    return;
+  }
   openedBundle.value = undefined;
   showConversation.value = false;
   readMessage(message);
@@ -428,6 +441,10 @@ function openMessage(message: TriageMessage, trigger: EventTarget | null) {
 }
 
 function openBundle(bundle: TriageBundle, trigger: EventTarget | null) {
+  if (inPlace.value && activeBundle.value?.id === bundle.id) {
+    void closeReader();
+    return;
+  }
   openedBundle.value = bundle;
   showConversation.value = bundle.messages.length > 1;
   readMessage(bundle.leading.message);
@@ -518,7 +535,7 @@ function setBundleDisposition(bundle: TriageBundle, disposition: Parameters<type
 }
 
 const readerProps = computed(() => ({
-  backLabel: 'Back to Attention',
+  backLabel: readerBackLabel.value,
   maximized: maximized.value,
   imap: imapReader.value,
 }));
@@ -584,7 +601,11 @@ onBeforeUnmount(() => {
 <template>
   <section
     class="unified-attention"
-    :class="{ 'unified-attention--reading': reading, 'unified-attention--maximized': maximized }"
+    :class="{
+      'unified-attention--reading': reading && !inPlace,
+      'unified-attention--maximized': maximized,
+      'unified-attention--inline': inPlace,
+    }"
     aria-label="Attention"
   >
     <div ref="list" v-show="!maximized" class="unified-attention__list">
@@ -593,6 +614,7 @@ onBeforeUnmount(() => {
         :account-labels="accountLabels"
         :loading="loading"
         :error="error"
+        :inline-reading="inPlace"
         :open-bundle-id="activeBundle?.id"
         :open-message="reading?.message"
         :rows="rows"
@@ -602,6 +624,8 @@ onBeforeUnmount(() => {
         @bundle-action="runBundleAction"
         @message-action="runMessageAction"
         @selection-action="runSelectionAction"
+        @inline-target="inlineTarget = $event"
+        @inline-hidden="closeReader"
         @done="(bundle) => setBundleDisposition(bundle, 'done')"
         @snooze="(bundle, until) => setBundleDisposition(bundle, { snoozeUntil: until })"
         @restore="(bundle) => setBundleDisposition(bundle, 'restore')"
@@ -617,6 +641,16 @@ onBeforeUnmount(() => {
               <RefreshCw :size="16" :stroke-width="1.75" :class="{ 'unified-attention__refresh--busy': busy }" aria-hidden="true" />
             </AppIconButton>
             <AttentionActionMenu label="Smart Inbox options">
+              <button
+                class="app-dropdown__item"
+                type="button"
+                role="checkbox"
+                :aria-checked="inlineReading"
+                @click="closeContainingDropdown($event, true); inlineReading = !inlineReading"
+              >
+                <Check :size="16" :style="{ visibility: inlineReading ? 'visible' : 'hidden' }" aria-hidden="true" />
+                Read in place
+              </button>
               <button
                 class="app-dropdown__item"
                 type="button"
@@ -669,13 +703,16 @@ onBeforeUnmount(() => {
       @account-change="refreshAfterAccountChange"
       @close="manageImap = false; googleImapResult = undefined"
     />
-    <div ref="reader" class="unified-attention__reader" tabindex="-1">
+    <div v-show="!inPlace" ref="reader" class="unified-attention__reader" tabindex="-1">
+      <p v-if="!reading" class="unified-attention__empty">Select a message to read it.</p>
+    </div>
+    <Teleport v-if="readerTarget" :to="readerTarget">
       <ConversationReader
         v-if="showConversation && activeBundle && activeMessageKey"
         :subject="activeBundle.leading.message.subject ?? ''"
         :messages="conversationMessages"
         :active-key="activeMessageKey"
-        back-label="Back to Attention"
+        :back-label="readerBackLabel"
         @select="selectConversationMessage"
         @back="closeReader"
       >
@@ -702,8 +739,7 @@ onBeforeUnmount(() => {
         v-bind="readerProps"
         v-on="readerEvents"
       />
-      <p v-else class="unified-attention__empty">Select a message to read it.</p>
-    </div>
+    </Teleport>
   </section>
 </template>
 
@@ -714,7 +750,7 @@ onBeforeUnmount(() => {
   grid-template-rows: minmax(0, 1fr);
   min-height: 0;
 }
-.unified-attention:not(.unified-attention--maximized) {
+.unified-attention:not(.unified-attention--maximized, .unified-attention--inline) {
   grid-template-columns: minmax(330px, 2fr) minmax(0, 3fr);
 }
 .unified-attention__list,

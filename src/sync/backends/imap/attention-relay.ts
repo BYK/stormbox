@@ -304,6 +304,7 @@ export class AttentionRelay {
       account_identity_changed: 'Remove this account before connecting it to a different IMAP server or username.',
       account_changed: 'The account changed while you were editing it. Reopen account management and try again.',
       mail_unavailable: 'The relay could not connect to the IMAP server. Check the hostname and TLS settings.',
+      mail_timeout: 'The IMAP server took too long to respond. Try again.',
       google_oauth_unavailable: 'Google sign-in has not been configured for this mail relay.',
       google_reconnect_required: 'Reconnect this Google account in Manage IMAP accounts.',
       smtp_not_configured: 'This account does not have a sending server.',

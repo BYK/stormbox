@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { Bell, Check, ChevronDown, CircleAlert, Mail, MailOpen, Star, Trash2 } from '@lucide/vue';
+import { Bell, Check, CircleAlert, Mail, MailOpen, Star, Trash2 } from '@lucide/vue';
 import { useElementSize } from '@vueuse/core';
-import { computed, nextTick, ref, useId, watch } from 'vue';
+import { computed, nextTick, ref, shallowReactive, useId, watch, watchPostEffect } from 'vue';
 
 import { useListSelection } from '../composables/useListSelection';
 import { provideSenderAvatars } from '../composables/useSenderAvatars';
@@ -13,14 +13,17 @@ import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, conversationRow, type M
 import type { MessageTagDefinition } from '../utils/message-tags';
 import AppIconButton from './AppIconButton.vue';
 import AttentionRowMenu from './AttentionRowMenu.vue';
+import InlineMailReader from './InlineMailReader.vue';
 import MessageListRow from './MessageListRow.vue';
 import SelectableListHeader from './SelectableListHeader.vue';
+import ThreadExpandPill from './ThreadExpandPill.vue';
 
 const props = withDefaults(defineProps<{
   bundles: readonly TriageBundle[];
   accountLabels?: Readonly<Record<string, string>>;
   loading?: boolean;
   error?: string | null;
+  inlineReading?: boolean;
   openBundleId?: string;
   openMessage?: TriageMessage;
   rows?: ReadonlyMap<string, MessageRowLike & { id: number | string }>;
@@ -38,6 +41,8 @@ const emit = defineEmits<{
   'bundle-action': [bundle: TriageBundle, action: ImapAttentionAction];
   'message-action': [message: TriageMessage, action: ImapAttentionAction];
   'selection-action': [messages: TriageMessage[], action: ImapAttentionAction];
+  'inline-target': [target: HTMLElement | undefined];
+  'inline-hidden': [];
   done: [bundle: TriageBundle];
   snooze: [bundle: TriageBundle, until: number];
   restore: [bundle: TriageBundle];
@@ -58,7 +63,31 @@ const { width } = useElementSize(listEl);
 const cardLayout = computed(() => width.value > 0 && width.value < CARD_LAYOUT_WIDTH);
 const rowHeight = computed(() => cardLayout.value ? CARD_ROW_HEIGHT : ROW_HEIGHT);
 const expandedBundles = ref(new Set<string>());
+const inlineTargets = shallowReactive(new Map<string, HTMLElement>());
 provideSenderAvatars();
+
+const bundleKey = (bundle: TriageBundle) => `bundle:${bundle.id}`;
+const messageKey = (message: TriageMessage) => `message:${browserTriageMessageKey(message)}`;
+const inlinePanelId = (rowKey: string) => `${headingId}-reader-${encodeURIComponent(rowKey)}`;
+const inlineKey = computed(() => {
+  if (!props.inlineReading) return undefined;
+  if (props.openBundleId) return `bundle:${props.openBundleId}`;
+  return props.openMessage && messageKey(props.openMessage);
+});
+
+function setInlineTarget(key: string, element: unknown) {
+  if (element instanceof HTMLElement) inlineTargets.set(key, element);
+  else inlineTargets.delete(key);
+}
+
+watchPostEffect(() => {
+  const key = inlineKey.value;
+  const target = key ? inlineTargets.get(key) : undefined;
+  emit('inline-target', target);
+  if (key && !target) void nextTick(() => {
+    if (inlineKey.value === key && !inlineTargets.has(key)) emit('inline-hidden');
+  });
+});
 
 const bundlesByFilter = computed(() => {
   const groups: Record<Filter, TriageBundle[]> = { attention: [], updates: [], handled: [] };
@@ -82,9 +111,9 @@ const bundlesByFilter = computed(() => {
 const visibleBundles = computed(() => bundlesByFilter.value[selectedFilter.value]);
 const visibleMessages = computed(() => visibleBundles.value.flatMap(({ messages }) => messages.map(({ message }) => message)));
 const selectionRows = computed(() => visibleBundles.value.flatMap((bundle) => [
-  { key: `bundle:${bundle.id}`, row: bundle, messages: bundle.messages.map(({ message }) => message) },
+  { key: bundleKey(bundle), row: bundle, messages: bundle.messages.map(({ message }) => message) },
   ...(expandedBundles.value.has(bundle.id) && bundle.messages.length > 1
-    ? bundle.messages.map(({ message }) => ({ key: `message:${browserTriageMessageKey(message)}`, row: message, messages: [message] })) : []),
+    ? bundle.messages.map(({ message }) => ({ key: messageKey(message), row: message, messages: [message] })) : []),
 ]));
 const selectionIndex = computed(() => new Map(selectionRows.value.map(({ row }, index) => [row, index])));
 const selection = useListSelection({
@@ -131,6 +160,7 @@ function toggleAll() {
 
 function selectionKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented) return;
+  if (event.target instanceof Element && event.target.closest('[data-inline-mail-reader]')) return;
   if (event.key === 'Escape' || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a')) {
     selection.handleKeyDown(event);
   }
@@ -311,6 +341,8 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
           :size="rowHeight"
           :dom-id-prefix="`${detailId(bundle)}-leader-`"
           :focused="openBundleId === bundle.id"
+          :expanded="inlineReading ? inlineKey === bundleKey(bundle) : undefined"
+          :reader-controls="inlineKey === bundleKey(bundle) ? inlinePanelId(bundleKey(bundle)) : undefined"
           :selected="bundleChecked(bundle)"
           :selection-mixed="bundleMixed(bundle)"
           unread-on-avatar
@@ -322,18 +354,6 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
         >
           <template #controls>
             <div class="msg-list__row-controls" draggable="false" @click.stop>
-              <button
-                v-if="bundle.messages.length > 1"
-                class="attention-inbox__expand"
-                type="button"
-                :aria-expanded="expandedBundles.has(bundle.id)"
-                :aria-controls="detailId(bundle)"
-                :aria-label="`${expandedBundles.has(bundle.id) ? 'Hide' : 'Show'} ${bundle.messages.length} messages`"
-                @click="toggleBundle(bundle)"
-              >
-                {{ bundle.messages.length }}
-                <ChevronDown :size="14" aria-hidden="true" />
-              </button>
               <AttentionRowMenu
                 :row="bundleRow(bundle)"
                 :bundle="bundle"
@@ -347,6 +367,20 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
             </div>
           </template>
           <template #after-row>
+            <ThreadExpandPill
+              v-if="bundle.messages.length > 1"
+              :count="bundle.messages.length"
+              :expanded="expandedBundles.has(bundle.id)"
+              :controls="detailId(bundle)"
+              @toggle="toggleBundle(bundle)"
+            />
+            <InlineMailReader v-if="inlineKey === bundleKey(bundle)" :id="inlinePanelId(bundleKey(bundle))">
+              <div
+                :ref="(element) => setInlineTarget(bundleKey(bundle), element)"
+                class="attention-inbox__reader-host"
+                tabindex="-1"
+              />
+            </InlineMailReader>
             <ul
               v-if="bundle.messages.length > 1"
               v-show="expandedBundles.has(bundle.id)"
@@ -361,6 +395,9 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
                 :size="rowHeight"
                 :dom-id-prefix="`${detailId(bundle)}-member-`"
                 :focused="!openBundleId && isOpen(item.message)"
+                :expanded="inlineReading ? inlineKey === messageKey(item.message) : undefined"
+                :reader-controls="inlineKey === messageKey(item.message) && expandedBundles.has(bundle.id)
+                  ? inlinePanelId(messageKey(item.message)) : undefined"
                 :selected="messageChecked(item.message)"
                 unread-on-avatar
                 :draggable="false"
@@ -377,6 +414,16 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
                       @action="(action, event) => applyMessageAction(item.message, action, event)"
                     />
                   </div>
+                </template>
+                <template #after-row>
+                  <InlineMailReader v-if="expandedBundles.has(bundle.id) && inlineKey === messageKey(item.message)"
+                    :id="inlinePanelId(messageKey(item.message))">
+                    <div
+                      :ref="(element) => setInlineTarget(messageKey(item.message), element)"
+                      class="attention-inbox__reader-host"
+                      tabindex="-1"
+                    />
+                  </InlineMailReader>
                 </template>
               </MessageListRow>
             </ul>
@@ -473,33 +520,9 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
   list-style: none;
 }
 
-.attention-inbox__expand {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  min-height: 34px;
-  padding: 0 4px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--muted);
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  cursor: pointer;
-}
-
-.attention-inbox__expand:hover {
-  background: var(--control-hover-bg);
-  color: var(--text);
-}
-
-.attention-inbox__expand:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-
-.attention-inbox__expand[aria-expanded='true'] svg {
-  transform: rotate(180deg);
+.attention-inbox__reader-host {
+  height: 100%;
+  min-height: 0;
 }
 
 .attention-inbox__messages {
@@ -508,11 +531,6 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
 }
 
 @media (pointer: coarse) {
-  .attention-inbox__expand {
-    min-width: 44px;
-    min-height: 44px;
-    justify-content: center;
-  }
   .attention-inbox__filter {
     min-width: 44px;
     min-height: 44px;

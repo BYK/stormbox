@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { Archive, ChevronDown, Layers, List, Mail, MailOpen, Star, Trash2 } from '@lucide/vue';
+import { Archive, Layers, List, Mail, MailOpen, PanelTopOpen, Star, Trash2 } from '@lucide/vue';
 import { useElementSize, useMediaQuery, useOnline } from '@vueuse/core';
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowReactive, shallowRef, useId, watch } from 'vue';
 import type { MailboxRole } from '../constants/states';
 import { useBulkActionItems } from '../composables/useBulkActionItems';
 import { imapEntry, useImapReader } from '../composables/useImapReader';
+import { useInlineReading } from '../composables/useInlineReading';
 import { useListSelection } from '../composables/useListSelection';
 import { useMailListActions, usesGmailLabels, type MailListAction } from '../composables/useMailListActions';
 import { useMessageTags } from '../composables/useMessageTags';
@@ -36,6 +37,7 @@ import ConversationReader from './ConversationReader.vue';
 import FolderNode from './FolderNode.vue';
 import FolderTreeHeading from './FolderTreeHeading.vue';
 import ImapAccountsDialog from './ImapAccountsDialog.vue';
+import InlineMailReader from './InlineMailReader.vue';
 import MailAccountLabel from './MailAccountLabel.vue';
 import type { MoreMenuItem } from './MessageListMoreMenu.vue';
 import MessageListRow from './MessageListRow.vue';
@@ -43,6 +45,7 @@ import MessageListToolbar from './MessageListToolbar.vue';
 import MessageView from './MessageView.vue';
 import TagPickerDropdown from './TagPickerDropdown.vue';
 import TagPickerPopover, { type PopoverAnchor } from './TagPickerPopover.vue';
+import ThreadExpandPill from './ThreadExpandPill.vue';
 
 type ImapEntry = ReturnType<typeof imapEntry>;
 type InboxFolder = Pick<FolderRow, 'id' | 'account_id' | 'name' | 'role' | 'total_emails'>;
@@ -70,6 +73,7 @@ const emit = defineEmits<{
   maximized: [maximized: boolean];
 }>();
 const online = useOnline();
+const inlineReading = useInlineReading();
 const authStore = useAuthStore();
 const composeStore = useComposeStore();
 const mailStore = useMailStore();
@@ -110,6 +114,8 @@ const { width: listWidth } = useElementSize(listElement);
 const singlePane = useMediaQuery('(max-width: 839px)');
 const cardLayout = computed(() => listWidth.value > 0 && listWidth.value < CARD_LAYOUT_WIDTH);
 const readerPane = ref<HTMLElement>();
+const inlineTargets = shallowReactive(new Map<string, HTMLElement>());
+const inlineReaderId = useId();
 const maximized = ref(false);
 const listingByAccount = new Set<string>();
 const expandedAccounts = ref(new Set<string>());
@@ -295,6 +301,11 @@ const conversationMessages = computed(() => conversationEntries.value.map((entry
   unread: entry.row.is_seen === 0,
 })));
 const reading = computed(() => !selectionCount.value && Boolean(activeMessageKey.value));
+const inlineAnchorKey = computed(() => inlineReading.value && reading.value
+  ? visibleRows.value.find(rowFocused)?.key : undefined);
+const readingInline = computed(() => Boolean(inlineAnchorKey.value && !maximized.value));
+const sideReading = computed(() => reading.value && !readingInline.value);
+const inlineTarget = computed(() => inlineAnchorKey.value ? inlineTargets.get(inlineAnchorKey.value) : undefined);
 const canCompose = computed(() => unified.value || threadedFolder.value != null || account.value?.can_send === true);
 const heading = computed(() => unified.value ? 'Unified Inbox' : threadedFolder.value?.name ?? folder.value?.name ?? selected.value?.path ?? '');
 const jmapFolders = computed<InboxFolder[]>(() => {
@@ -332,10 +343,12 @@ const listStatus = computed(() => [...new Set([
 ].filter((item): item is string => Boolean(item)))]);
 const listStatusError = computed(() => Boolean(visibleSyncError.value));
 const viewActions = computed<MoreMenuItem[]>(() => {
-  if (unified.value) return [];
-  if (threadedFolder.value) return [{ id: 'flat-view', label: 'Flat message list', icon: List, run: clearFolder }];
-  return [{ id: 'threads', label: imapThreaded.value ? 'Flat message list' : 'Threaded view',
-    icon: imapThreaded.value ? List : Layers, run: toggleImapThreads }];
+  const actions: MoreMenuItem[] = [{ id: 'read-inline', label: 'Read in place', icon: PanelTopOpen,
+    checked: inlineReading.value, run: () => { inlineReading.value = !inlineReading.value; } }];
+  if (threadedFolder.value) actions.push({ id: 'flat-view', label: 'Flat message list', icon: List, run: clearFolder });
+  else if (!unified.value) actions.push({ id: 'threads', label: imapThreaded.value ? 'Flat message list' : 'Threaded view',
+    icon: imapThreaded.value ? List : Layers, run: toggleImapThreads });
+  return actions;
 });
 const additionalTagsByEntry = computed(() => new Map(imapEntries.value.map((entry) => [
   entry.id, gmailLabelTags(entry.row.labels ?? [], definitions.value),
@@ -368,6 +381,11 @@ function rowMixed(row: ListRow) {
 function rowFocused({ entry, nested, stack }: ListRow) {
   if (!openedThread.value) return !stack && activeMessageKey.value === entry.key;
   return !nested && conversationEntries.value.some(({ key }) => key === entry.key);
+}
+
+function setInlineTarget(key: string, element: unknown) {
+  if (element instanceof HTMLElement) inlineTargets.set(key, element);
+  else inlineTargets.delete(key);
 }
 function tagPickerFor(targets: readonly ThreadEntry[]) {
   const imap = targets.filter((entry): entry is Extract<ThreadEntry, { kind: 'imap' }> => usesGmailLabels(entry));
@@ -792,7 +810,7 @@ function openRow({ entry, nested, key }: ListRow, button: HTMLElement | null) {
   openedThread.value = showThreads.value && !nested ? threadByMember.value.get(entry.key) : undefined;
   showMessage(entry);
   openingButton = button;
-  if (singlePane.value) void nextTick(() => readerPane.value?.focus({ preventScroll: true }));
+  if (singlePane.value && !inlineReading.value) void nextTick(() => readerPane.value?.focus({ preventScroll: true }));
 }
 
 function openThreadMessage(key: string) {
@@ -827,8 +845,11 @@ watch([() => mailStore.selectedMessageId, () => mailStore.selectedMessageFolderI
   if (current && (current.id !== id || current.folderId !== folderId)) closeReader();
 });
 
+watch(sideReading, (next) => emit('detail-visible', next));
+watch(inlineAnchorKey, (key, previous) => {
+  if (previous && !key && inlineReading.value && reading.value && !maximized.value) closeReader();
+});
 watch(reading, (next) => {
-  emit('detail-visible', next);
   if (next) return;
   maximized.value = false;
   if (selection.hasSelection.value) return;
@@ -890,8 +911,10 @@ function toggleSelectAll() {
 }
 
 function onListKeydown(event: KeyboardEvent) {
-  if (event.target instanceof HTMLElement && event.target.closest('[data-message-control], .imap-mail__stack')
-      && (event.key === 'Enter' || event.key === ' ')) return;
+  if (event.target instanceof HTMLElement) {
+    if (event.target.closest('[data-inline-mail-reader]')) return;
+    if (event.target.closest('[data-message-control]') && (event.key === 'Enter' || event.key === ' ')) return;
+  }
   const result = selection.handleKeyDown(event);
   if (result.focusChanged) {
     const index = selection.focusedIndex.value;
@@ -1001,7 +1024,7 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
   </Teleport>
 
   <section v-if="active" class="imap-mail" :aria-label="heading"
-    :class="{ 'imap-mail--reading': reading, 'imap-mail--maximized': maximized }">
+    :class="{ 'imap-mail--reading': sideReading, 'imap-mail--maximized': maximized }">
     <div v-show="!maximized" ref="listElement" class="imap-mail__list msg-list" :class="{ 'msg-list--card': cardLayout }">
       <h2 ref="listHeading" class="imap-mail__focus-title" tabindex="-1">{{ heading }}</h2>
       <MessageListToolbar
@@ -1041,6 +1064,8 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
             :class="{ 'imap-mail__nested': item.nested }" :context="rowContext(item.entry)"
             :dom-id-prefix="item.stack ? 'account-mail-conversation-' : 'account-mail-row-'"
             :focused="rowFocused(item)" :cursor="focusedId === item.key" :selected="rowChecked(item)"
+            :expanded="inlineReading ? readingInline && inlineAnchorKey === item.key : undefined"
+            :reader-controls="readingInline && inlineAnchorKey === item.key ? inlineReaderId : undefined"
             :selection-mixed="rowMixed(item)" :conversation-count="item.stack ? item.targets.length : undefined" :draggable="false"
             :shows-recipients="folderShowsRecipients({ role })"
             :sort="item.entry.kind === 'jmap' ? mailStore.sortForFolder(item.entry.folder.id) : 'received'"
@@ -1056,14 +1081,13 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
             @archive="runActions(item.targets, { type: 'archive' })"
             @delete="runActions(item.targets, { type: 'delete' })"
           >
-            <template v-if="item.stack" #controls>
-              <div class="msg-list__row-controls" @click.stop>
-                <button type="button" class="imap-mail__stack" :aria-expanded="expandedThreads.has(item.stack.key)"
-                  :aria-label="`${expandedThreads.has(item.stack.key) ? 'Hide' : 'Show'} ${item.targets.length} messages`"
-                  @click.stop="toggleThread(item.stack.key)">
-                  +{{ item.stack.previous.length }} <ChevronDown :size="14" aria-hidden="true" />
-                </button>
-              </div>
+            <template #after-row>
+              <ThreadExpandPill v-if="item.stack" class="imap-mail__thread-pill"
+                :count="item.targets.length" :expanded="expandedThreads.has(item.stack.key)"
+                @toggle="toggleThread(item.stack.key)" />
+              <InlineMailReader v-if="readingInline && inlineAnchorKey === item.key" :id="inlineReaderId">
+                <div :ref="(element) => setInlineTarget(item.key, element)" class="imap-mail__inline-target" />
+              </InlineMailReader>
             </template>
           </MessageListRow>
         </ul>
@@ -1075,9 +1099,12 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
           :disabled="jmapLoadingOlder && !canShowMore" @click="loadMore">{{ jmapLoadingOlder ? 'Loading older mail…' : 'Load older mail' }}</button>
       </div>
     </div>
-    <div v-if="reading" ref="readerPane" class="imap-mail__reader" tabindex="-1">
+    <Teleport v-if="reading" :to="inlineTarget" :disabled="!readingInline || !inlineTarget">
+    <div v-show="!readingInline || inlineTarget" ref="readerPane" class="imap-mail__reader"
+      :class="{ 'imap-mail__reader--inline': readingInline }" tabindex="-1">
       <component :is="threadReaderOpen ? ConversationReader : 'div'" class="imap-mail__reader-content"
         v-bind="threadReaderOpen ? { subject: conversationEntries.at(-1)?.subject, messages: conversationMessages, activeKey: activeMessageKey } : {}"
+        :back-label="threadReaderOpen && readingInline ? 'Collapse conversation' : undefined"
         @select="openThreadMessage" @back="closeReader">
         <template v-if="threadReaderOpen" #actions>
           <AppIconButton v-if="conversationEntries.some(({ row }) => row.is_seen === 0)"
@@ -1095,12 +1122,14 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
           <AppIconButton v-if="conversationEntries.every(canDeleteEntry)" danger title="Delete conversation" aria-label="Delete conversation"
             @click="runActions(conversationEntries, { type: 'delete' })"><Trash2 :size="18" /></AppIconButton>
         </template>
-        <MessageView :imap="readerProps" :maximized="maximized" back-label="Back" :show-back="!threadReaderOpen"
+        <MessageView :imap="readerProps" :maximized="maximized" :back-label="readingInline ? 'Collapse message' : 'Back'"
+          :show-back="!threadReaderOpen"
           @back="closeReader" @toggle-maximized="maximized = !maximized"
           @imap-action="reader.current.value && reader.runAction(reader.current.value, $event)"
           @imap-compose="reader.composeResponse" />
       </component>
     </div>
+    </Teleport>
     <TagPickerPopover :anchor="tagPopover?.anchor ?? null" :trigger="tagPopover?.trigger ?? null"
       :return-focus="tagPopover?.trigger ?? null" :targets="rowTagPicker.rows"
       :definitions="rowTagPicker.definitions" :additional-tags="rowTagPicker.labels"
@@ -1122,25 +1151,24 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
 .imap-mail__list { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .imap-mail__focus-title { position: absolute; clip-path: inset(50%); width: 1px; height: 1px; overflow: hidden; }
 .imap-mail__empty { margin: 0; padding: 8px 14px; color: var(--muted); font-size: .82rem; }
-.imap-mail__stack, .imap-mail__more {
+.imap-mail__more {
   border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted);
   font: inherit; font-size: .8rem; cursor: pointer;
 }
-.imap-mail__stack:hover, .imap-mail__more:hover { background: var(--rowHover); color: var(--text); }
-.imap-mail__stack { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 2px; min-height: 34px; white-space: nowrap; padding: 0 4px; }
-.imap-mail__stack[aria-expanded='true'] svg { transform: rotate(180deg); }
+.imap-mail__more:hover { background: var(--rowHover); color: var(--text); }
+.imap-mail__thread-pill { --thread-pill-indent: 100px; }
+.msg-list--card .imap-mail__thread-pill { --thread-pill-indent: 88px; }
 .imap-mail__more { display: block; margin: 10px auto; padding: 6px 10px; }
 .imap-mail__more:disabled { cursor: default; opacity: .6; }
 .imap-mail__scroll { flex: 1; min-height: 0; overflow: auto; }
 .imap-mail__rows { padding: 0; margin: 0; list-style: none; }
 .imap-mail__nested { margin-inline-start: 14px; border-inline-start: 2px solid var(--border); }
 .imap-mail__reader { min-height: 0; min-width: 0; border-inline-start: 1px solid var(--border); outline: none; }
+.imap-mail__inline-target, .imap-mail__reader--inline { height: 100%; }
+.imap-mail__reader--inline { border-inline-start: 0; }
 .imap-mail__reader-content { height: 100%; min-height: 0; }
 .imap-mail__reader :deep(.message-view) { height: 100%; }
 .imap-mail--maximized .imap-mail__reader { position: fixed; inset: 0; z-index: 45; }
-@media (pointer: coarse) {
-  .imap-mail__stack { min-width: 44px; min-height: 44px; }
-}
 @media (max-width: 839px) {
   .imap-mail--reading:not(.imap-mail--maximized) { grid-template-columns: minmax(0, 1fr); }
   .imap-mail--reading .imap-mail__list { display: none; }

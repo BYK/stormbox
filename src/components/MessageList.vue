@@ -2,10 +2,12 @@
 import {
   computed, nextTick, onBeforeUnmount, onMounted, ref, watch,
 } from 'vue';
-import { Layers, RefreshCw } from '@lucide/vue';
+import { Layers, PanelTopOpen, RefreshCw } from '@lucide/vue';
+import { useResizeObserver } from '@vueuse/core';
 
 import { useMailStore } from '../stores/mail-store';
 import { useBulkActionItems } from '../composables/useBulkActionItems';
+import { useInlineReading } from '../composables/useInlineReading';
 import { useListSelection } from '../composables/useListSelection';
 import {
   useMessageDragDrop,
@@ -24,7 +26,9 @@ import { folderShowsRecipients } from '../utils/message-row-presentation';
 import { isScheduledMessage } from '../utils/scheduled-message';
 import type { CachedRow } from '../stores/mail-store-types';
 import type { FolderRow } from '../types';
+import InlineMailReader from './InlineMailReader.vue';
 import MessageListHeaderTitle from './MessageListHeaderTitle.vue';
+import type { MoreMenuItem } from './MessageListMoreMenu.vue';
 import MessageListRow from './MessageListRow.vue';
 import MessageListToolbar from './MessageListToolbar.vue';
 import TagPickerDropdown from './TagPickerDropdown.vue';
@@ -58,6 +62,7 @@ const props = withDefaults(defineProps<{
   quickFilterQuery?: string;
   canAddColumn?: boolean;
   enableThreadedView?: boolean;
+  inlineReadingColumn?: boolean;
 }>(), {
   folderId: undefined,
   listId: '',
@@ -96,6 +101,8 @@ const regionLabel = computed(() => (
 ));
 const rowDomIdPrefix = computed(() => (props.listId ? `msg-row-${props.listId}-` : 'msg-row-'));
 const gridId = computed(() => (props.listId ? `msg-listbox-${props.listId}` : 'msg-listbox'));
+const readInPlace = useInlineReading();
+const inlineReaderId = computed(() => `${gridId.value}-inline-reader`);
 
 // Every column binds its folder's cached window; the store keeps the
 // bound folders fresh on broadcasts and asks the sync layer to keep
@@ -143,6 +150,22 @@ const openMessageId = computed<number | null>(() => (
     ? mailStore.selectedMessageId
     : null
 ));
+const inlineMessageId = computed(() => props.inlineReadingColumn ? openMessageId.value : null);
+const inlineReaderTarget = ref<HTMLElement | null>(null);
+const inlineReaderRegion = computed(() => inlineReaderTarget.value?.parentElement ?? null);
+const inlineReaderHeight = ref(0);
+
+function setInlineReaderTarget(key: string | number | bigint, element: unknown) {
+  if (element instanceof HTMLElement) inlineReaderTarget.value = element;
+  else if (inlineReaderTarget.value?.dataset.inlineMessageId === String(key)) inlineReaderTarget.value = null;
+}
+
+function measureInlineReader() {
+  if (inlineReaderRegion.value) inlineReaderHeight.value = inlineReaderRegion.value.getBoundingClientRect().height;
+}
+
+watch(inlineReaderRegion, measureInlineReader, { flush: 'post' });
+useResizeObserver(inlineReaderRegion, measureInlineReader, { box: 'border-box' });
 
 function openMessage(id: number | null) {
   mailStore.selectMessage(id, id == null ? undefined : folderId.value);
@@ -233,6 +256,7 @@ function onControlPointerInteraction(event: MouseEvent) {
 
 function handleKeyDown(event: KeyboardEvent) {
   if (event.defaultPrevented) return;
+  if (event.target instanceof Element && event.target.closest('[data-inline-mail-reader]')) return;
   if ((event.metaKey || event.ctrlKey) && (event.key === 'a' || event.key === 'A')) {
     event.preventDefault();
     selectAllForCurrentFilter();
@@ -375,6 +399,7 @@ const {
   scrollEl,
   listWidth,
   cardLayout,
+  summaryHeight,
   totalSize,
   virtualItems,
   onScroll,
@@ -386,6 +411,8 @@ const {
   rowCount,
   denseFilterActive: denseLocalFilterActive,
   focusedMessageId,
+  inlineMessageId,
+  inlineReaderHeight,
 });
 
 // Virtual rows outside the rendered window cannot be active descendants.
@@ -837,15 +864,19 @@ function refresh() {
   void mailStore.refresh(folderId.value);
 }
 
-const viewActions = computed(() => {
-  const current = folder.value;
-  if (!props.enableThreadedView || !current || current.role === 'scheduled' || current.id <= 0 || current.account_id <= 0) return [];
-  return [{
-    id: 'threads',
-    label: 'Threaded view',
-    icon: Layers,
-    run: () => emit('show-threads', current),
+const viewActions = computed<MoreMenuItem[]>(() => {
+  const actions: MoreMenuItem[] = [{
+    id: 'read-in-place',
+    label: 'Read in place',
+    icon: PanelTopOpen,
+    checked: readInPlace.value,
+    run: () => { readInPlace.value = !readInPlace.value; },
   }];
+  const current = folder.value;
+  if (props.enableThreadedView && current && current.role !== 'scheduled' && current.id > 0 && current.account_id > 0) {
+    actions.push({ id: 'threads', label: 'Threaded view', icon: Layers, run: () => emit('show-threads', current) });
+  }
+  return actions;
 });
 
 const titleEl = ref<InstanceType<typeof MessageListHeaderTitle> | null>(null);
@@ -879,7 +910,7 @@ watch(() => visibleMessages.value.length, async (count, previous) => {
   (scrollEl.value ?? msgListEl.value?.querySelector<HTMLElement>('input, button'))?.focus();
 });
 
-defineExpose({ focusColumnControl, focusFolderPicker });
+defineExpose({ focusColumnControl, focusFolderPicker, inlineReaderTarget });
 </script>
 
 <template>
@@ -993,8 +1024,12 @@ defineExpose({ focusColumnControl, focusFolderPicker });
             :index="v.index"
             :start="v.start"
             :size="v.size"
+            :class="{ 'msg-list__item-with-reader': inlineMessageId === visibleMessages[v.index].id }"
+            :style="inlineMessageId === visibleMessages[v.index].id ? { '--message-summary-height': `${summaryHeight}px` } : undefined"
             :dom-id-prefix="rowDomIdPrefix"
             :focused="openMessageId === visibleMessages[v.index].id"
+            :expanded="readInPlace ? inlineMessageId === visibleMessages[v.index].id : undefined"
+            :reader-controls="inlineMessageId === visibleMessages[v.index].id ? inlineReaderId : undefined"
             :cursor="focusedMessageId === visibleMessages[v.index].id"
             :selected="isSelected(visibleMessages[v.index].id)"
             :dragging="isDraggingMessage(visibleMessages[v.index].id)"
@@ -1013,7 +1048,14 @@ defineExpose({ focusColumnControl, focusFolderPicker });
             @tag="openRowTagPicker(visibleMessages[v.index], $event)"
             @archive="archiveOne(visibleMessages[v.index].id)"
             @delete="deleteOne(visibleMessages[v.index].id)"
-          />
+          >
+            <template #after-row>
+              <InlineMailReader v-if="inlineMessageId === visibleMessages[v.index].id" :id="inlineReaderId">
+                <div :ref="(element) => setInlineReaderTarget(v.key, element)" :data-inline-message-id="v.key"
+                  class="msg-list__inline-target" />
+              </InlineMailReader>
+            </template>
+          </MessageListRow>
           <li
             v-else
             :data-index="v.index"
@@ -1078,6 +1120,15 @@ defineExpose({ focusColumnControl, focusFolderPicker });
 </template>
 
 <style scoped>
+.msg-list__item-with-reader > :deep(.msg-list__item) {
+  height: var(--message-summary-height);
+}
+
+.msg-list__inline-target {
+  height: 100%;
+  min-height: 0;
+}
+
 .msg-list {
   display: grid;
   /* The header's nowrap row must never size the column: the track is

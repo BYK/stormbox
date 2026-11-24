@@ -182,8 +182,11 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
   const relay = new AttentionRelay(fetcher);
   const refreshing = new Map<number, { version: number; pending: Promise<string[]> }>();
   const relayOperations = new Map<number, Promise<unknown>>();
-  const folderOperations = new Map<string, Promise<unknown>>();
-  const prefetching = new Set<number>();
+  const folderWrites = new Map<string, Promise<unknown>>();
+  const folderRefreshes = new Map<string, Promise<CachedImapFolder | null>>();
+  const mailboxActivity = new Map<string, { revision: number; readers: number; writers: number }>();
+  const prefetching = new Set<string>();
+  const bodyReads = new Map<string, Promise<RelayMessageBody | null>>();
   const settingsVersions = new Map<number, number>();
   const loadingSettings = new Map<number, { version: number; pending: Promise<RelayAccountSettings> }>();
 
@@ -210,9 +213,26 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     return serializeOperation(relayOperations, ownerId, operation);
   }
 
-  function serializeFolderOperation<T>(ownerId: number, accountId: string, mailbox: string,
-    operation: () => Promise<T>): Promise<T> {
-    return serializeOperation(folderOperations, JSON.stringify([ownerId, accountId, mailbox]), operation);
+  async function trackMailboxActivity<T>(ownerId: number, accountId: string, writing: boolean,
+    operation: (canPublish: () => boolean) => Promise<T>): Promise<T> {
+    const key = JSON.stringify([ownerId, accountId]);
+    const activity = mailboxActivity.get(key) ?? { revision: 0, readers: 0, writers: 0 };
+    mailboxActivity.set(key, activity);
+    const revision = activity.revision;
+    const overlapsWrite = activity.writers > 0;
+    if (writing) {
+      activity.revision += 1;
+      activity.writers += 1;
+    } else activity.readers += 1;
+    try {
+      // Gmail can change the same message in another mailbox. Only publish
+      // snapshots that did not overlap an edit anywhere in this account.
+      return await operation(() => !overlapsWrite && activity.revision === revision);
+    } finally {
+      if (writing) activity.writers -= 1;
+      else activity.readers -= 1;
+      if (activity.readers === 0 && activity.writers === 0) mailboxActivity.delete(key);
+    }
   }
 
   async function isPaired(ownerId: number) {
@@ -231,18 +251,35 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     return mailbox === 'INBOX' ? 'attention_imap_accounts' : 'imap_folder_windows';
   }
 
-  async function readBody(ownerId: number, location: ImapMessageLocation, cachedOnly = false): Promise<RelayMessageBody | null> {
-    const version = settingsVersion(ownerId);
+  type BodyKey = [ownerId: number, accountId: string, mailbox: string, uidValidity: string, uid: number];
+
+  function readBody(ownerId: number, location: ImapMessageLocation, cachedOnly = false): Promise<RelayMessageBody | null> {
     const { accountId, mailbox, uidValidity, uid } = location;
-    const key = [ownerId, accountId, mailbox, uidValidity, uid];
+    const key: BodyKey = [ownerId, accountId, mailbox, uidValidity, uid];
+    if (cachedOnly) return readCachedBody(key);
+    const version = settingsVersion(ownerId);
+    const identity = JSON.stringify([version, ...key]);
+    const existing = bodyReads.get(identity);
+    if (existing) return existing;
+    const pending = downloadBody(location, key, version).finally(() => bodyReads.delete(identity));
+    bodyReads.set(identity, pending);
+    return pending;
+  }
+
+  async function readCachedBody(key: BodyKey): Promise<RelayMessageBody | null> {
     const record = await engine.get(
       `SELECT body_text, body_html FROM attention_imap_bodies WHERE owner_account_id = ?
        AND relay_id = ? AND mailbox = ? AND uid_validity = ? AND uid = ?`, key,
     );
-    const cached = record ? {
+    return record ? {
       text: String(record.body_text), html: record.body_html == null ? null : String(record.body_html),
     } : null;
-    if (cachedOnly || cached?.html != null) return cached;
+  }
+
+  async function downloadBody(location: ImapMessageLocation, key: BodyKey, version: number) {
+    const [ownerId, accountId, mailbox, , uid] = key;
+    const cached = await readCachedBody(key);
+    if (cached?.html != null) return cached;
     const snapshot = await engine.get(
       `SELECT 1 FROM ${folderTable(mailbox)} WHERE owner_account_id = ?
        AND relay_id = ? AND mailbox = ? AND uid_validity = ?`, key.slice(0, 4),
@@ -365,16 +402,15 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
   async function refresh(ownerId: number, version: number): Promise<string[]> {
     if (!await isPaired(ownerId)) return [];
     const { accounts } = await refreshRelaySettings(ownerId);
-    const windows = await Promise.allSettled(accounts.map((account) =>
-      serializeFolderOperation(ownerId, account.id, 'INBOX', () => refreshInbox(ownerId, account, version))));
-    if (!prefetching.has(ownerId)) {
-      prefetching.add(ownerId);
-      void prefetch(ownerId, accounts, windows).finally(() => prefetching.delete(ownerId));
-    }
+    const windows = await Promise.allSettled(accounts.map(async (account) => {
+      const window = await trackMailboxActivity(ownerId, account.id, false,
+        (canPublish) => refreshInbox(ownerId, account, version, canPublish));
+      if (window) schedulePrefetch(ownerId, account.id, window, version);
+    }));
     return accounts.filter((_account, index) => windows[index].status === 'rejected').map(({ email }) => email);
   }
 
-  async function refreshInbox(ownerId: number, account: RelayAccount, version: number) {
+  async function refreshInbox(ownerId: number, account: RelayAccount, version: number, canPublish: () => boolean) {
     if (version !== settingsVersion(ownerId)) return;
     const identity = [ownerId, account.id];
     let window: RelayWindow;
@@ -384,7 +420,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
       const message = cause instanceof AttentionRelayError
         ? cause.message : 'Could not reach the IMAP relay. Try refreshing again.';
       await engine.transaction(async (tx) => {
-        if (version !== settingsVersion(ownerId)) return;
+        if (version !== settingsVersion(ownerId) || !canPublish()) return;
         await tx.run(
           'UPDATE attention_imap_accounts SET sync_error = ? WHERE owner_account_id = ? AND relay_id = ?',
           [message, ...identity],
@@ -395,7 +431,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     }
     const { mailbox, uidValidity, messages, canSend, total } = window;
     const saved = await engine.transaction(async (tx) => {
-      if (version !== settingsVersion(ownerId)) return false;
+      if (version !== settingsVersion(ownerId) || !canPublish()) return false;
       await tx.run(
         `UPDATE attention_imap_accounts SET mailbox = ?, uid_validity = ?, messages_json = ?, can_send = ?,
            last_synced_at = ?, total_messages = ?, sync_error = NULL
@@ -413,13 +449,22 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     return saved ? window : undefined;
   }
 
-  async function prefetch(ownerId: number, accounts: Awaited<ReturnType<AttentionRelay['accounts']>>,
-    windows: PromiseSettledResult<RelayWindow | undefined>[]) {
-    for (const [index, result] of windows.entries()) {
-      if (result.status !== 'fulfilled' || !result.value) continue;
-      const { mailbox, uidValidity, messages } = result.value;
-      for (const { uid } of messages.slice(0, PREFETCH_COUNT)) {
-        await readBody(ownerId, { accountId: accounts[index].id, mailbox, uidValidity, uid }).catch(() => {});
+  function schedulePrefetch(ownerId: number, accountId: string, window: RelayWindow, version: number) {
+    const key = JSON.stringify([version, ownerId, accountId]);
+    if (prefetching.has(key)) return;
+    prefetching.add(key);
+    void prefetch(ownerId, accountId, window, version).finally(() => prefetching.delete(key)).catch(() => {});
+  }
+
+  async function prefetch(ownerId: number, accountId: string, { mailbox, uidValidity, messages }: RelayWindow, version: number) {
+    for (const { uid } of messages.slice(0, PREFETCH_COUNT)) {
+      if (version !== settingsVersion(ownerId)) break;
+      try {
+        await readBody(ownerId, { accountId, mailbox, uidValidity, uid });
+      } catch (cause) {
+        // Only a missing message is specific to this UID. Leave a failing
+        // account alone until its next refresh.
+        if (!(cause instanceof AttentionRelayError) || cause.code !== 'message_not_found') break;
       }
     }
   }
@@ -461,12 +506,22 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     });
   }
 
-  async function refreshFolder(ownerId: number, accountId: string, mailbox: string) {
+  function refreshFolderOnce(ownerId: number, accountId: string, mailbox: string) {
+    const key = JSON.stringify([settingsVersion(ownerId), ownerId, accountId, mailbox]);
+    const current = folderRefreshes.get(key);
+    if (current) return current;
+    const pending = trackMailboxActivity(ownerId, accountId, false,
+      (canPublish) => refreshFolder(ownerId, accountId, mailbox, canPublish)).finally(() => folderRefreshes.delete(key));
+    folderRefreshes.set(key, pending);
+    return pending;
+  }
+
+  async function refreshFolder(ownerId: number, accountId: string, mailbox: string, canPublish: () => boolean) {
     const version = settingsVersion(ownerId);
     await requirePairing(ownerId);
     const { uidValidity, messages, total }: RelayWindow = await relay.folder(accountId, mailbox, 100);
     await engine.transaction(async (tx) => {
-      if (version !== settingsVersion(ownerId)) return;
+      if (version !== settingsVersion(ownerId) || !canPublish()) return;
       await tx.run(`INSERT INTO imap_folder_windows
         (owner_account_id, relay_id, mailbox, uid_validity, messages_json, total_messages, cached_at)
         SELECT owner_account_id, relay_id, ?, ?, ?, ?, ? FROM attention_imap_accounts
@@ -613,12 +668,11 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     }
     const key = [ownerId, location.accountId, location.mailbox, location.uidValidity];
     const snapshot = await engine.get(
-      `SELECT messages_json FROM ${folderTable(location.mailbox)}
+      `SELECT 1 FROM ${folderTable(location.mailbox)}
        WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ?`, key,
     );
     if (!snapshot) return terminalImapAction('imapMailboxChanged', 'This mailbox changed. Refresh this folder and reopen the message.');
     if (!await activeImapAction(engine, ownerId, mutationId)) return { ok: true };
-    const messages: RelayMessage[] = JSON.parse(String(snapshot.messages_json));
 
     // The message may have aged out of the cached window while queued.
     // The relay verifies UIDVALIDITY and resolves the UID on the server.
@@ -640,11 +694,15 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     const tagUpdate = flags?.tagsApplied;
     const confirmed = flags && { seen: flags.seen, flagged: flags.flagged,
       ...(flags.keywords ? { keywords: flags.keywords } : {}), ...(flags.labels ? { labels: flags.labels } : {}) };
-    const next = confirmed
-      ? messages.map((message) => message.uid === location.uid ? { ...message, ...confirmed } : message)
-      : messages.filter((message) => message.uid !== location.uid);
     const reconciled = await engine.transaction(async (tx) => {
       if (!await activeImapAction(tx, ownerId, mutationId)) return false;
+      const latest = await tx.get(`SELECT messages_json FROM ${folderTable(location.mailbox)}
+        WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ?`, key);
+      if (!latest) return false;
+      const messages: RelayMessage[] = JSON.parse(String(latest.messages_json));
+      const next = confirmed
+        ? messages.map((message) => message.uid === location.uid ? { ...message, ...confirmed } : message)
+        : messages.filter((message) => message.uid !== location.uid);
       await tx.run(
         `UPDATE ${folderTable(location.mailbox)} SET messages_json = ?, total_messages = total_messages - ?
          WHERE owner_account_id = ? AND relay_id = ? AND mailbox = ? AND uid_validity = ?`,
@@ -790,7 +848,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     [DB_RPC.ATTENTION_REFRESH]: async ({ ownerId }) => refreshOnce(ownerId),
     [DB_RPC.IMAP_FOLDER_LIST_REFRESH]: async ({ ownerId, accountId }) => listFolders(ownerId, accountId),
     [DB_RPC.IMAP_FOLDER_GET]: async ({ ownerId, accountId, mailbox, refresh: online = false }) => online
-      ? serializeFolderOperation(ownerId, accountId, mailbox, () => refreshFolder(ownerId, accountId, mailbox))
+      ? refreshFolderOnce(ownerId, accountId, mailbox)
       : getFolder(ownerId, accountId, mailbox),
     [DB_RPC.ATTENTION_LIST_RELAY_ACCOUNTS]: async ({ ownerId, cachedOnly = false }) => cachedOnly
       ? readRelaySettings(ownerId) : refreshRelaySettings(ownerId),
@@ -844,8 +902,9 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
       if (!validImapAction(location, action)) {
         return terminalImapAction('invalidArguments', 'The pending IMAP change is invalid.');
       }
-      return serializeFolderOperation(ownerId, location.accountId, location.mailbox, () =>
-        applyImapAction(ownerId, location, action, mutationId));
+      const key = JSON.stringify([ownerId, location.accountId, location.mailbox]);
+      return serializeOperation(folderWrites, key, () => trackMailboxActivity(ownerId, location.accountId, true,
+        () => applyImapAction(ownerId, location, action, mutationId)));
     },
     [DB_RPC.ATTENTION_ENSURE_IMAP_SEND]: async ({ ownerId, accountId, draft }) => {
       const id = await ensureImapSend(ownerId, accountId, draft);

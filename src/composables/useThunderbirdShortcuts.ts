@@ -139,6 +139,17 @@ function hasScheduledTarget(
 type ShortcutHandler = (event: KeyboardEvent) => void | Promise<void>;
 let activeShortcutHandler: ShortcutHandler | null = null;
 
+const INLINE_READER_SHORTCUTS = new Set<ShortcutAction>([
+  'selectAll', 'next', 'previous', 'nextUnread', 'previousUnread', 'first', 'last',
+  'openTagMenu', 'archive', 'delete', 'toggleRead', 'toggleStar', 'reply', 'replyAll', 'forward',
+]);
+
+function isInlineReaderEvent(event: KeyboardEvent): boolean {
+  const target = event.target as Element | null;
+  const frame = target?.ownerDocument?.defaultView?.frameElement;
+  return Boolean(target?.closest?.('[data-inline-mail-reader]') || frame?.closest('[data-inline-mail-reader]'));
+}
+
 /** Forward key events from nested documents (e.g. message iframe) to the handler. */
 export function invokeThunderbirdShortcut(event: KeyboardEvent) {
   void activeShortcutHandler?.(event);
@@ -243,6 +254,7 @@ export function useThunderbirdShortcuts({
       return;
     }
     const { action, binding } = resolved;
+    if (INLINE_READER_SHORTCUTS.has(action) && isInlineReaderEvent(event)) return;
 
     switch (action) {
       case 'compose':

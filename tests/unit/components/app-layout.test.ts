@@ -201,18 +201,22 @@ function makeRepo() {
 
 const mountedWrappers = [];
 
-function mountApp() {
+function mountApp({ realMessageList = false } = {}) {
   const wrapper = mount(App, {
     attachTo: document.body,
     global: {
       stubs: {
         LoginGate: { template: '<div />' },
         FolderTree: { template: '<aside />' },
-        MessageList: {
+        MessageList: realMessageList ? false : {
           props: ['quickFilterQuery'],
           template: '<section class="msg-list" :data-filter="quickFilterQuery">list</section>',
         },
-        MessageView: { template: '<section class="message-view">view</section>' },
+        MessageView: realMessageList ? {
+          props: ['backLabel', 'maximized'],
+          emits: ['back', 'toggle-maximized'],
+          template: '<section class="message-view"><button :aria-label="backLabel || \'Back\'" @click="$emit(\'back\')">Back</button><button aria-label="Toggle full reader" @click="$emit(\'toggle-maximized\')">Maximize</button></section>',
+        } : { template: '<section class="message-view">view</section>' },
         // Carries the card the compose spotlights stage, the header controls
         // they press, and the schedule trigger the composeSchedule beacon anchors
         // to. Like the real dialog, one mounts per session and only the
@@ -1641,6 +1645,80 @@ describe('App mail layout', () => {
     await nextTick();
 
     expect(wrapper.find('.message-view').exists()).toBe(false);
+  });
+
+  it('keeps the same reader in a virtualized column row or maximized pane', async () => {
+    const mailStore = useMailStore();
+    const account = { id: 1, remote_account_id: 'me', server_origin: 'https://example.test', primary_email: 'me@example.test', is_primary: 1 };
+    const folder = { id: 10, account_id: 1, remote_id: 'inbox', role: 'inbox', name: 'Inbox', total_emails: 3 };
+    const rows = [1, 2, 3].map((id) => ({
+      id, account_id: 1, remote_id: `email-${id}`, subject: `Message ${id}`, from_text: 'Ada <ada@example.test>',
+      received_at: 1_700_000_000_000 + id, is_seen: 1, keywords_json: '{"$seen":true}',
+    }));
+    repoInstance = {
+      ...makeRepo(),
+      listAccounts: async () => [account],
+      listFolders: async () => [folder],
+      listMessagesForView: async () => rows,
+      queryViewProgress: async () => ({ total: rows.length, covered: rows.length, percent: 100 }),
+    };
+    const height = vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains('msg-list__scroller') ? 620 : 0;
+    });
+    const rect = HTMLElement.prototype.getBoundingClientRect;
+    const bounds = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      return this.matches('[data-inline-mail-reader]') ? new DOMRect(0, 0, 820, 360) : rect.call(this);
+    });
+
+    try {
+      const wrapper = mountApp({ realMessageList: true });
+      await flushPromises();
+      const columns = useMessageColumnsStore();
+      const extraColumn = columns.addColumn();
+      expect(extraColumn).not.toBeNull();
+      columns.setColumnFolder(extraColumn!, folder.id);
+      await flushPromises();
+
+      const secondList = () => wrapper.get(`[data-column-id="${extraColumn}"]`);
+      const rowButton = () => secondList().get('li[data-index="0"] .msg-list__open');
+      await rowButton().trigger('click');
+      const reader = wrapper.get('.shell > .message-view').element;
+      const toggle = () => secondList().get('[data-more-item="read-in-place"]');
+      expect(toggle().attributes('aria-checked')).toBe('false');
+
+      await toggle().trigger('click');
+      await flushPromises();
+      expect(toggle().attributes('aria-checked')).toBe('true');
+      expect(wrapper.findAll('[data-inline-mail-reader]')).toHaveLength(1);
+      expect(secondList().get('[data-inline-mail-reader] > div > .message-view').element).toBe(reader);
+      expect(rowButton().attributes('aria-expanded')).toBe('true');
+      expect(rowButton().attributes('aria-controls')).toBe(secondList().get('[data-inline-mail-reader]').attributes('id'));
+      expect(secondList().get('li[data-index="1"]').attributes('style')).toContain('translateY(424px)');
+
+      await secondList().get('.message-view button').trigger('keydown', { key: 'Enter' });
+      await secondList().get('.message-view button').trigger('keydown', { key: 'a', ctrlKey: true });
+      expect(mailStore.selectedMessageId).toBe(1);
+      expect(mailStore.selectedIds.size).toBe(0);
+
+      setWindowWidth(600, true);
+      await nextTick();
+      expect(secondList().get('.message-view').element).toBe(reader);
+      await wrapper.get('button[aria-label="Toggle full reader"]').trigger('click');
+      expect(wrapper.get('.shell > .message-view').element).toBe(reader);
+      expect(wrapper.find('.msg-columns').exists()).toBe(false);
+      await wrapper.get('button[aria-label="Toggle full reader"]').trigger('click');
+      await flushPromises();
+      expect(secondList().get('.message-view').element).toBe(reader);
+
+      await wrapper.get('button[aria-label="Close message"]').trigger('click');
+      expect(wrapper.find('.message-view').exists()).toBe(false);
+      expect(secondList().get('li[data-index="1"]').attributes('style')).toContain('translateY(64px)');
+      expect(rowButton().attributes('aria-expanded')).toBe('false');
+      expect(document.activeElement).toBe(secondList().get('.msg-list__scroller').element);
+    } finally {
+      height.mockRestore();
+      bounds.mockRestore();
+    }
   });
 
   it('lets the spaces toolbar hide and restore the folder list', async () => {

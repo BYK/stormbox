@@ -30,6 +30,8 @@ const props = withDefaults(defineProps<{
   focused?: boolean;
   cursor?: boolean;
   selected?: boolean;
+  expanded?: boolean;
+  readerControls?: string;
   selectionMixed?: boolean;
   conversationCount?: number;
   dragging?: boolean;
@@ -76,6 +78,7 @@ const props = withDefaults(defineProps<{
   focused: false,
   cursor: false,
   selected: false,
+  expanded: undefined,
   dragging: false,
   showsRecipients: false,
   sort: 'received',
@@ -183,6 +186,8 @@ const rowLabel = computed(() => [
         data-message-control
         :tabindex="controlTabIndex"
         :aria-current="inFlow && focused ? true : undefined"
+        :aria-expanded="expanded"
+        :aria-controls="readerControls"
         :aria-label="`Open ${rowKind}: ${message.subject || '(no subject)'}, ${label}${avatarUnread && isUnread ? ', unread' : ''}`"
         :title="context ? preview : undefined"
       />

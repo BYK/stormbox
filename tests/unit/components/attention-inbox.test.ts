@@ -74,11 +74,16 @@ describe('AttentionInbox', () => {
 
     const head = wrapper.get('[aria-label^="Open conversation"]');
     await head.trigger('click');
-    const expand = wrapper.get('[aria-expanded="false"]');
+    const expand = wrapper.get('.thread-expand__pill');
     const members = wrapper.get('[aria-label="Messages in bundle"]');
+    expect(expand.text()).toBe('Show 2 messages');
+    expect(head.element.closest('.msg-list__item')?.nextElementSibling).toBe(expand.element.parentElement);
+    expect(expand.element.parentElement?.nextElementSibling).toBe(members.element);
+    expect(expand.attributes('aria-controls')).toBe(members.attributes('id'));
     expect(members.isVisible()).toBe(false);
     await expand.trigger('click');
     expect(expand.attributes('aria-expanded')).toBe('true');
+    expect(expand.text()).toBe('Hide 2 messages');
     expect(members.isVisible()).toBe(true);
     const child = members.findAll('[aria-label^="Open message"]')[1];
     await child.trigger('click');
@@ -154,7 +159,7 @@ describe('AttentionInbox', () => {
     expect(head.get('[aria-label="Star"]').attributes('aria-pressed')).toBe('true');
     const markRead = head.findAll('button').find((button) => button.text() === 'Mark as read')!;
     await markRead.trigger('click');
-    await head.get('[aria-expanded="false"]').trigger('click');
+    await wrapper.get('.thread-expand__pill').trigger('click');
     const child = wrapper.get('[aria-label="Messages in bundle"]').findAll('.msg-list__item')[0];
     await child.get('[aria-label="Star"]').trigger('click');
 

@@ -199,7 +199,7 @@ describe('message list header tiers', () => {
     expect(head.find('.msg-list__filters--icons').exists()).toBe(false);
     expect(head.find('.msg-list__refresh').exists()).toBe(true);
     expect(head.find('.msg-list__add-column').exists()).toBe(true);
-    expect(head.find('[data-more-menu]').exists()).toBe(false);
+    expect(moreItems(wrapper)).toEqual(['Read in place']);
     // Alone, the column keeps the single list's header: no folder title,
     // the filters lead the row.
     expect(head.find('.msg-list__title').exists()).toBe(false);
@@ -236,7 +236,7 @@ describe('message list header tiers', () => {
     expect(head.find('.selectable-list-header__count').text()).toBe('');
     expect(head.find('.msg-list__filter').text()).toBe('Unread');
     expect(head.find('.msg-list__refresh').exists()).toBe(true);
-    expect(head.find('[data-more-menu]').exists()).toBe(false);
+    expect(moreItems(wrapper)).toEqual(['Read in place']);
   });
 
   it('then turns the filters icon-only, keeping their names for assistive tech', async () => {
@@ -269,7 +269,7 @@ describe('message list header tiers', () => {
     expect(trigger.attributes('aria-haspopup')).toBe('menu');
     expect(trigger.attributes('aria-label')).toBe('More actions for column 1');
     expect(wrapper.find('[role="menu"]').exists()).toBe(true);
-    expect(moreItems(wrapper)).toEqual(['Refresh', 'Add column']);
+    expect(moreItems(wrapper)).toEqual(['Refresh', 'Add column', 'Read in place']);
 
     const refreshSpy = vi.spyOn(mailStore, 'refresh').mockResolvedValue(undefined);
     await wrapper.find('[data-more-item="refresh"]').trigger('click');
@@ -303,7 +303,7 @@ describe('message list header tiers', () => {
 });
 
 describe('More menu focus hand-over', () => {
-  it('moves focus from a dissolving More menu to the control that returns to the row', async () => {
+  it('keeps focus on the More trigger when responsive actions return to the toolbar', async () => {
     seedInbox();
     // A controllable ResizeObserver stands in for the layout engine.
     const observers: Array<(entries: Array<{ contentRect: { width: number } }>) => void> = [];
@@ -322,17 +322,16 @@ describe('More menu focus hand-over', () => {
     (trigger.element as HTMLElement).focus();
     expect(document.activeElement).toBe(trigger.element);
 
-    // The column widens (as after a neighbour is removed): the menu goes,
-    // + comes back to the row, and focus lands on it.
     for (const callback of observers) callback([{ contentRect: { width: 600 } }]);
     await nextTick();
     await nextTick();
-    expect(wrapper.find('[data-more-menu]').exists()).toBe(false);
-    expect(document.activeElement).toBe(wrapper.find('.msg-list__add-column').element);
+    expect(wrapper.find('[data-more-menu]').element).toBe(trigger.element);
+    expect(wrapper.find('.msg-list__add-column').exists()).toBe(true);
+    expect(document.activeElement).toBe(trigger.element);
     vi.unstubAllGlobals();
   });
 
-  it('also hands focus over from an open menu item', async () => {
+  it('moves focus to the inline control when its menu action leaves More', async () => {
     seedInbox();
     const observers: Array<(entries: Array<{ contentRect: { width: number } }>) => void> = [];
     vi.stubGlobal('ResizeObserver', class {
@@ -355,7 +354,7 @@ describe('More menu focus hand-over', () => {
     for (const callback of observers) callback([{ contentRect: { width: 600 } }]);
     await nextTick();
     await nextTick();
-    expect(document.activeElement).toBe(wrapper.find('.msg-list__add-column').element);
+    expect(document.activeElement).toBe(wrapper.find('.msg-list__refresh').element);
     vi.unstubAllGlobals();
   });
 });

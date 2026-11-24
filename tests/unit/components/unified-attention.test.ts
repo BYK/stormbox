@@ -376,7 +376,7 @@ it('keeps the shared reader mounted while loading IMAP HTML and sends its toolba
   const wrapper = mount(UnifiedAttention, {
     attachTo: document.body,
     props: { ownerId: 1, address: 'owner@example.org' },
-    global: { plugins: [pinia], stubs: { Teleport: true } },
+    global: { plugins: [pinia] },
   });
 
   try {
@@ -417,9 +417,10 @@ it('keeps the shared reader mounted while loading IMAP HTML and sends its toolba
 
     await reader.get('[data-tag-picker-trigger]').trigger('click');
     await flushPromises();
-    const tag = wrapper.findAll('[role="menuitemcheckbox"]').find((item) => item.text().trim() === 'Read later');
-    expect(tag?.attributes('aria-checked')).toBe('true');
-    await tag!.trigger('click');
+    const tag = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitemcheckbox"]')]
+      .find((item) => item.textContent?.trim() === 'Read later');
+    expect(tag?.getAttribute('aria-checked')).toBe('true');
+    tag!.click();
     await flushPromises();
     expect(mutateAttentionImapMessage).toHaveBeenLastCalledWith(1, location, {
       type: 'tags', tags: { removeLabels: ['Read later'] },
@@ -676,7 +677,7 @@ it('trashes only the checked members of a bundle in one optimistic batch with on
   try {
     await flushPromises();
     await wrapper.get('[aria-label^="Select conversation"]').trigger('click');
-    await wrapper.get('[aria-label="Show 3 messages"]').trigger('click');
+    await wrapper.get('.thread-expand__pill').trigger('click');
     await wrapper.get('[aria-label^="Select message: Please review message 18"]').trigger('click');
     expect(wrapper.text()).toContain('2 selected');
     await wrapper.get('[aria-label="Selection actions"]').get('[aria-label="Move to Trash"]').trigger('click');
@@ -700,6 +701,97 @@ it('trashes only the checked members of a bundle in one optimistic batch with on
     gate.resolve();
     wrapper.unmount();
     feedback.$reset();
+    __resetRepositoryForTests();
+  }
+});
+
+it('opens conversations or individual messages under their rows when Read in place is enabled', async () => {
+  const latest = Date.now();
+  const thread = '<inline-thread@example.org>';
+  const messages = [17, 18, 19].map((uid) => ({
+    uid, subject: `Please review message ${uid}`, receivedAt: new Date(latest + uid).toISOString(),
+    messageId: `<review-${uid}@example.org>`, references: uid < 19 ? [thread] : [],
+    seen: true, flagged: false,
+    from: [{ address: `sender${uid}@example.org` }], to: [{ address: 'owner@example.org' }],
+  }));
+  __setRepositoryForTests({
+    subscribe: () => () => {},
+    getAttentionCache: async () => ({ paired: true, accounts: [{
+      relay_id: 'work', address: 'owner@example.org', mailbox: 'INBOX', uid_validity: '3', messages,
+    }], states: {} }),
+    folderByRole: async () => undefined,
+    refreshAttentionRelay: async () => [],
+    readAttentionImapMessage: async (_owner, location) => ({ text: `Body ${location.uid}`, html: '' }),
+  });
+  const wrapper = mount(UnifiedAttention, {
+    attachTo: document.body,
+    props: { ownerId: 1, address: 'owner@example.org' },
+    global: { plugins: [createPinia()] },
+  });
+
+  try {
+    await flushPromises();
+    const head = wrapper.get('[aria-label^="Open conversation"]');
+    const row = wrapper.findAll('.attention-inbox__bundle').find(({ element }) => element.contains(head.element))!;
+    const other = wrapper.get('[aria-label^="Open message: Please review message 19"]');
+    await head.trigger('click');
+    await flushPromises();
+    expect(wrapper.find('.unified-attention__reader .conversation-reader').exists()).toBe(true);
+    expect(wrapper.find('[data-inline-mail-reader]').exists()).toBe(false);
+    await wrapper.get('[aria-label="Back to Attention"]').trigger('click');
+
+    const options = wrapper.get('summary[aria-label="Smart Inbox options"]');
+    const toggle = wrapper.get('button[role="checkbox"]');
+    expect(toggle.text()).toBe('Read in place');
+    expect(toggle.attributes('aria-checked')).toBe('false');
+    await options.trigger('click');
+    await toggle.trigger('click');
+    expect(toggle.attributes('aria-checked')).toBe('true');
+    expect(head.attributes('aria-expanded')).toBe('false');
+
+    await head.trigger('click');
+    await flushPromises();
+    const inline = row.get('[data-inline-mail-reader]');
+    expect(head.attributes('aria-controls')).toBe(inline.attributes('id'));
+    expect(head.attributes('aria-expanded')).toBe('true');
+    expect(inline.find('[aria-label="Messages in conversation"]').exists()).toBe(true);
+    expect(inline.find('summary[aria-label="Conversation actions"]').exists()).toBe(true);
+    await inline.get('.message-view').trigger('keydown', { ctrlKey: true, key: 'a' });
+    expect(wrapper.find('[aria-label="Selection actions"]').exists()).toBe(false);
+    expect(other.isVisible()).toBe(true);
+    const messageView = inline.get('.message-view').element;
+    await inline.get('[aria-label="Maximize message view"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('.unified-attention__reader .message-view').element).toBe(messageView);
+    expect(wrapper.find('[data-inline-mail-reader]').exists()).toBe(false);
+    await wrapper.get('[aria-label="Restore message view"]').trigger('click');
+    await flushPromises();
+    expect(row.get('[data-inline-mail-reader] .message-view').element).toBe(messageView);
+    await row.get('[aria-label="Collapse reader"]').trigger('click');
+    expect(row.find('[data-inline-mail-reader]').exists()).toBe(false);
+    expect(document.activeElement).toBe(head.element);
+
+    const pill = row.get('.thread-expand__pill');
+    await pill.trigger('click');
+    const child = row.get('[aria-label^="Open message: Please review message 17"]');
+    await child.trigger('click');
+    await flushPromises();
+    const childReader = row.get('.attention-inbox__messages [data-inline-mail-reader]');
+    expect(childReader.find('.message-view').exists()).toBe(true);
+    expect(childReader.find('.conversation-reader').exists()).toBe(false);
+    expect(child.attributes('aria-controls')).toBe(childReader.attributes('id'));
+    await childReader.get('[aria-label="Collapse reader"]').trigger('click');
+    expect(document.activeElement).toBe(child.element);
+
+    await child.trigger('click');
+    await flushPromises();
+    await pill.trigger('click');
+    await flushPromises();
+    expect(row.find('[data-inline-mail-reader]').exists()).toBe(false);
+    expect(wrapper.find('.message-view').exists()).toBe(false);
+  } finally {
+    wrapper.unmount();
+    window.localStorage.removeItem('stormbox.mail.inline-reading');
     __resetRepositoryForTests();
   }
 });

@@ -93,10 +93,19 @@ function focusColumnControl() {
   else headerElement.value?.querySelector<HTMLElement>('.msg-list__refresh')?.focus();
 }
 
-// Keep focus in the toolbar when a menu disappears.
-watch([showsMoreMenu, hasStatus], ([more, status], [hadMore, hadStatus]) => {
+// Keep focus in the toolbar as responsive actions move out of a menu.
+watch([showsMoreMenu, hasStatus, moreMenuGroups], ([more, status, groups], [hadMore, hadStatus]) => {
   const active = document.activeElement;
-  if ((hadMore && !more && headerElement.value?.querySelector('.msg-list__more')?.contains(active))
+  const menu = headerElement.value?.querySelector<HTMLDetailsElement>('.msg-list__more');
+  const action = menu?.contains(active) ? active?.getAttribute('data-more-item') : null;
+  if (action && more && !groups.some((group) => group.items.some((item) => item.id === action))) {
+    if (menu) menu.open = false;
+    void nextTick(() => {
+      const control = action === 'refresh' ? headerElement.value?.querySelector<HTMLElement>('.msg-list__refresh') : null;
+      if (control) control.focus();
+      else focusColumnControl();
+    });
+  } else if ((hadMore && !more && menu?.contains(active))
       || (hadStatus && !status && headerElement.value?.querySelector('.msg-list__status')?.contains(active))) {
     void nextTick(focusColumnControl);
   }
