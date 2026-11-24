@@ -228,6 +228,7 @@ export class AccountState extends DurableObject<Env> {
   private syncing?: Promise<AccountSnapshot>;
   private settingKeywords?: Promise<KeywordWriteOutcome>;
   private delivering?: Promise<void>;
+  private folderInvalidation = 0;
   private refreshedAt = 0;
   private refreshFailed = false;
   private forgotten = false;
@@ -288,11 +289,12 @@ export class AccountState extends DurableObject<Env> {
     return pending;
   }
 
-  async liveFolder(account: MailAccount, mailbox: string, limit: number): Promise<ImapWindow | { error: MailTransportErrorCode }> {
-    const { window } = this.readFolder(account, mailbox, limit);
+  async liveFolder(account: MailAccount, mailbox: string, limit: number): Promise<ImapWindow | { error: MailTransportErrorCode | 'incomplete_window' }> {
+    const { generation, window } = this.readFolder(account, mailbox, limit);
     try {
       const result = await window;
       this.checkAccount(account.id);
+      if (generation < this.folderInvalidation) return { error: 'incomplete_window' };
       return result;
     } catch (error) {
       if (error instanceof MailTransportError) return { error: error.code };
@@ -308,7 +310,8 @@ export class AccountState extends DurableObject<Env> {
   private markFoldersDirty(): void {
     this.readingFolders.clear();
     this.refreshedAt = 0;
-    this.setState('applied_generation', this.beginSync());
+    this.folderInvalidation = this.beginSync();
+    this.setState('applied_generation', this.folderInvalidation);
   }
 
   snapshot(options: SnapshotOptions = {}): AccountSnapshot {
@@ -731,7 +734,7 @@ export class AccountState extends DurableObject<Env> {
       this.refreshFailed = true;
       throw error;
     }).finally(() => {
-      this.refreshedAt = Date.now();
+      if (!this.forgotten && generation >= this.getState('applied_generation')) this.refreshedAt = Date.now();
       this.syncing = undefined;
     });
     this.syncing = pending;
@@ -746,8 +749,10 @@ export class AccountState extends DurableObject<Env> {
     const account = await this.resolveAccount(id);
     this.checkAccount(id);
     if (!account) throw new HttpError(404, 'account_not_found');
-    const { folders, windows, failedFolders } = await listMailboxWindows(account, PER_FOLDER_WINDOW, MAX_FOLDERS);
+    const cursor = this.getState('refresh_folder_cursor');
+    const { folders, windows, failedFolders, nextFolder } = await listMailboxWindows(account, PER_FOLDER_WINDOW, MAX_FOLDERS, cursor);
     this.checkAccount(id);
+    if (nextFolder !== cursor) this.setState('refresh_folder_cursor', nextFolder);
     if (windows.length === 0 && failedFolders.length > 0) throw new Error('Could not refresh the configured mailboxes.');
     const selected = new Set([...windows.map(({ mailbox }) => mailbox), ...failedFolders]);
     const metadata = new Map(folders.filter(({ path }) => selected.has(path)).map((folder) => [folder.path, folder]));

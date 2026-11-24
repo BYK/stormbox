@@ -189,7 +189,10 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
       state.liveFolder(account, mailbox, number(url.searchParams.get('limit') ?? '50', 100)),
       mailbox === 'INBOX' ? state.inboxPreviews().catch(() => null) : null,
     ]);
-    if ('error' in window) throw new MailTransportError(window.error);
+    if ('error' in window) {
+      if (window.error === 'incomplete_window') throw new HttpError(503, window.error);
+      throw new MailTransportError(window.error);
+    }
     const messages = cached?.uidValidity === window.uidValidity
       ? window.messages.map((message) => ({ ...message, preview: cached.previews[message.uid] }))
       : window.messages;

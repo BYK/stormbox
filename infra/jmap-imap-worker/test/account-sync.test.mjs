@@ -89,7 +89,8 @@ test('concurrent folder reads share one connection until invalidation after a wr
   const afterWrite = read();
   assert.equal(reads.length, 2);
   reads[0].resolve(window);
-  assert.deepEqual(await first, await joined);
+  assert.deepEqual(await first, { error: 'incomplete_window' });
+  assert.deepEqual(await joined, { error: 'incomplete_window' });
   const joinedAfterWrite = read();
   assert.equal(reads.length, 2);
   reads[1].reject(new MailTransportError('mail_timeout'));
@@ -102,10 +103,13 @@ test('concurrent folder reads share one connection until invalidation after a wr
 });
 
 test('a slow JMAP refresh leaves cached reads and keyword writes available', { timeout: 3000 }, async (t) => {
-  const refresh = Promise.withResolvers();
-  let listCalls = 0;
+  const scans = [];
   const { store } = fixture(t, {
-    listMailboxWindows() { listCalls += 1; return refresh.promise; },
+    listMailboxWindows() {
+      const scan = Promise.withResolvers();
+      scans.push(scan);
+      return scan.promise;
+    },
     patchMailboxKeywords: async () => [{ uid: 10, keywords: { $flagged: true } }],
   });
   const cached = store.reconcile([{ ...folder, role: 'inbox', uidValidity: '1', total: 1, complete: true,
@@ -113,11 +117,19 @@ test('a slow JMAP refresh leaves cached reads and keyword writes available', { t
   const cachedRow = cached.messages[0];
   assert.deepEqual(await store.refresh(account.id), cached);
   const finished = store.refresh(account.id, { force: true });
-  assert.equal(listCalls, 1);
+  assert.equal(scans.length, 1);
   const update = await store.setKeywords(account, [{ id: cachedRow.id, keyword: '$flagged', add: true }], cached.state);
   assert.deepEqual(update.updated, [cachedRow.id]);
-  refresh.resolve({ folders: [folder], windows: [window], failedFolders: [] });
+  scans[0].resolve({ folders: [folder], windows: [window], failedFolders: [], nextFolder: 0 });
   assert.deepEqual((await finished).messages[0].keywords, { $flagged: true });
+  await store.refresh(account.id);
+  assert.equal(scans.length, 2);
+  const reconciled = store.refresh(account.id, { force: true });
+  scans[1].resolve({ folders: [folder], windows: [{ ...window, messages: [{ ...message, flagged: true }] }],
+    failedFolders: [], nextFolder: 0 });
+  assert.deepEqual((await reconciled).messages[0].keywords, { $flagged: true });
+  await store.refresh(account.id);
+  assert.equal(scans.length, 2);
 });
 
 test('a push poll shares a live Inbox read and schedules the next alarm after transport failure', async (t) => {

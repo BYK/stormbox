@@ -241,6 +241,19 @@ test('a slow later folder does not discard Inbox or confirm the unread folders',
   assert.deepEqual(result.windows.map(({ mailbox }) => mailbox), ['INBOX']);
   assert.deepEqual(result.failedFolders, ['Archive', 'Deleted items']);
   await fixture.sockets[0].closed;
+  const resumed = await transport.listMailboxWindows(account, 10, 8, result.nextFolder);
+  assert.deepEqual(resumed.windows.map(({ mailbox }) => mailbox), ['Deleted items', 'INBOX']);
+  assert.deepEqual(resumed.failedFolders, ['Archive']);
+});
+
+test('a stalled Inbox leaves the other folders eligible on the next scan', { timeout: 3000 }, async () => {
+  const fixture = makeImapSocket({ stall: (command) => /^EXAMINE INBOX$/.test(command) });
+  const transport = createMailTransport(fixture.connect, { folderTimeout: 100 });
+  const partial = await transport.listMailboxWindows(account, 10);
+  assert.deepEqual(partial.windows, []);
+  const resumed = await transport.listMailboxWindows(account, 10, 8, partial.nextFolder);
+  assert.deepEqual(resumed.windows.map(({ mailbox }) => mailbox), ['Archive']);
+  assert.deepEqual(resumed.failedFolders, ['INBOX']);
 });
 
 test('a deadline after issuing UID STORE preserves the uncertain write outcome', { timeout: 3000 }, async () => {

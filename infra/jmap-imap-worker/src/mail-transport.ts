@@ -295,25 +295,30 @@ export function createMailTransport(openSocket: SmtpConnect = connect, {
     return withClient(account.imap, (client) => readWindow(client, mailbox, limit));
   }
 
-  async function listMailboxWindows(account: MailAccount, limit: number, maxFolders = 8) {
+  async function listMailboxWindows(account: MailAccount, limit: number, maxFolders = 8, resumeAt = 0) {
     const count = Number.isSafeInteger(maxFolders) ? Math.min(25, Math.max(1, maxFolders)) : 8;
     let folders: ImapFolder[] = [];
     const windows: ImapWindow[] = [];
     const failedFolders = new Set<string>();
+    let selectedCount = 0;
+    let attempted = 0;
+    let offset = 0;
     try {
       await withClient(account.imap, async (client) => {
         folders = await readFolders(client);
         const inboxFirst = [...folders.filter(({ path }) => path === 'INBOX'), ...folders.filter(({ path }) => path !== 'INBOX')];
         const selected = inboxFirst.slice(0, count);
+        selectedCount = selected.length;
+        offset = selectedCount ? resumeAt % selectedCount : 0;
         for (const { path } of selected) failedFolders.add(path);
-        for (const { path } of selected) {
+        for (const { path } of [...selected.slice(offset), ...selected.slice(0, offset)]) {
+          attempted += 1;
           try {
             windows.push(await beforeDeadline(readWindow(client, path, limit), folderTimeout));
             failedFolders.delete(path);
           } catch (error) {
             if (error instanceof MailTransportError && error.code === 'mail_timeout') {
               client.close();
-              if (windows.length === 0) throw error;
               break;
             }
             if (!client.usable) break;
@@ -321,9 +326,10 @@ export function createMailTransport(openSocket: SmtpConnect = connect, {
         }
       }, syncTimeout);
     } catch (error) {
-      if (!(error instanceof MailTransportError && error.code === 'mail_timeout' && windows.length > 0)) throw error;
+      if (!(error instanceof MailTransportError && error.code === 'mail_timeout' && attempted > 0)) throw error;
     }
-    return { folders, windows, failedFolders: [...failedFolders] };
+    const nextFolder = attempted < selectedCount ? (offset + attempted) % selectedCount : 0;
+    return { folders, windows, failedFolders: [...failedFolders], nextFolder };
   }
 
   function readMessageSource(account: MailAccount, mailbox: string, uidValidity: string, uid: number): Promise<Uint8Array> {
