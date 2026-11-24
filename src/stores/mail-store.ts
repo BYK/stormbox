@@ -47,6 +47,9 @@ import {
   tagKeywordsOf,
 } from '../utils/message-tags';
 import { useSettingsStore } from './settings-store';
+import { useMailActionFeedbackStore } from './mail-action-feedback-store';
+import { useJmapMailActions } from './jmap-mail-actions';
+import type { MailActionPatch } from '../types/mail-action';
 import { createContactUid } from '../utils/contact-uid';
 import { TABLE_FAMILIES } from '../db/protocol';
 import { MUTATION_TYPE } from '../constants/states';
@@ -155,6 +158,7 @@ export const useMailStore = defineStore('mail', () => {
    * See {@link FolderCache} for shape details.
    */
   const folderStates = shallowReactive(new Map<number, FolderCache>());
+  const optimisticTransferRows = new Map<number, MessageRow>();
   /** View of the primary column while it has no folder; never written to in production. */
   const noFolderView = createFolderView();
   /** Shared read-only view for a folder that has no cache yet. */
@@ -187,10 +191,51 @@ export const useMailStore = defineStore('mail', () => {
   }
 
   function publishView(state: FolderCache) {
+    const messages = projectMailRows(state.folderId, state.rows, state.total);
     state.view.snapshot = Object.freeze({
-      messages: Object.freeze(state.rows.slice()),
-      total: state.total,
+      messages: Object.freeze(messages),
+      total: Math.max(0, state.total - (state.rows.length - messages.length)),
     });
+  }
+
+  function projectMailRows(folderId: number, rows: readonly MessageRow[], knownTotal?: number): MessageRow[];
+  function projectMailRows(folderId: number, rows: readonly CachedRow[], knownTotal?: number): CachedRow[];
+  function projectMailRows(folderId: number, rows: readonly CachedRow[], knownTotal?: number): CachedRow[] {
+    const tagKeyword = tagViewKeyword(folderId);
+    const projected = mailActions.project(folderId, rows, tagKeyword);
+    const incomingIds = tagKeyword ? [] : mailActions.incomingMessageIds(folderId);
+    if (incomingIds.length === 0) return projected;
+
+    const destination = findFolder(folderId);
+    const sort = _sortPropFor(destination);
+    const compare = (a: MessageRow, b: MessageRow) => sort === 'scheduled'
+      ? (a.sent_at ?? 0) - (b.sent_at ?? 0)
+      : sort === 'sent' ? (b.sent_at ?? 0) - (a.sent_at ?? 0) : (b.received_at ?? 0) - (a.received_at ?? 0);
+    // A sparse canonical view gives us ordering only through its first
+    // gap. Insert into that interval or a fully cached list; claiming a
+    // position farther down would put the row ahead of unknown messages.
+    let end = 0;
+    while (end < rows.length && rows[end]) end += 1;
+    const limit = rows[end - 1];
+    const complete = end === rows.length && end >= (knownTotal ?? Number(destination?.total_emails ?? 0));
+    if (!complete && !limit) return projected;
+    const present = new Set(rows.map((row) => row?.id));
+    const candidates = mailActions.project(folderId, incomingIds
+      .filter((id) => !present.has(id))
+      .map((id) => optimisticTransferRows.get(id))
+      .filter((row): row is MessageRow => !!row && (complete || compare(row, limit!) <= 0)))
+      .sort(compare);
+    if (candidates.length === 0) return projected;
+    const result: CachedRow[] = [];
+    let next = 0;
+    for (const row of projected) {
+      while (next < candidates.length && (!row || compare(candidates[next], row) < 0)) {
+        result.push(candidates[next]);
+        next += 1;
+      }
+      result.push(row);
+    }
+    return result.concat(candidates.slice(next));
   }
 
   /** Whether `state` is still the live cache for its folder (not replaced by a reset). */
@@ -409,6 +454,18 @@ export const useMailStore = defineStore('mail', () => {
   }
 
   let repo: Repository | null = null;
+  const mailActions = useJmapMailActions({
+    repository: () => repo,
+    account: () => authStore.accountId,
+    publish: () => {
+      folderStates.forEach(publishView);
+      for (const id of optimisticTransferRows.keys()) {
+        if (!mailActions.tracksMessage(id)) optimisticTransferRows.delete(id);
+      }
+    },
+    reload: () => Promise.all([refreshLoadedPages(), refreshFolders()]),
+    showNotice: setNotice,
+  });
   let unsubscribe: (() => void) | null = null;
 
   // Single-flight + re-run flag for refreshLoadedPages so a burst of
@@ -490,7 +547,7 @@ export const useMailStore = defineStore('mail', () => {
    */
   const sidebarPrimaryFolders = computed(
     () => primaryFolders.value.filter(
-      (f) => f.role != null || Number(f.is_subscribed ?? 1) !== 0,
+      (f) => !folderDeletePendingIds.value.has(f.id) && (f.role != null || Number(f.is_subscribed ?? 1) !== 0),
     ),
   );
 
@@ -505,7 +562,7 @@ export const useMailStore = defineStore('mail', () => {
     .map((account) => ({
       account,
       folders: folders.value.filter(
-        (f) => f.account_id === account.id && Number(f.is_subscribed) === 1,
+        (f) => f.account_id === account.id && Number(f.is_subscribed) === 1 && !folderDeletePendingIds.value.has(f.id),
       ),
     }))
     .filter((group) => group.folders.length > 0));
@@ -672,6 +729,9 @@ export const useMailStore = defineStore('mail', () => {
    * that want an explicit knob.
    */
   function $reset() {
+    mailActions.reset();
+    optimisticTransferRows.clear();
+    resetFolderActions();
     folders.value = [];
     accounts.value = [];
     currentFolderId.value = null;
@@ -714,7 +774,10 @@ export const useMailStore = defineStore('mail', () => {
       () => authStore.accountId,
       (newId, previousId) => {
         if (previousId != null || newId == null) $reset();
-        if (newId != null) void refreshFolders();
+        if (newId != null) {
+          void mailActions.sync();
+          void refreshFolders();
+        }
       },
       { immediate: true },
     );
@@ -755,6 +818,7 @@ export const useMailStore = defineStore('mail', () => {
   }
 
   function onTablesTouched(tables: string[]) {
+    if (tables.includes(TABLE_FAMILIES.MUTATIONS)) void mailActions.sync();
     if (tables.includes(TABLE_FAMILIES.FOLDERS)) {
       refreshFolders();
     }
@@ -828,8 +892,12 @@ export const useMailStore = defineStore('mail', () => {
   // momentarily resurrect the old value of a later one (which made
   // cascaded unsubscribes flash every child through the sidebar).
   const optimisticSubscriptions = new Map<number, 0 | 1>();
+  const optimisticFolderEdits = new Map<number, Partial<Pick<FolderRow, 'name' | 'parent_id'>>>();
+  let pendingCreatedFolder: FolderRow | null = null;
+  let folderReadRevision = 0;
 
   async function refreshFolders() {
+    const revision = ++folderReadRevision;
     const accountId = authStore.accountId;
     if (!repo || accountId == null) {
       folders.value = [];
@@ -849,7 +917,7 @@ export const useMailStore = defineStore('mail', () => {
       const folderLists = await Promise.all(
         visibleAccounts.map((a) => repo!.listFolders(a.id)),
       );
-      if (accountId !== authStore.accountId) return;
+      if (accountId !== authStore.accountId || revision !== folderReadRevision) return;
       accounts.value = visibleAccounts;
       const rows = folderLists.flat();
       // Keep in-flight optimistic subscription flips on top of the DB
@@ -858,13 +926,21 @@ export const useMailStore = defineStore('mail', () => {
       if (optimisticSubscriptions.size > 0) {
         for (const row of rows) {
           const pending = optimisticSubscriptions.get(row.id);
-          if (pending != null) row.is_subscribed = pending;
+          if (pending == null) continue;
+          row.is_subscribed = pending;
+          if (pending === 0) row.is_starred = 0;
         }
+      }
+      for (const row of rows) Object.assign(row, optimisticFolderEdits.get(row.id));
+      const pending = pendingCreatedFolder;
+      if (pending && !rows.some((row) => row.account_id === pending.account_id
+        && row.parent_id === pending.parent_id && row.name.toLowerCase() === pending.name.toLowerCase())) {
+        rows.push(pending);
       }
       folders.value = rows;
       await refreshFolderProgress();
     } catch (err) {
-      if (accountId !== authStore.accountId) return;
+      if (accountId !== authStore.accountId || revision !== folderReadRevision) return;
       error.value = err?.message ?? String(err);
       console.error('[mail-store] refreshFolders failed', err);
     }
@@ -917,7 +993,7 @@ export const useMailStore = defineStore('mail', () => {
   async function _refreshFolderProgress() {
     if (!repo || authStore.accountId == null || folders.value.length === 0) return;
     const next = new Map(folderProgress.value);
-    await Promise.all(folders.value.map(async (folder) => {
+    await Promise.all(folders.value.filter((folder) => !folder.pending_creation).map(async (folder) => {
       const progress = await repo.queryViewProgress({
         accountId: folder.account_id ?? authStore.accountId,
         folderId: folder.id,
@@ -1686,7 +1762,7 @@ export const useMailStore = defineStore('mail', () => {
         if (!isLiveState(state)) {
           return selection.value.ids.size;
         }
-        rows = cachedRows;
+        rows = projectMailRows(state.folderId, cachedRows, state.total);
       }
     }
 
@@ -1821,10 +1897,10 @@ export const useMailStore = defineStore('mail', () => {
     if (getRow) {
       const row = getRow();
       if (row && Number(row.is_seen) !== 1) {
-        void markManySeen([messageId], true, { sourceFolderId: owner, rows: [row] });
+        void markManySeen([messageId], true, { sourceFolderId: owner, rows: [row], undoable: false });
       }
     } else if (!_isSeenInList(messageId, owner)) {
-      markRead(messageId).catch((err) => {
+      markManySeen([messageId], true, { sourceFolderId: owner, undoable: false }).catch((err) => {
         console.warn('[mail-store] markRead failed', err);
       });
     }
@@ -1927,6 +2003,7 @@ export const useMailStore = defineStore('mail', () => {
   interface BulkSourceOptions {
     sourceFolderId?: number | null;
     rows?: ReadonlyArray<CachedRow | undefined>;
+    undoable?: boolean;
   }
 
   /**
@@ -1938,10 +2015,11 @@ export const useMailStore = defineStore('mail', () => {
     rows?: ReadonlyArray<CachedRow | undefined>,
     sourceFolderId?: number | null,
   ) {
-    return (id: number): CachedRow | undefined => (
-      rows?.find((m) => m?.id === id)
-      ?? findLoadedRow(id, sourceFolderId)
-    );
+    const supplied = new Map<number, MessageRow>();
+    if (rows) for (const row of projectMailRows(sourceFolderId ?? currentFolderId.value ?? 0, rows)) {
+      if (row) supplied.set(row.id, row);
+    }
+    return (id: number): CachedRow => supplied.get(id) ?? findLoadedRow(id, sourceFolderId);
   }
 
   interface KeywordPatch {
@@ -2019,6 +2097,22 @@ export const useMailStore = defineStore('mail', () => {
       changedIds.push(id);
     }
     if (changedIds.length === 0) return 0;
+    if (mailActions.enabled()) {
+      const read = add.includes('$seen') || remove.includes('$seen');
+      const starred = add.includes('$flagged') || remove.includes('$flagged');
+      const label = read ? (add.length ? 'Marked as read' : 'Marked as unread')
+        : starred ? (add.length ? 'Starred' : 'Unstarred') : 'Tags updated';
+      const failureAction = read ? 'change the read status of' : starred ? 'change the star on' : 'update tags for';
+      const accepted = await mailActions.stage({
+        accountId: authStore.accountId,
+        mutationType: MUTATION_TYPE.SET_KEYWORDS,
+        targetMessageId: changedIds.length === 1 ? changedIds[0] : null,
+        requestJson: JSON.stringify({ messageIds: changedIds, add, remove: [...removeOnWire] }),
+      }, { mailAction: true, messageIds: changedIds, label, failureAction, add, remove,
+        subject: changedIds.length === 1 ? rowFor(changedIds[0])?.subject?.slice(0, 120) : undefined,
+      }, options.undoable !== false);
+      return accepted ? changedIds.length : 0;
+    }
     const optimisticPatch: Partial<Record<'is_seen' | 'is_flagged' | 'is_junk', 0 | 1>> = {};
     for (const keyword of add) {
       const column = KEYWORD_COLUMNS[keyword];
@@ -2207,6 +2301,20 @@ export const useMailStore = defineStore('mail', () => {
     }
     const liveIds = mutable.ids;
     if (liveIds.length === 0) return { succeeded: 0, failed: 0, skipped: messageIds.length };
+    if (mailActions.enabled()) {
+      const keywordPatch = role === 'junk' ? { add: ['$junk'], remove: ['$notjunk'] } : {};
+      const label = role === 'junk' ? 'Marked as junk' : role === 'archive' ? 'Archived' : 'Moved to Trash';
+      const accepted = await stageTransfer({
+        accountId, mutationType: MUTATION_TYPE.MOVE_TO_FOLDERS,
+        targetMessageId: liveIds.length === 1 ? liveIds[0] : null,
+        requestJson: JSON.stringify({ messageIds: liveIds, addFolderIds: [destination.id], replaceExisting: true, ...keywordPatch }),
+      }, {
+        mailAction: true, messageIds: liveIds, sourceFolderId: sourceId ?? undefined,
+        removeFrom: 'other', destinationFolderId: destination.id, excludeFromTags: role !== 'junk',
+        label, failureAction: role === 'junk' ? 'mark as junk' : role === 'archive' ? 'archive' : 'delete', ...keywordPatch,
+      }, options);
+      return { succeeded: accepted ? liveIds.length : 0, failed: accepted ? 0 : liveIds.length, skipped: messageIds.length - liveIds.length };
+    }
     const beforeRows = [...(sourceState?.rows ?? [])];
     if (role === 'junk') {
       await setKeywordsMany(liveIds, { add: ['$junk'], remove: ['$notjunk'] }, options);
@@ -2267,7 +2375,7 @@ export const useMailStore = defineStore('mail', () => {
     return { succeeded: succeeded.length, failed: 0, skipped: messageIds.length - liveIds.length };
   }
 
-  async function archiveMessages(ids: number[], options: Pick<BulkSourceOptions, 'sourceFolderId'> = {}) {
+  async function archiveMessages(ids: number[], options: BulkSourceOptions = {}) {
     const messageIds = normalizeMessageIds(ids);
     if (isTagViewId(options.sourceFolderId ?? currentFolderId.value)) {
       return fileTagMessages(messageIds, 'archive', options);
@@ -2284,7 +2392,7 @@ export const useMailStore = defineStore('mail', () => {
       error.value = 'No archive folder is configured.';
       return { succeeded: 0, failed: 0, skipped: 0 };
     }
-    return moveMessages(ids, archive.id, { sourceFolderId: source.id });
+    return moveMessages(ids, archive.id, { ...options, sourceFolderId: source.id });
   }
 
   /**
@@ -2332,6 +2440,10 @@ export const useMailStore = defineStore('mail', () => {
     if (rows.length === 0) return { succeeded: 0, failed: 0, skipped: messageIds.length };
     const junkIds = rows.map((r) => r.id);
 
+    if (mailActions.enabled()) return moveMessages(junkIds, junk.id, {
+      ...options, sourceFolderId: source.id, keywords: { add: ['$junk'], remove: ['$notjunk'] },
+      label: 'Marked as junk', failureAction: 'mark as junk',
+    });
     await setKeywordsMany(junkIds, { add: ['$junk'], remove: ['$notjunk'] }, { rows });
 
     const result = await moveMessages(junkIds, junk.id, { sourceFolderId: source.id });
@@ -2428,6 +2540,35 @@ export const useMailStore = defineStore('mail', () => {
       uid: createContactUid(),
     }));
 
+    if (mailActions.enabled()) {
+      const actionRepo = repo;
+      const ownerId = authStore.accountId;
+      const result = await moveMessages(rescueIds, target.id, {
+        sourceFolderId: source.id, rows, keywords: { add: ['$notjunk'], remove: ['$junk'] },
+        label: 'Moved to Inbox', failureAction: 'move from Junk to Inbox', undoable: senders.length === 0,
+      });
+      if (result.succeeded === 0 || senders.length === 0) return result;
+      const who = senders.length === 1 ? (senders[0].name ?? senders[0].email) : `${senders.length} senders`;
+      const feedback = useMailActionFeedbackStore();
+      const trust = async () => {
+        if (repo !== actionRepo || authStore.accountId !== ownerId) return;
+        try {
+          const mutation = await actionRepo.insertPendingMutation({
+            accountId: ownerId, mutationType: MUTATION_TYPE.WHITELIST_SENDER,
+            targetMessageId: null, requestJson: JSON.stringify({ senders }),
+          });
+          const outcome = await actionRepo.runMutation(ownerId, mutation.id);
+          if (repo !== actionRepo || authStore.accountId !== ownerId) return;
+          if (outcome.succeeded > 0 && !outcome.failed) setNotice(`Whitelisted ${who}`);
+          else feedback.showFailure(`Couldn’t whitelist ${who}.`, trust);
+        } catch {
+          if (repo === actionRepo && authStore.accountId === ownerId) feedback.showFailure(`Couldn’t whitelist ${who}.`, trust);
+        }
+      };
+      void trust();
+      return result;
+    }
+
     // 1) Trust every unique sender in a single mutation, run it, and
     //    capture whether the trust write applied — the whole point of the
     //    action is that future mail is trusted, so we must not claim
@@ -2520,11 +2661,11 @@ export const useMailStore = defineStore('mail', () => {
    */
   async function destroyMessages(
     ids: number[],
-    { permanent = false, sourceFolderId }: { permanent?: boolean } & Pick<BulkSourceOptions, 'sourceFolderId'> = {},
+    { permanent = false, sourceFolderId, rows }: { permanent?: boolean } & BulkSourceOptions = {},
   ) {
     if (!repo || authStore.accountId == null) return;
     if (isTagViewId(sourceFolderId ?? currentFolderId.value) && !permanent) {
-      return fileTagMessages(ids, 'trash', { sourceFolderId });
+      return fileTagMessages(ids, 'trash', { sourceFolderId, rows });
     }
     if (rejectTagViewSource(sourceFolderId ?? currentFolderId.value, 'delete')) return;
     if (!Array.isArray(ids) || ids.length === 0) return;
@@ -2578,6 +2719,16 @@ export const useMailStore = defineStore('mail', () => {
     const overlayLabel = permanent
       ? 'Deleting messages permanently'
       : (trashTarget?.name ? `Moving messages to ${trashTarget.name}` : 'Deleting messages');
+    if (mailActions.enabled()) {
+      const destroying = permanent || source.role === 'trash';
+      await stageTransfer(destroying ? buildPermanentDeleteMutation(liveIds) : buildDeleteMutation(liveIds, source), {
+        mailAction: true, messageIds: liveIds, sourceFolderId: source.id,
+        removeFrom: destroying ? 'all' : 'source', excludeFromTags: true,
+        destinationFolderId: destroying ? undefined : trashTarget?.id,
+        label: destroying ? 'Deleted permanently' : 'Moved to Trash', failureAction: 'delete',
+      }, { rows });
+      return;
+    }
     const finalize = (succeeded: number[]) => (
       finalizeMovedMessages(succeeded, source.id, trashTarget?.id ?? null));
     let succeededIds: number[];
@@ -2751,6 +2902,33 @@ export const useMailStore = defineStore('mail', () => {
     selectMessage(nextPreviewId ?? null, nextPreviewId == null ? undefined : folderId);
   }
 
+  function stageTransfer(input: PendingMutationInsert, patch: MailActionPatch, options: BulkSourceOptions = {}) {
+    const folderId = patch.sourceFolderId ?? null;
+    const supplied = new Map(options.rows?.flatMap((row) => row ? [[row.id, row] as const] : []));
+    const open = openMessageRef.value.getRow?.();
+    if (open) supplied.set(open.id, open);
+    if (patch.destinationFolderId != null) {
+      const remaining = new Set(patch.messageIds.filter((id) => !supplied.has(id)));
+      for (const state of folderStates.values()) {
+        for (const row of state.rows) {
+          if (row && remaining.delete(row.id)) supplied.set(row.id, row);
+        }
+        if (remaining.size === 0) break;
+      }
+      for (const id of patch.messageIds) {
+        const row = supplied.get(id);
+        if (row) optimisticTransferRows.set(id, row);
+      }
+    }
+    const first = patch.messageIds[0];
+    const subject = patch.messageIds.length === 1 ? (supplied.get(first) ?? findLoadedRow(first, folderId))?.subject : undefined;
+    const preview = patch.removeFrom ? nextPreviewIdAfterRemoval(patch.messageIds, rowsForFolder(folderId), folderId) : undefined;
+    const staged = mailActions.stage(input, { ...patch, subject: subject?.slice(0, 120) }, options.undoable);
+    if (patch.removeFrom) clearSelectionFor(patch.messageIds);
+    applyPreviewAfterRemoval(preview, folderId);
+    return staged;
+  }
+
   /**
    * Single-row delete is the N=1 case of destroyMessages. Kept as a
    * named export so the open-message Delete button and any other
@@ -2789,6 +2967,7 @@ export const useMailStore = defineStore('mail', () => {
       selectMessage(null);
       clearSelection();
     }
+    if (mailActions.enabled()) return stageScheduledCancellation(id, true);
     const outcome = await runCancelScheduledSendMutation(id);
     if (outcome.ok) {
       setNotice('Sending canceled. The message is back in Drafts.');
@@ -2817,6 +2996,11 @@ export const useMailStore = defineStore('mail', () => {
       selectMessage(null);
     }
     clearSelectionFor(numeric);
+    if (mailActions.enabled()) {
+      const accepted = await Promise.all(numeric.map((id) => stageScheduledCancellation(id, numeric.length === 1)));
+      const succeeded = accepted.filter(Boolean).length;
+      return { succeeded, failed: numeric.length - succeeded };
+    }
     let firstDescription: string | null = null;
     for (const id of numeric) {
       const outcome = await runCancelScheduledSendMutation(id);
@@ -2839,6 +3023,19 @@ export const useMailStore = defineStore('mail', () => {
         + 'they will keep retrying in the background.';
     }
     return summary;
+  }
+
+  function stageScheduledCancellation(id: number, notify: boolean) {
+    const accountId = authStore.accountId!;
+    const scheduled = folders.value.find((folder) => folder.account_id === accountId && folder.role === 'scheduled');
+    return stageTransfer({
+      accountId, mutationType: MUTATION_TYPE.CANCEL_SCHEDULED_SEND,
+      targetMessageId: id, requestJson: JSON.stringify({ messageId: id }),
+    }, {
+      mailAction: true, messageIds: [id], sourceFolderId: scheduled?.id ?? currentFolderId.value ?? undefined,
+      removeFrom: 'source', label: 'Cancel scheduled send', failureAction: 'cancel sending',
+      successNotice: notify ? 'Sending canceled. The message is back in Drafts.' : undefined,
+    }, { undoable: false });
   }
 
   async function runCancelScheduledSendMutation(
@@ -2887,7 +3084,7 @@ export const useMailStore = defineStore('mail', () => {
   async function moveMessages(
     ids: number[],
     targetFolderId: number,
-    options: { sourceFolderId?: number | null } = {},
+    options: BulkSourceOptions & { keywords?: { add: string[]; remove: string[] }; label?: string; failureAction?: string } = {},
   ): Promise<MoveResult> {
     if (!repo || authStore.accountId == null) {
       return { succeeded: 0, failed: 0, skipped: 0 };
@@ -2922,6 +3119,21 @@ export const useMailStore = defineStore('mail', () => {
     }
 
     const mode = source.account_id === target.account_id ? 'move' : 'copy';
+    if (mailActions.enabled()) {
+      const input = buildMoveMutation(liveIds, target.id, source.id);
+      if (options.keywords) {
+        input.requestJson = JSON.stringify({ ...JSON.parse(input.requestJson), ...options.keywords });
+      }
+      const accepted = await stageTransfer(input, {
+        mailAction: true, messageIds: liveIds, sourceFolderId: source.id,
+        removeFrom: mode === 'move' ? 'source' : undefined,
+        destinationFolderId: mode === 'move' ? target.id : undefined,
+        excludeFromTags: mode === 'move' && (target.role === 'archive' || target.role === 'trash'),
+        label: options.label ?? (mode === 'copy' ? `Copied to ${target.name}` : `Moved to ${target.name}`),
+        failureAction: options.failureAction ?? mode, ...options.keywords,
+      }, options);
+      return { succeeded: accepted ? liveIds.length : 0, failed: accepted ? 0 : liveIds.length, skipped: messageIds.length - liveIds.length };
+    }
     let succeededIds: number[];
     try {
       succeededIds = await runBulkMutation({
@@ -3486,13 +3698,16 @@ export const useMailStore = defineStore('mail', () => {
     folderIds: number[],
     isSubscribed: boolean,
   ): Promise<boolean> {
-    if (!repo || authStore.accountId == null) return false;
+    const repository = repo;
+    const accountId = authStore.accountId;
+    const current = folderActionIsCurrent();
+    if (!repository || accountId == null) return false;
     const requestedIds = [...new Set(folderIds.map(Number))]
       .filter(Number.isFinite)
       .filter((id) => {
         const folder = folders.value.find((candidate) => candidate.id === id);
-        return folder != null
-          && folderCapabilities(folder, authStore.accountId).maySubscribe;
+        return folder != null && !folder.pending_creation
+          && folderCapabilities(folder, accountId).maySubscribe;
       });
     const omittedPendingIds = requestedIds.filter(
       (id) => subscriptionPendingFolderIds.value.has(id),
@@ -3520,17 +3735,18 @@ export const useMailStore = defineStore('mail', () => {
       ...ids,
     ]);
     try {
-      const mutation = await repo.insertPendingMutation({
-        accountId: authStore.accountId,
+      const mutation = await repository.insertPendingMutation({
+        accountId,
         mutationType: MUTATION_TYPE.SET_MAILBOX_SUBSCRIPTION,
         targetMessageId: null,
         requestJson: JSON.stringify({
           operations: ids.map((folderId) => ({ folderId, isSubscribed })),
         }),
       });
-      const result: MutationOutcome = typeof repo.runMutation === 'function' && mutation?.id != null
-        ? await repo.runMutation(authStore.accountId, mutation.id)
-        : await repo.drainOutbox(authStore.accountId);
+      const result: MutationOutcome = typeof repository.runMutation === 'function' && mutation?.id != null
+        ? await repository.runMutation(accountId, mutation.id)
+        : await repository.drainOutbox(accountId);
+      if (!current()) return false;
       const succeeded = new Set(
         (result?.result?.succeededIds ?? (
           (result?.failed ?? 0) === 0 && (result?.succeeded ?? 0) > 0 ? ids : []
@@ -3551,6 +3767,7 @@ export const useMailStore = defineStore('mail', () => {
           error.value = 'Some folders already have a subscription change in progress.';
         } else {
           const detail = mutation?.id != null ? await loadMutationError(mutation.id) : null;
+          if (!current()) return false;
           error.value = describeMutationFailure(
             result,
             detail,
@@ -3560,6 +3777,7 @@ export const useMailStore = defineStore('mail', () => {
       }
       return allOk;
     } catch (err) {
+      if (!current()) return false;
       for (const [id, snapshot] of previous) {
         const row = folders.value.find((folder) => folder.id === id);
         if (row) {
@@ -3570,10 +3788,12 @@ export const useMailStore = defineStore('mail', () => {
       error.value = err?.message ?? String(err);
       return false;
     } finally {
-      for (const id of ids) optimisticSubscriptions.delete(id);
-      const next = new Set(subscriptionPendingFolderIds.value);
-      for (const id of ids) next.delete(id);
-      subscriptionPendingFolderIds.value = next;
+      if (current()) {
+        for (const id of ids) optimisticSubscriptions.delete(id);
+        const next = new Set(subscriptionPendingFolderIds.value);
+        for (const id of ids) next.delete(id);
+        subscriptionPendingFolderIds.value = next;
+      }
     }
   }
 
@@ -3616,6 +3836,49 @@ export const useMailStore = defineStore('mail', () => {
   }
 
   // ----- folder create / rename / move / delete ------------------------
+
+  const folderFeedback = useMailActionFeedbackStore();
+  const folderDeletePendingIds = ref(new Set<number>());
+  const folderEditVersions = new Map<number, symbol>();
+  type FolderLocation = Pick<FolderRow, 'name' | 'parent_id' | 'account_id'>;
+  const pendingFolderLocations = new Map<number, { before: FolderLocation; after: FolderLocation; moved: boolean }>();
+  let folderActionsRevision = 0;
+
+  function resetFolderActions() {
+    folderActionsRevision += 1;
+    folderReadRevision += 1;
+    pendingCreatedFolder = null;
+    optimisticSubscriptions.clear();
+    optimisticFolderEdits.clear();
+    folderEditVersions.clear();
+    pendingFolderLocations.clear();
+    folderCreatePending.value = false;
+    subscriptionPendingFolderIds.value = new Set();
+    folderDeletePendingIds.value = new Set();
+    folderDeleteMailboxHasEmailIds.clear();
+    folderEditPendingIds.value = new Set();
+  }
+
+  function folderActionIsCurrent() {
+    const revision = folderActionsRevision;
+    const accountId = authStore.accountId;
+    return () => folderActionsRevision === revision && authStore.accountId === accountId;
+  }
+
+  function paintFolderEdit(id: number, patch: Partial<Pick<FolderRow, 'name' | 'parent_id'>>) {
+    optimisticFolderEdits.set(id, patch);
+    const row = folders.value.find((candidate) => candidate.id === id);
+    if (row) Object.assign(row, patch);
+  }
+
+  function canRetryFolderFailure(reason?: string) {
+    // A transport failure can leave a durable create live, or the mailbox
+    // can already exist upstream. Retry only explicit per-mailbox rejections.
+    return reason != null && [
+      'alreadyExists', 'forbidden', 'invalidName', 'invalidProperties', 'notFound',
+      'overQuota', 'tooDeep', 'unknownFolder',
+    ].includes(reason);
+  }
 
   /** Folder ids with an in-flight rename/move/delete mutation. */
   const folderEditPendingIds = ref<Set<number>>(new Set());
@@ -3661,23 +3924,27 @@ export const useMailStore = defineStore('mail', () => {
     mutationType: MutationType,
     request: Record<string, unknown>,
     action: string,
+    reportError = true,
   ): Promise<FolderOpResult> {
-    if (!repo || authStore.accountId == null) {
+    const repository = repo;
+    const accountId = authStore.accountId;
+    const current = folderActionIsCurrent();
+    if (!repository || accountId == null) {
       return { ok: false, reason: 'noBackend' };
     }
-    const mutation = await repo.insertPendingMutation({
-      accountId: authStore.accountId,
+    const mutation = await repository.insertPendingMutation({
+      accountId,
       mutationType,
       targetMessageId: null,
       requestJson: JSON.stringify(request),
     });
-    const result: MutationOutcome = typeof repo.runMutation === 'function' && mutation?.id != null
-      ? await repo.runMutation(authStore.accountId, mutation.id)
-      : await repo.drainOutbox(authStore.accountId);
+    const result: MutationOutcome = typeof repository.runMutation === 'function' && mutation?.id != null
+      ? await repository.runMutation(accountId, mutation.id)
+      : await repository.drainOutbox(accountId);
     if ((result?.failed ?? 0) > 0 || (result?.succeeded ?? 0) === 0) {
       const detail = mutation?.id != null ? await loadMutationError(mutation.id) : null;
       const failure = folderOpFailure(detail, 'serverFail');
-      error.value = describeMutationFailure(result, detail, action).replace('message', 'folder');
+      if (reportError && current()) error.value = describeMutationFailure(result, detail, action).replace('message', 'folder');
       return {
         ...failure,
         succeededIds: result.result?.succeededIds ?? [],
@@ -3692,12 +3959,44 @@ export const useMailStore = defineStore('mail', () => {
 
   function siblingNameTaken(accountId: number, parentFolderId: number | null, name: string, excludeFolderId?: number): boolean {
     const target = name.trim().toLowerCase();
-    return folders.value.some((f) =>
-      f.account_id === accountId
-      && Number(f.is_deleted) !== 1
-      && f.id !== excludeFolderId
-      && (f.parent_id ?? null) === (parentFolderId ?? null)
-      && f.name?.trim().toLowerCase() === target);
+    const matches = (f: FolderLocation) =>
+      f.account_id === accountId && (f.parent_id ?? null) === parentFolderId
+      && f.name.trim().toLowerCase() === target;
+    return folders.value.some((f) => f.id !== excludeFolderId && Number(f.is_deleted) !== 1 && matches(f))
+      || [...pendingFolderLocations].some(([id, { before, after }]) =>
+        id !== excludeFolderId && (matches(before) || matches(after)));
+  }
+
+  function folderAncestry(start: number | null) {
+    const ids = new Set<number>();
+    let parentId = start;
+    while (parentId != null && !ids.has(parentId)) {
+      ids.add(parentId);
+      parentId = folders.value.find((row) => row.id === parentId)?.parent_id ?? null;
+    }
+    return { ids, cycle: parentId != null };
+  }
+
+  function dependsOnPendingFolderMove(id: number, destination: number | null) {
+    const sourcePath = folderAncestry(id).ids;
+    const destinationPath = folderAncestry(destination).ids;
+    for (const [movedId, { before, after, moved }] of pendingFolderLocations) {
+      if (!moved || movedId === id) continue;
+      if (sourcePath.has(movedId) || destinationPath.has(movedId)
+        || folderAncestry(before.parent_id).ids.has(id) || folderAncestry(after.parent_id).ids.has(id)) return true;
+    }
+    return false;
+  }
+
+  function folderMoveFailure(folder: FolderRow, destination: number | null) {
+    const ancestry = folderAncestry(destination);
+    if (ancestry.cycle || ancestry.ids.has(folder.id)) return 'parentLoop';
+    if (dependsOnPendingFolderMove(folder.id, destination)
+      || [...ancestry.ids].some((id) => folderDeletePendingIds.value.has(id))) return 'pending';
+    if (destination == null) return folder.account_id === authStore.accountId ? null : 'forbidden';
+    const parent = folders.value.find((row) => row.id === destination);
+    if (!parent || parent.pending_creation || parent.account_id !== folder.account_id) return 'unknownFolder';
+    return folderCapabilities(parent, authStore.accountId).mayCreateChild ? null : 'forbidden';
   }
 
   /**
@@ -3712,7 +4011,8 @@ export const useMailStore = defineStore('mail', () => {
     const parent = parentFolderId != null
       ? folders.value.find((f) => f.id === parentFolderId) ?? null
       : null;
-    if (parentFolderId != null && !parent) return { ok: false, reason: 'unknownFolder' };
+    if (parentFolderId != null && (!parent || parent.pending_creation)) return { ok: false, reason: 'unknownFolder' };
+    if (parent && folderDeletePendingIds.value.has(parent.id)) return { ok: false, reason: 'pending' };
     if (
       parent != null
       && !folderCapabilities(parent, authStore.accountId).mayCreateChild
@@ -3724,18 +4024,41 @@ export const useMailStore = defineStore('mail', () => {
       error.value = `A folder named “${trimmed}” already exists here.`;
       return { ok: false, reason: 'duplicateName' };
     }
+    if (!repo || targetAccountId == null) return { ok: false, reason: 'noBackend' };
+    const current = folderActionIsCurrent();
     folderCreatePending.value = true;
+    const pending: FolderRow = {
+      id: 0, account_id: targetAccountId, remote_id: '', parent_id: parentFolderId, name: trimmed,
+      role: null, sort_order: 0, total_emails: 0, unread_emails: 0, total_threads: 0, unread_threads: 0,
+      may_read_items: 0, may_add_items: 0, may_remove_items: 0,
+      rights_json: JSON.stringify({ mayCreateChild: false, mayRename: false, mayDelete: false }),
+      raw_json: null, is_subscribed: 1, is_starred: 0, is_deleted: 0, updated_at: Date.now(), pending_creation: true,
+    };
+    pendingCreatedFolder = pending;
+    folders.value = [...folders.value, pending];
     try {
-      return await runFolderMutation(
+      const result = await runFolderMutation(
         MUTATION_TYPE.CREATE_MAILBOX,
         { operations: [{ clientId: 'c1', name: trimmed, parentFolderId }] },
         'create',
+        false,
       );
-    } catch (err) {
-      error.value = err?.message ?? String(err);
+      if (current()) {
+        if (result.ok) await refreshFolders();
+        else folderFeedback.showFailure(`Couldn’t create folder “${trimmed}”.`, canRetryFolderFailure(result.reason) ? async () => {
+          if (current()) await createFolder({ name: trimmed, parentFolderId });
+        } : undefined);
+      }
+      return result;
+    } catch {
+      if (current()) folderFeedback.showFailure(`Couldn’t confirm creation of folder “${trimmed}”.`);
       return { ok: false, reason: 'serverFail' };
     } finally {
-      folderCreatePending.value = false;
+      if (current()) {
+        pendingCreatedFolder = null;
+        folderCreatePending.value = false;
+        folders.value = folders.value.filter((row) => !row.pending_creation);
+      }
     }
   }
 
@@ -3746,10 +4069,11 @@ export const useMailStore = defineStore('mail', () => {
   async function updateFolder(
     folderId: number,
     changes: { name?: string; parentFolderId?: number | null },
+    offerUndo = true,
   ): Promise<FolderOpResult> {
     const id = Number(folderId);
     const folder = folders.value.find((f) => f.id === id);
-    if (!folder) return { ok: false, reason: 'unknownFolder' };
+    if (!folder || folder.pending_creation) return { ok: false, reason: 'unknownFolder' };
     const capabilities = folderCapabilities(folder, authStore.accountId);
     if (capabilities.isSystemProtected) return { ok: false, reason: 'systemFolder' };
     if (!capabilities.mayRename) return { ok: false, reason: 'forbidden' };
@@ -3761,24 +4085,8 @@ export const useMailStore = defineStore('mail', () => {
     if (nextName && nextName !== folder.name) request.name = nextName;
     if (parentProvided && (changes.parentFolderId ?? null) !== (folder.parent_id ?? null)) {
       const nextParentId = changes.parentFolderId ?? null;
-      if (nextParentId != null) {
-        // Walk up from the destination: moving under yourself or a
-        // descendant would detach the subtree into a cycle.
-        let cursor = folders.value.find((f) => f.id === nextParentId) ?? null;
-        while (cursor) {
-          if (cursor.id === id) return { ok: false, reason: 'parentLoop' };
-          cursor = folders.value.find((f) => f.id === cursor!.parent_id) ?? null;
-        }
-        const parent = folders.value.find((f) => f.id === nextParentId);
-        if (!parent || parent.account_id !== folder.account_id) {
-          return { ok: false, reason: 'unknownFolder' };
-        }
-        if (!folderCapabilities(parent, authStore.accountId).mayCreateChild) {
-          return { ok: false, reason: 'forbidden' };
-        }
-      } else if (folder.account_id !== authStore.accountId) {
-        return { ok: false, reason: 'forbidden' };
-      }
+      const failure = folderMoveFailure(folder, nextParentId);
+      if (failure) return { ok: false, reason: failure };
       request.parentFolderId = nextParentId;
     }
     if (request.name == null && !('parentFolderId' in request)) {
@@ -3793,20 +4101,85 @@ export const useMailStore = defineStore('mail', () => {
       return { ok: false, reason: 'duplicateName' };
     }
 
+    if (!repo || authStore.accountId == null) return { ok: false, reason: 'noBackend' };
+    const current = folderActionIsCurrent();
+    const version = Symbol();
+    folderEditVersions.set(id, version);
+    const stillLatest = () => current() && folderEditVersions.get(id) === version;
+    const originalName = folder.name;
+    const renamed = 'name' in request;
+    const moved = 'parentFolderId' in request;
+    const before = {
+      ...(renamed ? { name: originalName } : {}),
+      ...(moved ? { parent_id: folder.parent_id } : {}),
+    };
+    const after = {
+      ...(renamed ? { name: finalName } : {}),
+      ...(moved ? { parent_id: finalParent } : {}),
+    };
+    const inverse = {
+      ...(renamed ? { name: originalName } : {}),
+      ...(moved ? { parentFolderId: folder.parent_id } : {}),
+    };
+    pendingFolderLocations.set(id, {
+      before: { name: originalName, parent_id: folder.parent_id, account_id: folder.account_id },
+      after: { name: finalName, parent_id: finalParent, account_id: folder.account_id },
+      moved,
+    });
     folderEditPendingIds.value = new Set([...folderEditPendingIds.value, id]);
+    paintFolderEdit(id, after);
+
+    function originalLocationAvailable() {
+      const row = folders.value.find((candidate) => candidate.id === id);
+      if (!row) return false;
+      const parent = moved ? before.parent_id ?? null : row.parent_id;
+      if (moved && folderMoveFailure(row, parent)) return false;
+      return !siblingNameTaken(row.account_id, parent, before.name ?? row.name, id);
+    }
+
+    function showUndoFailure() {
+      folderFeedback.showFailure(`Couldn’t undo the change to folder “${originalName}”.`);
+    }
+
+    const failureMessage = offerUndo ? `Couldn’t update folder “${originalName}”.`
+      : `Couldn’t undo the change to folder “${originalName}”.`;
     try {
-      return await runFolderMutation(
-        MUTATION_TYPE.UPDATE_MAILBOX,
-        { operations: [request] },
-        'rename',
-      );
-    } catch (err) {
-      error.value = err?.message ?? String(err);
+      const result = await runFolderMutation(MUTATION_TYPE.UPDATE_MAILBOX, { operations: [request] }, moved ? 'move' : 'rename', false);
+      if (!stillLatest()) return result;
+      if (!result.ok) {
+        if (originalLocationAvailable()) paintFolderEdit(id, before);
+        folderFeedback.showFailure(failureMessage, canRetryFolderFailure(result.reason) ? async () => {
+          if (stillLatest()) await updateFolder(id, changes, offerUndo);
+        } : undefined);
+      } else if (offerUndo) {
+        folderFeedback.showUndo(`${moved ? 'Moved' : 'Renamed'} folder “${originalName}”.`, async () => {
+          if (!current()) return;
+          const row = folders.value.find((candidate) => candidate.id === id);
+          if (!stillLatest() || !row || (renamed && row.name !== finalName)
+            || (moved && row.parent_id !== finalParent) || !originalLocationAvailable()) {
+            showUndoFailure();
+            return;
+          }
+          const restored = await updateFolder(id, inverse, false);
+          if (!restored.ok && stillLatest()) showUndoFailure();
+        });
+      }
+      return result;
+    } catch {
+      if (stillLatest()) {
+        if (originalLocationAvailable()) paintFolderEdit(id, before);
+        folderFeedback.showFailure(`Couldn’t confirm the change to folder “${originalName}”.`);
+      }
       return { ok: false, reason: 'serverFail' };
     } finally {
-      const next = new Set(folderEditPendingIds.value);
-      next.delete(id);
-      folderEditPendingIds.value = next;
+      if (stillLatest()) {
+        optimisticFolderEdits.delete(id);
+        pendingFolderLocations.delete(id);
+        const next = new Set(folderEditPendingIds.value);
+        next.delete(id);
+        folderEditPendingIds.value = next;
+        void refreshFolders();
+      }
     }
   }
 
@@ -3839,7 +4212,7 @@ export const useMailStore = defineStore('mail', () => {
       folders.value.find((folder) => folder.id === id) ?? null,
     ]));
     for (const [id, folder] of rows) {
-      if (!folder) return { ok: false, reason: 'unknownFolder' };
+      if (!folder || folder.pending_creation) return { ok: false, reason: 'unknownFolder' };
       const capabilities = folderCapabilities(folder, authStore.accountId);
       if (capabilities.isSystemProtected) return { ok: false, reason: 'systemFolder' };
       if (!capabilities.mayDelete) return { ok: false, reason: 'forbidden' };
@@ -3850,7 +4223,8 @@ export const useMailStore = defineStore('mail', () => {
       ) {
         return { ok: false, reason: 'forbidden' };
       }
-      if (folderEditPendingIds.value.has(id)) return { ok: false, reason: 'pending' };
+      if (folderEditPendingIds.value.has(id) || dependsOnPendingFolderMove(id, null)) return { ok: false, reason: 'pending' };
+      if (folderAncestry(id).cycle) return { ok: false, reason: 'parentLoop' };
       if (!skipChildCheck && folders.value.some(
         (candidate) => candidate.parent_id === id
           && Number(candidate.is_deleted) !== 1
@@ -3879,6 +4253,8 @@ export const useMailStore = defineStore('mail', () => {
     }
 
     folderEditPendingIds.value = new Set([...folderEditPendingIds.value, ...ids]);
+    folderDeletePendingIds.value = new Set([...folderDeletePendingIds.value, ...ids]);
+    const current = folderActionIsCurrent();
     const succeededIds: number[] = [];
     const errors: Record<string, any> = {};
     const blocked = new Set<number>();
@@ -3892,6 +4268,7 @@ export const useMailStore = defineStore('mail', () => {
     try {
       const depths = [...byDepth.keys()].sort((a, b) => b - a);
       for (const depth of depths) {
+        if (!current()) return { ok: false, reason: 'noBackend', succeededIds, errors };
         const layer = (byDepth.get(depth) ?? []).filter((id) => !blocked.has(id));
         for (const id of byDepth.get(depth) ?? []) {
           if (blocked.has(id)) errors[String(id)] = { type: 'childFailed' };
@@ -3908,6 +4285,7 @@ export const useMailStore = defineStore('mail', () => {
           },
           'delete',
         );
+        if (!current()) return { ok: false, reason: 'noBackend', succeededIds, errors };
         let confirmed = new Set(
           (result.succeededIds ?? (result.ok ? layer : [])).map(Number),
         );
@@ -3937,6 +4315,7 @@ export const useMailStore = defineStore('mail', () => {
             },
             'delete',
           );
+          if (!current()) return { ok: false, reason: 'noBackend', succeededIds, errors };
           for (const id of newlyDestructive) delete layerErrors[String(id)];
           const retried = new Set(
             (retry.succeededIds ?? (retry.ok ? newlyDestructive : [])).map(Number),
@@ -3965,6 +4344,11 @@ export const useMailStore = defineStore('mail', () => {
         const fallback = inbox.value?.id ?? null;
         if (fallback != null) selectFolder(fallback);
       }
+      if (succeededIds.length > 0) {
+        const removed = new Set(succeededIds);
+        folders.value = folders.value.filter(({ id }) => !removed.has(id));
+        void refreshFolders();
+      }
       const failures = Object.values(errors) as any[];
       if (failures.length === 0) {
         error.value = null;
@@ -3983,12 +4367,13 @@ export const useMailStore = defineStore('mail', () => {
         : `Could not delete folder (${reason}).`;
       return { ok: false, reason, succeededIds, errors };
     } catch (err) {
-      error.value = err?.message ?? String(err);
+      if (current()) error.value = err?.message ?? String(err);
       return { ok: false, reason: 'serverFail', succeededIds, errors };
     } finally {
-      const next = new Set(folderEditPendingIds.value);
-      for (const id of ids) next.delete(id);
-      folderEditPendingIds.value = next;
+      if (current()) {
+        folderEditPendingIds.value = new Set([...folderEditPendingIds.value].filter((id) => !selected.has(id)));
+        folderDeletePendingIds.value = new Set([...folderDeletePendingIds.value].filter((id) => !selected.has(id)));
+      }
     }
   }
 
@@ -4029,6 +4414,7 @@ export const useMailStore = defineStore('mail', () => {
     sortPropFor: _sortPropFor,
     jmapSortFor: _jmapSortFor,
     inbox,
+    projectMailRows,
     messages,
     totalForFolder,
     folderView,

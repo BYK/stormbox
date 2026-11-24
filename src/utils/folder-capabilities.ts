@@ -116,8 +116,8 @@ export function folderCapabilities(
     isSystemProtected,
     // Stalwart currently gates shared isSubscribed updates on Modify,
     // represented by mayRename. Keep this server-specific policy explicit.
-    maySubscribe: !isSystemProtected && (isPrimary || rights.mayRename),
-    mayStar: !isSystemProtected && subscribed,
+    maySubscribe: !folder.pending_creation && !isSystemProtected && (isPrimary || rights.mayRename),
+    mayStar: !folder.pending_creation && !isSystemProtected && subscribed,
     mayReparent: !isSystemProtected && rights.mayRename,
     mayDeleteWithMail: !isSystemProtected && rights.mayDelete && rights.mayRemoveItems,
     mayMoveMessages: rights.mayRemoveItems,

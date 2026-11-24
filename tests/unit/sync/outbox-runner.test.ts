@@ -149,6 +149,87 @@ afterEach(async () => {
 });
 
 describe('OutboxRunner auto-drain', () => {
+  it('holds a staged action and overlapping changes until Undo or the deadline', async () => {
+    const first = await seedMessage('first');
+    const second = await seedMessage('second');
+    const third = await seedMessage('third');
+    let now = Date.now();
+    const initialTime = now;
+    async function stage(messageIds, notBefore = null) {
+      const { id } = await handlers[DB_RPC.PENDING_MUTATION_INSERT]({
+        accountId,
+        mutationType: MUTATION_TYPE.SET_KEYWORDS,
+        requestJson: JSON.stringify({ messageIds, add: ['$seen'] }),
+        optimisticPatchJson: JSON.stringify({ mailAction: true, messageIds }),
+        notBefore,
+      });
+      return id;
+    }
+    const held = await stage([first, second], now + 8_000);
+    const overlapping = await stage([second]);
+    const unrelated = await stage([third]);
+    const calls = [];
+    const runner = new OutboxRunner({
+      accountId, handlers, options: { now: () => now },
+      processRow: async (row) => { calls.push(row.id); return { ok: true }; },
+    });
+    try {
+      await runner.drain();
+      expect(calls).toEqual([unrelated]);
+      expect(await loadRow(held)).toMatchObject({ local_status: 'pending', not_before: initialTime + 8_000 });
+      await expect(handlers[DB_RPC.MAIL_ACTION_CANCEL]({ accountId: accountId + 1, mutationId: held }))
+        .resolves.toEqual({ canceled: false });
+      await expect(handlers[DB_RPC.MAIL_ACTION_CANCEL]({ accountId, mutationId: held }))
+        .resolves.toEqual({ canceled: true });
+      await runner.drain();
+      expect(calls).toEqual([unrelated, overlapping]);
+
+      const remaining = await stage([first], initialTime + 8_000);
+      now += 7_999;
+      await runner.drain();
+      expect(calls).not.toContain(remaining);
+      now += 1;
+      await runner.drain();
+      expect(calls).toEqual([unrelated, overlapping, remaining]);
+      await expect(handlers[DB_RPC.MAIL_ACTION_CANCEL]({ accountId, mutationId: remaining }))
+        .resolves.toEqual({ canceled: false });
+    } finally {
+      await runner.stop();
+    }
+  });
+
+  it('keeps replayable staged edits after the retry cap and preserves partial success', async () => {
+    const first = await seedMessage('first');
+    const second = await seedMessage('second');
+    const messageIds = [first, second];
+    const { id } = await handlers[DB_RPC.PENDING_MUTATION_INSERT]({
+      accountId, mutationType: MUTATION_TYPE.DESTROY,
+      requestJson: JSON.stringify({ messageIds }),
+      optimisticPatchJson: JSON.stringify({ mailAction: true, messageIds }),
+    });
+    let now = Date.now();
+    const processRow = vi.fn().mockResolvedValueOnce({
+      ok: false, error: { type: 'transport' }, result: { succeededIds: [first] },
+    }).mockResolvedValueOnce({ ok: false, error: { type: 'forbidden' } });
+    const runner = new OutboxRunner({
+      accountId, handlers, processRow,
+      options: { now: () => now, maxAttempts: 1, backoffBaseMs: 1_000 },
+    });
+    try {
+      await runner.drain();
+      expect(await loadRow(id)).toMatchObject({ local_status: 'retry', attempts: 1 });
+      now += 1_000;
+      await runner.drain();
+      expect(processRow).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(processRow.mock.calls[1][0].request_json)).toEqual({ messageIds: [second] });
+      const failed = await loadRow(id);
+      expect(failed.local_status).toBe('conflicted');
+      expect(JSON.parse(failed.error_json)).toEqual({ type: 'forbidden', result: { succeededIds: [first] } });
+    } finally {
+      await runner.stop();
+    }
+  });
+
   it.each([
     ['row read', 'setKeywords'],
     ['row read', 'send'],

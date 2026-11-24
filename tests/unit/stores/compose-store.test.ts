@@ -13,6 +13,7 @@ vi.mock('../../../src/services/auth', () => ({
 import { __resetRepositoryForTests, __setRepositoryForTests } from '../../../src/composables/useRepository';
 import { COMPOSE_STATE, MUTATION_TYPE } from '../../../src/constants/states';
 import { useAuthStore } from '../../../src/stores/auth-store';
+import { useMailActionFeedbackStore } from '../../../src/stores/mail-action-feedback-store';
 import { useMailStore } from '../../../src/stores/mail-store';
 import { useSettingsStore } from '../../../src/stores/settings-store';
 import {
@@ -2832,6 +2833,56 @@ describe('compose-store sessions and draft autosave', () => {
     expect(composeStore.sessionById(sessionId)).toBeNull();
   });
 
+  it('docks Save Draft immediately and lets Restore keep the editor open through confirmation', async () => {
+    let completeSave: (result: any) => void = () => {};
+    const { composeStore, repo } = await autosaveStore(async () => new Promise((resolve) => {
+      completeSave = resolve;
+    }));
+    const id = composeStore.open({ subject: 'Unsent proposal' });
+
+    const saving = composeStore.saveAndClose(id);
+    expect(composeStore.activeSession).toBeNull();
+    expect(composeStore.sessionById(id)?.presentation).toBe(COMPOSE_PRESENTATION.MINIMIZED);
+    expect(composeStore.sessionById(id)?.closeAction).toBe('save');
+    const duplicate = composeStore.saveAndClose(id);
+
+    await vi.waitFor(() => expect(repo.runMutation).toHaveBeenCalledTimes(1));
+    expect(composeStore.restore(id)).toBe(true);
+    completeSave({ succeeded: 1, failed: 0, result: { emailId: 'confirmed-draft' } });
+    await expect(saving).resolves.toBe(true);
+    await expect(duplicate).resolves.toBe(true);
+    expect(repo.insertPendingMutation).toHaveBeenCalledTimes(1);
+    expect(composeStore.activeSession?.draft.subject).toBe('Unsent proposal');
+    expect(composeStore.activeSession?.confirmedRevision?.emailId).toBe('confirmed-draft');
+  });
+
+  it('leaves a newer editor alone and offers Retry when background draft save fails', async () => {
+    let failSave: (result: any) => void = () => {};
+    const { composeStore, repo } = await autosaveStore(async () => new Promise((resolve) => {
+      failSave = resolve;
+    }));
+    const id = composeStore.open({ subject: 'Keep this draft', textBody: 'Original content' });
+    const saving = composeStore.saveAndClose(id);
+    const next = composeStore.open({ subject: 'New editor' });
+
+    await vi.waitFor(() => expect(repo.runMutation).toHaveBeenCalledTimes(1));
+    failSave({ succeeded: 0, failed: 1 });
+    await expect(saving).resolves.toBe(false);
+    expect(composeStore.activeSession?.id).toBe(next);
+    expect(composeStore.sessionById(id)?.draft.textBody).toBe('Original content');
+    const feedback = useMailActionFeedbackStore();
+    expect(feedback.entries[0]).toMatchObject({
+      message: 'Couldn’t save draft “Keep this draft”.',
+      action: 'Retry',
+    });
+
+    repo.runMutation.mockResolvedValueOnce({ succeeded: 1, failed: 0, result: { emailId: 'saved-draft' } });
+    await feedback.run(feedback.entries[0].id);
+    expect(repo.retryPendingDraftMutation).toHaveBeenCalledWith(1, 1);
+    expect(composeStore.sessionById(id)).toBeNull();
+    expect(composeStore.activeSession?.id).toBe(next);
+  });
+
   it('ignores injected provenance in equality and strips it from a draft request', async () => {
     const { composeStore, repo } = await autosaveStore();
     const sessionId = composeStore.open({
@@ -3330,7 +3381,10 @@ describe('compose-store sessions and draft autosave', () => {
   });
 
   it('permanently destroys the confirmed revision when Discard is chosen', async () => {
-    const { composeStore, repo } = await autosaveStore();
+    let finishDiscard: (result: any) => void = () => {};
+    const { composeStore, repo } = await autosaveStore(async () => new Promise((resolve) => {
+      finishDiscard = resolve;
+    }));
     const sessionId = composeStore.open({ subject: 'Saved draft' });
     const session = composeStore.sessionById(sessionId)!;
     session.confirmedRevision = {
@@ -3341,7 +3395,12 @@ describe('compose-store sessions and draft autosave', () => {
       payloadHash: 'hash',
     };
 
-    await expect(composeStore.discardDraft(sessionId)).resolves.toBe(true);
+    const discarding = composeStore.discardDraft(sessionId);
+    expect(composeStore.activeSession).toBeNull();
+    expect(composeStore.sessionById(sessionId)?.closeAction).toBe('discard');
+    await vi.waitFor(() => expect(repo.runMutation).toHaveBeenCalledTimes(1));
+    finishDiscard({ succeeded: 1, failed: 0 });
+    await expect(discarding).resolves.toBe(true);
 
     const input = repo.insertPendingMutation.mock.calls[0][0];
     expect(input.mutationType).toBe(MUTATION_TYPE.DISCARD_DRAFT);

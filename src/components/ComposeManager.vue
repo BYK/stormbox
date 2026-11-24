@@ -129,11 +129,12 @@ const flightStyle = computed(() => {
 });
 
 /**
- * What the dock says about a session's send, or null when there is nothing
- * to say. A sending session is off screen rather than docked (CS-1.16), so
- * only a failure ever reaches the bar.
+ * The dock shows outstanding close operations and send failures (CD-5.2, CS-1.16).
  */
-function dockSendStatus(session: ComposeSession): string | null {
+function dockStatus(session: ComposeSession): string | null {
+  if (session.closeAction === 'save') return 'Saving draft…';
+  if (session.closeAction === 'discard') return 'Discarding draft…';
+  if (session.closeAction === 'abandon') return 'Closing draft…';
   switch (session.status) {
     case COMPOSE_STATE.FAILED:
       return session.error ? 'Send failed' : null;
@@ -172,17 +173,18 @@ function dockSendStatus(session: ComposeSession): string | null {
         type="button"
         class="compose-dock__restore"
         :aria-label="`Restore ${sessionLabel(session)}`"
+        :disabled="session.closeAction === 'discard' || session.closeAction === 'abandon'"
         @click="composeStore.restore(session.id)"
       >
         <span class="compose-dock__text">
           <span class="compose-dock__title">{{ sessionLabel(session) }}</span>
           <span
-            v-if="dockSendStatus(session)"
+            v-if="dockStatus(session)"
             class="compose-dock__status"
             :class="{ 'compose-dock__status--failed': session.status === COMPOSE_STATE.FAILED }"
             role="status"
             aria-live="polite"
-          >{{ dockSendStatus(session) }}</span>
+          >{{ dockStatus(session) }}</span>
         </span>
         <span
           v-if="session.saveError || (session.status === COMPOSE_STATE.FAILED && session.error)"
@@ -196,7 +198,7 @@ function dockSendStatus(session: ComposeSession): string | null {
         type="button"
         class="compose-dock__close"
         :aria-label="`Close ${sessionLabel(session)}`"
-        :disabled="session.isSaving || session.isDiscarding"
+        :disabled="session.isSaving || session.isDiscarding || Boolean(session.closeAction)"
         @click="composeStore.requestClose(session.id)"
       >×</button>
     </div>

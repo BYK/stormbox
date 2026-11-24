@@ -1,9 +1,12 @@
 import { MUTATION_TYPE } from '../constants/states';
+import { MAIL_UNDO_MS } from '../constants/mail-actions';
 import {
   AttentionRelay, AttentionRelayError, type AttentionImapDraft, type ImapAttentionAction, type ImapMessageLocation,
   type RelayAccount, type RelayAccountInput, type RelayAccountSettings, type RelayFolder, type RelayMessage, type RelayMessageBody, type RelayWindow,
 } from '../sync/backends/imap/attention-relay';
+import { describeImapAction, isImapMove, projectImapAction } from '../sync/backends/imap/project-action';
 import type { BundleState } from '../triage/smart-sort';
+import { equalBundleStates, matchingBundleStates, type BundleStates } from '../triage/bundle-state-edits';
 import type { Engine } from './engine';
 import { DB_RPC, TABLE_FAMILIES } from './protocol';
 
@@ -32,7 +35,15 @@ export interface AttentionCache {
   paired: boolean;
   accounts: CachedImapAccount[];
   states: Record<string, BundleState>;
-  actionFailure?: { id: number; accountId: string; message: string } | null;
+  actionFailure?: ImapActionFailure | null;
+}
+
+export interface ImapActionFailure {
+  id: number;
+  accountId: string;
+  message: string;
+  updatedAt: number;
+  canRetry: boolean;
 }
 
 const PREFETCH_COUNT = 5;
@@ -56,15 +67,53 @@ export interface ImapActionRequest {
 type PendingImapAction = ImapActionRequest & { cancelled?: number };
 type Connection = Pick<Engine, 'all'>;
 
-function isMove(action: ImapAttentionAction) {
-  return action.type === 'archive' || action.type === 'trash' || action.type === 'junk';
+const SUPERSEDES_IMAP_EDIT = `
+  json_extract(earlier.request_json, '$.location.accountId') = json_extract(later.request_json, '$.location.accountId')
+  AND (
+    (json_extract(earlier.request_json, '$.location.mailbox') = json_extract(later.request_json, '$.location.mailbox')
+      AND json_extract(earlier.request_json, '$.location.uidValidity') = json_extract(later.request_json, '$.location.uidValidity')
+      AND json_extract(earlier.request_json, '$.location.uid') = json_extract(later.request_json, '$.location.uid'))
+    OR (json_extract(earlier.request_json, '$.accountScoped') = 1
+      AND json_extract(later.request_json, '$.accountScoped') = 1
+      AND json_extract(earlier.request_json, '$.messageId') = json_extract(later.request_json, '$.messageId'))
+  )
+  AND (
+    json_extract(earlier.request_json, '$.action.type') = json_extract(later.request_json, '$.action.type')
+    OR json_extract(earlier.request_json, '$.action.type') IN ('trash', 'archive', 'junk')
+    OR json_extract(later.request_json, '$.action.type') IN ('trash', 'archive', 'junk')
+  )`;
+
+const IMAP_CAN_RETRY = `json_extract(earlier.request_json, '$.superseded') IS NOT 1
+  AND json_extract(earlier.error_json, '$.type') IS NOT 'imapMailboxChanged'
+  AND NOT EXISTS (SELECT 1 FROM pending_mutations later
+    WHERE later.account_id = earlier.account_id AND later.mutation_type = earlier.mutation_type
+      AND later.id > earlier.id AND json_extract(later.request_json, '$.cancelled') IS NOT 1
+      AND ${SUPERSEDES_IMAP_EDIT})`;
+
+async function readImapActionFailures(db: Connection, ownerId: number, limit: number): Promise<ImapActionFailure[]> {
+  const rows = await db.all(`SELECT earlier.id, a.relay_id AS account_id, earlier.updated_at,
+      json_extract(earlier.request_json, '$.action') AS action_json,
+      json_extract(earlier.request_json, '$.subject') AS subject,
+      json_extract(earlier.error_json, '$.message') AS message, (${IMAP_CAN_RETRY}) AS can_retry
+    FROM pending_mutations earlier JOIN attention_imap_accounts a
+      ON a.owner_account_id = earlier.account_id AND a.relay_id = json_extract(earlier.request_json, '$.location.accountId')
+    WHERE earlier.account_id = ? AND earlier.mutation_type = ? AND earlier.local_status = 'conflicted'
+    ORDER BY earlier.updated_at DESC, earlier.id DESC LIMIT ?`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP, limit]);
+  return rows.map((row) => {
+    const action = JSON.parse(String(row.action_json ?? 'null')) as ImapAttentionAction | null;
+    const detail = row.message == null ? '' : String(row.message);
+    const attempt = action && row.subject != null && describeImapAction(action, `“${row.subject || '(no subject)'}”`)?.attempt;
+    const message = attempt ? `Couldn’t ${attempt}.${detail ? ` ${detail}` : ''}` : detail || 'Could not update this IMAP message.';
+    return { id: Number(row.id), accountId: String(row.account_id), updatedAt: Number(row.updated_at),
+      message, canRetry: Boolean(row.can_retry) };
+  });
 }
 
 function validImapAction(location: ImapMessageLocation, action: ImapAttentionAction) {
   if (typeof location?.mailbox !== 'string' || !location.mailbox || typeof location.accountId !== 'string'
     || typeof location.uidValidity !== 'string' || !Number.isSafeInteger(location.uid)
     || location.uid < 1 || location.uid > 0xffffffff || !action) return false;
-  if (isMove(action)) return true;
+  if (isImapMove(action)) return true;
   if (action.type === 'star' || action.type === 'seen') return typeof action.value === 'boolean';
   return action.type === 'tags' && Boolean(action.tags)
     && [action.tags.add, action.tags.remove, action.tags.addLabels, action.tags.removeLabels].every((items) =>
@@ -93,16 +142,6 @@ async function pendingActions(db: Connection, ownerId: number) {
   return byFolder;
 }
 
-function patchTags(
-  tags: string[] = [], added: string[] = [], removed: string[] = [], caseInsensitive = false,
-) {
-  const key = (tag: string) => caseInsensitive ? tag.toLowerCase() : tag;
-  const byName = new Map(tags.map((tag) => [key(tag), tag]));
-  for (const tag of removed) byName.delete(key(tag));
-  for (const tag of added) if (!byName.has(key(tag))) byName.set(key(tag), tag);
-  return [...byName.values()];
-}
-
 function projectFolder(row: Record<string, unknown>, actions: ImapActionRequest[] = []) {
   const messages = JSON.parse(String(row.messages_json)) as RelayMessage[];
   const total = row.total_messages == null ? null : Number(row.total_messages);
@@ -114,16 +153,9 @@ function projectFolder(row: Record<string, unknown>, actions: ImapActionRequest[
   for (const { location: { uid }, action } of actions) {
     const message = byUid.get(uid);
     if (!message) continue;
-    if (isMove(action)) byUid.delete(uid);
-    else if (action.type === 'star') byUid.set(uid, { ...message, flagged: action.value });
-    else if (action.type === 'seen') byUid.set(uid, { ...message, seen: action.value });
-    else if (action.type === 'tags') {
-      const { add, remove, addLabels, removeLabels } = action.tags;
-      byUid.set(uid, { ...message,
-        keywords: patchTags(message.keywords, add, remove, true),
-        labels: patchTags(message.labels, addLabels, removeLabels),
-      });
-    }
+    const next = projectImapAction(message, action);
+    if (next) byUid.set(uid, next);
+    else byUid.delete(uid);
   }
   return {
     messages: [...byUid.values()],
@@ -463,16 +495,25 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
     if (!authenticationOnly || changes > 0) notifyMutation(ownerId);
   }
 
-  async function enqueueImapActions(ownerId: number, requests: readonly ImapActionRequest[]) {
+  async function enqueueImapActions(ownerId: number, requests: readonly ImapActionRequest[],
+    { undoable = false, retryOf }: { undoable?: boolean; retryOf?: number } = {}) {
     if (!Array.isArray(requests)) throw new Error('The IMAP change is invalid.');
-    if (requests.length === 0) return { mutationIds: [] };
+    if (requests.length === 0 && retryOf == null) return { mutationIds: [] };
     const mutationIds = await engine.transaction(async (tx) => {
       const paired = await tx.get('SELECT 1 FROM attention_imap_pairing WHERE owner_account_id = ?', [ownerId]);
       if (!paired) throw new Error('Connect the mail relay to update IMAP mail.');
+      let targetRequests = requests;
+      if (retryOf != null) {
+        const failed = await tx.get(`SELECT request_json FROM pending_mutations earlier
+          WHERE id = ? AND account_id = ? AND mutation_type = ? AND local_status = 'conflicted' AND ${IMAP_CAN_RETRY}`,
+        [retryOf, ownerId, MUTATION_TYPE.ATTENTION_IMAP]);
+        if (!failed) throw new Error('This mail change was replaced by a newer action or is no longer available.');
+        targetRequests = [JSON.parse(String(failed.request_json)) as ImapActionRequest];
+      }
       const actions = await pendingActions(tx, ownerId);
       const messagesByFolder = new Map<string, Map<number, RelayMessage>>();
-      const queued: Array<ImapActionRequest & { accountScoped?: true }> = [];
-      for (const request of requests) {
+      const queued: Array<ImapActionRequest & { accountScoped?: true; messageId?: string; undoable?: true; subject?: string }> = [];
+      for (const request of targetRequests) {
         if (!request || !validImapAction(request.location, request.action)) throw new Error('The IMAP change is invalid.');
         const { location, action } = request;
         const { accountId, mailbox, uidValidity, uid } = location;
@@ -493,21 +534,43 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
         if (!message) throw new Error('This message is no longer in this folder.');
         // Gmail shares flags and labels across mailbox views with different UIDs.
         const accountScoped = message.gmailLabels === true || Boolean(message.labels?.length);
-        queued.push({ location, action, ...(accountScoped && { accountScoped }) });
-        if (isMove(action)) messages.delete(uid);
+        queued.push({ location, action,
+          ...(accountScoped && { accountScoped, ...(message.messageId && { messageId: message.messageId }) }),
+          ...(undoable && { undoable: true }),
+          ...(typeof message.subject === 'string' && { subject: message.subject.slice(0, 200) }),
+        });
+        if (isImapMove(action)) messages.delete(uid);
       }
       const now = Date.now();
       const rows: { id: number }[] = await tx.all(
-        `INSERT INTO pending_mutations (account_id, mutation_type, local_status, request_json, created_at, updated_at)
-         SELECT ?, ?, 'pending', value, ?, ? FROM json_each(?) ORDER BY CAST(key AS INTEGER)
-         RETURNING id`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP, now, now, JSON.stringify(queued)],
+        `INSERT INTO pending_mutations (account_id, mutation_type, local_status, request_json, created_at, updated_at, not_before)
+         SELECT ?, ?, 'pending', value, ?, ?, ? FROM json_each(?) ORDER BY CAST(key AS INTEGER)
+         RETURNING id`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP, now, now, undoable ? now + MAIL_UNDO_MS : null, JSON.stringify(queued)],
       );
+      if (retryOf != null) await tx.run('DELETE FROM pending_mutations WHERE id = ?', [retryOf]);
       return rows.map(({ id }) => Number(id)).sort((a, b) => a - b);
     });
     broadcaster.touch(TABLE_FAMILIES.ATTENTION);
     broadcaster.touch(TABLE_FAMILIES.MUTATIONS);
     notifyMutation(ownerId, mutationIds[0]);
     return { mutationIds };
+  }
+
+  async function undoImapActions(ownerId: number, mutationIds: readonly number[]) {
+    if (!Array.isArray(mutationIds) || !mutationIds.length || !mutationIds.every((id) => Number.isSafeInteger(id) && id > 0)) {
+      throw new Error('This mail change cannot be undone.');
+    }
+    const ids = [...new Set(mutationIds)];
+    await engine.transaction(async (tx) => {
+      const result = await tx.run(`DELETE FROM pending_mutations
+        WHERE account_id = ? AND mutation_type = ? AND local_status = 'pending' AND attempts = 0
+          AND json_extract(request_json, '$.undoable') = 1 AND json_extract(request_json, '$.cancelled') IS NOT 1
+          AND id IN (SELECT value FROM json_each(?))`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP, JSON.stringify(ids)]);
+      if (result.changes !== ids.length) throw new Error('This mail change has already started syncing.');
+    });
+    broadcaster.touch(TABLE_FAMILIES.ATTENTION);
+    broadcaster.touch(TABLE_FAMILIES.MUTATIONS);
+    notifyMutation(ownerId);
   }
 
   async function settleImapAction(mutationId: number, error?: { type?: string; message?: string }) {
@@ -518,6 +581,14 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
             AND json_extract(request_json, '$.cancelled') IS NOT 1`,
         [JSON.stringify(error), Date.now(), mutationId, MUTATION_TYPE.ATTENTION_IMAP]);
         if (result.changes) return;
+      } else {
+        await tx.run(`UPDATE pending_mutations AS earlier
+          SET request_json = json_set(request_json, '$.superseded', 1)
+          WHERE earlier.mutation_type = ? AND earlier.local_status = 'conflicted' AND earlier.id < ?
+            AND EXISTS (SELECT 1 FROM pending_mutations later WHERE later.id = ?
+              AND later.account_id = earlier.account_id AND later.mutation_type = earlier.mutation_type
+              AND json_extract(later.request_json, '$.cancelled') IS NOT 1 AND ${SUPERSEDES_IMAP_EDIT})`,
+        [MUTATION_TYPE.ATTENTION_IMAP, mutationId, mutationId]);
       }
       await tx.run('DELETE FROM pending_mutations WHERE id = ? AND mutation_type = ?',
         [mutationId, MUTATION_TYPE.ATTENTION_IMAP]);
@@ -651,12 +722,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
         'SELECT bundle_id, state_json FROM attention_bundle_states WHERE owner_account_id = ?', [ownerId],
       );
       const actions = await pendingActions(tx, ownerId);
-      const failure = paired ? await tx.get(`SELECT p.id, a.relay_id AS account_id,
-          json_extract(p.error_json, '$.message') AS message
-        FROM pending_mutations p JOIN attention_imap_accounts a
-          ON a.owner_account_id = p.account_id AND a.relay_id = json_extract(p.request_json, '$.location.accountId')
-        WHERE p.account_id = ? AND p.mutation_type = ? AND p.local_status = 'conflicted'
-        ORDER BY p.updated_at DESC, p.id DESC LIMIT 1`, [ownerId, MUTATION_TYPE.ATTENTION_IMAP]) : null;
+      const [failure] = paired ? await readImapActionFailures(tx, ownerId, 1) : [];
       return {
         paired,
         accounts: accounts.map((row) => {
@@ -677,10 +743,7 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
           };
         }),
         states: Object.fromEntries(states.map((row) => [row.bundle_id, JSON.parse(String(row.state_json))])),
-        ...(failure && {
-          actionFailure: { id: Number(failure.id), accountId: String(failure.account_id),
-            message: String(failure.message ?? 'Could not update this IMAP message.') },
-        }),
+        ...(failure && { actionFailure: failure }),
       };
     }),
     [DB_RPC.ATTENTION_IMAP_UNREAD_COUNT]: async ({ ownerId }) => engine.transaction(async (tx) => {
@@ -760,12 +823,17 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
         notifyMutation(ownerId);
       }),
     [DB_RPC.ATTENTION_BODY]: async ({ ownerId, location, cachedOnly = false }) => readBody(ownerId, location, cachedOnly),
-    [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]: async ({ ownerId, location, action }) => {
-      await enqueueImapActions(ownerId, [{ location, action }]);
-    },
-    [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS]: async ({ ownerId, requests }) => enqueueImapActions(ownerId, requests),
+    [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]: async ({ ownerId, location, action, undoable = false }) =>
+      enqueueImapActions(ownerId, [{ location, action }], { undoable: undoable === true }),
+    [DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS]: async ({ ownerId, requests, undoable = false }) =>
+      enqueueImapActions(ownerId, requests, { undoable: undoable === true }),
+    [DB_RPC.ATTENTION_UNDO_IMAP_ACTIONS]: async ({ ownerId, mutationIds }) => undoImapActions(ownerId, mutationIds),
+    [DB_RPC.ATTENTION_IMAP_ACTION_FAILURES]: async ({ ownerId }) => readImapActionFailures(engine, ownerId, 20),
+    [DB_RPC.ATTENTION_RETRY_IMAP_ACTION]: async ({ ownerId, mutationId }) =>
+      enqueueImapActions(ownerId, [], { retryOf: mutationId }),
     [DB_RPC.ATTENTION_RESUME_IMAP_ACTIONS]: async ({ ownerId }) => resumeImapActions(ownerId),
-    [DB_RPC.ATTENTION_SETTLE_IMAP_ACTION]: async ({ mutationId, error }) => settleImapAction(mutationId, error),
+    [DB_RPC.ATTENTION_SETTLE_IMAP_ACTION]: async ({ mutationId, error }: { mutationId: number; error?: { type?: string; message?: string } }) =>
+      settleImapAction(mutationId, error),
     [DB_RPC.ATTENTION_APPLY_IMAP_ACTION]: async ({ ownerId, location, action, mutationId }:
       ImapActionRequest & { ownerId: number; mutationId?: number }) => {
       if (!validImapAction(location, action)) {
@@ -790,6 +858,27 @@ export function makeAttentionHandlers(engine: Engine, broadcaster: { touch: (tab
         }
       });
       broadcaster.touch(TABLE_FAMILIES.ATTENTION);
+    },
+    [DB_RPC.ATTENTION_CHANGE_BUNDLE_STATES]: async ({ ownerId, aliases, replacements, expected }: {
+      ownerId: number; aliases: readonly string[]; replacements: BundleStates; expected?: BundleStates;
+    }) => {
+      const result = await engine.transaction(async (tx) => {
+        const rows = await tx.all(
+          'SELECT bundle_id, state_json FROM attention_bundle_states WHERE owner_account_id = ?', [ownerId],
+        );
+        const states = Object.fromEntries(rows.map(({ bundle_id, state_json }) => [String(bundle_id), JSON.parse(String(state_json)) as BundleState]));
+        const previous = matchingBundleStates(states, aliases);
+        if (expected && !equalBundleStates(previous, expected)) return { applied: false, previous };
+        for (const id of Object.keys(previous)) {
+          await tx.run('DELETE FROM attention_bundle_states WHERE owner_account_id = ? AND bundle_id = ?', [ownerId, id]);
+        }
+        for (const [id, state] of Object.entries(replacements)) {
+          await tx.run('INSERT INTO attention_bundle_states VALUES (?, ?, ?)', [ownerId, id, JSON.stringify(state)]);
+        }
+        return { applied: true, previous };
+      });
+      if (result.applied) broadcaster.touch(TABLE_FAMILIES.ATTENTION);
+      return result;
     },
   };
 }

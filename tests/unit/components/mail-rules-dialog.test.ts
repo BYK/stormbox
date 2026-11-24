@@ -101,7 +101,7 @@ function installRepo({
         });
       return { attempted: 1, succeeded: 1, failed: 0 };
     }),
-    getPendingMutationError: vi.fn(),
+    getPendingMutationError: vi.fn(async (): Promise<{ error_json: string } | null> => null),
   };
   __setRepositoryForTests(repo);
   return repo;
@@ -210,27 +210,88 @@ describe('MailRulesDialog', () => {
       .toHaveProperty('value', 'newsletter');
   });
 
-  it('locks the draft while a server save is in flight', async () => {
+  it('reopens a queued draft while activation is pending and preserves newer edits', async () => {
     let releaseSave = () => {};
     const saveGate = new Promise<void>((resolve) => {
       releaseSave = resolve;
     });
-    installRepo({ saveGate });
+    const repo = installRepo({ saveGate });
     const wrapper = mountDialog();
     await flushPromises();
 
     await wrapper.get('[data-mail-rules-add]').trigger('click');
     const condition = wrapper.get('input[aria-label="Condition value"]');
-    await condition.setValue('locked');
+    await condition.setValue('queued newsletter');
     await wrapper.get('[data-mail-rules-save]').trigger('click');
     await flushPromises();
 
     expect(wrapper.get('[data-mail-rules-save]').attributes('disabled')).toBeDefined();
-    expect(wrapper.get('input[aria-label="Condition value"]').attributes('disabled')).toBeDefined();
+    expect(condition.attributes('disabled')).toBeUndefined();
+    expect(wrapper.text()).toContain('Draft queued for activation');
+    expect(wrapper.text()).not.toContain('Rules saved, validated, and activated.');
+    await wrapper.get('button[aria-label="Close mail rules"]').trigger('click');
+    expect(wrapper.emitted('close')).toHaveLength(1);
+    wrapper.unmount();
+
+    const reopened = mountDialog();
+    await flushPromises();
+    const reopenedCondition = reopened.get('input[aria-label="Condition value"]');
+    expect(reopenedCondition.element).toHaveProperty('value', 'queued newsletter');
+    expect(repo.getMailRules).toHaveBeenCalledOnce();
+    await reopenedCondition.setValue('newer edits');
 
     releaseSave();
     await flushPromises();
-    expect(wrapper.text()).toContain('Rules saved, validated, and activated.');
+    expect(reopened.text()).toContain('Rules saved, validated, and activated.');
+    expect(reopened.text()).toContain('Unsaved changes');
+    expect(reopenedCondition.element).toHaveProperty('value', 'newer edits');
+    reopened.unmount();
+  });
+
+  it('preserves a source draft through conflict and requires explicit review of server rules', async () => {
+    const repo = installRepo({ incompatible: true });
+    repo.runMutation.mockResolvedValueOnce({ attempted: 1, succeeded: 0, failed: 1 });
+    repo.getPendingMutationError.mockResolvedValueOnce({
+      error_json: JSON.stringify({
+        type: 'sieveStateMismatch',
+        message: 'The server rules changed since you opened the editor.',
+      }),
+    });
+    const wrapper = mountDialog();
+    await flushPromises();
+
+    const source = 'vacation "Back Tuesday";\r\n';
+    await wrapper.get('textarea[aria-label="Sieve source"]').setValue(source);
+    await wrapper.get('[data-mail-rules-save]').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('[data-mail-rules-save]').attributes('disabled')).toBeDefined();
+    expect(wrapper.text()).toContain('The server rules changed since you opened the editor.');
+    await wrapper.get('button[aria-label="Close mail rules"]').trigger('click');
+    wrapper.unmount();
+
+    const reopened = mountDialog();
+    await flushPromises();
+    expect(reopened.get('textarea[aria-label="Sieve source"]').element).toHaveProperty('value', source);
+    expect(repo.insertPendingMutation).toHaveBeenCalledOnce();
+    const review = reopened.get('.mail-rules__text-button');
+    expect(review.text()).toBe('Review server rules');
+    repo.getMailRules.mockResolvedValueOnce(snapshot({
+      state: 'sieve-state-from-other-client',
+      source: 'vacation "Away elsewhere";\r\n',
+    }));
+    await review.trigger('click');
+    await flushPromises();
+    expect(reopened.get('details').text()).toContain('vacation "Away elsewhere";');
+    expect(reopened.get('textarea[aria-label="Sieve source"]').element).toHaveProperty('value', source);
+    expect(repo.insertPendingMutation).toHaveBeenCalledOnce();
+    await reopened.get('[data-mail-rules-save]').trigger('click');
+    await flushPromises();
+    expect(JSON.parse(repo.insertPendingMutation.mock.calls[1][0].requestJson)).toEqual({
+      mode: 'source',
+      source,
+      expectedState: 'sieve-state-from-other-client',
+    });
+    reopened.unmount();
   });
 
   it('falls back to source and saves an incompatible active script in place', async () => {

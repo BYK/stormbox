@@ -1,8 +1,13 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, watch } from 'vue';
 import { X } from '@lucide/vue';
+import { useEventListener } from '@vueuse/core';
 
 import { COMPOSE_STATE } from '../constants/states';
+import { getRepositoryAsync } from '../composables/useRepository';
+import { TABLE_FAMILIES } from '../db/protocol';
+import { useAuthStore } from '../stores/auth-store';
+import { useMailActionFeedbackStore } from '../stores/mail-action-feedback-store';
 import { useMailStore } from '../stores/mail-store';
 import {
   COMPOSE_PRESENTATION,
@@ -41,12 +46,85 @@ function plainDismiss(run: () => void): ToastDismiss {
 const mailStore = useMailStore();
 const composeStore = useComposeStore();
 const contactsStore = useContactsStore();
+const mailActions = useMailActionFeedbackStore();
+const authStore = useAuthStore();
+useEventListener('keydown', (event) => {
+  if (event.defaultPrevented || event.repeat || event.shiftKey || event.altKey
+      || (!event.ctrlKey && !event.metaKey) || event.key.toLowerCase() !== 'z') return;
+  const target = event.composedPath()[0];
+  if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input, textarea, select, [role="textbox"]'))) return;
+  const id = mailActions.latestUndo();
+  if (id === undefined) return;
+  event.preventDefault();
+  void mailActions.run(id);
+});
+watch(() => authStore.accountId, async (ownerId, previous, onCleanup) => {
+  if (previous != null && ownerId !== previous) mailActions.$reset();
+  if (ownerId == null) return;
+  let active = true;
+  let unsubscribe: (() => void) | undefined;
+  onCleanup(() => {
+    active = false;
+    unsubscribe?.();
+  });
+
+  try {
+    const repo = await getRepositoryAsync();
+    if (!active || typeof repo.getAttentionImapActionFailures !== 'function') return;
+    const shown = new Map<number, { updatedAt: number; canRetry: boolean; toast: number }>();
+    let sequence = 0;
+    async function refreshFailures() {
+      const request = ++sequence;
+      const failures = await repo.getAttentionImapActionFailures(ownerId);
+      if (!active || request !== sequence) return;
+      for (const failure of failures) {
+        const previousFailure = shown.get(failure.id);
+        if (previousFailure && previousFailure.updatedAt >= failure.updatedAt) {
+          if (previousFailure.canRetry && !failure.canRetry) {
+            mailActions.dismiss(previousFailure.toast);
+            previousFailure.canRetry = false;
+          }
+          continue;
+        }
+        if (previousFailure) mailActions.dismiss(previousFailure.toast);
+        const toast = mailActions.showFailure(failure.message, failure.canRetry ? async () => {
+          try {
+            await repo.retryAttentionImapAction(ownerId, failure.id);
+          } catch (cause) {
+            const current = (await repo.getAttentionImapActionFailures(ownerId)).find(({ id }) => id === failure.id);
+            if (current?.canRetry) throw cause;
+          }
+        } : undefined);
+        shown.set(failure.id, { updatedAt: failure.updatedAt, canRetry: failure.canRetry, toast });
+      }
+    }
+    unsubscribe = repo.subscribe((tables) => {
+      if (tables.includes(TABLE_FAMILIES.ATTENTION)) void refreshFailures().catch(() => {});
+    });
+    await refreshFailures();
+  } catch {
+    // Existing notices still render when the local mail cache is unavailable.
+  }
+}, { immediate: true });
 
 // Compose errors are already surfaced inline in the dialog while it
 // is open; they only need a global toast when compose has closed
 // without the user reading the inline message.
 const entries = computed<ToastEntry[]>(() => {
   const out: ToastEntry[] = [];
+  for (const entry of mailActions.entries) {
+    out.push({
+      key: `mail-action:${entry.id}`,
+      message: entry.message,
+      kind: entry.kind,
+      action: entry.action ? {
+        label: entry.action,
+        name: `${entry.action} ${entry.message}`,
+        run: () => { void mailActions.run(entry.id); },
+      } : undefined,
+      dismiss: plainDismiss(() => mailActions.dismiss(entry.id)),
+    });
+  }
   if (mailStore.error) {
     out.push({
       key: 'mail',
@@ -173,7 +251,7 @@ const entries = computed<ToastEntry[]>(() => {
 <style scoped>
 .store-error-toast {
   position: fixed;
-  z-index: 80;
+  z-index: 140;
   inset-inline: 0;
   bottom: 16px;
   display: flex;

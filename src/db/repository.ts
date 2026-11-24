@@ -7,9 +7,10 @@
  * and shared across all stores.
  */
 
-import type { AttentionCache, ImapActionRequest } from './attention';
+import type { AttentionCache, ImapActionFailure, ImapActionRequest } from './attention';
 import type { AttentionImapDraft, AttentionImapSendResult, ImapAttentionAction, ImapMessageLocation, RelayAccount, RelayAccountInput, RelayAccountSettings, RelayMessageBody } from '../sync/backends/imap/attention-relay';
 import type { BundleState } from '../triage/smart-sort';
+import type { BundleStates } from '../triage/bundle-state-edits';
 import type {
   AddressBookInventory,
   ContactDetail,
@@ -345,13 +346,25 @@ export class Repository {
     return this.call<RelayMessageBody | null>(DB_RPC.ATTENTION_BODY, { ownerId, location, cachedOnly });
   }
 
-  mutateAttentionImapMessage(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction) {
-    return this.call<void>(DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION, { ownerId, location, action });
+  mutateAttentionImapMessage(ownerId: number, location: ImapMessageLocation, action: ImapAttentionAction, undoable = false) {
+    return this.call<{ mutationIds: number[] }>(DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION, { ownerId, location, action, undoable });
   }
 
   /** Persist an entire selection at once. Reject invalid selections without queuing any changes. */
-  mutateAttentionImapMessages(ownerId: number, requests: readonly ImapActionRequest[]) {
-    return this.call<{ mutationIds: number[] }>(DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS, { ownerId, requests });
+  mutateAttentionImapMessages(ownerId: number, requests: readonly ImapActionRequest[], undoable = false) {
+    return this.call<{ mutationIds: number[] }>(DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS, { ownerId, requests, undoable });
+  }
+
+  undoAttentionImapActions(ownerId: number, mutationIds: readonly number[]) {
+    return this.call<void>(DB_RPC.ATTENTION_UNDO_IMAP_ACTIONS, { ownerId, mutationIds });
+  }
+
+  getAttentionImapActionFailures(ownerId: number) {
+    return this.call<ImapActionFailure[]>(DB_RPC.ATTENTION_IMAP_ACTION_FAILURES, { ownerId });
+  }
+
+  retryAttentionImapAction(ownerId: number, mutationId: number) {
+    return this.call<{ mutationIds: number[] }>(DB_RPC.ATTENTION_RETRY_IMAP_ACTION, { ownerId, mutationId });
   }
 
   resumeAttentionImapActions(ownerId: number) {
@@ -378,6 +391,12 @@ export class Repository {
 
   setAttentionBundleState(ownerId: number, bundleId: string, state: BundleState | null, replacedIds: string[]) {
     return this.call<void>(DB_RPC.ATTENTION_SET_STATE, { ownerId, bundleId, state, replacedIds });
+  }
+
+  changeAttentionBundleStates(ownerId: number, aliases: readonly string[], replacements: BundleStates, expected?: BundleStates) {
+    return this.call<{ applied: boolean; previous: BundleStates }>(DB_RPC.ATTENTION_CHANGE_BUNDLE_STATES, {
+      ownerId, aliases, replacements, expected,
+    });
   }
 
   // Folders ------------------------------------------------------------
@@ -675,6 +694,14 @@ export class Repository {
 
   listPendingMutations(accountId, limit = 50) {
     return this.call(DB_RPC.PENDING_MUTATION_LIST_PENDING, { accountId, limit });
+  }
+
+  listMailActions(accountId: number, failedSince: number) {
+    return this.call<import('../types/mail-action').MailActionRow[]>(DB_RPC.MAIL_ACTION_LIST, { accountId, failedSince });
+  }
+
+  cancelMailAction(accountId: number, mutationId: number) {
+    return this.call<{ canceled: boolean }>(DB_RPC.MAIL_ACTION_CANCEL, { accountId, mutationId });
   }
 
   /**

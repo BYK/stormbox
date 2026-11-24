@@ -54,6 +54,8 @@ export interface FolderRow {
   is_starred: 0 | 1;
   is_deleted: 0 | 1;
   updated_at: number;
+  /** A folder waiting for the server to assign its mailbox id. */
+  pending_creation?: boolean;
   // populated by the mail-store after queryViewProgress lands
   index_total?: number;
   index_covered?: number;

@@ -51,7 +51,7 @@ interface FolderOptionGroup {
 }
 
 function optionsFor(rows: FolderRow[]): FolderOption[] {
-  return flattenFolderTree(rows.filter((row) => Number(row.is_deleted) !== 1))
+  return flattenFolderTree(rows.filter((row) => Number(row.is_deleted) !== 1 && !row.pending_creation))
     .map(({ folder: row, depth }) => ({ folder: row, depth, ...folderPresentation(row) }));
 }
 

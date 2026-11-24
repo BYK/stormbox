@@ -1,8 +1,9 @@
 import { useOnline } from '@vueuse/core';
-import { computed, ref, shallowReactive, shallowRef, watch } from 'vue';
+import { computed, shallowReactive, shallowRef, watch } from 'vue';
 import type { CachedImapAccount } from '../db/attention';
 import type { Repository } from '../db/repository';
 import { useComposeStore } from '../stores/compose-store';
+import { useImapOptimisticActions } from '../stores/imap-optimistic-actions-store';
 import type { ImapAttentionAction, ImapMessageLocation, RelayMessage, RelayMessageBody } from '../sync/backends/imap/attention-relay';
 import { formatAddressList } from '../utils/address-parse';
 
@@ -29,18 +30,18 @@ export function imapEntry(account: CachedImapAccount, mailbox: string, uidValidi
 }
 
 type ImapEntry = ReturnType<typeof imapEntry>;
-type Reading = { id: string; body?: RelayMessageBody; bodyError?: string; actionError?: string };
+type Reading = { id: string; body?: RelayMessageBody; bodyError?: string };
 
 export function useImapReader(
   ownerId: () => number,
   repository: () => Repository,
   find: (id: string) => ImapEntry | undefined,
-  report: (cause: unknown) => void,
+  refresh: () => void | Promise<void>,
 ) {
   const online = useOnline();
   const composeStore = useComposeStore();
+  const optimistic = useImapOptimisticActions();
   const reading = shallowRef<Reading>();
-  const pending = ref(new Set<string>());
   const current = computed(() => reading.value && find(reading.value.id));
   const view = computed(() => {
     const entry = current.value;
@@ -53,14 +54,10 @@ export function useImapReader(
       knownLabels: [...new Set([...labels, ...account.messages.flatMap((message) => message.labels ?? [])])],
       gmailLabels: row.gmailLabels ?? labels.length > 0,
       canSend: account.can_send === true,
-      seen: row.seen, flagged: row.flagged, disabled: disabled(entry.id),
+      seen: row.seen, flagged: row.flagged, disabled: false,
       ...reading.value,
     };
   });
-
-  function disabled(id: string) {
-    return pending.value.has(id);
-  }
 
   function close() { reading.value = undefined; }
 
@@ -85,20 +82,8 @@ export function useImapReader(
     }
   }
 
-  async function runAction(entry: ImapEntry, action: ImapAttentionAction) {
-    if (disabled(entry.id)) return;
-    pending.value.add(entry.id);
-    const opened = reading.value?.id === entry.id ? reading.value : undefined;
-    if (opened) opened.actionError = undefined;
-    try {
-      await repository().mutateAttentionImapMessage(ownerId(), entry.location, action);
-    } catch (cause) {
-      if (opened && opened === reading.value) opened.actionError = cause instanceof Error
-        ? cause.message : 'Could not update this message.';
-      else report(cause);
-    } finally {
-      pending.value.delete(entry.id);
-    }
+  function runAction(entry: ImapEntry, action: ImapAttentionAction, { undo }: { undo?: boolean } = {}) {
+    return optimistic.run(ownerId(), repository(), [{ entry, action }], { undo, refresh });
   }
 
   function composeResponse(kind: 'reply' | 'reply-all' | 'forward') {
@@ -117,5 +102,5 @@ export function useImapReader(
     }, body);
   }
 
-  return { current, view, disabled, open, close, runAction, composeResponse };
+  return { current, view, open, close, runAction, composeResponse };
 }

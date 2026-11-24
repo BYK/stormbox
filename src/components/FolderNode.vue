@@ -87,6 +87,8 @@ function toggle() {
       type="button"
       class="folder-node__button"
       :aria-current="current ? 'page' : undefined"
+      :aria-busy="folder.pending_creation || undefined"
+      :disabled="folder.pending_creation"
       @click="onPick(folder.id)"
     >
       <span class="folder-node__icon-wrap">

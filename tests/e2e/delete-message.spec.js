@@ -107,16 +107,20 @@ test.describe('Delete message e2e', () => {
           // Scoped to the open message: every list row carries its own
           // Delete in the hover overlay.
           await page.locator('.message-view__header').getByRole('button', { name: 'Delete' }).click();
+          const row = page.locator('.msg-list__item').filter({ hasText: subject });
+          await expect(row).toHaveCount(0, { timeout: 4_000 });
+          expect(classifyMailboxState(await getEmailMailboxIds(jmap, createdId), { source, trash })).toBe('source');
+          await page.getByRole('button', { name: /Undo Moved to Trash/i }).click();
+          await expect(row).toBeVisible({ timeout: 4_000 });
+          expect(classifyMailboxState(await getEmailMailboxIds(jmap, createdId), { source, trash })).toBe('source');
+          await row.first().click();
+          await page.locator('.message-view__header').getByRole('button', { name: 'Delete' }).click();
         }
 
         await expect.poll(
           async () => page.locator('.msg-list__item').filter({ hasText: subject }).count(),
           { timeout: 30_000, message: `deleted message should disappear from the ${source.name} list` },
         ).toBe(0);
-
-        const sourceCache = await readViewCacheForFolderRole(page, sourceRole);
-        expect(sourceCache, `local ${source.name} cache should be reachable via window.__repo`).not.toBeNull();
-        expect(sourceCache.remoteIds, `remote id should be gone from ${source.name} cache`).not.toContain(createdId);
 
         try {
           await expect.poll(
@@ -139,6 +143,10 @@ test.describe('Delete message e2e', () => {
           });
           throw err;
         }
+        await expect.poll(async () => {
+          const sourceCache = await readViewCacheForFolderRole(page, sourceRole);
+          return sourceCache == null ? null : sourceCache.remoteIds.includes(createdId);
+        }, { timeout: 10_000, message: `remote id should be gone from ${source.name} cache` }).toBe(false);
       } finally {
         await attachConsoleTail(testInfo, consoleLinesFor(page));
         if (createdId) {

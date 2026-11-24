@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MUTATION_TYPE } from '../../../src/constants/states';
+import { MAIL_UNDO_MS } from '../../../src/constants/mail-actions';
 import { makeAttentionHandlers } from '../../../src/db/attention';
 import { bootTestEngine } from '../../../src/db/bootstrap-memory';
 import { makeHandlers } from '../../../src/db/handlers';
@@ -257,7 +258,8 @@ describe('Attention cache', () => {
       mutationId: archive?.id, error: { type: 'archive_not_configured', message: 'Archive is unavailable.' },
     });
     const recovered = await reopened[DB_RPC.ATTENTION_GET]({ ownerId });
-    expect(recovered.actionFailure).toMatchObject({ accountId: 'work', message: 'Archive is unavailable.' });
+    expect(recovered.actionFailure).toMatchObject({ accountId: 'work',
+      message: expect.stringMatching(/^Couldn’t archive .*Archive is unavailable\.$/) });
     expect(work(recovered)?.messages).toMatchObject([
       { uid: 12, flagged: true, seen: false, keywords: ['FollowUp'], labels: ['To do'] },
     ]);
@@ -279,7 +281,7 @@ describe('Attention cache', () => {
     const rows = await engine.all(`SELECT id, request_json FROM pending_mutations ORDER BY id`);
     expect(mutationIds).toEqual(rows.map(({ id }) => id));
     expect(rows.map(({ request_json }) => JSON.parse(String(request_json)))).toEqual(
-      requests.map((request) => ({ ...request, accountScoped: true })),
+      requests.map((request) => ({ ...request, accountScoped: true, subject: expect.any(String) })),
     );
     expect(notify).toHaveBeenCalledExactlyOnceWith(ownerId, mutationIds[0]);
     expect(touch.mock.calls).toEqual([[TABLE_FAMILIES.ATTENTION], [TABLE_FAMILIES.MUTATIONS]]);
@@ -305,6 +307,77 @@ describe('Attention cache', () => {
     expect(touch).not.toHaveBeenCalled();
     expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts.map(({ messages }) => messages.length))
       .toEqual([1, 1]);
+  });
+
+  it('projects a deferred edit across worker restart and cancels the whole batch without an IMAP command', async () => {
+    const { handlers, server, fetcher } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const { mutationIds } = await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTIONS]({ ownerId, undoable: true,
+      requests: [
+        { location: workMessage, action: { type: 'trash' } },
+        { location: { ...workMessage, accountId: 'home' }, action: { type: 'seen', value: false } },
+      ],
+    });
+    const reopened = makeAttentionHandlers(engine, { touch: vi.fn() }, fetcher as unknown as typeof fetch);
+    const rows = await engine.all('SELECT id, not_before - created_at AS delay, not_before FROM pending_mutations ORDER BY id');
+    expect(rows.map(({ delay }) => delay)).toEqual([MAIL_UNDO_MS, MAIL_UNDO_MS]);
+    let clock = Number(rows[0].not_before) - 1;
+    const allHandlers = { ...makeHandlers(engine, { touch: vi.fn() }), ...reopened };
+    const runner = new OutboxRunner({ accountId: ownerId, handlers: allHandlers,
+      options: { now: () => clock },
+      processRow: (row) => processMutationRow({ account: { id: ownerId }, transport: null, handlers: allHandlers, row }),
+    });
+    try {
+      await runner.drain();
+      await expect(reopened[DB_RPC.ATTENTION_UNDO_IMAP_ACTIONS]({ ownerId: 2, mutationIds })).rejects.toThrow('started syncing');
+      await expect(reopened[DB_RPC.ATTENTION_UNDO_IMAP_ACTIONS]({ ownerId, mutationIds: [...mutationIds, 999] }))
+        .rejects.toThrow('started syncing');
+      expect((await reopened[DB_RPC.ATTENTION_GET]({ ownerId })).accounts).toMatchObject([
+        { relay_id: 'home', messages: [{ seen: false }] }, { relay_id: 'work', messages: [] },
+      ]);
+      await reopened[DB_RPC.ATTENTION_UNDO_IMAP_ACTIONS]({ ownerId, mutationIds });
+      clock += MAIL_UNDO_MS;
+      await runner.drain();
+      expect(server.trashed).toBe(false);
+      expect(server.attemptedPatches).toHaveLength(0);
+      expect((await reopened[DB_RPC.ATTENTION_GET]({ ownerId })).accounts).toMatchObject([
+        { relay_id: 'home', messages: [{ seen: true }] }, { relay_id: 'work', messages: [{ uid: 12 }] },
+      ]);
+    } finally {
+      await runner.stop();
+    }
+  });
+
+  it('retries an unsuperseded failure as a fresh edit and refuses stale retries after a newer edit', async () => {
+    const { handlers } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const [failedId] = (await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]({
+      ownerId, location: workMessage, action: { type: 'star', value: true },
+    })).mutationIds;
+    const reject = (mutationId: number) => handlers[DB_RPC.ATTENTION_SETTLE_IMAP_ACTION]({ mutationId,
+      error: { type: 'rejected', message: 'The server rejected the change.' },
+    });
+    await reject(failedId);
+    expect(await handlers[DB_RPC.ATTENTION_IMAP_ACTION_FAILURES]({ ownerId: 2 })).toEqual([]);
+    expect(await handlers[DB_RPC.ATTENTION_IMAP_ACTION_FAILURES]({ ownerId })).toMatchObject([
+      { id: failedId, accountId: 'work', canRetry: true, updatedAt: expect.any(Number),
+        message: expect.stringMatching(/^Couldn’t star .*The server rejected the change\.$/) },
+    ]);
+    const [unrelated] = (await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]({
+      ownerId, location: workMessage, action: { type: 'seen', value: false },
+    })).mutationIds;
+    await handlers[DB_RPC.ATTENTION_SETTLE_IMAP_ACTION]({ mutationId: unrelated });
+    const [retried] = (await handlers[DB_RPC.ATTENTION_RETRY_IMAP_ACTION]({ ownerId, mutationId: failedId })).mutationIds;
+    expect(retried).toBeGreaterThan(failedId);
+    expect(await handlers[DB_RPC.ATTENTION_IMAP_ACTION_FAILURES]({ ownerId })).toEqual([]);
+    await reject(retried);
+    const [newer] = (await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]({
+      ownerId, location: workMessage, action: { type: 'star', value: false },
+    })).mutationIds;
+    expect(await handlers[DB_RPC.ATTENTION_IMAP_ACTION_FAILURES]({ ownerId })).toMatchObject([{ id: retried, canRetry: false }]);
+    await handlers[DB_RPC.ATTENTION_SETTLE_IMAP_ACTION]({ mutationId: newer });
+    await expect(handlers[DB_RPC.ATTENTION_RETRY_IMAP_ACTION]({ ownerId, mutationId: retried }))
+      .rejects.toThrow('replaced by a newer action');
   });
 
   it('replays Gmail edits across mailbox aliases in order while another account is refreshing', async () => {
@@ -408,6 +481,28 @@ describe('Attention cache', () => {
     expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).states).toEqual({ new: state });
     await handlers[DB_RPC.ATTENTION_SET_STATE]({ ownerId, bundleId: 'new', state: null, replacedIds: [] });
     expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).states).toEqual({});
+  });
+
+  it('compares and restores all matching bundle records without changing newer or unrelated state', async () => {
+    const { handlers } = fakeRelay();
+    const restore = { disposition: 'snoozed' as const, aliases: ['thread', 'old'], changedAt: 1, observed: [], resolved: [], snoozedUntil: 900 };
+    const done = { disposition: 'done' as const, aliases: ['thread', 'first'], changedAt: 2, observed: ['mail'], resolved: ['mail'] };
+    const unrelated = { ...done, aliases: ['unrelated'] };
+    await handlers[DB_RPC.ATTENTION_SET_STATE]({ ownerId, bundleId: 'old', state: restore, replacedIds: [] });
+    await handlers[DB_RPC.ATTENTION_SET_STATE]({ ownerId, bundleId: 'first', state: done, replacedIds: [] });
+    await handlers[DB_RPC.ATTENTION_SET_STATE]({ ownerId, bundleId: 'unrelated', state: unrelated, replacedIds: [] });
+    await handlers[DB_RPC.ATTENTION_SET_STATE]({ ownerId: 2, bundleId: 'old', state: restore, replacedIds: [] });
+    const original = { old: restore, first: done };
+    const aliases = ['thread', 'old', 'first', 'new'];
+    const merged = { new: { ...done, aliases, changedAt: 3 } };
+    const write = (replacements: typeof original | typeof merged, expected?: typeof merged) =>
+      handlers[DB_RPC.ATTENTION_CHANGE_BUNDLE_STATES]({ ownerId, aliases, replacements, expected });
+    await expect(write(merged)).resolves.toEqual({ applied: true, previous: original });
+    await expect(write(original, { new: { ...merged.new, changedAt: 1 } })).resolves.toEqual({ applied: false, previous: merged });
+    expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).states).toEqual({ unrelated, ...merged });
+    await expect(write(original, merged)).resolves.toEqual({ applied: true, previous: merged });
+    expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).states).toEqual({ unrelated, ...original });
+    expect((await handlers[DB_RPC.ATTENTION_GET]({ ownerId: 2 })).states).toEqual({ old: restore });
   });
 
   it('applies an IMAP outbox change only to its paired account and updates its cached flags and Trash state', async () => {

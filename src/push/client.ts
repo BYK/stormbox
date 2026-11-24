@@ -92,9 +92,9 @@ function syncWebPushAttentionStates(): Promise<void> {
   return attentionSync;
 }
 
-export function publishWebPushAttentionState(id: string, state: BundleState | null, replacedIds: string[]): Promise<void> {
+export function publishWebPushAttentionState(id: string, state: BundleState | null, replacedIds: string[], changedAt = state?.changedAt ?? Date.now()): Promise<void> {
   const key = `${stateQueuePrefix}${crypto.randomUUID()}`;
-  const body = JSON.stringify({ id, state, replacedIds, changedAt: state?.changedAt ?? Date.now() });
+  const body = JSON.stringify({ id, state, replacedIds, changedAt });
   try {
     localStorage.setItem(key, body);
   } catch {

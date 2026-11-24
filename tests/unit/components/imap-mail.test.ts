@@ -71,7 +71,7 @@ it('shows a failed Google account in Mail and makes its messages available after
     await wrapper.get('[data-bulk-action="mark-read"]').trigger('click');
     expect(batch).toHaveBeenCalledWith(1, [12, 13].map((uid) => ({
       location: { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid }, action: { type: 'seen', value: true },
-    })));
+    })), true);
     await wrapper.setProps({ search: 'absent subject' });
     expect(wrapper.text()).toContain('No matches in downloaded messages.');
     await wrapper.setProps({ search: 'work update' });
@@ -79,13 +79,14 @@ it('shows a failed Google account in Mail and makes its messages available after
     const location = { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 12 };
     await wrapper.get('.msg-list__actions button[aria-label="Star"]').trigger('click');
     await flushPromises();
-    expect(mutate).toHaveBeenCalledWith(1, location, { type: 'star', value: true });
+    expect(mutate).toHaveBeenCalledWith(1, location, { type: 'star', value: true }, true);
     await wrapper.get('.msg-list__actions button[aria-label="Tags: Project"]').trigger('click');
     await flushPromises();
     const label = document.querySelector<HTMLButtonElement>('button[data-tag-keyword="gmail label:Project"]')!;
     expect(label.getAttribute('aria-checked')).toBe('true');
     label.click();
-    expect(mutate).toHaveBeenCalledWith(1, location, { type: 'tags', tags: { removeLabels: ['Project'] } });
+    await flushPromises();
+    expect(mutate).toHaveBeenCalledWith(1, location, { type: 'tags', tags: { removeLabels: ['Project'] } }, true);
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     await wrapper.get('button[aria-label^="Open message: Work update"]').trigger('click');
     await flushPromises();
@@ -158,7 +159,7 @@ it('restores the Unified Inbox from saved mail and expands a conversation across
     expect(wrapper.find('button[aria-label^="Open message: Re: Planning"]').exists()).toBe(false);
     await wrapper.get('.msg-list__select-all input').trigger('change');
     await wrapper.get('[data-bulk-action="delete"]').trigger('click');
-    expect(mutateImap).toHaveBeenLastCalledWith(1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 41 }, { type: 'trash' });
+    expect(mutateImap).toHaveBeenLastCalledWith(1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 41 }, { type: 'trash' }, true);
     expect(destroyJmap).not.toHaveBeenCalled();
     auth.isOfflineSession = false;
     await flushPromises();

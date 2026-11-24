@@ -134,7 +134,7 @@ test.describe('Folder create/rename/delete e2e', () => {
     await resetSharedSession(sharedPage);
   });
 
-  test('create, rename, and delete round-trip through UI, cache, and server', async ({ sharedPage: page }, testInfo) => {
+  test('create, rename, undo, and delete round-trip through UI, cache, and server', async ({ sharedPage: page }, testInfo) => {
     const jmap = await connectJmap();
     // Idempotent baseline: a previous aborted run may have left either
     // name behind.
@@ -198,6 +198,16 @@ test.describe('Folder create/rename/delete e2e', () => {
         async () => (await getServerMailboxByName(jmap, RENAMED_NAME))?.id ?? null,
         { timeout: 10_000, message: 'server should report the new name' },
       ).toBe(serverCreated.id);
+      await page.getByRole('button', { name: `Undo Renamed folder “${CREATE_NAME}”.` }).click();
+      await expect(createdNode).toBeVisible({ timeout: 10_000 });
+      await expect.poll(
+        async () => (await readCachedFolderByName(page, CREATE_NAME))?.remote_id ?? null,
+        { timeout: 10_000, message: 'cache should restore the original name' },
+      ).toBe(serverCreated.id);
+      await expect.poll(
+        async () => (await getServerMailboxByName(jmap, CREATE_NAME))?.id ?? null,
+        { timeout: 10_000, message: 'server should restore the original name' },
+      ).toBe(serverCreated.id);
 
       // ---- delete (escalation path) -----------------------------------
       // Seed one message so the first destroy attempt
@@ -208,10 +218,10 @@ test.describe('Folder create/rename/delete e2e', () => {
         subject: `${SWEEP_SUBJECT} ${Date.now()}`,
       });
 
-      dialog = await openManageDialog(page, RENAMED_NAME);
-      await dialog.locator(`[data-folder-edit="${RENAMED_NAME}"]`).click();
+      dialog = await openManageDialog(page, CREATE_NAME);
+      await dialog.locator(`[data-folder-edit="${CREATE_NAME}"]`).click();
       await dialog.locator('[data-folder-delete]').click();
-      await expect(dialog).toContainText(`Delete “${RENAMED_NAME}”?`, { timeout: 5_000 });
+      await expect(dialog).toContainText(`Delete “${CREATE_NAME}”?`, { timeout: 5_000 });
 
       // First confirmation: server refuses (folder still has mail) and
       // the dialog escalates to the permanent-delete warning.
@@ -228,14 +238,14 @@ test.describe('Folder create/rename/delete e2e', () => {
       await expect(dialog).toBeHidden({ timeout: 5_000 });
 
       await expect(
-        page.locator('.folder-node').filter({ hasText: RENAMED_NAME }),
+        page.locator('.folder-node').filter({ hasText: CREATE_NAME }),
       ).toHaveCount(0, { timeout: 10_000 });
       await expect.poll(
-        async () => readCachedFolderByName(page, RENAMED_NAME),
+        async () => readCachedFolderByName(page, CREATE_NAME),
         { timeout: 10_000, message: 'cache row should be soft-deleted' },
       ).toBeNull();
       await expect.poll(
-        async () => getServerMailboxByName(jmap, RENAMED_NAME),
+        async () => getServerMailboxByName(jmap, CREATE_NAME),
         { timeout: 10_000, message: 'server should no longer list the mailbox' },
       ).toBeNull();
     } finally {

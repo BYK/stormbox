@@ -1,4 +1,5 @@
 import type { Repository } from '../db/repository';
+import { useImapOptimisticActions } from '../stores/imap-optimistic-actions-store';
 import { useMailStore } from '../stores/mail-store';
 import type { ImapAttentionAction } from '../sync/backends/imap/attention-relay';
 import type { FolderRow, MessageRow } from '../types/db';
@@ -48,8 +49,9 @@ function imapAction(source: ImapSource, action: MailListAction, definitions: Rea
 }
 
 /** Run the same list action against its owning local outbox. */
-export function useMailListActions(ownerId: () => number, repository: () => Repository) {
+export function useMailListActions(ownerId: () => number, repository: () => Repository, refreshImap: () => Promise<void>) {
   const mail = useMailStore();
+  const optimistic = useImapOptimisticActions();
 
   async function runJmap(folderId: number, rows: MessageRow[], action: MailListAction) {
     const ids = rows.map(({ id }) => id);
@@ -70,25 +72,21 @@ export function useMailListActions(ownerId: () => number, repository: () => Repo
     const imap = [];
     for (const source of sources) {
       if (source.kind === 'imap') {
-        imap.push({ location: source.entry.location, action: imapAction(source, action, definitions) });
+        imap.push({ entry: source.entry, action: imapAction(source, action, definitions) });
       } else {
         const rows = folders.get(source.folder.id) ?? [];
         rows.push(source.row);
         folders.set(source.folder.id, rows);
       }
     }
-    const jobs: Promise<unknown>[] = [];
     const errors: unknown[] = [];
-    if (imap.length === 1) {
-      jobs.push(repository().mutateAttentionImapMessage(ownerId(), imap[0].location, imap[0].action));
-    } else if (imap.length > 1) {
-      jobs.push(repository().mutateAttentionImapMessages(ownerId(), imap));
-    }
-    const imapResults = Promise.allSettled(jobs);
+    const imapResult = imap.length ? Promise.allSettled([
+      optimistic.run(ownerId(), repository(), imap, { refresh: refreshImap }),
+    ]) : [];
     for (const [folderId, rows] of folders) {
       try { await runJmap(folderId, rows, action); } catch (cause) { errors.push(cause); }
     }
-    for (const result of await imapResults) {
+    for (const result of await imapResult) {
       if (result.status === 'rejected') errors.push(result.reason);
     }
     if (errors.length === 1) throw errors[0];

@@ -18,6 +18,7 @@ import { MUTATION_TYPE } from '../../../src/constants/states';
 import { compileRules } from '../../../src/sieve/rules';
 import type { MailRuleDocument } from '../../../src/sieve/rules';
 import { useAuthStore } from '../../../src/stores/auth-store';
+import { useMailActionFeedbackStore } from '../../../src/stores/mail-action-feedback-store';
 import {
   MailRulesSaveError,
   useRulesStore,
@@ -202,6 +203,51 @@ describe('rules store', () => {
     } satisfies Partial<MailRulesSaveError>);
     expect(store.error).toBe('The server rejected the script.');
     expect(store.saving).toBe(false);
+  });
+
+  it('keeps a mutation queued when the backend is unavailable and checks the same row later', async () => {
+    const repo = {
+      getMailRules: vi.fn(async () => snapshot()),
+      insertPendingMutation: vi.fn(async () => ({ id: 97 })),
+      runMutation: vi.fn(async () => ({ attempted: 1, succeeded: 1, failed: 0 }))
+        .mockResolvedValueOnce({ attempted: 0, succeeded: 0, failed: 0 }),
+    };
+    __setRepositoryForTests(repo);
+    useAuthStore().accountId = 7;
+    const store = useRulesStore();
+    await store.load();
+
+    await store.save(document());
+
+    expect(repo.getMailRules).toHaveBeenCalledOnce();
+    expect(store.queued).toBe(true);
+    expect(store.appliedMode).toBeNull();
+    await store.resumeActivation();
+    expect(repo.insertPendingMutation).toHaveBeenCalledOnce();
+    expect(repo.runMutation).toHaveBeenNthCalledWith(2, 7, 97);
+    expect(store.queued).toBe(false);
+    expect(store.appliedMode).toBe('visual');
+  });
+
+  it('offers a retry of the same mutation after a monitoring failure', async () => {
+    const repo = {
+      getMailRules: vi.fn(async () => snapshot()),
+      insertPendingMutation: vi.fn(async () => ({ id: 98 })),
+      runMutation: vi.fn(async () => ({ attempted: 1, succeeded: 1, failed: 0 }))
+        .mockRejectedValueOnce(new Error('Lost connection to the worker')),
+    };
+    __setRepositoryForTests(repo);
+    useAuthStore().accountId = 7;
+    const store = useRulesStore();
+    const feedback = useMailActionFeedbackStore();
+    await store.load();
+    await expect(store.save(document())).rejects.toThrow('Lost connection to the worker');
+
+    expect(feedback.entries[0]?.action).toBe('Retry');
+    await feedback.run(feedback.entries[0].id);
+    expect(repo.insertPendingMutation).toHaveBeenCalledOnce();
+    expect(repo.runMutation).toHaveBeenNthCalledWith(2, 7, 98);
+    expect(store.appliedMode).toBe('visual');
   });
 
   it('requires an authenticated local account', async () => {

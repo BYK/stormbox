@@ -14,13 +14,15 @@ import { TABLE_FAMILIES } from '../db/protocol';
 import { JMAP_SERVER_URL } from '../defines';
 import type { AttentionCache } from '../db/attention';
 import type { Repository } from '../db/repository';
+import { useAttentionBundleActionsStore } from '../stores/attention-bundle-actions-store';
 import { useAuthStore } from '../stores/auth-store';
+import { useImapOptimisticActions } from '../stores/imap-optimistic-actions-store';
 import { useMailStore } from '../stores/mail-store';
 import { browserSessionEnabled } from '../services/browser-session';
 import { GOOGLE_IMAP_RESULTS, type GoogleImapResult, type ImapAttentionAction } from '../sync/backends/imap/attention-relay';
 import { browserTriageMessageKey, createBrowserTriageRanker, type BrowserTriageProgress } from '../triage/browser-model';
-import { buildTriageBundles, markBundleDone, snoozeBundle, type BundleState, type TriageBundle, type TriageClassification, type TriageMessage } from '../triage/smart-sort';
-import { disableWebPush, enableWebPush, getWebPushPublicKey, isWebPushEnabled, onWebPushRefresh, publishWebPushAttentionState } from '../push/client';
+import { buildTriageBundles, type TriageClassification, type TriageMessage } from '../triage/smart-sort';
+import { disableWebPush, enableWebPush, getWebPushPublicKey, isWebPushEnabled, onWebPushRefresh } from '../push/client';
 import type { MessageRow, FolderRow } from '../types';
 import { parseAddressList } from '../utils/address-list';
 import { closeContainingDropdown } from '../utils/dropdown';
@@ -41,17 +43,20 @@ const error = ref('');
 const manageImap = ref(false);
 const googleImapResult = ref<GoogleImapResult>();
 const jmapFolder = shallowRef<FolderRow>();
-const jmapRows = shallowRef<MessageRow[]>([]);
+const cachedJmapRows = shallowRef<MessageRow[]>([]);
 const cache = shallowRef<AttentionCache>({ paired: false, accounts: [], states: {} });
 type Reading = { kind: 'jmap' | 'imap'; message: TriageMessage };
 const mailStore = useMailStore();
+const imapActions = useImapOptimisticActions();
+const jmapRows = computed(() => jmapFolder.value
+  ? mailStore.projectMailRows(jmapFolder.value.id, cachedJmapRows.value) : cachedJmapRows.value);
 const authStore = useAuthStore();
+const bundleActions = useAttentionBundleActionsStore().forOwner(props.ownerId);
 const { definitions: tagDefinitions } = useMessageTags();
 const reading = shallowRef<Reading>();
 const reader = ref<HTMLElement>();
 const list = ref<HTMLElement>();
 const maximized = ref(false);
-const pendingActions = ref(new Set<string>());
 let openingButton: HTMLElement | undefined;
 const pushRegistration = shallowRef<ServiceWorkerRegistration>();
 const pushKey = shallowRef<Uint8Array<ArrayBuffer>>();
@@ -104,7 +109,7 @@ function parseHeaderList(value: string | null): string[] {
 const imap = computed(() => cache.value.accounts.flatMap((account) => {
   const { mailbox, uid_validity: uidValidity } = account;
   if (!mailbox || !uidValidity) return [];
-  return account.messages.map((row) => {
+  return imapActions.projectFolder(props.ownerId, account.relay_id, mailbox, uidValidity, account.messages).map((row) => {
     const entry = imapEntry(account, mailbox, uidValidity, row);
     const message: TriageMessage = {
       id: JSON.stringify([mailbox, uidValidity, row.uid]),
@@ -123,7 +128,7 @@ const imap = computed(() => cache.value.accounts.flatMap((account) => {
   });
 }));
 const imapById = computed(() => new Map(imap.value.map((entry) => [entry.id, entry])));
-const imapReading = useImapReader(() => props.ownerId, () => repo, (id) => imapById.value.get(id), report);
+const imapReading = useImapReader(() => props.ownerId, () => repo, (id) => imapById.value.get(id), loadCache);
 const imapReader = imapReading.view;
 const jmapRowsById = computed(() => new Map(jmapRows.value.map((row) => [row.id, row])));
 const rows = computed(() => new Map<string, MessageRowLike & { id: number | string }>([
@@ -133,10 +138,6 @@ const rows = computed(() => new Map<string, MessageRowLike & { id: number | stri
   ...imap.value.map(({ message, presentation }) => [
     browserTriageMessageKey(message), presentation,
   ] as const),
-]));
-const disabledActions = computed(() => new Set([
-  ...pendingActions.value,
-  ...imap.value.filter(({ id }) => imapReading.disabled(id)).map(({ message }) => browserTriageMessageKey(message)),
 ]));
 const accountLabels = computed(() => Object.fromEntries([
   [`jmap:${props.ownerId}`, props.address],
@@ -148,7 +149,7 @@ const bundles = computed(() => {
     ...message, classification: modelScores.value.get(browserTriageMessageKey(message)),
   }));
   const query = props.search?.trim().toLowerCase();
-  return buildTriageBundles(messages, cache.value.states, clock.value).filter((bundle) =>
+  return buildTriageBundles(messages, bundleActions.states.value, clock.value).filter((bundle) =>
     !query || bundle.messages.some(({ message }) =>
       [message.subject, message.sender, message.preview, accountLabels.value[String(message.accountId)]]
         .some((value) => value?.toLowerCase().includes(query))),
@@ -195,6 +196,8 @@ watch(localModelEnabled, (enabled) => {
 
 async function loadCache() {
   const request = ++loadSequence;
+  const checkpoint = imapActions.cacheCheckpoint();
+  const bundleRevision = bundleActions.revision();
   const [nextCache, folder] = await Promise.all([
     repo.getAttentionCache(props.ownerId),
     repo.folderByRole(props.ownerId, 'inbox'),
@@ -204,9 +207,11 @@ async function loadCache() {
   }) : [];
   if (!active || request !== loadSequence) return;
   const inboxDiscovered = folder != null && folder.id !== jmapFolder.value?.id;
+  bundleActions.observe(bundleRevision, nextCache.states);
   cache.value = nextCache;
+  imapActions.reconcileCache(props.ownerId, checkpoint, 'INBOX');
   jmapFolder.value = folder;
-  jmapRows.value = rows;
+  cachedJmapRows.value = rows;
   if (inboxDiscovered && !loading.value) requestRefresh();
 }
 
@@ -325,22 +330,6 @@ async function disconnectRelay() {
   }
 }
 
-async function saveState(bundle: TriageBundle, state: BundleState | null) {
-  try {
-    const aliases = new Set(bundle.aliases);
-    const replacedIds = Object.entries(cache.value.states)
-      .filter(([id, previous]) => aliases.has(id) || previous.aliases.some((alias) => aliases.has(alias)))
-      .map(([id]) => id);
-    await repo.setAttentionBundleState(props.ownerId, bundle.id, state, replacedIds);
-    if (typeof bundle.accountId === 'string' && bundle.accountId.startsWith('imap:')) {
-      void publishWebPushAttentionState(bundle.id, state, replacedIds).catch(report);
-    }
-    await loadCache();
-  } catch (cause) {
-    report(cause);
-  }
-}
-
 function releaseJmapReader(previous?: Reading) {
   if (previous?.kind === 'jmap' && mailStore.selectedMessageId === previous.message.id) {
     mailStore.selectMessage(null);
@@ -393,9 +382,6 @@ async function runMessageAction(message: TriageMessage, action: ImapAttentionAct
     await imapReading.runAction(entry, action);
     return;
   }
-  const key = browserTriageMessageKey(message);
-  if (pendingActions.value.has(key)) return;
-  pendingActions.value.add(key);
   try {
     const row = jmapRowsById.value.get(message.id);
     if (!row || !jmapFolder.value) return;
@@ -403,11 +389,8 @@ async function runMessageAction(message: TriageMessage, action: ImapAttentionAct
     if (action.type === 'star') await mailStore.markManyFlagged([message.id], action.value, source);
     else if (action.type === 'seen') await mailStore.markManySeen([message.id], action.value, source);
     else if (action.type === 'trash') await mailStore.destroyMessage(message.id, source);
-    await loadCache();
   } catch (cause) {
     report(cause);
-  } finally {
-    pendingActions.value.delete(key);
   }
 }
 
@@ -483,16 +466,15 @@ onBeforeUnmount(() => {
         :bundles="bundles"
         :account-labels="accountLabels"
         :loading="loading"
-        :error="error || cache.actionFailure?.message"
+        :error="error"
         :open-message="reading?.message"
         :rows="rows"
-        :disabled-actions="disabledActions"
         :tag-definitions="tagDefinitions"
         @open="openMessage"
         @message-action="runMessageAction"
-        @done="(bundle) => saveState(bundle, markBundleDone(bundle))"
-        @snooze="(bundle, until) => saveState(bundle, snoozeBundle(bundle, until))"
-        @restore="(bundle) => saveState(bundle, null)"
+        @done="(bundle) => bundleActions.save(repo, bundle, 'done')"
+        @snooze="(bundle, until) => bundleActions.save(repo, bundle, { snoozeUntil: until })"
+        @restore="(bundle) => bundleActions.save(repo, bundle, 'restore')"
       >
         <template #actions>
           <div class="unified-attention__tools">

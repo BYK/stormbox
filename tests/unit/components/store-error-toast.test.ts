@@ -3,7 +3,7 @@
 import {
   afterEach, beforeEach, describe, expect, it, vi,
 } from 'vitest';
-import { mount } from '@vue/test-utils';
+import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { nextTick } from 'vue';
 
@@ -13,8 +13,11 @@ vi.mock('../../../src/services/auth', () => ({
 }));
 
 import StoreErrorToast from '../../../src/components/StoreErrorToast.vue';
-import { __resetRepositoryForTests } from '../../../src/composables/useRepository';
+import { __resetRepositoryForTests, __setRepositoryForTests } from '../../../src/composables/useRepository';
 import { COMPOSE_STATE } from '../../../src/constants/states';
+import { TABLE_FAMILIES } from '../../../src/db/protocol';
+import { useAuthStore } from '../../../src/stores/auth-store';
+import { MAIL_UNDO_MS, useMailActionFeedbackStore } from '../../../src/stores/mail-action-feedback-store';
 import {
   COMPOSE_PRESENTATION,
   sessionLabel,
@@ -50,6 +53,83 @@ afterEach(() => {
   for (const wrapper of mountedWrappers.splice(0)) wrapper.unmount();
   document.body.innerHTML = '';
   __resetRepositoryForTests();
+  useMailActionFeedbackStore().$reset();
+  vi.useRealTimers();
+});
+
+describe('mail Undo and Retry feedback', () => {
+  it('runs only the chosen undo and expires the remaining action', async () => {
+    vi.useFakeTimers();
+    const feedback = useMailActionFeedbackStore();
+    const undoArchive = vi.fn();
+    const undoDelete = vi.fn();
+    const wrapper = mountToast();
+    feedback.showUndo('Archived “One”', undoArchive);
+    feedback.showUndo('Moved “Two” to Trash', undoDelete);
+    await nextTick();
+
+    await wrapper.get('button[aria-label="Undo Moved “Two” to Trash"]').trigger('click');
+    expect(undoDelete).toHaveBeenCalledOnce();
+    expect(undoArchive).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain('Archived “One”');
+    vi.advanceTimersByTime(MAIL_UNDO_MS);
+    await nextTick();
+    expect(wrapper.find('.store-error-toast').exists()).toBe(false);
+  });
+
+  it('preserves a failed retry without restoring other toast actions', async () => {
+    const feedback = useMailActionFeedbackStore();
+    const retry = vi.fn().mockRejectedValueOnce(new Error('temporary')).mockResolvedValueOnce(undefined);
+    feedback.showFailure('Couldn’t archive “Meeting notes”', retry);
+    const [entry] = feedback.entries;
+    await feedback.run(entry.id);
+    expect(feedback.entries).toHaveLength(1);
+    expect(feedback.entries[0]).toMatchObject({ action: 'Retry', message: entry.message });
+    await feedback.run(feedback.entries[0].id);
+    expect(retry).toHaveBeenCalledTimes(2);
+    expect(feedback.entries).toHaveLength(0);
+  });
+
+  it('undoes the latest mail action from the keyboard and leaves editor undo alone', async () => {
+    const feedback = useMailActionFeedbackStore();
+    const older = vi.fn();
+    const latest = vi.fn();
+    const input = document.createElement('input');
+    document.body.append(input);
+    mountToast();
+    feedback.showUndo('Archived “Older”', older);
+    feedback.showUndo('Archived “Latest”', latest);
+    await nextTick();
+
+    const key = { key: 'z', ctrlKey: true, bubbles: true, cancelable: true };
+    expect(input.dispatchEvent(new KeyboardEvent('keydown', key))).toBe(true);
+    expect(latest).not.toHaveBeenCalled();
+    expect(document.body.dispatchEvent(new KeyboardEvent('keydown', key))).toBe(false);
+    expect(latest).toHaveBeenCalledOnce();
+    expect(older).not.toHaveBeenCalled();
+  });
+
+  it('removes a cached IMAP Retry once a newer choice has superseded it', async () => {
+    const failure = { id: 19, accountId: 'work', updatedAt: 180, message: 'Couldn’t unstar “Meeting notes”', canRetry: true };
+    let publish!: (tables: string[]) => void;
+    const retry = vi.fn(async () => { throw new Error('Superseded'); });
+    __setRepositoryForTests({
+      subscribe: (listener: (tables: string[]) => void) => { publish = listener; return () => {}; },
+      getAttentionImapActionFailures: async () => [{ ...failure }],
+      retryAttentionImapAction: retry,
+    });
+    useAuthStore().accountId = 42;
+    const wrapper = mountToast();
+    await flushPromises();
+    const action = wrapper.get('.store-error-toast__action');
+    expect(action.text()).toBe('Retry');
+
+    failure.canRetry = false;
+    publish([TABLE_FAMILIES.ATTENTION]);
+    await flushPromises();
+    expect(wrapper.find('.store-error-toast__action').exists()).toBe(false);
+    expect(retry).not.toHaveBeenCalled();
+  });
 });
 
 describe('StoreErrorToast send progress', () => {

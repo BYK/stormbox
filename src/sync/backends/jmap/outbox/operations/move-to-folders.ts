@@ -16,6 +16,12 @@ async function runMoveToFolders({ transport, handlers, row, request, useWebSocke
   const replaceExisting = request.replaceExisting === true;
   const addLocalIds = (request.addFolderIds ?? []).map(Number).filter(Number.isFinite);
   const removeLocalIds = (request.removeFolderIds ?? []).map(Number).filter(Number.isFinite);
+  const addKeywords: string[] = request.add ?? [];
+  const removeKeywords: string[] = request.remove ?? [];
+  const keywordPatch = Object.fromEntries([
+    ...removeKeywords.map((key) => [`keywords/${key}`, null]),
+    ...addKeywords.map((key) => [`keywords/${key}`, true]),
+  ]);
   const folderContexts = await resolveFolderContexts(
     handlers,
     [...addLocalIds, ...removeLocalIds],
@@ -151,6 +157,9 @@ async function runMoveToFolders({ transport, handlers, row, request, useWebSocke
           chunk.map((message) => [message.remoteId, patch]),
         );
       }
+      if (addKeywords.length || removeKeywords.length) {
+        update = Object.fromEntries(Object.entries(update).map(([id, properties]) => [id, { ...properties, ...keywordPatch }]));
+      }
       const raw = await callJmap(transport, {
         using: [JMAP_CAPS.CORE, JMAP_CAPS.MAIL],
         methodCalls: [['Email/set', {
@@ -176,6 +185,10 @@ async function runMoveToFolders({ transport, handlers, row, request, useWebSocke
           removeFolderIds: removeLocalIds,
           replaceExisting,
         });
+        if (addKeywords.length || removeKeywords.length) {
+          await handlers[DB_RPC.MAIL_ACTION_APPLY_KEYWORDS]({ messageIds: confirmed.map(({ localId }) => localId),
+            add: addKeywords, remove: removeKeywords });
+        }
         succeededIds.push(...confirmed.map((message) => message.localId));
       }
       for (const message of submitted) {

@@ -142,21 +142,31 @@ test('Mail applies IMAP row actions offline and reconciles them when it reconnec
     await expect.poll(cachedMessage).toMatchObject({ flagged: true });
     expect(await serverFlags()).toMatchObject({ flagged: false });
     await context.setOffline(false);
-    await expect.poll(serverFlags).toMatchObject({ flagged: true });
+    await expect.poll(serverFlags, { timeout: 15_000 }).toMatchObject({ flagged: true });
 
     await row.locator('.msg-list__open').hover();
     await row.getByRole('checkbox', { name: /^Select message/ }).check();
     await mail.getByRole('button', { name: 'Mark as unread', exact: true }).click();
     await expect.poll(cachedMessage).toMatchObject({ seen: false, flagged: true });
-    await expect.poll(serverFlags).toEqual({ seen: false, flagged: true });
+    await expect.poll(serverFlags, { timeout: 15_000 }).toEqual({ seen: false, flagged: true });
 
     await context.setOffline(true);
     await mail.locator('.msg-list__header').getByRole('button', { name: 'Delete', exact: true }).click();
     await expect(row).toHaveCount(0);
     await expect.poll(cachedMessage).toBeNull();
     expect(await serverFlags()).not.toBeNull();
+    await page.locator('.store-error-toast__action').filter({ hasText: /^Undo$/ }).last().click();
+    await expect(row).toBeVisible();
+    await expect.poll(cachedMessage).toMatchObject({ seen: false, flagged: true });
+    expect(await serverFlags()).toEqual({ seen: false, flagged: true });
+
+    await row.locator('.msg-list__open').hover();
+    await row.getByRole('checkbox', { name: /^Select message/ }).check();
+    await mail.locator('.msg-list__header').getByRole('button', { name: 'Delete', exact: true }).click();
+    await expect(row).toHaveCount(0);
+    await expect.poll(cachedMessage).toBeNull();
     await context.setOffline(false);
-    await expect.poll(serverFlags).toBeNull();
+    await expect.poll(serverFlags, { timeout: 15_000 }).toBeNull();
     await expect.poll(() => withMailbox(trash, (ids) => ids.length)).toBe(1);
     await account.getByRole('button', { name: 'Trash', exact: true }).click();
     await expect(mail).toHaveAttribute('aria-label', 'Trash');

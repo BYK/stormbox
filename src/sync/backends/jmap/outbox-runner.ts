@@ -67,6 +67,10 @@ const DEFAULT_BACKOFF_BASE_MS = 1_000;
 const DEFAULT_BACKOFF_CAP_MS = 60_000;
 const DRAIN_BATCH_SIZE = 50;
 const RECENT_IMAP_SEND_LIMIT = 32;
+const REPLAYABLE_MAIL_ACTIONS = new Set<string>([
+  MUTATION_TYPE.SET_KEYWORDS, MUTATION_TYPE.MOVE_TO_FOLDERS, MUTATION_TYPE.DESTROY,
+  MUTATION_TYPE.CANCEL_SCHEDULED_SEND,
+]);
 
 // An older retry must keep later edits to the same IMAP message from
 // overtaking it. Gmail shares message state across mailboxes, so its edits
@@ -87,6 +91,15 @@ const IMAP_ACTION_IS_NEXT = `(mutation.mutation_type != '${MUTATION_TYPE.ATTENTI
         AND json_extract(earlier.request_json, '$.location.uid') = json_extract(mutation.request_json, '$.location.uid')
       )
     )
+))`;
+
+const MAIL_ACTION_IS_NEXT = `(COALESCE(json_extract(mutation.optimistic_patch_json, '$.mailAction'), 0) != 1 OR NOT EXISTS (
+  SELECT 1 FROM pending_mutations earlier
+  JOIN json_each(earlier.optimistic_patch_json, '$.messageIds') earlier_message
+  JOIN json_each(mutation.optimistic_patch_json, '$.messageIds') later_message ON later_message.value = earlier_message.value
+  WHERE earlier.account_id = mutation.account_id AND earlier.id < mutation.id
+    AND earlier.local_status IN ('pending','retry','in_flight')
+    AND json_extract(earlier.optimistic_patch_json, '$.mailAction') = 1
 ))`;
 
 export type ProcessRowContext = {
@@ -377,7 +390,8 @@ export class OutboxRunner {
       sql: `UPDATE pending_mutations
                SET not_before = NULL, updated_at = ?
              WHERE account_id = ? AND id = ?
-               AND local_status IN ('pending','retry')`,
+               AND local_status IN ('pending','retry')
+               AND COALESCE(json_extract(optimistic_patch_json, '$.mailAction'), 0) != 1`,
       params: [this._now(), this._accountId, mutationId],
     });
 
@@ -702,6 +716,8 @@ export class OutboxRunner {
       this._signalForeground(-1);
     }
     const imapAction = activeRow.mutation_type === MUTATION_TYPE.ATTENTION_IMAP;
+    let stagedMail = false;
+    try { stagedMail = JSON.parse(activeRow.optimistic_patch_json)?.mailAction === true; } catch { /* Unstaged mutation. */ }
     if (result?.ok) {
       if (activeRow.mutation_type === MUTATION_TYPE.ATTENTION_IMAP_SEND && result.result?.rejected > 0) {
         this.recentImapSendResults.set(activeRow.id, { rejected: result.result.rejected });
@@ -711,6 +727,7 @@ export class OutboxRunner {
         }
       }
       if (imapAction) await this._handlers[DB_RPC.ATTENTION_SETTLE_IMAP_ACTION]({ mutationId: activeRow.id });
+      else if (stagedMail) await this._handlers[DB_RPC.MAIL_ACTION_SETTLE]({ mutationId: activeRow.id });
       else await this._deleteRow(activeRow.id);
       this._resolveAwaiters(activeRow.id, { ok: true, result: result.result });
       this._fireTally(activeRow.id, { ok: true, result: result.result });
@@ -718,18 +735,37 @@ export class OutboxRunner {
     }
     const errorType = result?.error?.type ?? 'unknown';
     const maxAttempts = this._maxAttemptsByType.get(activeRow.mutation_type) ?? this._maxAttempts;
-    // Explicit server and authentication rejections are terminal even for
-    // IMAP edits, which keep retrying transport failures across long outages.
+    const replayableMail = stagedMail && REPLAYABLE_MAIL_ACTIONS.has(activeRow.mutation_type);
+    let error = result?.error ?? { type: 'unknown' };
+    let nextRequestJson: string | null = null;
+    if (replayableMail) {
+      const request = JSON.parse(activeRow.request_json);
+      const previousError = JSON.parse(activeRow.error_json ?? '{}');
+      const succeededIds = [...new Set<number>([
+        ...(previousError.result?.succeededIds ?? []), ...(result?.result?.succeededIds ?? []),
+      ].map(Number))];
+      if (succeededIds.length && Array.isArray(request.messageIds)) {
+        const succeeded = new Set(succeededIds);
+        const remaining = request.messageIds.filter((id) => !succeeded.has(Number(id)));
+        if (remaining.length > 0) nextRequestJson = JSON.stringify({ ...request, messageIds: remaining });
+        error = { ...error, result: { ...error.result, succeededIds } };
+      }
+    }
+    // Reversible, idempotent edits survive a long outage. Explicit
+    // rejections and ambiguous outcomes still settle immediately.
     const authentication = classifyAuthenticationOrAuthorizationError(result?.error);
     const terminal = result?.error?.terminal === true
       || (authentication ? authentication.terminal : TERMINAL_ERROR_TYPES.has(errorType))
-      || (!imapAction && attemptNumber >= maxAttempts);
+      || (!imapAction && !replayableMail && attemptNumber >= maxAttempts);
     if (terminal) {
       if (imapAction) {
         await this._handlers[DB_RPC.ATTENTION_SETTLE_IMAP_ACTION]({
           mutationId: activeRow.id, error: result?.error ?? { type: 'unknown' },
         });
-      } else await this._markConflicted(activeRow.id, result?.error);
+      } else if (stagedMail) await this._handlers[DB_RPC.MAIL_ACTION_SETTLE]({
+        mutationId: activeRow.id, error,
+      });
+      else await this._markConflicted(activeRow.id, result?.error);
       this._resolveAwaiters(activeRow.id, {
         ok: false,
         error: result?.error,
@@ -746,7 +782,7 @@ export class OutboxRunner {
       this._backoffBaseMs * 2 ** (attemptNumber - 1),
       this._backoffCapMs,
     );
-    await this._markRetry(activeRow.id, this._now() + delay, result?.error);
+    await this._markRetry(activeRow.id, this._now() + delay, error, nextRequestJson);
     // Awaiters intentionally not resolved on transient retry — the
     // next drain pass picks this row up after the backoff window
     // and will eventually resolve the awaiter when it terminates.
@@ -763,7 +799,8 @@ export class OutboxRunner {
              WHERE account_id = ?
                AND local_status IN ('pending','retry')
                AND not_before IS NOT NULL
-               AND ${IMAP_ACTION_IS_NEXT}`,
+               AND ${IMAP_ACTION_IS_NEXT}
+               AND ${MAIL_ACTION_IS_NEXT}`,
       params: [this._accountId],
     });
     const nextMs = Number(rows?.[0]?.next_ms ?? 0);
@@ -782,6 +819,7 @@ export class OutboxRunner {
                AND local_status IN ('pending','retry')
                AND (not_before IS NULL OR not_before <= ?)
                AND ${IMAP_ACTION_IS_NEXT}
+               AND ${MAIL_ACTION_IS_NEXT}
              ORDER BY created_at, id
              LIMIT ?`,
       params: [this._accountId, this._now(), DRAIN_BATCH_SIZE],
@@ -847,17 +885,19 @@ export class OutboxRunner {
     this._resolveAwaiters(mutationId, { ok: false, error });
   }
 
-  async _markRetry(mutationId, notBefore, error) {
+  async _markRetry(mutationId, notBefore, error, requestJson: string | null = null) {
     await this._handlers[DB_RPC.QUERY]({
       sql: `UPDATE pending_mutations
                SET local_status = 'retry',
                    not_before = ?,
                    error_json = ?,
+                   request_json = COALESCE(?, request_json),
                    updated_at = ?
              WHERE id = ?`,
       params: [
         Math.floor(notBefore),
         JSON.stringify(error ?? {}),
+        requestJson,
         this._now(),
         mutationId,
       ],

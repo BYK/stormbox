@@ -19,6 +19,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { nextTick, shallowRef } from 'vue';
 
 import { useMailStore } from '../../../src/stores/mail-store';
+import { useMailActionFeedbackStore } from '../../../src/stores/mail-action-feedback-store';
 import { useAuthStore } from '../../../src/stores/auth-store';
 import { useSettingsStore } from '../../../src/stores/settings-store';
 import type { MessageRow } from '../../../src/types';
@@ -341,6 +342,89 @@ async function flushWithTimers(count = 6) {
 
 afterEach(() => {
   __resetRepositoryForTests();
+});
+
+describe('staged JMAP actions', () => {
+  it('hides a deleted row and can undo it while its local insert is pending', async () => {
+    const { mailStore, repo } = await setupStore({
+      folders: [makeFolder(1, { total_emails: 2 }), makeFolder(2, { role: 'trash', name: 'Trash', total_emails: 2 })],
+      views: {
+        1: { rows: [makeRow(1), makeRow(2)], total: 2 },
+        2: { rows: [makeRow(3), makeRow(0)], total: 2 },
+      },
+    });
+    await mailStore.ensureLoaded(0, 2);
+    const releaseTrash = mailStore.bindFolderView(2);
+    await flush();
+    repo.listMailActions = async () => [];
+    repo.cancelMailAction = vi.fn(async () => ({ canceled: true }));
+    repo.runMutation = vi.fn();
+    let accept!: (value: { id: number }) => void;
+    repo.insertPendingMutation = vi.fn(() => new Promise((resolve) => { accept = resolve; }));
+    const feedback = useMailActionFeedbackStore();
+    const removing = mailStore.destroyMessage(1);
+    await vi.waitFor(() => expect(repo.insertPendingMutation).toHaveBeenCalledTimes(1));
+    expect(mailStore.messages.map((row) => row?.id)).toEqual([2]);
+    expect(mailStore.folderView(2).messages.map((row) => row?.id)).toEqual([3, 1, 0]);
+    expect(await mailStore.selectAllLoadedMessages()).toBe(1);
+    expect([...mailStore.selectedIds]).toEqual([2]);
+    expect(repo.runMutation).not.toHaveBeenCalled();
+    const reversing = feedback.run(feedback.entries[0]!.id);
+    expect(mailStore.messages.map((row) => row?.id)).toEqual([1, 2]);
+    expect(mailStore.folderView(2).messages.map((row) => row?.id)).toEqual([3, 0]);
+    accept({ id: 91 });
+    await Promise.all([removing, reversing]);
+    expect(repo.cancelMailAction).toHaveBeenCalledWith(1, 91);
+    expect(mailStore.messages.map((row) => row?.id)).toEqual([1, 2]);
+    releaseTrash();
+  });
+
+  it('marks an opened message read without an Undo delay', async () => {
+    const { mailStore, repo } = await setupStore({
+      folders: [makeFolder(1, { total_emails: 1 })],
+      views: { 1: { rows: [makeRow(1, { is_seen: 0 })], total: 1 } },
+    });
+    await mailStore.ensureLoaded(0, 1);
+    repo.listMailActions = () => new Promise(() => {});
+    repo.cancelMailAction = vi.fn();
+    repo.insertPendingMutation = vi.fn(async () => ({ id: 99 }));
+    mailStore.selectMessage(1);
+    await flush();
+    expect(mailStore.messages[0]?.is_seen).toBe(1);
+    expect(repo.insertPendingMutation).toHaveBeenCalledWith(expect.objectContaining({ notBefore: null }));
+    expect(useMailActionFeedbackStore().entries).toHaveLength(0);
+  });
+
+  it('restores a rejected edit while keeping an unrelated edit and offers a retry', async () => {
+    const { mailStore, repo } = await setupStore({
+      folders: [makeFolder(1, { total_emails: 2 }), makeFolder(2, { role: 'trash', name: 'Trash' })],
+      views: { 1: { rows: [makeRow(1), makeRow(2)], total: 2 } },
+    });
+    await mailStore.ensureLoaded(0, 2);
+    const mutations = [];
+    repo.listMailActions = async () => mutations.slice();
+    repo.cancelMailAction = vi.fn();
+    repo.insertPendingMutation = vi.fn(async (input) => {
+      const row = { id: mutations.length + 1, request_json: input.requestJson, mutation_type: input.mutationType,
+        optimistic_patch_json: input.optimisticPatchJson, local_status: 'pending', error_json: null };
+      mutations.push(row);
+      return row;
+    });
+    const feedback = useMailActionFeedbackStore();
+    await mailStore.destroyMessage(1);
+    await mailStore.markManyFlagged([2], true);
+    expect(mailStore.messages.map((row) => [row?.id, row?.is_flagged])).toEqual([[2, 1]]);
+    mutations[0].local_status = 'conflicted';
+    mutations[0].error_json = JSON.stringify({ type: 'forbidden' });
+    repo.triggerBroadcast([TABLE_FAMILIES.MUTATIONS]);
+    await vi.waitFor(() => expect(mailStore.messages.map((row) => [row?.id, row?.is_flagged])).toEqual([[1, 0], [2, 1]]));
+    const failed = feedback.entries.find((entry) => entry.kind === 'error');
+    expect(failed).toMatchObject({ message: 'Couldn’t delete “Subject 1”.', action: 'Retry' });
+    await feedback.run(failed!.id);
+    expect(mailStore.messages.map((row) => [row?.id, row?.is_flagged])).toEqual([[2, 1]]);
+    expect(repo.insertPendingMutation).toHaveBeenCalledTimes(3);
+    feedback.$reset();
+  });
 });
 
 describe('selectFolder', () => {
@@ -3563,6 +3647,36 @@ describe('folder create/rename/delete actions', () => {
     expect(mailStore.error).toContain('already exists');
   });
 
+  it('projects a pending folder and offers Retry after a confirmed rejection', async () => {
+    const { mailStore, repo } = await setupCrudStore();
+    const feedback = useMailActionFeedbackStore();
+    let settle: (result: { succeeded: number; failed: number }) => void;
+    const pending = new Promise<{ succeeded: number; failed: number }>((resolve) => { settle = resolve; });
+    repo.insertPendingMutation = vi.fn(async () => ({ id: 6 }));
+    repo.runMutation = vi.fn(() => pending);
+    repo.getPendingMutationError = async () => ({
+      error_json: JSON.stringify({ type: 'notCreated', detail: { type: 'overQuota' } }),
+    });
+    const creation = mailStore.createFolder({ name: 'Receipts', parentFolderId: 10 });
+    const pendingFolder = () => mailStore.sidebarPrimaryFolders.find((row) => row.name === 'Receipts');
+    expect(pendingFolder()).toMatchObject({ parent_id: 10, pending_creation: true });
+    await mailStore.refreshFolders();
+    expect(pendingFolder()).toBeDefined();
+    settle!({ succeeded: 0, failed: 1 });
+    expect(await creation).toEqual(expect.objectContaining({ ok: false, reason: 'overQuota' }));
+    expect(pendingFolder()).toBeUndefined();
+    expect(feedback.entries).toMatchObject([{ message: 'Couldn’t create folder “Receipts”.', action: 'Retry' }]);
+
+    const existing = await repo.listFolders();
+    repo.runMutation.mockImplementationOnce(async () => {
+      repo.setFolders([...existing, makeFolder(22, { name: 'Receipts', parent_id: 10 })]);
+      return { succeeded: 1, failed: 0 };
+    });
+    await feedback.run(feedback.entries[0].id);
+    expect(pendingFolder()).toMatchObject({ id: 22, parent_id: 10 });
+    expect(repo.insertPendingMutation).toHaveBeenCalledTimes(2);
+  });
+
   it('updateFolder refuses system folders and parent loops client-side', async () => {
     const { mailStore, repo } = await setupCrudStore();
     let inserts = 0;
@@ -3598,6 +3712,68 @@ describe('folder create/rename/delete actions', () => {
     });
   });
 
+  it('projects rename immediately and Undo once the rename has been confirmed', async () => {
+    const { mailStore, repo } = await setupCrudStore();
+    const feedback = useMailActionFeedbackStore();
+    let confirmRename: (result: { succeeded: number; failed: number }) => void;
+    let confirmUndo: (result: { succeeded: number; failed: number }) => void;
+    const pending = new Promise<{ succeeded: number; failed: number }>((resolve) => { confirmRename = resolve; });
+    const reversal = new Promise<{ succeeded: number; failed: number }>((resolve) => { confirmUndo = resolve; });
+    const requests = [];
+    repo.insertPendingMutation = async ({ requestJson }) => {
+      requests.push(JSON.parse(requestJson));
+      return { id: requests.length };
+    };
+    repo.runMutation = vi.fn().mockImplementationOnce(() => pending).mockImplementationOnce(() => reversal);
+    const rename = mailStore.updateFolder(20, { name: 'Statements' });
+    const folderName = () => mailStore.sidebarPrimaryFolders.find((row) => row.id === 20)?.name;
+    expect(folderName()).toBe('Statements');
+    expect(feedback.entries).toHaveLength(0);
+    await flush();
+    expect(requests).toEqual([{ operations: [{ folderId: 20, name: 'Statements' }] }]);
+    repo.setFolders((await repo.listFolders()).map((row) => row.id === 20 ? { ...row, name: 'Statements' } : row));
+    confirmRename!({ succeeded: 1, failed: 0 });
+    await rename;
+    expect(feedback.entries).toMatchObject([{ action: 'Undo' }]);
+    const undo = feedback.run(feedback.entries[0].id);
+    expect(folderName()).toBe('Reports');
+    await flush();
+    repo.setFolders((await repo.listFolders()).map((row) => row.id === 20 ? { ...row, name: 'Reports' } : row));
+    confirmUndo!({ succeeded: 1, failed: 0 });
+    await undo;
+    expect(requests).toEqual([
+      { operations: [{ folderId: 20, name: 'Statements' }] },
+      { operations: [{ folderId: 20, name: 'Reports' }] },
+    ]);
+    expect(folderName()).toBe('Reports');
+    expect(mailStore.folderEditPendingIds.has(20)).toBe(false);
+  });
+
+  it('reserves a pending move’s old location and refuses an Undo that would introduce a cycle', async () => {
+    const { mailStore, repo } = await setupCrudStore();
+    const feedback = useMailActionFeedbackStore();
+    let confirmMove: (result: { succeeded: number; failed: number }) => void;
+    const pending = new Promise<{ succeeded: number; failed: number }>((resolve) => { confirmMove = resolve; });
+    repo.insertPendingMutation = vi.fn(async () => ({ id: 7 }));
+    repo.runMutation = vi.fn(async () => {
+      repo.setFolders((await repo.listFolders()).map((row) => row.id === 10 ? { ...row, parent_id: 11 } : row));
+      return { succeeded: 1, failed: 0 };
+    }).mockImplementationOnce(() => pending);
+
+    const detach = mailStore.updateFolder(11, { parentFolderId: null });
+    expect(await mailStore.updateFolder(10, { parentFolderId: 11 })).toEqual({ ok: false, reason: 'pending' });
+    expect(await mailStore.createFolder({ name: 'Alpha', parentFolderId: 10 })).toEqual({ ok: false, reason: 'duplicateName' });
+    repo.setFolders((await repo.listFolders()).map((row) => row.id === 11 ? { ...row, parent_id: null } : row));
+    confirmMove!({ succeeded: 1, failed: 0 });
+    await detach;
+    const originalUndo = feedback.entries[0].id;
+    expect(await mailStore.updateFolder(10, { parentFolderId: 11 })).toEqual({ ok: true });
+    await feedback.run(originalUndo);
+    expect(repo.insertPendingMutation).toHaveBeenCalledTimes(2);
+    expect(mailStore.folders.find(({ id }) => id === 11)?.parent_id).toBeNull();
+    expect(feedback.entries.at(-1)).toMatchObject({ message: 'Couldn’t undo the change to folder “Alpha”.' });
+  });
+
   it('deleteFolder blocks folders that still have children', async () => {
     const { mailStore, repo } = await setupCrudStore();
     let inserts = 0;
@@ -3618,13 +3794,21 @@ describe('folder create/rename/delete actions', () => {
       requested = JSON.parse(input.requestJson);
       return { id: 9 };
     };
-    repo.runMutation = async () => ({ attempted: 1, succeeded: 0, failed: 1 });
+    let settle: (result: { succeeded: number; failed: number }) => void;
+    repo.runMutation = () => new Promise((resolve) => { settle = resolve; });
     repo.getPendingMutationError = async () => ({
       error_json: JSON.stringify({ type: 'notDestroyed', detail: { type: 'mailboxHasEmail' } }),
     });
 
-    const result = await mailStore.deleteFolder(20);
+    const deletion = mailStore.deleteFolder(20);
+    expect(mailStore.sidebarPrimaryFolders.some((row) => row.id === 20)).toBe(false);
+    expect(await mailStore.updateFolder(11, { parentFolderId: 20 })).toEqual({ ok: false, reason: 'pending' });
+    expect(await mailStore.createFolder({ name: 'Receipts', parentFolderId: 20 })).toEqual({ ok: false, reason: 'pending' });
+    await flush();
+    settle!({ succeeded: 0, failed: 1 });
+    const result = await deletion;
     expect(result).toEqual({ ok: false, reason: 'mailboxHasEmail' });
+    expect(mailStore.sidebarPrimaryFolders.some((row) => row.id === 20)).toBe(true);
     expect(requested).toEqual({
       operations: [{ folderId: 20, onDestroyRemoveEmails: false }],
     });

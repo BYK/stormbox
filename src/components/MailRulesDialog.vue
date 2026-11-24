@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  computed, nextTick, onBeforeUnmount, onMounted, ref,
+  computed, nextTick, onBeforeUnmount, onMounted, ref, watch,
 } from 'vue';
 import {
   ArrowDown, ArrowUp, CircleAlert, Filter, Plus, Trash2, X,
@@ -40,10 +40,15 @@ const sourceBaseline = ref('');
 const visualSourceCheckpoint = ref('');
 const localError = ref<string | null>(null);
 const modeError = ref<string | null>(null);
-const notice = ref<string | null>(null);
+const reviewedServerRules = ref<string | null>(null);
 const confirmation = ref<'discard' | null>(null);
 
-const busy = computed(() => rulesStore.loading || rulesStore.saving);
+const busy = computed(() => rulesStore.loading);
+const notice = computed(() => {
+  if (rulesStore.appliedMode === 'source') return 'Sieve source saved, validated, and activated.';
+  if (rulesStore.appliedMode === 'visual') return 'Rules saved, validated, and activated.';
+  return null;
+});
 const dirty = computed(() =>
   JSON.stringify(draft.value) !== baseline.value
   || sourceDraft.value !== sourceBaseline.value);
@@ -159,10 +164,14 @@ function createAction(type: MailRuleAction['type']): MailRuleAction {
 async function load() {
   localError.value = null;
   modeError.value = null;
-  notice.value = null;
+  const keepDraft = rulesStore.needsReview || (baseline.value !== '' && dirty.value);
   try {
-    await rulesStore.load();
-    syncDrafts();
+    const server = await rulesStore.load();
+    if (keepDraft) {
+      reviewedServerRules.value = server.source;
+    } else {
+      syncDrafts();
+    }
   } catch (error) {
     localError.value = errorMessage(error);
   }
@@ -177,6 +186,20 @@ function syncDrafts(preferredMode?: 'visual' | 'source') {
   mode.value = rulesStore.snapshot?.visualizationError
     ? 'source'
     : (preferredMode ?? 'visual');
+}
+
+function restoreSubmittedDraft() {
+  const saved = rulesStore.submittedDraft;
+  if (!saved) return;
+  if (saved.mode === 'visual') draft.value = resolveFolderTargets(saved.document);
+  else sourceDraft.value = saved.source;
+  mode.value = saved.mode;
+  markDraftSubmitted();
+}
+
+function markDraftSubmitted() {
+  baseline.value = JSON.stringify(draft.value);
+  sourceBaseline.value = sourceDraft.value;
 }
 
 function switchToSource() {
@@ -216,7 +239,6 @@ function switchToVisual() {
 function requestSave() {
   localError.value = null;
   modeError.value = null;
-  notice.value = null;
   if (mode.value === 'source') {
     void persist();
     return;
@@ -232,18 +254,17 @@ function requestSave() {
 }
 
 async function persist() {
-  localError.value = null;
-  notice.value = null;
+  const save = mode.value === 'source'
+    ? rulesStore.saveSource(sourceDraft.value)
+    : rulesStore.save(draft.value);
+  if (rulesStore.saving) {
+    reviewedServerRules.value = null;
+    markDraftSubmitted();
+  }
   try {
-    const savedMode = mode.value;
-    if (savedMode === 'source') await rulesStore.saveSource(sourceDraft.value);
-    else await rulesStore.save(draft.value);
-    syncDrafts(savedMode);
-    notice.value = savedMode === 'source'
-      ? 'Sieve source saved, validated, and activated.'
-      : 'Rules saved, validated, and activated.';
+    await save;
   } catch (error) {
-    localError.value = errorMessage(error);
+    if (!rulesStore.error) localError.value = errorMessage(error);
   }
 }
 
@@ -279,8 +300,7 @@ function resolveFolderTargets(input: MailRuleDocument): MailRuleDocument {
 }
 
 function requestClose() {
-  if (busy.value) return;
-  if (dirty.value) {
+  if (baseline.value && dirty.value) {
     confirmation.value = 'discard';
     focusConfirmation();
     return;
@@ -345,8 +365,20 @@ function errorMessage(error: unknown): string {
 onMounted(async () => {
   window.addEventListener('keydown', onWindowKeydown);
   closeButtonEl.value?.focus();
-  await load();
+  if (rulesStore.snapshot && rulesStore.submittedDraft) {
+    syncDrafts();
+    restoreSubmittedDraft();
+    void rulesStore.resumeActivation();
+  } else {
+    await load();
+  }
 });
+
+watch(() => rulesStore.appliedMode, (applied) => {
+  if (applied && !dirty.value) syncDrafts(mode.value);
+});
+
+watch(() => authStore.accountId, () => emit('close'));
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onWindowKeydown);
@@ -373,7 +405,6 @@ onBeforeUnmount(() => {
             class="mail-rules__icon-button"
             type="button"
             aria-label="Close mail rules"
-            :disabled="busy"
             @click="requestClose"
           >
             <X :size="19" :stroke-width="2" aria-hidden="true" />
@@ -390,8 +421,14 @@ onBeforeUnmount(() => {
             <div>
               <strong>Mail rules could not be loaded or saved.</strong>
               <p>{{ localError || rulesStore.error }}</p>
-              <button v-if="!rulesStore.saving" type="button" class="mail-rules__text-button" @click="load">
-                Reload from server
+              <button
+                v-if="!rulesStore.saving && (!rulesStore.snapshot || rulesStore.needsReview)"
+                type="button"
+                class="mail-rules__text-button"
+                :disabled="busy"
+                @click="load"
+              >
+                {{ rulesStore.needsReview ? 'Review server rules' : 'Reload from server' }}
               </button>
             </div>
           </div>
@@ -399,6 +436,13 @@ onBeforeUnmount(() => {
           <div v-if="notice" class="mail-rules__alert mail-rules__alert--success" role="status">
             {{ notice }}
           </div>
+
+          <details v-if="reviewedServerRules !== null" class="mail-rules__alert mail-rules__server" open>
+            <summary>Current server rules</summary>
+            <p>Review this version and update your draft before saving again.</p>
+            <pre v-if="reviewedServerRules" class="mail-rules__server-source">{{ reviewedServerRules }}</pre>
+            <p v-else>No active rules.</p>
+          </details>
 
           <template v-if="!rulesStore.loading && rulesStore.snapshot">
             <div v-if="!rulesStore.supported" class="mail-rules__alert" role="status">
@@ -604,14 +648,21 @@ onBeforeUnmount(() => {
         </main>
 
         <footer class="mail-rules__footer">
-          <span class="mail-rules__footer-status">
-            <template v-if="rulesStore.saving">Uploading and validating…</template>
+          <span class="mail-rules__footer-status" role="status">
+            <template v-if="rulesStore.queued">Draft queued for activation</template>
+            <template v-else-if="rulesStore.saving">Saving draft…</template>
             <template v-else-if="dirty">Unsaved changes</template>
           </span>
-          <AppButton variant="outline" :disabled="busy" @click="requestClose">Close</AppButton>
+          <AppButton
+            v-if="rulesStore.canResume"
+            variant="outline"
+            @click="rulesStore.resumeActivation"
+          >Check activation</AppButton>
+          <AppButton variant="outline" @click="requestClose">Close</AppButton>
           <AppButton
             data-mail-rules-save
-            :disabled="busy || !rulesStore.supported || Boolean(rulesStore.snapshot?.parseError)"
+            :disabled="busy || rulesStore.saving || rulesStore.needsReview
+              || !rulesStore.supported || Boolean(rulesStore.snapshot?.parseError)"
             @click="requestSave"
           >Save and activate</AppButton>
         </footer>
@@ -624,7 +675,7 @@ onBeforeUnmount(() => {
             aria-labelledby="discard-title"
           >
             <h3 id="discard-title">Discard unsaved changes?</h3>
-            <p>Your server-side rules will stay as they were when this editor opened.</p>
+            <p>Changes made since your last save will be discarded.</p>
             <div class="mail-rules__confirm-actions">
               <AppButton variant="outline" @click="cancelConfirmation">Keep editing</AppButton>
               <AppButton data-mail-rules-confirm @click="confirmDiscard">Discard changes</AppButton>
@@ -776,6 +827,13 @@ onBeforeUnmount(() => {
 .mail-rules__alert--success {
   border-color: color-mix(in srgb, #2b9b58 60%, var(--border));
   background: color-mix(in srgb, #2b9b58 10%, var(--panel));
+}
+.mail-rules__server {
+  display: block;
+}
+.mail-rules__server-source {
+  max-height: 14rem;
+  overflow: auto;
 }
 .mail-rules__empty {
   margin: 28px 8px;

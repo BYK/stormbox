@@ -95,10 +95,15 @@ const canSubmit = computed(() => name.value.trim().length > 0 && !mailStore.fold
 async function submit() {
   if (!canSubmit.value) return;
   failure.value = null;
-  const result = await mailStore.createFolder({
+  const pending = mailStore.createFolder({
     name: name.value,
     parentFolderId: parentFolderId.value,
   });
+  if (mailStore.folderCreatePending) {
+    emit('close');
+    return;
+  }
+  const result = await pending;
   if (result.ok) {
     emit('close');
     return;

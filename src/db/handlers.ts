@@ -40,6 +40,7 @@ import {
   type ContactsTrashShardDocument,
 } from '../constants/contacts-trash-document';
 import type { ContactTrashDetail, ContactTrashLookup } from '../types/db';
+import { mailActionPatch } from '../types/mail-action';
 import {
   emptySettingsDocument,
   mergeSettingsDocuments,
@@ -5110,6 +5111,7 @@ export function makeHandlers(engine: any, broadcaster: any = noopBroadcaster(), 
 
     [DB_RPC.PENDING_MUTATION_INSERT]: async (input) => {
       const ts = now();
+      const action = mailActionPatch(input.optimisticPatchJson);
       // target_message_id has a FK to messages(id). If the caller
       // passes an id that no longer exists (e.g. a ghost row the
       // user double-clicked Delete on after the first click already
@@ -5130,8 +5132,8 @@ export function makeHandlers(engine: any, broadcaster: any = noopBroadcaster(), 
         `INSERT INTO pending_mutations(
             account_id, mutation_type, local_status, target_message_id,
             request_json, optimistic_patch_json, server_response_json, error_json,
-            created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            created_at, updated_at, not_before
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           input.accountId,
           input.mutationType,
@@ -5143,6 +5145,7 @@ export function makeHandlers(engine: any, broadcaster: any = noopBroadcaster(), 
           null,
           ts,
           ts,
+          action && Number.isFinite(input.notBefore) ? Math.max(ts, input.notBefore) : null,
         ],
       );
       broadcaster.touch(TABLE_FAMILIES.MUTATIONS);
@@ -5163,6 +5166,70 @@ export function makeHandlers(engine: any, broadcaster: any = noopBroadcaster(), 
         // Swallow synchronous throws from the hook for the same reason.
       }
       return { id: result.lastInsertRowid };
+    },
+
+    [DB_RPC.MAIL_ACTION_LIST]: async ({ accountId, failedSince }) => engine.all(
+      `SELECT id, mutation_type, target_message_id, request_json, optimistic_patch_json,
+              local_status, error_json, not_before
+         FROM pending_mutations
+        WHERE account_id = ? AND json_extract(optimistic_patch_json, '$.mailAction') = 1
+          AND (local_status IN ('pending','retry','in_flight')
+               OR (local_status = 'conflicted' AND updated_at >= ?))
+        ORDER BY id`, [accountId, failedSince],
+    ),
+
+    [DB_RPC.MAIL_ACTION_CANCEL]: async ({ accountId, mutationId }) => {
+      const result = await engine.run(
+        `DELETE FROM pending_mutations
+          WHERE account_id = ? AND id = ? AND local_status = 'pending' AND attempts = 0
+            AND json_extract(optimistic_patch_json, '$.mailAction') = 1`,
+        [accountId, mutationId],
+      );
+      const canceled = (result.changes ?? 0) > 0;
+      if (canceled) {
+        broadcaster.touch(TABLE_FAMILIES.MUTATIONS);
+        notifyMutation(accountId, mutationId);
+      }
+      return { canceled };
+    },
+
+    [DB_RPC.MAIL_ACTION_SETTLE]: async ({ mutationId, error }) => {
+      if (error == null) {
+        await engine.run('DELETE FROM pending_mutations WHERE id = ?', [mutationId]);
+      } else {
+        await engine.run(
+          `UPDATE pending_mutations SET local_status = 'conflicted', not_before = NULL,
+                  error_json = ?, updated_at = ? WHERE id = ?`,
+          [JSON.stringify(error), now(), mutationId],
+        );
+      }
+      broadcaster.touch(TABLE_FAMILIES.MUTATIONS);
+    },
+
+    [DB_RPC.MAIL_ACTION_APPLY_KEYWORDS]: async ({ messageIds, add = [], remove = [] }) => {
+      const ids = numericUnique(messageIds);
+      if (ids.length === 0) return;
+      const ts = now();
+      const additions = new Set<string>(add.map((keyword: string) => keyword.toLowerCase()));
+      const removals = new Set<string>(remove.map((keyword: string) => keyword.toLowerCase()));
+      await engine.transaction(async (tx) => {
+        const rows = await tx.all(`SELECT id, keywords_json FROM messages WHERE id IN (${placeholdersFor(ids)})`, ids);
+        for (const row of rows) {
+          const keywords = jsonRecord(row.keywords_json) ?? {};
+          for (const key of Object.keys(keywords)) {
+            if (removals.has(key.toLowerCase())) delete keywords[key];
+          }
+          for (const key of additions) keywords[key] = true;
+          const count = (key: string) => keywords[key] === true ? 1 : 0;
+          await tx.run(`UPDATE messages SET keywords_json = ?, is_seen = ?, is_flagged = ?, is_junk = ?, updated_at = ? WHERE id = ?`,
+            [JSON.stringify(keywords), count('$seen'), count('$flagged'), count('$junk'), ts, row.id]);
+          await tx.run('DELETE FROM message_keywords WHERE message_id = ?', [row.id]);
+          for (const [key, value] of Object.entries(keywords)) {
+            if (value === true) await tx.run('INSERT INTO message_keywords (message_id, keyword) VALUES (?, ?)', [row.id, key]);
+          }
+        }
+      });
+      broadcaster.touch(TABLE_FAMILIES.MESSAGES);
     },
 
     [DB_RPC.PENDING_MUTATION_INSERT_MANY]: async ({ accountId, mutations = [] }) => {

@@ -138,7 +138,7 @@ function flattenFolders(accountFolders: FolderRow[], isOwn: boolean): DialogFold
         depth,
         isOwn,
         subscribed,
-        pending: mailStore.subscriptionPendingFolderIds.has(folder.id)
+        pending: Boolean(folder.pending_creation) || mailStore.subscriptionPendingFolderIds.has(folder.id)
           || mailStore.folderEditPendingIds.has(folder.id),
         editable: capabilities.maySubscribe,
         isSystem,
@@ -639,8 +639,10 @@ function rowDraggable(row: DialogFolderRow): boolean {
 }
 
 function isDescendantOf(candidateId: number, ancestorId: number): boolean {
+  const visited = new Set<number>();
   let cursor = mailStore.folders.find((f) => f.id === candidateId) ?? null;
-  while (cursor?.parent_id != null) {
+  while (cursor?.parent_id != null && !visited.has(cursor.id)) {
+    visited.add(cursor.id);
     if (cursor.parent_id === ancestorId) return true;
     cursor = mailStore.folders.find((f) => f.id === cursor!.parent_id) ?? null;
   }
@@ -820,9 +822,14 @@ async function saveEditor(row: DialogFolderRow) {
     closeEditor();
     return;
   }
+  const pending = mailStore.updateFolder(row.folder.id, changes);
+  if (mailStore.folderEditPendingIds.has(row.folder.id)) {
+    closeEditor();
+    return;
+  }
   editorBusy.value = true;
   try {
-    const result = await mailStore.updateFolder(row.folder.id, changes);
+    const result = await pending;
     if (result.ok) {
       closeEditor();
     } else {
@@ -1062,6 +1069,7 @@ onBeforeUnmount(() => {
               <div
                 class="folder-subs__row-main"
                 :style="{ paddingLeft: indentPx(item.indent) }"
+                :aria-busy="item.row.pending || undefined"
                 :draggable="rowDraggable(item.row)"
                 @dragstart="onRowDragStart(item.row, $event)"
                 @dragend="onDragEnd()"
@@ -1197,6 +1205,7 @@ onBeforeUnmount(() => {
                   v-if="item.row.canRename || item.row.canDelete"
                   type="button"
                   class="folder-subs__edit"
+                  :disabled="item.row.pending && editingFolderId !== item.row.folder.id"
                   :data-folder-edit="item.row.folder.name"
                   :aria-label="`Edit folder ${item.row.folder.name}`"
                   title="Rename, move, or delete"

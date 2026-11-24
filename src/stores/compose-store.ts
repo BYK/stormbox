@@ -18,6 +18,7 @@ import {
 import { getRepositoryAsync } from '../composables/useRepository';
 import { useAuthStore } from './auth-store';
 import { useMailStore } from './mail-store';
+import { useMailActionFeedbackStore } from './mail-action-feedback-store';
 import { useSettingsStore } from './settings-store';
 import { COMPOSE_STATE, MUTATION_TYPE } from '../constants/states';
 import type { ComposeState, MailboxRole } from '../constants/states';
@@ -85,6 +86,7 @@ import {
 
 export type RecipientField = 'to' | 'cc' | 'bcc';
 type PendingDiscardIntent = 'discard-all' | 'keep-confirmed';
+type DraftCloseAction = 'save' | 'discard' | 'abandon';
 
 export const RECIPIENT_FIELDS: readonly RecipientField[] = ['to', 'cc', 'bcc'];
 export const INVALID_RECIPIENT_MESSAGE =
@@ -259,6 +261,7 @@ export interface ComposeSession {
   saveError: string | null;
   isSaving: boolean;
   isDiscarding: boolean;
+  closeAction: DraftCloseAction | null;
   closePromptOpen: boolean;
   draft: Draft;
   attachments: ComposeAttachment[];
@@ -536,6 +539,7 @@ function sameIdentitySignatureDefault(
 export const useComposeStore = defineStore('compose', () => {
   const authStore = useAuthStore();
   const mailStore = useMailStore();
+  const feedbackStore = useMailActionFeedbackStore();
   const settingsStore = useSettingsStore();
 
   // Transient send confirmation, rendered by StoreErrorToast after the
@@ -634,6 +638,7 @@ export const useComposeStore = defineStore('compose', () => {
     held: boolean;
     /** The session's one send in flight; later activations join it (CS-1.15). */
     sending: Promise<boolean> | null;
+    closing: Promise<boolean> | null;
   }>();
   const attachmentController = createComposeAttachmentController({
     sessionById,
@@ -675,6 +680,7 @@ export const useComposeStore = defineStore('compose', () => {
         blocked: false,
         held: false,
         sending: null,
+        closing: null,
       };
       autosaveRuntime.set(sessionId, runtime);
     }
@@ -1529,6 +1535,7 @@ export const useComposeStore = defineStore('compose', () => {
       saveError: null,
       isSaving: false,
       isDiscarding: false,
+      closeAction: null,
       closePromptOpen: false,
       draft: nextDraft,
       attachments: composeAttachmentsFromBody(initialAttachments, id),
@@ -1588,7 +1595,8 @@ export const useComposeStore = defineStore('compose', () => {
     if (!session) return true;
     if (session.status === COMPOSE_STATE.SENDING
         || session.isSaving
-        || session.isDiscarding) return false;
+        || session.isDiscarding
+        || session.closeAction) return false;
     session.generation += 1;
     disposeSessionRuntime(session.id);
     sessions.value = sessions.value.filter((candidate) => candidate.id !== session.id);
@@ -1626,6 +1634,8 @@ export const useComposeStore = defineStore('compose', () => {
   function restore(sessionId: string): boolean {
     const session = sessionById(sessionId);
     if (!session || session.presentation === COMPOSE_PRESENTATION.HIDDEN) return false;
+    if (session.closeAction && session.closeAction !== 'save') return false;
+    session.closeAction = null;
     expand(session);
     return true;
   }
@@ -2218,9 +2228,51 @@ export const useComposeStore = defineStore('compose', () => {
     return saved;
   }
 
-  async function saveAndClose(sessionId: string | null = activeSessionId.value): Promise<boolean> {
-    const session = sessionById(sessionId);
-    if (!session) return false;
+  /** Dock while the requested close settles. Keep the draft session until confirmation (CD-5.2, CD-5.7). */
+  function finishDraftClose(
+    session: ComposeSession,
+    action: DraftCloseAction,
+    work: () => Promise<boolean>,
+    retry: () => Promise<boolean>,
+  ): Promise<boolean> {
+    if (session.status === COMPOSE_STATE.SENDING || session.isDiscarding) return Promise.resolve(false);
+    const runtime = runtimeFor(session.id);
+    if (runtime.closing) return runtime.closing;
+    const wasExpanded = isExpandedPresentation(session.presentation);
+    const failure = action === 'save' ? 'Couldn’t save draft'
+      : action === 'discard' ? 'Couldn’t discard draft' : 'Couldn’t close draft';
+    session.closePromptOpen = false;
+    session.closeAction = action;
+    dock(session);
+    const closing = (async () => {
+      let completed: boolean;
+      try {
+        completed = await work();
+      } catch {
+        session.error = `${failure}.`;
+        runtime.blocked = false;
+        completed = false;
+      }
+      const current = sessionById(session.id);
+      // Restore can revoke the pending close while the draft save keeps running.
+      if (!current || current.closeAction !== action) return completed;
+      current.closeAction = null;
+      if (completed && close(current.id)) return true;
+      if (wasExpanded && !activeSession.value) expand(current);
+      else if (!isExpandedPresentation(current.presentation)) {
+        feedbackStore.showFailure(`${failure} “${sessionLabel(current)}”.`, action === 'discard' ? undefined : async () => {
+          await retry();
+        });
+      }
+      return false;
+    })().finally(() => {
+      if (runtime.closing === closing) runtime.closing = null;
+    });
+    runtime.closing = closing;
+    return closing;
+  }
+
+  async function saveForClose(session: ComposeSession): Promise<boolean> {
     const saved = await saveDraft(session.id, { explicit: true });
     if (!saved) return false;
     const current = sessionById(session.id);
@@ -2230,7 +2282,13 @@ export const useComposeStore = defineStore('compose', () => {
         : UNFINISHED_ATTACHMENT_MESSAGE;
       return false;
     }
-    return close(session.id);
+    return true;
+  }
+
+  function saveAndClose(sessionId: string | null = activeSessionId.value): Promise<boolean> {
+    const session = sessionById(sessionId);
+    if (!session || session.imapAccount) return Promise.resolve(false);
+    return finishDraftClose(session, 'save', () => saveForClose(session), () => saveAndClose(session.id));
   }
 
   function unfinishedAttachmentCount(
@@ -2286,7 +2344,8 @@ export const useComposeStore = defineStore('compose', () => {
     if (!session
         || session.status === COMPOSE_STATE.SENDING
         || session.isSaving
-        || session.isDiscarding) return false;
+        || session.isDiscarding
+        || session.closeAction) return false;
     if (!isSessionDirty(session.id)) return close(session.id);
     if (!isExpandedPresentation(session.presentation) && !restore(session.id)) return false;
     session.closePromptOpen = true;
@@ -2298,11 +2357,15 @@ export const useComposeStore = defineStore('compose', () => {
     if (session) session.closePromptOpen = false;
   }
 
-  async function closeWithoutSaving(
+  function closeWithoutSaving(
     sessionId: string | null = activeSessionId.value,
   ): Promise<boolean> {
     const session = sessionById(sessionId);
-    if (!session) return true;
+    if (!session) return Promise.resolve(true);
+    return finishDraftClose(session, 'abandon', () => abandonDraftEdits(session), () => closeWithoutSaving(session.id));
+  }
+
+  async function abandonDraftEdits(session: ComposeSession): Promise<boolean> {
     const runtime = runtimeFor(session.id);
     runtime.blocked = true;
     clearAutosaveTimer(session.id);
@@ -2314,15 +2377,18 @@ export const useComposeStore = defineStore('compose', () => {
       runtime.blocked = false;
       return false;
     }
-    session.closePromptOpen = false;
-    return close(session.id);
+    return true;
   }
 
-  async function discardDraft(
+  function discardDraft(
     sessionId: string | null = activeSessionId.value,
   ): Promise<boolean> {
     const session = sessionById(sessionId);
-    if (!session || session.status === COMPOSE_STATE.SENDING || session.isDiscarding) return false;
+    if (!session) return Promise.resolve(false);
+    return finishDraftClose(session, 'discard', () => discardDraftRevisions(session), () => discardDraft(session.id));
+  }
+
+  async function discardDraftRevisions(session: ComposeSession): Promise<boolean> {
     const runtime = runtimeFor(session.id);
     runtime.blocked = true;
     clearAutosaveTimer(session.id);
@@ -2332,7 +2398,7 @@ export const useComposeStore = defineStore('compose', () => {
     if (current.failedSaveMutationId == null
         && current.pendingDiscardMutationId == null
         && current.confirmedRevision == null) {
-      return close(current.id);
+      return true;
     }
     if (!repo || authStore.accountId == null) {
       current.error = 'Draft could not be discarded while disconnected.';
@@ -2354,9 +2420,10 @@ export const useComposeStore = defineStore('compose', () => {
           return false;
         }
         mutationId = abandoned.mutationId;
+        if (mutationId == null) return true;
       } else if (mutationId == null) {
         const emailIds = current.confirmedRevision ? [current.confirmedRevision.emailId] : [];
-        if (emailIds.length === 0) return close(current.id);
+        if (emailIds.length === 0) return true;
         const mutation = await repo.insertPendingMutation({
           accountId: authStore.accountId,
           mutationType: MUTATION_TYPE.DISCARD_DRAFT,
@@ -2372,7 +2439,11 @@ export const useComposeStore = defineStore('compose', () => {
         current.pendingDiscardMutationId = mutationId;
         current.pendingDiscardIntent = mutationId == null ? null : 'discard-all';
       }
-      if (mutationId == null) return close(current.id);
+      if (mutationId == null) {
+        current.error = 'Draft could not be queued for discard.';
+        runtime.blocked = false;
+        return false;
+      }
       const result = typeof repo.runMutation === 'function'
         ? await repo.runMutation(authStore.accountId, mutationId)
         : await repo.drainOutbox(authStore.accountId);
@@ -2383,8 +2454,7 @@ export const useComposeStore = defineStore('compose', () => {
       }
       current.pendingDiscardMutationId = null;
       current.pendingDiscardIntent = null;
-      current.isDiscarding = false;
-      return close(current.id);
+      return true;
     } catch (discardError: any) {
       current.error = discardError?.message ?? 'Draft could not be discarded.';
       runtime.blocked = false;
@@ -2893,7 +2963,7 @@ export const useComposeStore = defineStore('compose', () => {
     scheduledAt: string | null = null,
   ): Promise<boolean> {
     const session = sessionById(sessionId);
-    if (!session || session.isDiscarding) return Promise.resolve(false);
+    if (!session || session.isDiscarding || session.closeAction) return Promise.resolve(false);
     const runtime = runtimeFor(session.id);
     if (runtime.sending) return runtime.sending;
     const lane = performSend(session, scheduledAt).finally(() => {

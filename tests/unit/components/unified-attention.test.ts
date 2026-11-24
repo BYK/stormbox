@@ -7,18 +7,158 @@ import { watch } from 'vue';
 import UnifiedAttention from '../../../src/components/UnifiedAttention.vue';
 import { __resetRepositoryForTests, __setRepositoryForTests } from '../../../src/composables/useRepository';
 import { TABLE_FAMILIES } from '../../../src/db/protocol';
-import { onWebPushRefresh } from '../../../src/push/client';
+import { onWebPushRefresh, publishWebPushAttentionState } from '../../../src/push/client';
 import { useAuthStore } from '../../../src/stores/auth-store';
 import { useComposeStore } from '../../../src/stores/compose-store';
 import { useMailStore } from '../../../src/stores/mail-store';
+import { useMailActionFeedbackStore } from '../../../src/stores/mail-action-feedback-store';
 import type { RelayMessageBody } from '../../../src/sync/backends/imap/attention-relay';
+import { matchingBundleStates, replaceBundleStates, type BundleStates } from '../../../src/triage/bundle-state-edits';
 import type { FolderRow } from '../../../src/types';
 
 vi.mock('../../../src/services/auth', () => ({ initOidc: vi.fn(), getOidc: vi.fn() }));
 vi.mock('../../../src/push/client', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../../src/push/client')>(),
   onWebPushRefresh: vi.fn(() => () => {}),
+  publishWebPushAttentionState: vi.fn(async () => {}),
 }));
+
+function deferred(): { promise: Promise<void>; resolve: () => void; reject: (error: Error) => void } {
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise; });
+  return { promise, resolve, reject };
+}
+
+function mountBundleActions() {
+  const subjects = ['Please review the release', 'Please approve the estimate'];
+  const arrived = Date.now();
+  const pinia = createPinia();
+  let states: BundleStates = {};
+  let announce: (tables: string[]) => void = () => {};
+  const persist = vi.fn(async () => {});
+  const changeAttentionBundleStates = vi.fn(async (_ownerId, aliases: string[], replacements: BundleStates) => {
+    await persist();
+    const previous = matchingBundleStates(states, aliases);
+    states = replaceBundleStates(states, aliases, replacements);
+    announce([TABLE_FAMILIES.ATTENTION]);
+    return { applied: true, previous };
+  });
+  __setRepositoryForTests({
+    subscribe: (callback: typeof announce) => { announce = callback; return () => {}; },
+    folderByRole: async () => undefined,
+    getAttentionCache: async () => ({ paired: true, accounts: [{
+      relay_id: 'work', address: 'owner@example.org', mailbox: 'INBOX', uid_validity: '3',
+      messages: subjects.map((subject, uid) => ({
+        uid: uid + 1, subject, receivedAt: new Date(arrived - uid * 60_000).toISOString(), seen: false, flagged: true,
+        from: [{ address: `sender${uid}@example.org` }], to: [{ address: 'owner@example.org' }],
+      })),
+    }], states }),
+    refreshAttentionRelay: async () => [],
+    changeAttentionBundleStates,
+  });
+  const wrapper = mount(UnifiedAttention, {
+    attachTo: document.body,
+    props: { ownerId: 1, address: 'owner@example.org' },
+    global: { plugins: [pinia] },
+  });
+  const feedback = useMailActionFeedbackStore(pinia);
+  const currentSubjects = () => wrapper.findAll('.attention-inbox__bundle .msg-list__subject').map((node) => node.text());
+  const select = (label: RegExp) => wrapper.findAll('.attention-inbox__filter')
+    .find((button) => label.test(button.attributes('aria-label')))?.trigger('click');
+  const act = async (subject: string, label: string) => {
+    const row = wrapper.findAll('.attention-inbox__bundle').find((node) => node.text().includes(subject))!;
+    await row.get('summary[aria-label="Message actions"]').trigger('click');
+    await row.findAll('button').find((button) => button.text() === label)!.trigger('click');
+  };
+  return {
+    wrapper, feedback, persist, subjects, currentSubjects, select, act, changeAttentionBundleStates,
+    notify: () => announce([TABLE_FAMILIES.ATTENTION]), currentStates: () => states,
+    dispose: () => { wrapper.unmount(); feedback.$reset(); __resetRepositoryForTests(); },
+  };
+}
+
+it('moves a bundle and lets Undo restore it before a single SQLite write settles', async () => {
+  const fixture = mountBundleActions();
+  const { feedback, persist, subjects: [first, second], currentSubjects, act, changeAttentionBundleStates } = fixture;
+  const done = deferred();
+  const undo = deferred();
+  persist.mockReturnValueOnce(done.promise).mockReturnValueOnce(undo.promise);
+  vi.mocked(publishWebPushAttentionState).mockClear();
+  try {
+    await flushPromises();
+    const order = currentSubjects();
+    await act(first, 'Mark bundle done');
+    expect(currentSubjects()).toEqual([second]);
+    expect(fixture.currentStates()).toEqual({});
+    fixture.notify();
+    await flushPromises();
+    expect(currentSubjects()).toEqual([second]);
+    expect(publishWebPushAttentionState).not.toHaveBeenCalled();
+
+    const entry = feedback.entries.find(({ action }) => action === 'Undo')!;
+    const undoing = feedback.run(entry.id);
+    await flushPromises();
+    expect(currentSubjects()).toEqual(order);
+    expect(changeAttentionBundleStates).toHaveBeenCalledTimes(1);
+
+    done.resolve();
+    await flushPromises();
+    expect(currentSubjects()).toEqual(order);
+    expect(changeAttentionBundleStates).toHaveBeenCalledTimes(2);
+    expect(publishWebPushAttentionState).not.toHaveBeenCalled();
+    undo.resolve();
+    await undoing;
+    expect(fixture.currentStates()).toEqual({});
+    expect(publishWebPushAttentionState).toHaveBeenCalledExactlyOnceWith(expect.any(String), null, expect.any(Array), expect.any(Number));
+  } finally {
+    done.resolve();
+    undo.resolve();
+    fixture.dispose();
+  }
+});
+
+it('rolls back only the failed bundle, offers Retry, and makes Snooze and Restore immediately reversible', async () => {
+  const fixture = mountBundleActions();
+  const { feedback, persist, subjects: [first, second], currentSubjects, select, act } = fixture;
+  const pending = deferred();
+  persist.mockReturnValueOnce(pending.promise);
+  try {
+    await flushPromises();
+    await act(first, 'Mark bundle done');
+    await act(second, 'Snooze for one hour');
+    expect(currentSubjects()).toEqual([]);
+    pending.reject(new Error('SQLite write failed'));
+    await flushPromises();
+    expect(currentSubjects()).toEqual([first]);
+
+    const retry = feedback.entries.find(({ action }) => action === 'Retry')!;
+    expect(retry.message).toContain(first);
+    await feedback.run(retry.id);
+    expect(currentSubjects()).toEqual([]);
+    await select(/^Done & snoozed/);
+    expect(currentSubjects()).toEqual(expect.arrayContaining([first, second]));
+    expect(Object.values(fixture.currentStates()).map(({ disposition }) => disposition)).toEqual(expect.arrayContaining(['done', 'snoozed']));
+    const restore = deferred();
+    persist.mockReturnValueOnce(restore.promise);
+    try {
+      await act(second, 'Cancel snooze');
+      expect(currentSubjects()).toEqual([first]);
+      const undo = feedback.entries.find(({ message }) => message === 'Bundle restored.')!;
+      const undoing = feedback.run(undo.id);
+      await flushPromises();
+      expect(currentSubjects()).toEqual(expect.arrayContaining([first, second]));
+      restore.resolve();
+      await undoing;
+      expect(Object.values(fixture.currentStates()).map(({ disposition }) => disposition)).toEqual(expect.arrayContaining(['done', 'snoozed']));
+    } finally {
+      restore.resolve();
+    }
+  } finally {
+    pending.resolve();
+    fixture.dispose();
+  }
+});
 
 it('coalesces arrivals during a refresh and shows the new mail without switching filters', async () => {
   let finishFirstRefresh!: (result: string[]) => void;
@@ -217,6 +357,7 @@ it('keeps the shared reader mounted while loading IMAP HTML and sends its toolba
     if (action.type === 'tags') row.labels = row.labels.filter((label) => !action.tags.removeLabels?.includes(label));
     if (action.type === 'trash') messages = [];
     announce([TABLE_FAMILIES.ATTENTION]);
+    return { mutationIds: [1] };
   });
   __setRepositoryForTests({
     subscribe: (callback: typeof announce) => { announce = callback; return () => {}; },
@@ -282,7 +423,7 @@ it('keeps the shared reader mounted while loading IMAP HTML and sends its toolba
     await flushPromises();
     expect(mutateAttentionImapMessage).toHaveBeenLastCalledWith(1, location, {
       type: 'tags', tags: { removeLabels: ['Read later'] },
-    });
+    }, true);
     expect(header.text()).not.toContain('Read later');
     await back.trigger('click');
     expect(document.activeElement).toBe(open.element);
@@ -293,15 +434,15 @@ it('keeps the shared reader mounted while loading IMAP HTML and sends its toolba
     const star = reopened.get('[aria-label="Star"]');
     await star.trigger('click');
     await flushPromises();
-    expect(mutateAttentionImapMessage).toHaveBeenLastCalledWith(1, location, { type: 'star', value: true });
+    expect(mutateAttentionImapMessage).toHaveBeenLastCalledWith(1, location, { type: 'star', value: true }, true);
     expect(star.attributes('aria-pressed')).toBe('true');
     await reopened.get('[aria-label="Mark as unread"]').trigger('click');
     await flushPromises();
-    expect(mutateAttentionImapMessage).toHaveBeenLastCalledWith(1, location, { type: 'seen', value: false });
+    expect(mutateAttentionImapMessage).toHaveBeenLastCalledWith(1, location, { type: 'seen', value: false }, true);
     expect(reopened.find('[aria-label="Mark as read"]').exists()).toBe(true);
     await reopened.get('[aria-label="Delete"]').trigger('click');
     await flushPromises();
-    expect(mutateAttentionImapMessage).toHaveBeenLastCalledWith(1, location, { type: 'trash' });
+    expect(mutateAttentionImapMessage).toHaveBeenLastCalledWith(1, location, { type: 'trash' }, true);
     expect(wrapper.find('.message-view').exists()).toBe(false);
   } finally {
     wrapper.unmount();
