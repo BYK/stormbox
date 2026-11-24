@@ -267,12 +267,6 @@ export async function jmap(request: Request, accounts: readonly JmapAccount[], s
       if (!payload.using.includes(MAIL)) throw new MethodError('unknownMethod');
       const account = accounts.find(({ id }) => id === resolved.accountId);
       if (!account) throw new MethodError('accountNotFound');
-      let pending = snapshots.get(account.id);
-      if (!pending) {
-        pending = store.snapshot(account);
-        snapshots.set(account.id, pending);
-      }
-      const snapshot = await pending;
       if (name === 'Email/set') {
         try {
           methodResponses.push([name, await emailSet(resolved, account, store), callId]);
@@ -280,6 +274,12 @@ export async function jmap(request: Request, accounts: readonly JmapAccount[], s
           snapshots.delete(account.id);
         }
       } else {
+        let pending = snapshots.get(account.id);
+        if (!pending) {
+          pending = store.snapshot(account);
+          snapshots.set(account.id, pending);
+        }
+        const snapshot = await pending;
         methodResponses.push([name, await handleMethod(name, resolved, account, snapshot, store, bodyBudget), callId]);
       }
     } catch (error) {

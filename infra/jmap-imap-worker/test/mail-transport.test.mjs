@@ -77,9 +77,10 @@ const sample = [
 
 function makeImapSocket({
   mailboxSize = 1, trash = false, junk = false, archive = true, supportsMove = true, oauth = false, gmail = false,
-  keywordsAllowed = true, rejectLabelUpdate = false, omitKeywordFetch = false,
+  keywordsAllowed = true, rejectLabelUpdate = false, omitKeywordFetch = false, stall = () => false,
 } = {}) {
   const calls = [];
+  const sockets = [];
   let connections = 0;
   let moved = false;
   const flags = new Set(['\\Seen', 'localtriage-category-newsletter']);
@@ -92,7 +93,7 @@ function makeImapSocket({
     let current = 'INBOX';
     let authTag;
     const capability = `IMAP4rev1 AUTH=${oauth ? 'XOAUTH2' : 'PLAIN'} UIDPLUS${supportsMove ? ' MOVE' : ''}${gmail ? ' X-GM-EXT-1' : ''}`;
-    return scriptedSocket(`* OK [CAPABILITY ${capability}] fixture ready\r\n`, (line, write) => {
+    const socket = scriptedSocket(`* OK [CAPABILITY ${capability}] fixture ready\r\n`, (line, write) => {
       calls.push(line);
       if (authTag) {
         write(`${authTag} OK logged in\r\n`);
@@ -100,6 +101,7 @@ function makeImapSocket({
         return;
       }
       const [, tag, command] = /^(\S+) (.*)$/.exec(line) ?? [];
+      if (stall(command)) return;
       const ok = (value = 'OK') => write(`${tag} ${value}\r\n`);
       if (command.startsWith('AUTHENTICATE')) {
         authTag = tag;
@@ -189,8 +191,10 @@ function makeImapSocket({
         ok();
       }
     });
+    sockets.push(socket);
+    return socket;
   }
-  return { connect, calls, connections: () => connections };
+  return { connect, calls, sockets, connections: () => connections };
 }
 
 test('lists and reads multiple IMAP windows over one TLS connection', async () => {
@@ -213,6 +217,39 @@ test('lists and reads multiple IMAP windows over one TLS connection', async () =
   const body = await transport.readMessage(account, 'INBOX', '7', 44);
   assert.match(body.text, /Hi from IMAP!/);
   assert.equal(new TextDecoder().decode(await transport.readMessageSource(account, 'INBOX', '7', 44)), sample);
+});
+
+test('a stalled IMAP command closes its socket and permits a fresh read', { timeout: 3000 }, async () => {
+  let stalled = false;
+  const fixture = makeImapSocket({ stall: (command) => {
+    if (stalled || !/^FETCH /.test(command)) return false;
+    stalled = true;
+    return true;
+  } });
+  const transport = createMailTransport(fixture.connect, { operationTimeout: 100 });
+  await assert.rejects(transport.listMessages(account, 'INBOX', 10), { code: 'mail_timeout' });
+  assert.equal(stalled, true);
+  await fixture.sockets[0].closed;
+  assert.equal((await transport.listMessages(account, 'INBOX', 10)).messages[0].uid, 44);
+  assert.equal(fixture.connections(), 2);
+});
+
+test('a slow later folder does not discard Inbox or confirm the unread folders', { timeout: 3000 }, async () => {
+  const fixture = makeImapSocket({ trash: true, stall: (command) => /^EXAMINE Archive$/.test(command) });
+  const transport = createMailTransport(fixture.connect, { folderTimeout: 100 });
+  const result = await transport.listMailboxWindows(account, 10);
+  assert.deepEqual(result.windows.map(({ mailbox }) => mailbox), ['INBOX']);
+  assert.deepEqual(result.failedFolders, ['Archive', 'Deleted items']);
+  await fixture.sockets[0].closed;
+});
+
+test('a deadline after issuing UID STORE preserves the uncertain write outcome', { timeout: 3000 }, async () => {
+  const fixture = makeImapSocket({ stall: (command) => /^UID STORE /.test(command) });
+  const transport = createMailTransport(fixture.connect, { operationTimeout: 100 });
+  await assert.rejects(transport.patchMailboxKeywords(account, 'INBOX', '7', [{ uid: 44, keyword: '$flagged', add: true }]),
+    { code: 'keyword_write_unknown' });
+  assert.equal(fixture.calls.filter((line) => / UID STORE /.test(line)).length, 1);
+  await fixture.sockets[0].closed;
 });
 
 test('applies compatible JMAP keyword updates in a single batched UID STORE', async () => {

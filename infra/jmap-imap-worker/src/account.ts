@@ -1,10 +1,11 @@
 import { DurableObject } from 'cloudflare:workers';
 import { newAttentionNotifications } from './attention-notifications';
 import { mailAccounts, type Env } from './config';
+import { HttpError } from './http';
 import { jmapKeywords, type KeywordError, type KeywordUpdate, type KeywordWriteOutcome } from './keywords';
-import { listMailboxWindows, listMessages, MailTransportError, patchMailboxKeywords, readMessagePreviews, type ImapKeywordResult, type ImapMessage, type MailAccount } from './mail-transport';
+import { listMailboxWindows, listMessages, MailTransportError, patchMailboxKeywords, readMessagePreviews, type ImapKeywordResult, type ImapMessage, type ImapWindow, type MailAccount, type MailTransportErrorCode } from './mail-transport';
 import { getManagedAccount } from './managed-accounts';
-import { notifyArrival, pushAttentionStates } from './push';
+import { hasPushSubscribers, notifyArrival, pushAttentionStates } from './push';
 
 export interface Address {
   email: string;
@@ -102,6 +103,7 @@ const DEFAULT_PAGE_SIZE = 5000;
 const PER_FOLDER_WINDOW = 50;
 const MAX_FOLDERS = 25;
 const REFRESH_COOLDOWN = 15_000;
+const KEYWORD_WRITE_BUDGET = 20_000;
 const MIN_POLL_SECONDS = 60;
 const MAX_POLL_SECONDS = 3600;
 
@@ -222,10 +224,12 @@ function mailboxRole(path: string, specialUse: string | null): string | null {
 
 export class AccountState extends DurableObject<Env> {
   private readonly sql: SqlStorage;
+  private readonly readingFolders = new Map<string, { generation: number; window: Promise<ImapWindow> }>();
   private syncing?: Promise<AccountSnapshot>;
   private settingKeywords?: Promise<KeywordWriteOutcome>;
   private delivering?: Promise<void>;
   private refreshedAt = 0;
+  private refreshFailed = false;
   private forgotten = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -265,6 +269,48 @@ export class AccountState extends DurableObject<Env> {
     return generation;
   }
 
+  private checkAccount(id: string): void {
+    if (this.ctx.id.name && id !== this.ctx.id.name) throw new Error('Account does not match this storage object.');
+    if (this.forgotten) throw new Error('Account is disconnected.');
+  }
+
+  private readFolder(account: MailAccount, mailbox: string, limit: number) {
+    this.checkAccount(account.id);
+    const key = JSON.stringify([mailbox, limit]);
+    const current = this.readingFolders.get(key);
+    if (current) return current;
+    const generation = this.beginSync();
+    const window = listMessages(account, mailbox, limit).finally(() => {
+      if (this.readingFolders.get(key)?.window === window) this.readingFolders.delete(key);
+    });
+    const pending = { generation, window };
+    this.readingFolders.set(key, pending);
+    return pending;
+  }
+
+  async liveFolder(account: MailAccount, mailbox: string, limit: number): Promise<ImapWindow | { error: MailTransportErrorCode }> {
+    const { window } = this.readFolder(account, mailbox, limit);
+    try {
+      const result = await window;
+      this.checkAccount(account.id);
+      return result;
+    } catch (error) {
+      if (error instanceof MailTransportError) return { error: error.code };
+      throw error;
+    }
+  }
+
+  invalidateFolders(id: string): void {
+    this.checkAccount(id);
+    this.markFoldersDirty();
+  }
+
+  private markFoldersDirty(): void {
+    this.readingFolders.clear();
+    this.refreshedAt = 0;
+    this.setState('applied_generation', this.beginSync());
+  }
+
   snapshot(options: SnapshotOptions = {}): AccountSnapshot {
     const limit = clampInteger(options.limit, 0, DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE);
     const offset = clampInteger(options.offset, 0, Number.MAX_SAFE_INTEGER, 0);
@@ -297,10 +343,9 @@ export class AccountState extends DurableObject<Env> {
   }
 
   async setKeywords(account: MailAccount, updates: KeywordUpdate[], ifInState: string | null): Promise<KeywordWriteOutcome> {
-    if (this.ctx.id.name && account.id !== this.ctx.id.name) throw new Error('Account does not match this storage object.');
+    this.checkAccount(account.id);
     const previous = this.settingKeywords;
-    const sync = this.syncing;
-    const pending = Promise.allSettled([previous, sync]).then(() => this.writeKeywords(account, updates, ifInState));
+    const pending = Promise.resolve(previous).catch(() => {}).then(() => this.writeKeywords(account, updates, ifInState));
     this.settingKeywords = pending;
     try {
       return await pending;
@@ -328,12 +373,18 @@ export class AccountState extends DurableObject<Env> {
 
     const confirmed: { id: string; result: ImapKeywordResult }[] = [];
     let failure: 'serverPartialFail' | 'serverUnavailable' | undefined;
+    const deadline = Date.now() + KEYWORD_WRITE_BUDGET;
     for (const group of groups.values()) {
       if (this.forgotten) break;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        failure = confirmed.length ? 'serverPartialFail' : 'serverUnavailable';
+        break;
+      }
       const { path, uidValidity } = group[0].message;
       try {
         const results = await patchMailboxKeywords(account, path, uidValidity, group.map(({ message, update }) =>
-          ({ uid: message.uid, add: update.add, keyword: update.keyword })));
+          ({ uid: message.uid, add: update.add, keyword: update.keyword })), remaining);
         const idsByUid = new Map(group.map(({ message }) => [message.uid, message.id]));
         for (const result of results) {
           const id = idsByUid.get(result.uid)!;
@@ -343,6 +394,7 @@ export class AccountState extends DurableObject<Env> {
       } catch (error) {
         this.refreshedAt = 0;
         const code = error instanceof MailTransportError ? error.code : undefined;
+        if (code === 'keyword_write_unknown' && !this.forgotten) this.markFoldersDirty();
         if (code === 'mailbox_changed') {
           for (const { message } of group) outcomes.push([message.id, 'notFound']);
           continue;
@@ -371,7 +423,7 @@ export class AccountState extends DurableObject<Env> {
   private saveConfirmedKeywords(confirmed: { id: string; result: ImapKeywordResult }[]): void {
     if (!confirmed.length) return;
     // An IMAP snapshot fetched before the STORE must not overwrite its confirmed flags.
-    this.setState('applied_generation', this.beginSync());
+    this.markFoldersDirty();
     const changes: Change[] = [];
     const mailboxDeltas = new Map<string, { total: number; unread: number }>();
     for (const { id, result } of confirmed) {
@@ -561,6 +613,10 @@ export class AccountState extends DurableObject<Env> {
     return this.delivering;
   }
 
+  private queueDelivery(account: MailAccount): void {
+    this.ctx.waitUntil(this.deliverArrivals(account).catch(() => {}));
+  }
+
   private async processArrivals(account: MailAccount): Promise<void> {
     const staleAt = Date.now() - 24 * 60 * 60 * 1000;
     this.sql.exec('DELETE FROM gateway_push_outbox WHERE created_at < ?', staleAt);
@@ -649,32 +705,49 @@ export class AccountState extends DurableObject<Env> {
     return threadId;
   }
 
-  async refresh(account: MailAccount, options: { force?: boolean } = {}): Promise<AccountSnapshot> {
-    if (this.ctx.id.name && account.id !== this.ctx.id.name) throw new Error('Account does not match this storage object.');
-    const running = this.syncing;
-    if (running) {
-      if (!options.force) return running;
-      await running.catch(() => {});
-      return this.refresh(account, options);
-    }
-    if (this.settingKeywords) {
-      await this.settingKeywords.catch(() => {});
-      return this.refresh(account, options);
-    }
-    if (!options.force && Date.now() - this.refreshedAt < REFRESH_COOLDOWN) return this.snapshot();
-    const generation = this.beginSync();
-    this.syncing = this.refreshMailboxes(account, generation);
-    try {
-      const snapshot = await this.syncing;
-      this.refreshedAt = Date.now();
-      return snapshot;
-    } finally {
-      this.syncing = undefined;
-    }
+  private resolveAccount(id: string): MailAccount | Promise<MailAccount | undefined> | undefined {
+    return mailAccounts(this.env).find((entry) => entry.id === id)
+      ?? (id.startsWith('managed_') ? getManagedAccount(this.env, id) : undefined);
   }
 
-  private async refreshMailboxes(account: MailAccount, generation: number): Promise<AccountSnapshot> {
+  async refresh(id: string, options: { force?: boolean } = {}): Promise<AccountSnapshot> {
+    this.checkAccount(id);
+    const warm = this.getState('version') > 0 || (this.refreshedAt > 0 && !this.refreshFailed);
+    if (this.syncing) return warm && !options.force ? this.snapshot() : this.syncing;
+    if (this.settingKeywords) {
+      if (warm && !options.force) return this.snapshot();
+      await this.settingKeywords.catch(() => {});
+      return this.refresh(id, options);
+    }
+    if (!options.force && Date.now() - this.refreshedAt < REFRESH_COOLDOWN) {
+      if (this.refreshFailed && !warm) throw new MailTransportError('mail_unavailable');
+      return this.snapshot();
+    }
+    const generation = this.beginSync();
+    const pending = this.refreshMailboxes(id, generation).then((snapshot) => {
+      this.refreshFailed = false;
+      return snapshot;
+    }).catch((error) => {
+      this.refreshFailed = true;
+      throw error;
+    }).finally(() => {
+      this.refreshedAt = Date.now();
+      this.syncing = undefined;
+    });
+    this.syncing = pending;
+    if (warm && !options.force) {
+      this.ctx.waitUntil(pending.catch(() => {}));
+      return this.snapshot();
+    }
+    return pending;
+  }
+
+  private async refreshMailboxes(id: string, generation: number): Promise<AccountSnapshot> {
+    const account = await this.resolveAccount(id);
+    this.checkAccount(id);
+    if (!account) throw new HttpError(404, 'account_not_found');
     const { folders, windows, failedFolders } = await listMailboxWindows(account, PER_FOLDER_WINDOW, MAX_FOLDERS);
+    this.checkAccount(id);
     if (windows.length === 0 && failedFolders.length > 0) throw new Error('Could not refresh the configured mailboxes.');
     const selected = new Set([...windows.map(({ mailbox }) => mailbox), ...failedFolders]);
     const metadata = new Map(folders.filter(({ path }) => selected.has(path)).map((folder) => [folder.path, folder]));
@@ -688,7 +761,7 @@ export class AccountState extends DurableObject<Env> {
       }];
     });
     const snapshot = this.reconcile(snapshots, { generation, allMailboxPaths: [...metadata.keys()] });
-    this.ctx.waitUntil(this.deliverArrivals(account).catch(() => {}));
+    this.queueDelivery(account);
     return snapshot;
   }
 
@@ -703,7 +776,9 @@ export class AccountState extends DurableObject<Env> {
     this.setState('poll_interval_seconds', interval);
     const next = Date.now() + interval * 1000;
     const existing = await this.ctx.storage.getAlarm();
-    if (!this.forgotten && (existing === null || existing > next)) await this.ctx.storage.setAlarm(next);
+    if (!this.forgotten && this.getState('poll_interval_seconds') === interval && (existing === null || existing > next)) {
+      await this.ctx.storage.setAlarm(next);
+    }
   }
 
   async forgetManagedMailbox(): Promise<void> {
@@ -715,17 +790,16 @@ export class AccountState extends DurableObject<Env> {
 
   private async pollInbox(account: MailAccount): Promise<void> {
     const previous = this.sql.exec<Row>("SELECT * FROM gateway_mailboxes WHERE role = 'inbox' LIMIT 1").toArray()[0];
-    const generation = this.beginSync();
     const path = previous ? String(previous.path) : 'INBOX';
-    const window = await listMessages(account, path, PER_FOLDER_WINDOW);
+    const pending = this.readFolder(account, path, PER_FOLDER_WINDOW);
+    const window = await pending.window;
     if (this.forgotten) return;
     this.reconcile([{
       path, name: previous ? String(previous.name) : 'Inbox', role: 'inbox',
       delimiter: previous?.delimiter == null ? null : String(previous.delimiter),
       uidValidity: window.uidValidity, total: window.total, complete: window.complete, minUid: window.minUid,
       messages: window.messages.map(normalizeEnvelope),
-    }], { generation });
-    await this.deliverArrivals(account);
+    }], { generation: pending.generation });
   }
 
   async alarm(): Promise<void> {
@@ -736,23 +810,28 @@ export class AccountState extends DurableObject<Env> {
     if (!id) return;
     const managed = id.startsWith('managed_');
     let account: MailAccount | undefined;
+    let shouldPoll = true;
     try {
-      account = mailAccounts(this.env).find((entry) => entry.id === id) ?? (managed ? await getManagedAccount(this.env, id) : undefined);
+      shouldPoll = await hasPushSubscribers(this.env);
+      if (!shouldPoll || this.forgotten) return;
+      account = await this.resolveAccount(id);
       if (this.forgotten) return;
       if (!account) {
+        shouldPoll = false;
         if (managed) await this.forgetManagedMailbox();
         return;
       }
-      const running = this.syncing;
-      if (running) await running;
-      else if (this.settingKeywords) await this.settingKeywords.catch(() => {});
-      else await this.pollInbox(account);
+      if (!this.syncing) await this.pollInbox(account);
+    } catch (error) {
+      // The scheduled poll supplies the retry for transient upstream failures.
+      if (!(error instanceof MailTransportError || error instanceof HttpError)) throw error;
     } finally {
       // A disconnect can cancel polling while the refresh awaits IMAP.
-      if (!this.forgotten && (account || managed)) {
+      if (shouldPoll && !this.forgotten) {
         const current = this.getState('poll_interval_seconds');
         if (current !== 0) await this.ctx.storage.setAlarm(Date.now() + current * 1000);
       }
+      if (account && !this.forgotten) this.queueDelivery(account);
     }
   }
 }

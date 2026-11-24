@@ -6,7 +6,7 @@ import { authorization, consumeSessionAssertion, HttpError, json, matchesToken, 
 import { jmap, session, type JmapAccount, type JmapStore } from './jmap';
 import { isTagKeyword } from './keywords';
 import {
-  listMailboxes, listMessages, MailTransportError, MOVE_ROLES, moveToRole, patchMessage, patchMessageTags,
+  listMailboxes, MailTransportError, MOVE_ROLES, moveToRole, patchMessage, patchMessageTags,
   readMessage, readMessageSource, type ImapTagPatch, type MailAccount, type MoveAction,
 } from './mail-transport';
 import {
@@ -32,10 +32,7 @@ function makeStore(env: Env, configured: readonly MailAccount[], paired = false)
     return connection;
   }
   return {
-    snapshot: async (account) => {
-      const state = accountObject(env, account);
-      return state.refresh(await open(account));
-    },
+    snapshot: (account) => accountObject(env, account).refresh(account.id),
     changes: (account, type, since, max) => accountObject(env, account).changes(since, type, max),
     body: async (account, { path, uidValidity, uid }) => readMessage(await open(account), path, uidValidity, uid),
     source: async (account, id) => {
@@ -183,13 +180,16 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
     return json({ mailboxes: await listMailboxes(account) });
   }
   if (subresource !== 'messages') throw new HttpError(404, 'not_found');
-  const mailbox = url.searchParams.get('mailbox') ?? 'INBOX';
+  const mailboxValue = url.searchParams.get('mailbox') ?? 'INBOX';
+  const mailbox = mailboxValue.toUpperCase() === 'INBOX' ? 'INBOX' : mailboxValue;
   if (!mailbox || mailbox.length > 1024 || /[\0\r\n]/.test(mailbox)) throw new HttpError(400, 'invalid_mailbox');
   if (parts.length === 3 && request.method === 'GET') {
+    const state = accountObject(env, account);
     const [window, cached] = await Promise.all([
-      listMessages(account, mailbox, number(url.searchParams.get('limit') ?? '50', 100)),
-      mailbox.toUpperCase() === 'INBOX' ? accountObject(env, account).inboxPreviews().catch(() => null) : null,
+      state.liveFolder(account, mailbox, number(url.searchParams.get('limit') ?? '50', 100)),
+      mailbox === 'INBOX' ? state.inboxPreviews().catch(() => null) : null,
     ]);
+    if ('error' in window) throw new MailTransportError(window.error);
     const messages = cached?.uidValidity === window.uidValidity
       ? window.messages.map((message) => ({ ...message, preview: cached.previews[message.uid] }))
       : window.messages;
@@ -206,14 +206,18 @@ async function relay(request: Request, url: URL, env: Env): Promise<Response> {
   }
   if (parts.length === 4 && request.method === 'PATCH') {
     const input = await readJson(request, 65_536);
+    let mutation;
     if (input && typeof input === 'object' && Object.hasOwn(input, 'tags')) {
       if (Object.keys(input).length !== 1) throw new HttpError(400, 'invalid_tags');
-      return json(await patchMessageTags(account, mailbox, uidValidity, messageUid, readTagPatch(input.tags)));
+      mutation = patchMessageTags(account, mailbox, uidValidity, messageUid, readTagPatch(input.tags));
+    } else {
+      mutation = patchMessage(account, mailbox, uidValidity, messageUid, readFlagPatch(input));
     }
-    return json(await patchMessage(account, mailbox, uidValidity, messageUid, readFlagPatch(input)));
+    return json(await mutation.finally(() => accountObject(env, account).invalidateFolders(id).catch(() => {})));
   }
   if (action && request.method === 'POST') {
-    return json(await moveToRole(account, mailbox, uidValidity, messageUid, action));
+    const mutation = moveToRole(account, mailbox, uidValidity, messageUid, action);
+    return json(await mutation.finally(() => accountObject(env, account).invalidateFolders(id).catch(() => {})));
   }
   throw new HttpError(405, 'method_not_allowed');
 }
@@ -324,6 +328,7 @@ function errorResponse(error: unknown): Response {
       case 'mailbox_changed': return json({ error: error.code }, 409);
       case 'message_not_found': return json({ error: error.code }, 404);
       case 'message_too_large': return json({ error: error.code }, 413);
+      case 'mail_timeout': return json({ error: error.code }, 504);
       case 'same_mailbox':
       case 'move_not_supported':
       case 'archive_not_configured':

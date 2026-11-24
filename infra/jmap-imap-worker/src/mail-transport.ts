@@ -101,7 +101,7 @@ export const MOVE_ROLES = {
 export type MoveAction = keyof typeof MOVE_ROLES;
 
 export type MailTransportErrorCode = 'authentication_failed' | 'invalid_message' | 'mailbox_changed'
-  | 'mail_unavailable' | 'keyword_write_unknown' | 'message_not_found' | 'message_too_large' | 'move_not_supported'
+  | 'mail_unavailable' | 'mail_timeout' | 'keyword_write_unknown' | 'message_not_found' | 'message_too_large' | 'move_not_supported'
   | 'archive_not_configured' | 'archive_requires_inbox' | 'archive_rejected' | 'junk_not_configured' | 'labels_not_supported'
   | 'same_mailbox' | 'trash_not_configured' | 'smtp_not_configured' | 'submission_rejected' | 'submission_unknown';
 
@@ -176,13 +176,24 @@ async function fetchSource(client: ImapFlow, uid: number, size: number | undefin
   return raw.source;
 }
 
-export function createMailTransport(openSocket: SmtpConnect = connect) {
+function beforeDeadline<T>(operation: Promise<T>, timeout: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new MailTransportError('mail_timeout')), timeout);
+  });
+  return Promise.race([operation, deadline]).finally(() => clearTimeout(timer));
+}
+
+export function createMailTransport(openSocket: SmtpConnect = connect, {
+  operationTimeout = 15_000, folderTimeout = 6_000, syncTimeout = 20_000,
+} = {}) {
   const transport = createSocketsTransport((address, options) => openSocket(address, {
     secureTransport: options?.secureTransport ?? 'off',
     allowHalfOpen: options?.allowHalfOpen ?? false,
   }));
 
-  async function withClient<T>(options: ImapConnection, task: (client: ImapFlow) => Promise<T>): Promise<T> {
+  async function withClient<T>(options: ImapConnection, task: (client: ImapFlow) => Promise<T>,
+    timeout = operationTimeout): Promise<T> {
     const useStartTls = options.mode === 'starttls';
     const client = new ImapFlow({
       host: options.host,
@@ -202,8 +213,7 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     // The operation promise reports failures to its caller.
     client.on('error', () => {});
     try {
-      await client.connect();
-      return await task(client);
+      return await beforeDeadline(client.connect().then(() => task(client)), timeout);
     } catch (error) {
       if (error instanceof MailTransportError) throw error;
       if (error instanceof AuthenticationFailure) throw new MailTransportError('authentication_failed');
@@ -237,8 +247,9 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     mailbox: string,
     options: { readOnly: boolean; uidValidity?: string },
     task: (client: ImapFlow, selected: MailboxObject) => Promise<T>,
+    timeout?: number,
   ): Promise<T> {
-    return withClient(account.imap, (client) => withSelectedMailbox(client, mailbox, options, (selected) => task(client, selected)));
+    return withClient(account.imap, (client) => withSelectedMailbox(client, mailbox, options, (selected) => task(client, selected)), timeout);
   }
 
   async function readFolders(client: ImapFlow): Promise<ImapFolder[]> {
@@ -284,22 +295,35 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     return withClient(account.imap, (client) => readWindow(client, mailbox, limit));
   }
 
-  function listMailboxWindows(account: MailAccount, limit: number, maxFolders = 8) {
+  async function listMailboxWindows(account: MailAccount, limit: number, maxFolders = 8) {
     const count = Number.isSafeInteger(maxFolders) ? Math.min(25, Math.max(1, maxFolders)) : 8;
-    return withClient(account.imap, async (client) => {
-      const folders = await readFolders(client);
-      const inboxFirst = [...folders.filter(({ path }) => path === 'INBOX'), ...folders.filter(({ path }) => path !== 'INBOX')];
-      const windows: ImapWindow[] = [];
-      const failedFolders: string[] = [];
-      for (const { path } of inboxFirst.slice(0, count)) {
-        try {
-          windows.push(await readWindow(client, path, limit));
-        } catch {
-          failedFolders.push(path);
+    let folders: ImapFolder[] = [];
+    const windows: ImapWindow[] = [];
+    const failedFolders = new Set<string>();
+    try {
+      await withClient(account.imap, async (client) => {
+        folders = await readFolders(client);
+        const inboxFirst = [...folders.filter(({ path }) => path === 'INBOX'), ...folders.filter(({ path }) => path !== 'INBOX')];
+        const selected = inboxFirst.slice(0, count);
+        for (const { path } of selected) failedFolders.add(path);
+        for (const { path } of selected) {
+          try {
+            windows.push(await beforeDeadline(readWindow(client, path, limit), folderTimeout));
+            failedFolders.delete(path);
+          } catch (error) {
+            if (error instanceof MailTransportError && error.code === 'mail_timeout') {
+              client.close();
+              if (windows.length === 0) throw error;
+              break;
+            }
+            if (!client.usable) break;
+          }
         }
-      }
-      return { folders, windows, failedFolders };
-    });
+      }, syncTimeout);
+    } catch (error) {
+      if (!(error instanceof MailTransportError && error.code === 'mail_timeout' && windows.length > 0)) throw error;
+    }
+    return { folders, windows, failedFolders: [...failedFolders] };
   }
 
   function readMessageSource(account: MailAccount, mailbox: string, uidValidity: string, uid: number): Promise<Uint8Array> {
@@ -408,7 +432,8 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
     });
   }
 
-  function patchMailboxKeywords(account: MailAccount, mailbox: string, uidValidity: string, updates: ImapKeywordUpdate[]): Promise<ImapKeywordResult[]> {
+  function patchMailboxKeywords(account: MailAccount, mailbox: string, uidValidity: string, updates: ImapKeywordUpdate[],
+    timeout = operationTimeout): Promise<ImapKeywordResult[]> {
     let storeAttempted = false;
     return withMailbox(account, mailbox, { readOnly: false, uidValidity }, async (client) => {
       const groups = new Map<string, { flag: string; add: boolean; uids: number[] }>();
@@ -442,7 +467,7 @@ export function createMailTransport(openSocket: SmtpConnect = connect) {
         if (!keywords) return { uid, error: 'notFound' };
         return { uid, keywords, ...(imapFlag(keyword) && Object.hasOwn(keywords, keyword) === add ? {} : { error: 'forbidden' }) };
       });
-    }).catch((error) => {
+    }, Math.min(timeout, operationTimeout)).catch((error) => {
       if (storeAttempted) throw new MailTransportError('keyword_write_unknown');
       throw error;
     });

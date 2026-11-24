@@ -134,7 +134,7 @@ test('triggers same-request resync after a possibly applied Email/set and reject
     },
   });
   assert.equal(writes, 1);
-  assert.equal(loads, 3);
+  assert.equal(loads, 2);
   assert.deepEqual(output[0], ['error', { type: 'requestTooLarge' }, 'limit']);
   assert.equal(output[1][1].state, '2');
   assert.deepEqual(output[2], ['error', { type: 'serverPartialFail' }, 'partial']);
