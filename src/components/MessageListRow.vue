@@ -454,7 +454,12 @@ const rowLabel = computed(() => [
   transform: translateY(5px);
 }
 .msg-list__stack-toggle:hover { color: var(--text); }
-.msg-list__stack-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.msg-list__stack-toggle:focus-visible { outline: none; }
+.msg-list__stack-toggle:focus-visible span {
+  border-radius: 3px;
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 .msg-list__scroller:focus-visible .is-cursor .msg-list__item {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
