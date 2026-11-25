@@ -69,10 +69,13 @@ describe('AttentionInbox', () => {
   it('opens a conversation from its head and just one message from an expanded child', async () => {
     const request = bundle('req', 'action', 'Review these changes');
     const followup = bundle('progress', 'update', 'Progress update').leading;
-    request.messages.push(followup);
+    followup.message.receivedAt += 60_000;
+    request.messages.unshift(followup);
+    request.latestAt = followup.message.receivedAt;
     const wrapper = mount(AttentionInbox, { attachTo: document.body, props: { bundles: [request] } });
 
     const head = wrapper.get('[aria-label^="Open conversation"]');
+    expect(head.attributes('aria-label')).toContain('Progress update');
     await head.trigger('click');
     const expand = wrapper.get('.msg-list__stack-toggle');
     const members = wrapper.get('[aria-label="Messages in bundle"]');
@@ -87,7 +90,9 @@ describe('AttentionInbox', () => {
     expect(expand.attributes('aria-label')).toBe('Hide 2 messages');
     expect(expand.find('.lucide-chevron-up').exists()).toBe(true);
     expect(members.isVisible()).toBe(true);
-    const child = members.findAll('[aria-label^="Open message"]')[1];
+    const [older, child] = members.findAll('[aria-label^="Open message"]');
+    expect(older.attributes('aria-label')).toContain('Review these changes');
+    expect(child.attributes('aria-label')).toContain('Progress update');
     await child.trigger('click');
 
     expect(wrapper.emitted('open-bundle')).toEqual([[request, head.element]]);
@@ -162,7 +167,7 @@ describe('AttentionInbox', () => {
     const markRead = head.findAll('button').find((button) => button.text() === 'Mark as read')!;
     await markRead.trigger('click');
     await wrapper.get('.msg-list__stack-toggle').trigger('click');
-    const child = wrapper.get('[aria-label="Messages in bundle"]').findAll('.msg-list__item')[0];
+    const child = wrapper.get('[aria-label="Messages in bundle"] li:has([aria-label^="Open message: Please review"])');
     await child.get('[aria-label="Star"]').trigger('click');
 
     expect(wrapper.emitted('bundle-action')).toEqual([[request, { type: 'seen', value: true }]]);
@@ -185,7 +190,7 @@ describe('AttentionInbox', () => {
     const expander = wrapper.get('button[aria-controls]');
     await expander.trigger('click');
     const children = wrapper.get('[aria-label="Messages in bundle"]');
-    const member = children.findAll<HTMLInputElement>('input[aria-label^="Select message"]')[1];
+    const member = children.get<HTMLInputElement>('input[aria-label^="Select message: Follow-up"]');
     await member.trigger('click');
     expect(head.element.checked).toBe(false);
     expect(head.element.indeterminate).toBe(true);

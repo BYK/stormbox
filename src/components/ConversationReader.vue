@@ -77,9 +77,8 @@ watch(() => props.activeKey, async (key) => {
     </header>
 
     <ol ref="stack" class="conversation-reader__stack" role="list" aria-label="Messages in conversation">
-      <li v-for="(message, index) in messages" :key="message.key" class="conversation-reader__message"
-        :class="{ 'conversation-reader__message--expanded': expanded.has(message.key) }"
-        :style="expanded.has(message.key) ? undefined : { zIndex: messages.length - index }">
+      <li v-for="message in messages" :key="message.key" class="conversation-reader__message"
+        :class="{ 'conversation-reader__message--expanded': expanded.has(message.key) }">
         <h3 class="conversation-reader__summary-heading">
           <button :id="summaryId(message.key)" type="button" class="conversation-reader__summary"
             :aria-controls="panelId(message.key)" :aria-expanded="expanded.has(message.key)"
@@ -156,6 +155,7 @@ watch(() => props.activeKey, async (key) => {
 }
 
 .conversation-reader__message {
+  position: relative;
   flex: 0 0 auto;
   min-width: 0;
   border: 1px solid var(--control-border);
@@ -163,17 +163,18 @@ watch(() => props.activeKey, async (key) => {
   background: var(--panel);
 }
 
-.conversation-reader__message + .conversation-reader__message { margin-block-start: 6px; }
-.conversation-reader__message:not(.conversation-reader__message--expanded)
-  + .conversation-reader__message:not(.conversation-reader__message--expanded) {
-  margin-block-start: -6px;
+.conversation-reader__message--expanded + .conversation-reader__message { margin-block-start: 6px; }
+/* A collapsed card tucks behind the next message in chronological order. */
+.conversation-reader__message:not(.conversation-reader__message--expanded):has(+ .conversation-reader__message) {
+  isolation: isolate;
+  margin-block-end: -6px;
   margin-inline: 6px;
-  padding-block-start: 6px;
+  padding-block-end: 6px;
   background: var(--panel2);
 }
-.conversation-reader__message:not(.conversation-reader__message--expanded)
-  + .conversation-reader__message:not(.conversation-reader__message--expanded)
-  + .conversation-reader__message:not(.conversation-reader__message--expanded) {
+.conversation-reader__message:not(.conversation-reader__message--expanded):has(
+  + .conversation-reader__message:not(.conversation-reader__message--expanded) + .conversation-reader__message
+) {
   margin-inline: 12px;
 }
 

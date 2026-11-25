@@ -109,10 +109,11 @@ const bundlesByFilter = computed(() => {
 });
 const visibleBundles = computed(() => bundlesByFilter.value[selectedFilter.value]);
 const visibleMessages = computed(() => visibleBundles.value.flatMap(({ messages }) => messages.map(({ message }) => message)));
+const chronologicalItems = (bundle: TriageBundle) => [...bundle.messages].reverse();
 const selectionRows = computed(() => visibleBundles.value.flatMap((bundle) => [
   { key: bundleKey(bundle), row: bundle, messages: bundle.messages.map(({ message }) => message) },
   ...(expandedBundles.value.has(bundle.id) && bundle.messages.length > 1
-    ? bundle.messages.map(({ message }) => ({ key: messageKey(message), row: message, messages: [message] })) : []),
+    ? chronologicalItems(bundle).map(({ message }) => ({ key: messageKey(message), row: message, messages: [message] })) : []),
 ]));
 const selectionIndex = computed(() => new Map(selectionRows.value.map(({ row }, index) => [row, index])));
 const selection = useListSelection({
@@ -187,7 +188,8 @@ function rowFor(message: TriageMessage): MessageRowLike & { id: number | string 
 }
 
 function bundleRow(bundle: TriageBundle) {
-  return conversationRow(rowFor(bundle.leading.message), bundle.messages.map(({ message }) => rowFor(message)));
+  const rows = bundle.messages.map(({ message }) => rowFor(message));
+  return conversationRow(rows[0], rows);
 }
 
 function isOpen(message: TriageMessage): boolean {
@@ -384,7 +386,7 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
               aria-label="Messages in bundle"
             >
               <MessageListRow
-                v-for="item in bundle.messages"
+                v-for="item in chronologicalItems(bundle)"
                 :key="item.message.id"
                 :message="rowFor(item.message)"
                 :size="rowHeight"

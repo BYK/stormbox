@@ -158,6 +158,7 @@ const rowLabel = computed(() => [
       'is-dragging': dragging,
       'is-unread': isUnread,
       'is-unselectable': !selectable,
+      'msg-list__row--stack': hasStack,
     }"
     :style="inFlow ? { minHeight: size + 'px', '--message-stack-height': hasStack ? `${size}px` : undefined } : {
       position: 'absolute',
@@ -394,6 +395,10 @@ const rowLabel = computed(() => [
 .msg-list__item--in-flow {
   min-height: inherit;
 }
+.msg-list__row--stack {
+  position: relative;
+  padding-block-start: 10px;
+}
 .msg-list__item.msg-list__item--stack {
   min-height: calc(var(--message-stack-height) - 10px);
   width: auto;
@@ -405,29 +410,31 @@ const rowLabel = computed(() => [
 }
 .msg-list__item--stack .msg-list__open { border-radius: inherit; }
 .msg-list__stack-edge {
-  position: relative;
+  position: absolute;
+  inset: 0 0 auto;
   height: 10px;
+  pointer-events: none;
 }
 .msg-list__stack-edge:not(.msg-list__stack-edge--expanded)::before,
 .msg-list__stack-edge--deep:not(.msg-list__stack-edge--expanded)::after {
   content: '';
   position: absolute;
-  inset: 0 12px auto;
+  inset: 5px 12px auto;
   height: 5px;
   border: 1px solid var(--control-border);
-  border-top: 0;
-  border-radius: 0 0 6px 6px;
+  border-bottom: 0;
+  border-radius: 6px 6px 0 0;
   background: var(--panel2);
   pointer-events: none;
 }
 .msg-list__stack-edge--deep:not(.msg-list__stack-edge--expanded)::after {
-  inset: 5px 19px auto;
+  inset: 1px 19px auto;
   height: 4px;
 }
 .msg-list__stack-toggle {
   position: absolute;
   z-index: 1;
-  inset: -14px 0 auto;
+  inset: 0 0 auto;
   margin-inline: auto;
   width: max-content;
   min-width: 52px;
@@ -443,6 +450,7 @@ const rowLabel = computed(() => [
   font-size: .6875rem;
   font-variant-numeric: tabular-nums;
   cursor: pointer;
+  pointer-events: auto;
 }
 .msg-list__stack-toggle span {
   display: flex;
@@ -451,7 +459,7 @@ const rowLabel = computed(() => [
   padding-inline: 4px;
   background: var(--panel);
   line-height: 13px;
-  transform: translateY(5px);
+  transform: translateY(-5px);
 }
 .msg-list__stack-toggle:hover { color: var(--text); }
 .msg-list__stack-toggle:focus-visible { outline: none; }

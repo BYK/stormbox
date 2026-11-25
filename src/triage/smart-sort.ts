@@ -43,6 +43,7 @@ export interface BundleState {
 export interface TriageBundle {
   id: string;
   accountId: TriageMessage['accountId'];
+  /** Newest first. */
   messages: TriageItem[];
   leading: TriageItem;
   status: TriageDisposition | 'done' | 'snoozed';
