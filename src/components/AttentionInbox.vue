@@ -9,6 +9,7 @@ import type { ImapAttentionAction } from '../sync/backends/imap/attention-relay'
 import { browserTriageMessageKey } from '../triage/browser-model';
 import type { TriageBundle, TriageMessage } from '../triage/smart-sort';
 import { closeContainingDropdown } from '../utils/dropdown';
+import { threadSubject } from '../utils/mail-threads';
 import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, conversationRow, type MessageRowLike } from '../utils/message-row-presentation';
 import type { MessageTagDefinition } from '../utils/message-tags';
 import AppIconButton from './AppIconButton.vue';
@@ -108,6 +109,9 @@ const bundlesByFilter = computed(() => {
   return groups;
 });
 const visibleBundles = computed(() => bundlesByFilter.value[selectedFilter.value]);
+const stackSubjects = computed(() => new Map(visibleBundles.value.filter(({ messages }) => messages.length > 1).map(({ id, messages }) => [
+  id, threadSubject(messages.at(-1)?.message.subject),
+])));
 const visibleMessages = computed(() => visibleBundles.value.flatMap(({ messages }) => messages.map(({ message }) => message)));
 const chronologicalItems = (bundle: TriageBundle) => [...bundle.messages].reverse();
 const selectionRows = computed(() => visibleBundles.value.flatMap((bundle) => [
@@ -340,6 +344,7 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
           :message="bundleRow(bundle)"
           :conversation-count="bundle.messages.length"
           :stack-expanded="expandedBundles.has(bundle.id)"
+          :stack-subject="stackSubjects.get(bundle.id)"
           :stack-controls="detailId(bundle)"
           :size="rowHeight"
           :dom-id-prefix="`${detailId(bundle)}-leader-`"
@@ -389,6 +394,7 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
                 v-for="item in chronologicalItems(bundle)"
                 :key="item.message.id"
                 :message="rowFor(item.message)"
+                :stack-subject="stackSubjects.get(bundle.id)"
                 :size="rowHeight"
                 :dom-id-prefix="`${detailId(bundle)}-member-`"
                 :focused="!openBundleId && isOpen(item.message)"

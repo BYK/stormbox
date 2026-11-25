@@ -68,9 +68,11 @@ describe('AttentionInbox', () => {
 
   it('opens a conversation from its head and just one message from an expanded child', async () => {
     const request = bundle('req', 'action', 'Review these changes');
+    const reply = bundle('reply', 'update', 'RE: Review these changes').leading;
+    reply.message.receivedAt += 30_000;
     const followup = bundle('progress', 'update', 'Progress update').leading;
     followup.message.receivedAt += 60_000;
-    request.messages.unshift(followup);
+    request.messages.unshift(followup, reply);
     request.latestAt = followup.message.receivedAt;
     const wrapper = mount(AttentionInbox, { attachTo: document.body, props: { bundles: [request] } });
 
@@ -79,7 +81,7 @@ describe('AttentionInbox', () => {
     await head.trigger('click');
     const expand = wrapper.get('.msg-list__stack-toggle');
     const members = wrapper.get('[aria-label="Messages in bundle"]');
-    expect(expand.attributes('aria-label')).toBe('Show 2 messages');
+    expect(expand.attributes('aria-label')).toBe('Show 3 messages');
     expect(expand.find('.lucide-chevron-down').exists()).toBe(true);
     expect(head.element.closest('.msg-list__item--stack')?.nextElementSibling).toBe(expand.element.parentElement);
     expect(expand.element.parentElement?.nextElementSibling).toBe(members.element);
@@ -87,14 +89,15 @@ describe('AttentionInbox', () => {
     expect(members.isVisible()).toBe(false);
     await expand.trigger('click');
     expect(expand.attributes('aria-expanded')).toBe('true');
-    expect(expand.attributes('aria-label')).toBe('Hide 2 messages');
+    expect(expand.attributes('aria-label')).toBe('Hide 3 messages');
     expect(expand.find('.lucide-chevron-up').exists()).toBe(true);
     expect(members.isVisible()).toBe(true);
     expect(wrapper.findAll('.msg-list__subject').map((subject) => subject.text()))
-      .toEqual(['Conversation', 'Review these changes', 'Progress update']);
+      .toEqual(['Review these changes', 'Progress update']);
     expect(head.element.closest('.msg-list__item')?.querySelector('.msg-list__from, .msg-list__date, .msg-list__preview')).toBeNull();
-    const [older, child] = members.findAll('[aria-label^="Open message"]');
+    const [older, repeated, child] = members.findAll('[aria-label^="Open message"]');
     expect(older.attributes('aria-label')).toContain('Review these changes');
+    expect(repeated.attributes('aria-label')).toContain('RE: Review these changes');
     expect(child.attributes('aria-label')).toContain('Progress update');
     await child.trigger('click');
 

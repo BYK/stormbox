@@ -28,7 +28,7 @@ import type { FolderRow, MessageRow } from '../types/db';
 import { folderCapabilities } from '../utils/folder-capabilities';
 import { folderCompare, folderPresentation } from '../utils/folder-presentation';
 import { gmailLabelTags } from '../utils/imap-message-tags';
-import { groupMailThreads, parseThreadHeaders, type MailThread, type ThreadMessage } from '../utils/mail-threads';
+import { groupMailThreads, parseThreadHeaders, threadSubject, type MailThread, type ThreadMessage } from '../utils/mail-threads';
 import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, conversationRow, correspondentLabel, folderShowsRecipients } from '../utils/message-row-presentation';
 import { tagKeywordsOf } from '../utils/message-tags';
 import { isScheduledMessage } from '../utils/scheduled-message';
@@ -53,7 +53,7 @@ type ThreadEntry = ThreadMessage & (
   | { kind: 'imap'; entry: ImapEntry; row: ImapEntry['presentation'] }
   | { kind: 'jmap'; folder: InboxFolder; row: MessageRow }
 );
-type ListRow = { key: string; entry: ThreadEntry; targets: ThreadEntry[]; stack?: MailThread<ThreadEntry>; nested: boolean };
+type ListRow = { key: string; entry: ThreadEntry; targets: ThreadEntry[]; stack?: MailThread<ThreadEntry>; stackSubject?: string; nested: boolean };
 type SavedView = { kind: 'unified' } | { kind: 'imap'; accountId: string; path: string };
 
 const PAGE_SIZE = 120;
@@ -251,10 +251,11 @@ const visibleThreads = computed(() => filteredThreads.value.slice(0, visibleThre
 const visibleRows = computed<ListRow[]>(() => visibleThreads.value.flatMap((thread) => {
   const targets = threadEntries(thread);
   const stack = targets.length > 1 ? thread : undefined;
+  const stackSubject = stack ? threadSubject(targets[0].subject) : undefined;
   return [
-    { key: stack ? `conversation:${thread.key}` : thread.newest.key, entry: thread.newest, targets, stack, nested: false },
+    { key: stack ? `conversation:${thread.key}` : thread.newest.key, entry: thread.newest, targets, stack, stackSubject, nested: false },
     ...(stack && expandedThreads.value.has(thread.key)
-      ? targets.map((entry) => ({ key: entry.key, entry, targets: [entry], nested: true })) : []),
+      ? targets.map((entry) => ({ key: entry.key, entry, targets: [entry], stackSubject, nested: true })) : []),
   ];
 }));
 const selectableEntries = computed(() => visibleThreads.value.flatMap(threadEntries));
@@ -1090,6 +1091,7 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
             :reader-controls="readingInline && inlineAnchorKey === item.key ? inlineReaderId : undefined"
             :selection-mixed="rowMixed(item)" :conversation-count="item.stack ? item.targets.length : undefined" :draggable="false"
             :stack-expanded="item.stack ? expandedThreads.has(item.stack.key) : undefined"
+            :stack-subject="item.stackSubject"
             :shows-recipients="folderShowsRecipients({ role })"
             :sort="item.entry.kind === 'jmap' ? mailStore.sortForFolder(item.entry.folder.id) : 'received'"
             :tag-definitions="definitions"

@@ -25,10 +25,14 @@ function messageIds(values: readonly string[]) {
   });
 }
 
-function baseSubject(subject: string | null | undefined) {
-  return (subject ?? '').normalize('NFC').trim().toLowerCase()
+export function threadSubject(subject: string | null | undefined) {
+  return (subject ?? '').normalize('NFC').trim()
     .replace(/^(?:(?:re|fw|fwd|aw|sv)(?:\[\d+\])?:\s*)+/i, '')
     .replace(/\s+/g, ' ');
+}
+
+export function baseThreadSubject(subject: string | null | undefined) {
+  return threadSubject(subject).toLowerCase();
 }
 
 export function parseThreadHeaders(json: string | null): string[] {
@@ -73,7 +77,7 @@ export function groupMailThreads<T extends ThreadMessage>(messages: readonly T[]
     const references = messageIds(message.references ?? []);
     // RFC 5256 uses the first valid In-Reply-To ID only when References is absent.
     const ancestors = references.length ? references : messageIds(message.inReplyTo ?? []).slice(0, 1);
-    const subject = baseSubject(message.subject);
+    const subject = baseThreadSubject(message.subject);
     // Combine the ID with the base subject so a reply that starts a different topic
     // does not join an unrelated conversation across providers (RFC 8621 §3).
     const aliases = [...ancestors, ...ids.slice(0, 1)].map((id) => JSON.stringify(['rfc', subject, id]));

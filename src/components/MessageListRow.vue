@@ -11,7 +11,9 @@ import { ChevronDown, ChevronUp, Paperclip, Star, Trash2 } from '@lucide/vue';
 import archiveIcon from '../assets/icons/tb-folder-archive.svg?raw';
 import type { JmapViewSort } from '../constants/states';
 import { useSenderAvatars } from '../composables/useSenderAvatars';
+import { baseThreadSubject } from '../utils/mail-threads';
 import {
+  ROW_HEIGHT,
   correspondentLabel,
   fmtDate,
   rowCorrespondent,
@@ -36,6 +38,7 @@ const props = withDefaults(defineProps<{
   conversationCount?: number;
   stackExpanded?: boolean;
   stackControls?: string;
+  stackSubject?: string;
   dragging?: boolean;
   showsRecipients?: boolean;
   sort?: JmapViewSort;
@@ -133,7 +136,13 @@ const rowKind = computed(() => props.conversationCount && props.conversationCoun
 const hasStack = computed(() => inFlow.value && props.stackExpanded !== undefined && rowKind.value === 'conversation');
 const expandedStack = computed(() => hasStack.value && props.stackExpanded);
 const subject = computed(() => props.message.subject || '(no subject)');
-const rowTitle = computed(() => expandedStack.value ? subject.value : `${subject.value}, ${label.value}`);
+const displaySubject = computed(() => expandedStack.value && props.stackSubject !== undefined
+  ? props.stackSubject || '(no subject)' : subject.value);
+const sharedSubject = computed(() => rowKind.value === 'message' && props.stackSubject !== undefined
+  && baseThreadSubject(props.message.subject) === baseThreadSubject(props.stackSubject));
+const minRowHeight = computed(() => expandedStack.value ? undefined
+  : `${sharedSubject.value ? Math.min(props.size, ROW_HEIGHT) : props.size}px`);
+const rowTitle = computed(() => expandedStack.value ? displaySubject.value : `${subject.value}, ${label.value}`);
 const rowLabel = computed(() => [
   label.value,
   subject.value,
@@ -163,7 +172,7 @@ const rowLabel = computed(() => [
       'is-unselectable': !selectable,
       'msg-list__row--stack': hasStack,
     }"
-    :style="inFlow ? { minHeight: expandedStack ? undefined : size + 'px', '--message-stack-height': hasStack ? `${size}px` : undefined } : {
+    :style="inFlow ? { minHeight: minRowHeight, '--message-stack-height': hasStack ? `${size}px` : undefined } : {
       position: 'absolute',
       top: '0px',
       left: '0px',
@@ -180,6 +189,7 @@ const rowLabel = computed(() => [
         'msg-list__item--in-flow': inFlow,
         'msg-list__item--stack': hasStack,
         'msg-list__item--stack-expanded': expandedStack,
+        'msg-list__item--shared-subject': sharedSubject,
         'msg-list__item--avatar-unread': avatarUnread,
         'msg-list__item--avatar-selection': avatarUnread && selectable,
         'has-tag-menu': tagMenuOpen,
@@ -200,7 +210,7 @@ const rowLabel = computed(() => [
         :aria-expanded="expanded"
         :aria-controls="readerControls"
         :aria-label="`Open ${rowKind}: ${rowTitle}${avatarUnread && isUnread ? ', unread' : ''}`"
-        :title="expandedStack ? `Open conversation: ${subject}` : context ? preview : undefined"
+        :title="expandedStack ? `Open conversation: ${displaySubject}` : context ? preview : undefined"
       />
       <div v-if="selectable || !avatarUnread" class="msg-list__state">
         <label v-if="selectable" class="msg-list__check" draggable="false" @click.stop>
@@ -242,7 +252,7 @@ const rowLabel = computed(() => [
       <div class="msg-list__content">
         <div class="msg-list__summary">
           <span v-if="!expandedStack" class="msg-list__from">{{ label }}</span>
-          <span class="msg-list__subject">{{ expandedStack ? 'Conversation' : subject }}</span>
+          <span v-if="!sharedSubject" class="msg-list__subject">{{ displaySubject }}</span>
           <span v-if="!expandedStack" class="msg-list__icons">
             <Star v-if="isFlagged && !hoverActions" :size="13" :stroke-width="2" class="msg-list__star" />
             <Paperclip v-if="Number(message.has_attachment) === 1" :size="13" :stroke-width="1.75" class="msg-list__attach" />
@@ -880,6 +890,10 @@ const rowLabel = computed(() => [
   margin-top: 3px;
   -webkit-line-clamp: 1;
 }
+.msg-list__item--shared-subject .msg-list__from { grid-column-end: subject-end; }
+.msg-list--card .msg-list__item--shared-subject { align-items: center; }
+.msg-list--card .msg-list__item--shared-subject .msg-list__from { grid-column-end: from-end; }
+.msg-list--card .msg-list__item--shared-subject .msg-list__summary { row-gap: 0; }
 
 /* The expanded stack keeps its group controls above the individual messages. */
 .msg-list__item.msg-list__item--stack-expanded {
@@ -892,10 +906,14 @@ const rowLabel = computed(() => [
   grid-template-columns: 34px minmax(0, 1fr) auto;
 }
 .msg-list__item--stack-expanded .msg-list__check { opacity: 1; }
-.msg-list__item--stack-expanded .msg-list__summary {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-areas: 'subject';
+.msg-list__item.msg-list__item--stack-expanded .msg-list__summary {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: 'subject actions';
+  align-items: center;
+  row-gap: 0;
 }
+.msg-list__item--stack-expanded .msg-list__subject { display: block; white-space: nowrap; }
+.msg-list__item--stack-expanded .msg-list__actions { grid-area: actions; position: static; transform: none; }
 
 @media (max-width: 639px) {
   .msg-list__check {
