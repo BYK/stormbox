@@ -14,7 +14,6 @@ import { ArrowLeft, ChevronDown } from '@lucide/vue';
 
 import { fmtDate } from '../utils/message-row-presentation';
 import AppIconButton from './AppIconButton.vue';
-import LetterStackIcon from './LetterStackIcon.vue';
 
 const props = withDefaults(defineProps<{
   subject: string | null | undefined;
@@ -78,13 +77,13 @@ watch(() => props.activeKey, async (key) => {
     </header>
 
     <ol ref="stack" class="conversation-reader__stack" role="list" aria-label="Messages in conversation">
-      <li v-for="message in messages" :key="message.key" class="conversation-reader__message"
-        :class="{ 'conversation-reader__message--expanded': expanded.has(message.key) }">
+      <li v-for="(message, index) in messages" :key="message.key" class="conversation-reader__message"
+        :class="{ 'conversation-reader__message--expanded': expanded.has(message.key) }"
+        :style="expanded.has(message.key) ? undefined : { zIndex: messages.length - index }">
         <h3 class="conversation-reader__summary-heading">
           <button :id="summaryId(message.key)" type="button" class="conversation-reader__summary"
             :aria-controls="panelId(message.key)" :aria-expanded="expanded.has(message.key)"
             @click="toggleMessage(message.key)">
-            <LetterStackIcon class="conversation-reader__letter" />
             <span class="conversation-reader__summary-text">
               <span class="conversation-reader__sender" :class="{ 'conversation-reader__sender--unread': message.unread }">
                 {{ message.sender || '(no sender)' }}<span v-if="message.unread" class="conversation-reader__unread-label">, unread</span>
@@ -148,6 +147,7 @@ watch(() => props.activeKey, async (key) => {
   display: flex;
   flex-direction: column;
   overflow-y: auto;
+  isolation: isolate;
   overscroll-behavior-y: contain;
   min-height: 0;
   margin: 0;
@@ -158,14 +158,25 @@ watch(() => props.activeKey, async (key) => {
 .conversation-reader__message {
   flex: 0 0 auto;
   min-width: 0;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: 6px;
   background: var(--panel);
 }
 
-.conversation-reader__message + .conversation-reader__message { margin-block-start: -1px; }
-.conversation-reader__message--expanded + .conversation-reader__message,
-.conversation-reader__message + .conversation-reader__message--expanded { margin-block-start: 6px; }
+.conversation-reader__message + .conversation-reader__message { margin-block-start: 6px; }
+.conversation-reader__message:not(.conversation-reader__message--expanded)
+  + .conversation-reader__message:not(.conversation-reader__message--expanded) {
+  margin-block-start: -6px;
+  margin-inline: 6px;
+  padding-block-start: 6px;
+  background: var(--panel2);
+}
+.conversation-reader__message:not(.conversation-reader__message--expanded)
+  + .conversation-reader__message:not(.conversation-reader__message--expanded)
+  + .conversation-reader__message:not(.conversation-reader__message--expanded) {
+  margin-inline: 12px;
+}
+
 .conversation-reader__summary-heading {
   margin: 0;
   font: inherit;
@@ -204,7 +215,6 @@ watch(() => props.activeKey, async (key) => {
   rotate: 180deg;
 }
 
-.conversation-reader__letter,
 .conversation-reader__chevron,
 .conversation-reader__date {
   flex: 0 0 auto;

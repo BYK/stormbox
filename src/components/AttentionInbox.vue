@@ -16,7 +16,6 @@ import AttentionRowMenu from './AttentionRowMenu.vue';
 import InlineMailReader from './InlineMailReader.vue';
 import MessageListRow from './MessageListRow.vue';
 import SelectableListHeader from './SelectableListHeader.vue';
-import ThreadExpandPill from './ThreadExpandPill.vue';
 
 const props = withDefaults(defineProps<{
   bundles: readonly TriageBundle[];
@@ -338,6 +337,8 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
           class="attention-inbox__bundle"
           :message="bundleRow(bundle)"
           :conversation-count="bundle.messages.length"
+          :stack-expanded="expandedBundles.has(bundle.id)"
+          :stack-controls="detailId(bundle)"
           :size="rowHeight"
           :dom-id-prefix="`${detailId(bundle)}-leader-`"
           :focused="openBundleId === bundle.id"
@@ -351,6 +352,7 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
           :tag-definitions="tagDefinitions"
           @row-click="(_event, trigger) => emit('open-bundle', bundle, trigger)"
           @checkbox-click="toggleSelection(bundle, $event)"
+          @toggle-stack="toggleBundle(bundle)"
         >
           <template #controls>
             <div class="msg-list__row-controls" draggable="false" @click.stop>
@@ -367,13 +369,6 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
             </div>
           </template>
           <template #after-row>
-            <ThreadExpandPill
-              v-if="bundle.messages.length > 1"
-              :count="bundle.messages.length"
-              :expanded="expandedBundles.has(bundle.id)"
-              :controls="detailId(bundle)"
-              @toggle="toggleBundle(bundle)"
-            />
             <InlineMailReader v-if="inlineKey === bundleKey(bundle)" :id="inlinePanelId(bundleKey(bundle))">
               <div
                 :ref="(element) => setInlineTarget(bundleKey(bundle), element)"

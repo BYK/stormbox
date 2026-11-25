@@ -680,7 +680,7 @@ it('trashes only the checked members of a bundle in one optimistic batch with on
   try {
     await flushPromises();
     await wrapper.get('[aria-label^="Select conversation"]').trigger('click');
-    await wrapper.get('.thread-expand__pill').trigger('click');
+    await wrapper.get('.msg-list__stack-toggle').trigger('click');
     await wrapper.get('[aria-label^="Select message: Please review message 18"]').trigger('click');
     expect(wrapper.text()).toContain('2 selected');
     await wrapper.get('[aria-label="Selection actions"]').get('[aria-label="Move to Trash"]').trigger('click');
@@ -774,7 +774,7 @@ it('opens conversations or individual messages under their rows when Read in pla
     expect(row.find('[data-inline-mail-reader]').exists()).toBe(false);
     expect(document.activeElement).toBe(head.element);
 
-    const pill = row.get('.thread-expand__pill');
+    const pill = row.get('.msg-list__stack-toggle');
     await pill.trigger('click');
     const child = row.get('[aria-label^="Open message: Please review message 17"]');
     await child.trigger('click');

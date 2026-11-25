@@ -46,7 +46,6 @@ import MessageListToolbar from './MessageListToolbar.vue';
 import MessageView from './MessageView.vue';
 import TagPickerDropdown from './TagPickerDropdown.vue';
 import TagPickerPopover, { type PopoverAnchor } from './TagPickerPopover.vue';
-import ThreadExpandPill from './ThreadExpandPill.vue';
 
 type ImapEntry = ReturnType<typeof imapEntry>;
 type InboxFolder = Pick<FolderRow, 'id' | 'account_id' | 'name' | 'role' | 'total_emails'>;
@@ -1078,6 +1077,7 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
             :expanded="inlineReading ? readingInline && inlineAnchorKey === item.key : undefined"
             :reader-controls="readingInline && inlineAnchorKey === item.key ? inlineReaderId : undefined"
             :selection-mixed="rowMixed(item)" :conversation-count="item.stack ? item.targets.length : undefined" :draggable="false"
+            :stack-expanded="item.stack ? expandedThreads.has(item.stack.key) : undefined"
             :shows-recipients="folderShowsRecipients({ role })"
             :sort="item.entry.kind === 'jmap' ? mailStore.sortForFolder(item.entry.folder.id) : 'received'"
             :tag-definitions="definitions"
@@ -1091,11 +1091,9 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
             @star="runActions(item.targets, { type: 'star', value: $event })"
             @archive="runActions(item.targets, { type: 'archive' })"
             @delete="runActions(item.targets, { type: 'delete' })"
+            @toggle-stack="item.stack && toggleThread(item.stack.key)"
           >
             <template #after-row>
-              <ThreadExpandPill v-if="item.stack"
-                :count="item.targets.length" :expanded="expandedThreads.has(item.stack.key)"
-                @toggle="toggleThread(item.stack.key)" />
               <InlineMailReader v-if="readingInline && inlineAnchorKey === item.key" :id="inlineReaderId">
                 <div :ref="(element) => setInlineTarget(item.key, element)" class="imap-mail__inline-target" />
               </InlineMailReader>

@@ -6,7 +6,7 @@
  * is emitted back to the owner.
  */
 import { computed, ref } from 'vue';
-import { Paperclip, Star, Trash2 } from '@lucide/vue';
+import { ChevronDown, ChevronUp, Paperclip, Star, Trash2 } from '@lucide/vue';
 
 import archiveIcon from '../assets/icons/tb-folder-archive.svg?raw';
 import type { JmapViewSort } from '../constants/states';
@@ -34,6 +34,8 @@ const props = withDefaults(defineProps<{
   readerControls?: string;
   selectionMixed?: boolean;
   conversationCount?: number;
+  stackExpanded?: boolean;
+  stackControls?: string;
   dragging?: boolean;
   showsRecipients?: boolean;
   sort?: JmapViewSort;
@@ -79,6 +81,7 @@ const props = withDefaults(defineProps<{
   cursor: false,
   selected: false,
   expanded: undefined,
+  stackExpanded: undefined,
   dragging: false,
   showsRecipients: false,
   sort: 'received',
@@ -103,6 +106,7 @@ const emit = defineEmits<{
   /** A chip was clicked: the owner filters the list to that tag. */
   (e: 'archive'): void;
   (e: 'delete'): void;
+  (e: 'toggle-stack'): void;
 }>();
 
 const { senderAvatar, onAvatarError } = useSenderAvatars();
@@ -126,6 +130,7 @@ const label = computed(() => correspondentLabel(props.message, props.showsRecipi
 const dateText = computed(() => fmtDate(rowTimestamp(props.message, props.sort)));
 const preview = computed(() => [props.context, props.message.preview].filter(Boolean).join(' · '));
 const rowKind = computed(() => props.conversationCount && props.conversationCount > 1 ? 'conversation' : 'message');
+const hasStack = computed(() => inFlow.value && props.stackExpanded !== undefined && rowKind.value === 'conversation');
 const rowLabel = computed(() => [
   label.value,
   props.message.subject || '(no subject)',
@@ -154,7 +159,7 @@ const rowLabel = computed(() => [
       'is-unread': isUnread,
       'is-unselectable': !selectable,
     }"
-    :style="inFlow ? { minHeight: size + 'px' } : {
+    :style="inFlow ? { minHeight: size + 'px', '--message-stack-height': hasStack ? `${size}px` : undefined } : {
       position: 'absolute',
       top: '0px',
       left: '0px',
@@ -169,6 +174,7 @@ const rowLabel = computed(() => [
         'msg-list__item--hover-actions': hoverActions,
         'msg-list__item--row-controls': $slots.controls,
         'msg-list__item--in-flow': inFlow,
+        'msg-list__item--stack': hasStack,
         'msg-list__item--avatar-unread': avatarUnread,
         'msg-list__item--avatar-selection': avatarUnread && selectable,
         'has-tag-menu': tagMenuOpen,
@@ -317,6 +323,19 @@ const rowLabel = computed(() => [
       </div>
       <slot name="controls" />
     </div>
+    <div v-if="hasStack" class="msg-list__stack-edge" :class="{
+      'msg-list__stack-edge--expanded': stackExpanded,
+      'msg-list__stack-edge--deep': (conversationCount ?? 0) > 2,
+    }">
+      <button type="button" class="msg-list__stack-toggle" data-message-control
+        :aria-label="`${stackExpanded ? 'Hide' : 'Show'} ${conversationCount} messages`"
+        :aria-expanded="stackExpanded" :aria-controls="stackControls" @click.stop="emit('toggle-stack')">
+        <span aria-hidden="true">
+          {{ conversationCount }}
+          <component :is="stackExpanded ? ChevronUp : ChevronDown" :size="11" />
+        </span>
+      </button>
+    </div>
     <slot name="after-row" />
   </li>
 </template>
@@ -344,6 +363,9 @@ const rowLabel = computed(() => [
 }
 
 .msg-list__item {
+  --row-padding-block: 7px;
+  --row-padding-start: 12px;
+  --row-padding-end: 14px;
   position: relative;
   display: grid;
   grid-template-columns: 34px 34px minmax(0, 1fr);
@@ -352,7 +374,7 @@ const rowLabel = computed(() => [
   width: 100%;
   height: 100%;
   text-align: left;
-  padding: 7px 14px 7px 12px;
+  padding: var(--row-padding-block) var(--row-padding-end) var(--row-padding-block) var(--row-padding-start);
   border: 0;
   background: transparent;
   cursor: pointer;
@@ -372,6 +394,67 @@ const rowLabel = computed(() => [
 .msg-list__item--in-flow {
   min-height: inherit;
 }
+.msg-list__item.msg-list__item--stack {
+  min-height: calc(var(--message-stack-height) - 10px);
+  width: auto;
+  margin-inline: 6px;
+  padding: calc(var(--row-padding-block) - 2px) calc(var(--row-padding-end) - 7px)
+    max(0px, calc(var(--row-padding-block) - 8px)) calc(var(--row-padding-start) - 7px);
+  border: 1px solid var(--control-border);
+  border-radius: 7px;
+}
+.msg-list__item--stack .msg-list__open { border-radius: inherit; }
+.msg-list__stack-edge {
+  position: relative;
+  height: 10px;
+}
+.msg-list__stack-edge:not(.msg-list__stack-edge--expanded)::before,
+.msg-list__stack-edge--deep:not(.msg-list__stack-edge--expanded)::after {
+  content: '';
+  position: absolute;
+  inset: 0 12px auto;
+  height: 5px;
+  border: 1px solid var(--control-border);
+  border-top: 0;
+  border-radius: 0 0 6px 6px;
+  background: var(--panel2);
+  pointer-events: none;
+}
+.msg-list__stack-edge--deep:not(.msg-list__stack-edge--expanded)::after {
+  inset: 5px 19px auto;
+  height: 4px;
+}
+.msg-list__stack-toggle {
+  position: absolute;
+  z-index: 1;
+  inset: -14px 0 auto;
+  margin-inline: auto;
+  width: max-content;
+  min-width: 52px;
+  min-height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: .6875rem;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.msg-list__stack-toggle span {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-inline: 4px;
+  background: var(--panel);
+  line-height: 13px;
+  transform: translateY(5px);
+}
+.msg-list__stack-toggle:hover { color: var(--text); }
+.msg-list__stack-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .msg-list__scroller:focus-visible .is-cursor .msg-list__item {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -694,10 +777,12 @@ const rowLabel = computed(() => [
 }
 
 .msg-list--card .msg-list__item {
+  --row-padding-block: 10px;
+  --row-padding-start: 12px;
+  --row-padding-end: 12px;
   grid-template-columns: 24px 34px minmax(0, 1fr);
   align-items: start;
   column-gap: 9px;
-  padding: 10px 12px;
 }
 .msg-list__item--row-controls {
   grid-template-columns: 34px 34px minmax(0, 1fr) auto;

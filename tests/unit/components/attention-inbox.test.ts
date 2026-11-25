@@ -74,11 +74,11 @@ describe('AttentionInbox', () => {
 
     const head = wrapper.get('[aria-label^="Open conversation"]');
     await head.trigger('click');
-    const expand = wrapper.get('.thread-expand__pill');
+    const expand = wrapper.get('.msg-list__stack-toggle');
     const members = wrapper.get('[aria-label="Messages in bundle"]');
     expect(expand.attributes('aria-label')).toBe('Show 2 messages');
     expect(expand.find('.lucide-chevron-down').exists()).toBe(true);
-    expect(head.element.closest('.msg-list__item')?.nextElementSibling).toBe(expand.element.parentElement);
+    expect(head.element.closest('.msg-list__item--stack')?.nextElementSibling).toBe(expand.element.parentElement);
     expect(expand.element.parentElement?.nextElementSibling).toBe(members.element);
     expect(expand.attributes('aria-controls')).toBe(members.attributes('id'));
     expect(members.isVisible()).toBe(false);
@@ -161,7 +161,7 @@ describe('AttentionInbox', () => {
     expect(head.get('[aria-label="Star"]').attributes('aria-pressed')).toBe('true');
     const markRead = head.findAll('button').find((button) => button.text() === 'Mark as read')!;
     await markRead.trigger('click');
-    await wrapper.get('.thread-expand__pill').trigger('click');
+    await wrapper.get('.msg-list__stack-toggle').trigger('click');
     const child = wrapper.get('[aria-label="Messages in bundle"]').findAll('.msg-list__item')[0];
     await child.get('[aria-label="Star"]').trigger('click');
 

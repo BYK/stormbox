@@ -194,11 +194,13 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     const headCheckbox = wrapper.get<HTMLInputElement>('input[aria-label^="Select conversation: Re: Planning"]');
     await headCheckbox.trigger('click');
     expect(wrapper.get('.msg-list__header').text()).toContain('3 selected');
-    const pill = wrapper.get('.thread-expand__pill');
+    const pill = wrapper.get('.msg-list__stack-toggle');
     expect(pill.attributes('aria-label')).toBe('Show 3 messages');
-    expect(pill.element.closest('.msg-list__item')).toBeNull();
+    expect(pill.element.parentElement?.previousElementSibling?.classList.contains('msg-list__item--stack')).toBe(true);
     await pill.trigger('click');
     expect(wrapper.findAll('.imap-mail__rows > li')).toHaveLength(4);
+    expect(wrapper.findAll('.msg-list__item--stack')).toHaveLength(1);
+    expect(pill.element.parentElement?.classList.contains('msg-list__stack-edge--expanded')).toBe(true);
     const newest = wrapper.get<HTMLInputElement>('input[aria-label^="Select message: Re: Planning"]');
     await newest.trigger('click');
     expect(headCheckbox.element.indeterminate).toBe(true);
