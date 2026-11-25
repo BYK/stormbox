@@ -15,6 +15,7 @@ import {
   ArrowLeft,
   ChevronDown,
   Clock,
+  Info,
   Mail,
   MailOpen,
   Moon,
@@ -49,6 +50,7 @@ import {
 } from '../utils/message-html';
 import { adaptHtmlForDarkMode } from '../utils/dark-email';
 import { formatAddressList } from '../utils/address-parse';
+import { closeContainingDropdown } from '../utils/dropdown';
 import { resolveShortcut, titleWithShortcut, type ShortcutAction } from '../constants/shortcuts';
 import { gmailLabelTags, imapTagPatch } from '../utils/imap-message-tags';
 import { isComposingKeyEvent, isEditableTarget } from '../utils/keyboard';
@@ -63,6 +65,7 @@ import replyIcon from '../assets/icons/tb-reply.svg?raw';
 import replyAllIcon from '../assets/icons/tb-reply-all.svg?raw';
 import AppButton from './AppButton.vue';
 import AppIconButton from './AppIconButton.vue';
+import AttentionActionMenu from './AttentionActionMenu.vue';
 import MaximizeButton from './MaximizeButton.vue';
 import MessageAttachmentBar from './MessageAttachmentBar.vue';
 import MessageAttachmentPreviews from './MessageAttachmentPreviews.vue';
@@ -83,6 +86,7 @@ const props = withDefaults(defineProps<{
   showBack?: boolean;
   backLabel?: string;
   inConversation?: boolean;
+  conversationActionsTarget?: HTMLElement;
   jmap?: { row: MessageRow; folderId: number; body: MessageBody | null; addresses: MessageAddress[]; error?: string };
   imap?: {
     id: string;
@@ -135,6 +139,7 @@ watch(() => props.maximized, async (maximized) => {
 let sizeChange = 0;
 let fitIframe: (() => void) | null = null;
 async function toggleMaximized() {
+  const restoringConversation = props.inConversation && props.maximized;
   const messageId = viewMessageId.value;
   const bodyEl = bodyScrollEl.value;
   const scrollRange = bodyEl ? bodyEl.scrollHeight - bodyEl.clientHeight : 0;
@@ -158,6 +163,11 @@ async function toggleMaximized() {
   }
   fitIframe?.();
   await nextTick();
+  if (restoringConversation && change === sizeChange && !props.maximized
+    && !messageViewEl.value?.contains(document.activeElement)
+    && !conversationControls.value?.contains(document.activeElement)) {
+    (tagMenuTrigger.value ?? messageViewEl.value)?.focus({ preventScroll: true });
+  }
   window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
     if (change === sizeChange && messageId === viewMessageId.value && bodyEl?.isConnected) {
       if (anchor?.isConnected && frame?.isConnected) {
@@ -186,6 +196,7 @@ function onReadingKeyDown(event: KeyboardEvent) {
   if (event.defaultPrevented || isComposingKeyEvent(event) || isEditableTarget(event.target)
     || (composeStore.isExpanded && (!inlineComposer || inlineComposer.contains(document.activeElement)))
     || tagMenuAnchor.value
+    || (event.target instanceof Element && event.target.closest('details[open]'))
     || messageViewEl.value?.querySelector('[role="dialog"], details[open]')) return;
   if (props.maximized && event.key === 'Escape') {
     event.preventDefault();
@@ -266,7 +277,7 @@ const metadataExpanded = computed(() => !compactHeader.value || headerExpanded.v
 const metadataId = useId();
 const metadataEl = ref<HTMLDListElement | null>(null);
 watch(compactHeader, (compact) => {
-  if (compact) return;
+  if (compact || props.inConversation) return;
   const active = document.activeElement;
   if (active === metadataEl.value || active === messageViewEl.value?.querySelector('.message-view__details-toggle')) {
     bodyScrollEl.value?.focus({ preventScroll: true });
@@ -318,7 +329,11 @@ const canDelete = computed(() => props.imap?.canTrash !== false);
 // The toolbar's tag stack opens the menu as a popover: the header sits in
 // an overflow-hidden article, which would clip an inline dropdown.
 const tagMenuButton = ref<InstanceType<typeof AppIconButton> | null>(null);
-const tagMenuTrigger = computed<HTMLElement | null>(() => (tagMenuButton.value?.$el as HTMLElement | undefined) ?? null);
+const conversationControls = ref<HTMLElement | null>(null);
+const conversationMenu = ref<InstanceType<typeof AttentionActionMenu> | null>(null);
+const tagMenuTrigger = computed<HTMLElement | null>(() => props.inConversation
+  ? conversationMenu.value?.$el.querySelector('summary') ?? null
+  : tagMenuButton.value?.$el ?? null);
 const tagMenuAnchor = ref<PopoverAnchor | null>(null);
 const tagStackLabel = computed(() => (
   messageTags.value.length === 0 ? 'Tag' : `Tags: ${messageTags.value.map((tag) => tag.name).join(', ')}`
@@ -993,6 +1008,32 @@ function readerShortcut(action: ShortcutAction | undefined) {
   }
 }
 
+const conversationActions = computed(() => {
+  const messageActions = [
+    { label: tagStackLabel.value, run: toggleTagMenu, hidden: !canTagMessage.value, disabled: actionsDisabled.value },
+    { label: starLabel.value, run: toggleStar, disabled: actionsDisabled.value },
+    { label: seenLabel.value, run: toggleSeen, disabled: actionsDisabled.value },
+    { label: 'Archive', run: archive, hidden: !canArchive.value, disabled: actionsDisabled.value },
+    { label: 'Mark as junk', run: junk, hidden: !canJunk.value, disabled: actionsDisabled.value },
+    { label: 'Not Junk — whitelist sender and move to Inbox', run: whitelistSender, hidden: !canWhitelistInJunk.value, disabled: whitelisting.value },
+    { label: 'Delete', run: destroy, hidden: !canDelete.value, disabled: actionsDisabled.value },
+    { label: 'Reply', run: reply, disabled: !canRespond.value },
+    { label: 'Reply all', run: replyAll, disabled: !canRespond.value },
+    { label: 'Forward', run: forward, disabled: !canRespond.value },
+  ];
+  return [
+    ...(isPendingScheduled.value ? [] : messageActions),
+    { label: 'Print email', run: printOpenMessage, disabled: !canPrint.value },
+    { label: `View this message in ${forceLightBody.value ? 'dark' : 'light'} mode`, run: toggleBodyLightMode, hidden: !canForceLightBody.value },
+    { label: `${props.maximized ? 'Restore' : 'Maximize'} message view`, run: toggleMaximized },
+  ].filter((action) => !action.hidden);
+});
+
+function runConversationAction(event: MouseEvent, run: () => unknown) {
+  closeContainingDropdown(event, true);
+  void run();
+}
+
 function closeMessageView() {
   if (props.backLabel) {
     emit('back');
@@ -1022,7 +1063,19 @@ function closeMessageView() {
       <p>Select a message to read it.</p>
     </div>
     <article v-else class="message-view__article">
-      <header ref="toolbarEl" class="message-view__header">
+      <Teleport v-if="inConversation" :to="conversationActionsTarget" :disabled="!conversationActionsTarget">
+        <div ref="conversationControls" class="message-view__conversation-actions" @keydown="onReadingKeyDown">
+          <AppIconButton :aria-expanded="headerExpanded" :aria-controls="metadataId"
+            :aria-label="headerDetailsLabel" :title="headerDetailsLabel" @click="toggleHeaderDetails">
+            <Info :size="17" aria-hidden="true" />
+          </AppIconButton>
+          <AttentionActionMenu ref="conversationMenu" label="Message actions">
+            <button v-for="action in conversationActions" :key="action.label" class="app-dropdown__item message-view__menu-item"
+              type="button" :disabled="action.disabled" @click="runConversationAction($event, action.run)">{{ action.label }}</button>
+          </AttentionActionMenu>
+        </div>
+      </Teleport>
+      <header v-else ref="toolbarEl" class="message-view__header">
         <AppIconButton
           v-if="showBack"
           class="message-view__action message-view__action--back"
@@ -1103,19 +1156,6 @@ function closeMessageView() {
             <span class="message-view__toolbar-icon message-view__toolbar-icon--shape" aria-hidden="true" v-html="forwardIcon" />
           </AppIconButton>
         </template>
-        <TagPickerPopover
-          :anchor="tagMenuAnchor"
-          :targets="messageTagTargets"
-          :definitions="pickerDefinitions"
-          :additional-tags="gmailTags"
-          :busy="actionsDisabled"
-          :trigger="tagMenuTrigger"
-          label="Tags"
-          @close="closeTagMenu"
-          @toggle="setMessageTag"
-          @clear="clearMessageTags"
-          @manage="manageTags"
-        />
         <div class="message-view__view-actions">
         <AppIconButton
           class="message-view__action"
@@ -1145,6 +1185,20 @@ function closeMessageView() {
         />
         </div>
       </header>
+      <TagPickerPopover
+        :anchor="tagMenuAnchor"
+        :targets="messageTagTargets"
+        :definitions="pickerDefinitions"
+        :additional-tags="gmailTags"
+        :busy="actionsDisabled"
+        :trigger="tagMenuTrigger"
+        :align="inConversation ? 'end' : 'start'"
+        label="Tags"
+        @close="closeTagMenu"
+        @toggle="setMessageTag"
+        @clear="clearMessageTags"
+        @manage="manageTags"
+      />
       <div v-if="hasScheduledBanner" ref="scheduledBannerEl" class="message-view__scheduled" role="status">
         <Clock :size="16" :stroke-width="1.75" aria-hidden="true" />
         <span class="message-view__scheduled-text">{{ scheduledBannerText }}</span>
@@ -1158,9 +1212,10 @@ function closeMessageView() {
           {{ cancelingScheduled ? 'Canceling…' : 'Cancel send' }}
         </button>
       </div>
-      <section class="message-view__details" :class="{ 'message-view__details--expanded': headerExpanded }" aria-label="Message header">
+      <section v-show="!inConversation || headerExpanded" class="message-view__details"
+        :class="{ 'message-view__details--expanded': headerExpanded }" aria-label="Message header">
         <AppIconButton
-          v-show="compactHeader"
+          v-show="compactHeader && !inConversation"
           class="message-view__details-toggle"
           :aria-expanded="headerExpanded"
           :aria-controls="metadataId"
@@ -1310,6 +1365,8 @@ function closeMessageView() {
 }
 .message-view--conversation { height: auto; }
 .message-view--conversation .message-view__body { overflow: clip; }
+.message-view__conversation-actions { display: flex; align-items: center; }
+.message-view__menu-item { grid-template-columns: minmax(0, 1fr); }
 .message-view__quick-reply { margin: 12px var(--message-content-trailing-inset) 14px var(--message-content-inset); }
 .message-view__quick-reply-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .message-view__empty {
@@ -1644,6 +1701,11 @@ function closeMessageView() {
   .message-view__metadata:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
+  }
+  .message-view--conversation .message-view__details {
+    display: block;
+    max-height: none;
+    padding-inline-end: var(--message-content-trailing-inset);
   }
   .message-view__body {
     min-height: var(--message-body-min-height);

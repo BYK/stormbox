@@ -23,7 +23,7 @@ import { useComposeStore } from '../stores/compose-store';
 import { useImapOptimisticActions } from '../stores/imap-optimistic-actions-store';
 import { useMailActionFeedbackStore } from '../stores/mail-action-feedback-store';
 import { useMailStore } from '../stores/mail-store';
-import { GOOGLE_IMAP_RESULTS, GOOGLE_IMAP_RETURN_SPACE, type GoogleImapResult, type RelayFolder } from '../sync/backends/imap/attention-relay';
+import { GOOGLE_IMAP_RESULTS, GOOGLE_IMAP_RETURN_SPACE, type GoogleImapResult, type ImapAttentionAction, type RelayFolder } from '../sync/backends/imap/attention-relay';
 import type { FolderRow, MessageRow } from '../types/db';
 import { folderCapabilities } from '../utils/folder-capabilities';
 import { folderCompare, folderPresentation } from '../utils/folder-presentation';
@@ -33,6 +33,7 @@ import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, conversationRow, corres
 import { tagKeywordsOf } from '../utils/message-tags';
 import { isScheduledMessage } from '../utils/scheduled-message';
 import AppIconButton from './AppIconButton.vue';
+import AttentionRowMenu from './AttentionRowMenu.vue';
 import ConversationReader from './ConversationReader.vue';
 import ConversationMessage, { type ConversationMessageSource } from './ConversationMessage.vue';
 import FolderNode from './FolderNode.vue';
@@ -104,6 +105,7 @@ const unreadOnly = ref(false);
 const starredOnly = ref(false);
 const imapThreaded = ref(false);
 const expandedThreads = ref(new Set<string>());
+const selectedKeys = shallowRef(new Set<string>());
 const visibleThreadLimit = ref(THREAD_PAGE_SIZE);
 const tagPopover = shallowRef<{ key?: string; targets?: string[]; trigger: HTMLElement; anchor: PopoverAnchor }>();
 const accountError = ref('');
@@ -252,15 +254,17 @@ const visibleRows = computed<ListRow[]>(() => visibleThreads.value.flatMap((thre
   const targets = threadEntries(thread);
   const stack = targets.length > 1 ? thread : undefined;
   const stackSubject = stack ? threadSubject(targets[0].subject) : undefined;
+  const readingStack = inlineReading.value && !maximized.value && !selectedKeys.value.size
+    && activeMessageKey.value != null && openedThread.value?.key === thread.key;
   return [
     { key: stack ? `conversation:${thread.key}` : thread.newest.key, entry: thread.newest, targets, stack, stackSubject, nested: false },
-    ...(stack && expandedThreads.value.has(thread.key)
+    ...(stack && expandedThreads.value.has(thread.key) && !readingStack
       ? targets.map((entry) => ({ key: entry.key, entry, targets: [entry], stackSubject, nested: true })) : []),
   ];
 }));
 const selectableEntries = computed(() => visibleThreads.value.flatMap(threadEntries));
 const selection = useListSelection({
-  rows: visibleRows, total: computed(() => visibleRows.value.length), getKey: ({ key }) => key,
+  rows: visibleRows, total: computed(() => visibleRows.value.length), getKey: ({ key }) => key, selectedIds: selectedKeys,
   getSelectionKeys: ({ targets }) => targets.map(({ key }) => key),
 });
 const { selectionCount, focusedId } = selection;
@@ -307,6 +311,7 @@ watch([activeMessageKey, threadReaderOpen], ([key, threaded]) => {
 const conversationMessages = computed(() => conversationEntries.value.map((entry) => ({
   key: entry.key,
   sender: correspondentLabel(entry.row, folderShowsRecipients({ role: role.value })),
+  subject: entry.subject,
   preview: entry.row.preview,
   timestamp: entry.receivedAt,
   unread: entry.row.is_seen === 0,
@@ -321,6 +326,7 @@ const reading = computed(() => !selectionCount.value && Boolean(activeMessageKey
 const inlineAnchorKey = computed(() => inlineReading.value && reading.value
   ? visibleRows.value.find(rowFocused)?.key : undefined);
 const readingInline = computed(() => Boolean(inlineAnchorKey.value && !maximized.value));
+const inlineConversationKey = computed(() => readingInline.value && threadReaderOpen.value ? inlineAnchorKey.value : undefined);
 const sideReading = computed(() => reading.value && !readingInline.value);
 const inlineTarget = computed(() => inlineAnchorKey.value ? inlineTargets.get(inlineAnchorKey.value) : undefined);
 const canCompose = computed(() => unified.value || threadedFolder.value != null || account.value?.can_send === true);
@@ -916,6 +922,11 @@ function runSelected(action: MailListAction) {
   void runActions(selectedEntries.value, action);
 }
 
+function runConversationAction(targets: readonly ThreadEntry[], action: ImapAttentionAction) {
+  if (action.type === 'tags') return;
+  void runActions(targets, action.type === 'trash' ? { type: 'delete' } : action);
+}
+
 function toggleSelectAll() {
   if (allSelected.value) selection.selectNone();
   else selection.selectAllLoaded();
@@ -1096,7 +1107,7 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
             :sort="item.entry.kind === 'jmap' ? mailStore.sortForFolder(item.entry.folder.id) : 'received'"
             :tag-definitions="definitions"
             :additional-tags="rowAdditionalTags(item.targets)"
-            :hover-actions="!item.targets.some((target) => target.kind === 'jmap' && isScheduledMessage(target.row))"
+            :hover-actions="item.key !== inlineConversationKey && !item.targets.some((target) => target.kind === 'jmap' && isScheduledMessage(target.row))"
             :archive-action="item.targets.every(canArchiveEntry)"
             :delete-action="item.targets.every(canDeleteEntry)" :tag-menu-open="tagPopover?.key === item.key"
             @row-click="(event, button) => clickRow(item, index, event, button)"
@@ -1107,6 +1118,13 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
             @delete="runActions(item.targets, { type: 'delete' })"
             @toggle-stack="item.stack && toggleThread(item.stack.key)"
           >
+            <template v-if="item.stack && item.key === inlineConversationKey" #controls>
+              <div class="msg-list__row-controls" @click.stop>
+                <AttentionRowMenu :row="rowPresentation(item)" label="Conversation actions" can-tag
+                  :can-archive="item.targets.every(canArchiveEntry)" :can-trash="item.targets.every(canDeleteEntry)"
+                  @tag="openTagMenu(item, $event)" @action="runConversationAction(item.targets, $event)" />
+              </div>
+            </template>
             <template #after-row>
               <InlineMailReader v-if="readingInline && inlineAnchorKey === item.key" :id="inlineReaderId">
                 <div :ref="(element) => setInlineTarget(item.key, element)" class="imap-mail__inline-target" />
@@ -1126,7 +1144,8 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
     <div v-show="!readingInline || inlineTarget" ref="readerPane" class="imap-mail__reader"
       :class="{ 'imap-mail__reader--inline': readingInline }" tabindex="-1">
       <ConversationReader v-if="threadReaderOpen && activeMessageKey" class="imap-mail__reader-content"
-        :subject="conversationEntries.at(-1)?.subject" :messages="conversationMessages" :active-key="activeMessageKey"
+        :subject="threadSubject(conversationEntries[0]?.subject)" :messages="conversationMessages" :active-key="activeMessageKey"
+        :inline="readingInline && conversationEntries.length > 1"
         :back-label="readingInline ? 'Collapse conversation' : undefined"
         @expand="lastExpandedMessageKey = $event" @back="closeReader">
         <template #actions>
@@ -1145,9 +1164,10 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
           <AppIconButton v-if="conversationEntries.every(canDeleteEntry)" danger title="Delete conversation" aria-label="Delete conversation"
             @click="runActions(conversationEntries, { type: 'delete' })"><Trash2 :size="18" /></AppIconButton>
         </template>
-        <template #default="{ messageKey }">
+        <template #default="{ messageKey, actionsTarget }">
           <ConversationMessage v-if="conversationSources.has(messageKey)"
             :source="conversationSources.get(messageKey)!" :owner-id="ownerId"
+            :actions-target="actionsTarget"
             :repository="repo" :refresh-imap="refreshLocalImap" :maximized="maximized"
             @toggle-maximized="maximized = !maximized" />
         </template>

@@ -134,7 +134,8 @@ const dateText = computed(() => fmtDate(rowTimestamp(props.message, props.sort))
 const preview = computed(() => [props.context, props.message.preview].filter(Boolean).join(' · '));
 const rowKind = computed(() => props.conversationCount && props.conversationCount > 1 ? 'conversation' : 'message');
 const hasStack = computed(() => inFlow.value && props.stackExpanded !== undefined && rowKind.value === 'conversation');
-const expandedStack = computed(() => hasStack.value && props.stackExpanded);
+const readingStack = computed(() => hasStack.value && props.expanded);
+const expandedStack = computed(() => hasStack.value && (props.stackExpanded || readingStack.value));
 const subject = computed(() => props.message.subject || '(no subject)');
 const displaySubject = computed(() => expandedStack.value && props.stackSubject !== undefined
   ? props.stackSubject || '(no subject)' : subject.value);
@@ -340,15 +341,16 @@ const rowLabel = computed(() => [
       <slot name="controls" />
     </div>
     <div v-if="hasStack" class="msg-list__stack-edge" :class="{
-      'msg-list__stack-edge--expanded': stackExpanded,
+      'msg-list__stack-edge--expanded': expandedStack,
       'msg-list__stack-edge--deep': (conversationCount ?? 0) > 2,
     }">
       <button type="button" class="msg-list__stack-toggle" data-message-control
-        :aria-label="`${stackExpanded ? 'Hide' : 'Show'} ${conversationCount} messages`"
-        :aria-expanded="stackExpanded" :aria-controls="stackControls" @click.stop="emit('toggle-stack')">
+        :aria-label="readingStack ? 'Collapse conversation' : `${stackExpanded ? 'Hide' : 'Show'} ${conversationCount} messages`"
+        :aria-expanded="expandedStack" :aria-controls="readingStack ? readerControls : stackControls"
+        @click.stop="readingStack ? emit('row-click', $event, openButton) : emit('toggle-stack')">
         <span aria-hidden="true">
           {{ conversationCount }}
-          <component :is="stackExpanded ? ChevronUp : ChevronDown" :size="11" />
+          <component :is="expandedStack ? ChevronUp : ChevronDown" :size="11" />
         </span>
       </button>
     </div>

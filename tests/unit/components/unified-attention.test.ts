@@ -550,7 +550,9 @@ it('batches a conversation action and advances the stacked reader after deleting
     expect(summaries.map((button) => button.attributes('aria-expanded'))).toEqual(['true', 'true']);
     const originalPanel = stack.get(`[id="${summaries[0].attributes('aria-controls')}"]`);
     expect(originalPanel.text()).toContain('Body of message 17');
-    await originalPanel.get('[aria-label="Delete"]').trigger('click');
+    const originalCard = stack.findAll('.conversation-reader__message')[0];
+    await originalCard.get('summary[aria-label="Message actions"]').trigger('click');
+    await originalCard.findAll('button').find((button) => button.text() === 'Delete')!.trigger('click');
     await flushPromises();
     expect(mutateAttentionImapMessage).toHaveBeenCalledExactlyOnceWith(
       1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid: 17 }, { type: 'trash' }, true,
@@ -622,7 +624,8 @@ it('keeps native conversation selection within the remaining messages and closes
     expect(mail.selectedMessageId).toBe(19);
     const stack = wrapper.get('[aria-label="Messages in conversation"]');
     expect(stack.findAll('.conversation-reader__summary')).toHaveLength(3);
-    await stack.get('[aria-label="Delete"]').trigger('click');
+    await stack.get('summary[aria-label="Message actions"]').trigger('click');
+    await stack.findAll('button').find((button) => button.text() === 'Delete')!.trigger('click');
     await flushPromises();
     expect(move.mock.calls[0][0]).toEqual([19]);
     expect(mail.selectedMessageId).toBe(18);
@@ -758,19 +761,28 @@ it('opens conversations or individual messages under their rows when Read in pla
     expect(head.attributes('aria-controls')).toBe(inline.attributes('id'));
     expect(head.attributes('aria-expanded')).toBe('true');
     expect(inline.find('[aria-label="Messages in conversation"]').exists()).toBe(true);
-    expect(inline.find('summary[aria-label="Conversation actions"]').exists()).toBe(true);
+    expect(inline.find('.conversation-reader__toolbar').exists()).toBe(false);
+    expect(row.findAll('summary[aria-label="Conversation actions"]')).toHaveLength(1);
+    expect(inline.get('.conversation-reader__message--expanded .message-view__details').isVisible()).toBe(false);
+    const headerDetails = inline.get('[aria-label="Show message details"]');
+    await headerDetails.trigger('click');
+    expect(inline.get('.conversation-reader__message--expanded .message-view__details').isVisible()).toBe(true);
+    await headerDetails.trigger('click');
     await inline.get('.message-view').trigger('keydown', { ctrlKey: true, key: 'a' });
     expect(wrapper.find('[aria-label="Selection actions"]').exists()).toBe(false);
     expect(other.isVisible()).toBe(true);
     const messageView = inline.get('.message-view').element;
-    await inline.get('[aria-label="Maximize message view"]').trigger('click');
+    await inline.get('summary[aria-label="Message actions"]').trigger('click');
+    await inline.findAll('button').find((button) => button.text() === 'Maximize message view')!.trigger('click');
     await flushPromises();
     expect(wrapper.get('.unified-attention__reader .message-view').element).toBe(messageView);
     expect(wrapper.find('[data-inline-mail-reader]').exists()).toBe(false);
-    await wrapper.get('[aria-label="Restore message view"]').trigger('click');
+    const maximizedReader = wrapper.get('.unified-attention__reader');
+    await maximizedReader.get('summary[aria-label="Message actions"]').trigger('click');
+    await maximizedReader.findAll('button').find((button) => button.text() === 'Restore message view')!.trigger('click');
     await flushPromises();
     expect(row.get('[data-inline-mail-reader] .message-view').element).toBe(messageView);
-    await row.get('[aria-label="Collapse reader"]').trigger('click');
+    await row.get('[aria-label="Collapse conversation"]').trigger('click');
     expect(row.find('[data-inline-mail-reader]').exists()).toBe(false);
     expect(document.activeElement).toBe(head.element);
 

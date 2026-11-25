@@ -24,6 +24,7 @@ const props = defineProps<{
   repository: Repository;
   refreshImap: () => void | Promise<void>;
   maximized: boolean;
+  actionsTarget?: HTMLElement;
 }>();
 const emit = defineEmits<{ toggleMaximized: [] }>();
 const mailStore = useMailStore();
@@ -106,6 +107,6 @@ watch(jmapId, (id, _old, onCleanup) => {
 
 <template>
   <MessageView v-if="jmapView || imapView" :jmap="jmapView" :imap="imapView"
-    in-conversation :show-back="false" :maximized="maximized"
+    in-conversation :conversation-actions-target="actionsTarget" :show-back="false" :maximized="maximized"
     @toggle-maximized="emit('toggleMaximized')" @imap-action="runImapAction" @imap-compose="imap.composeResponse" />
 </template>

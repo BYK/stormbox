@@ -2,6 +2,7 @@
 export interface ConversationReaderMessage {
   key: string;
   sender: string;
+  subject?: string | null;
   preview?: string | null;
   timestamp: number;
   unread?: boolean;
@@ -9,10 +10,11 @@ export interface ConversationReaderMessage {
 </script>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, useId, watch } from 'vue';
+import { computed, nextTick, ref, shallowReactive, useId, watch } from 'vue';
 import { ArrowLeft, ChevronDown } from '@lucide/vue';
 
 import { fmtDate } from '../utils/message-row-presentation';
+import { baseThreadSubject } from '../utils/mail-threads';
 import AppIconButton from './AppIconButton.vue';
 
 const props = withDefaults(defineProps<{
@@ -20,6 +22,7 @@ const props = withDefaults(defineProps<{
   messages: readonly ConversationReaderMessage[];
   activeKey: string;
   backLabel?: string;
+  inline?: boolean;
 }>(), { backLabel: 'Back to messages' });
 
 const emit = defineEmits<{
@@ -31,6 +34,7 @@ const id = useId();
 const titleId = `${id}-subject`;
 const stack = ref<HTMLOListElement | null>(null);
 const expanded = ref(new Set<string>());
+const actionTargets = shallowReactive(new Map<string, HTMLElement>());
 const summaryId = (key: string) => `${id}-summary-${encodeURIComponent(key)}`;
 const panelId = (key: string) => `${id}-panel-${encodeURIComponent(key)}`;
 const messages = computed(() => [...props.messages].sort((a, b) => a.timestamp - b.timestamp).map((message) => {
@@ -39,8 +43,13 @@ const messages = computed(() => [...props.messages].sort((a, b) => a.timestamp -
     ...message,
     date: fmtDate(message.timestamp),
     dateTime: Number.isFinite(date.getTime()) ? date.toISOString() : undefined,
+    changedSubject: baseThreadSubject(message.subject) !== baseThreadSubject(props.subject) ? message.subject : undefined,
   };
 }));
+function setActionTarget(key: string, element: unknown) {
+  if (element instanceof HTMLElement) actionTargets.set(key, element);
+  else actionTargets.delete(key);
+}
 function toggleMessage(key: string) {
   if (expanded.value.has(key)) expanded.value.delete(key);
   else {
@@ -67,8 +76,9 @@ watch(() => props.activeKey, async (key) => {
 </script>
 
 <template>
-  <section class="conversation-reader" :aria-labelledby="titleId">
-    <header class="conversation-reader__toolbar">
+  <section class="conversation-reader" :class="{ 'conversation-reader--inline': inline }"
+    :aria-labelledby="inline ? undefined : titleId" :aria-label="inline ? subject || '(no subject)' : undefined">
+    <header v-if="!inline" class="conversation-reader__toolbar">
       <AppIconButton :title="backLabel" :aria-label="backLabel" @click="emit('back')">
         <ArrowLeft :size="18" :stroke-width="1.65" aria-hidden="true" />
       </AppIconButton>
@@ -79,23 +89,27 @@ watch(() => props.activeKey, async (key) => {
     <ol ref="stack" class="conversation-reader__stack" role="list" aria-label="Messages in conversation">
       <li v-for="message in messages" :key="message.key" class="conversation-reader__message"
         :class="{ 'conversation-reader__message--expanded': expanded.has(message.key) }">
-        <h3 class="conversation-reader__summary-heading">
-          <button :id="summaryId(message.key)" type="button" class="conversation-reader__summary"
-            :aria-controls="panelId(message.key)" :aria-expanded="expanded.has(message.key)"
-            @click="toggleMessage(message.key)">
-            <span class="conversation-reader__summary-text">
-              <span class="conversation-reader__sender" :class="{ 'conversation-reader__sender--unread': message.unread }">
-                {{ message.sender || '(no sender)' }}<span v-if="message.unread" class="conversation-reader__unread-label">, unread</span>
+        <div class="conversation-reader__heading">
+          <h3 class="conversation-reader__summary-heading">
+            <button :id="summaryId(message.key)" type="button" class="conversation-reader__summary"
+              :aria-controls="panelId(message.key)" :aria-expanded="expanded.has(message.key)"
+              @click="toggleMessage(message.key)">
+              <span class="conversation-reader__summary-text">
+                <span class="conversation-reader__sender" :class="{ 'conversation-reader__sender--unread': message.unread }">
+                  {{ message.sender || '(no sender)' }}<span v-if="message.unread" class="conversation-reader__unread-label">, unread</span>
+                </span>
+                <span v-if="message.changedSubject" class="conversation-reader__subject">{{ message.changedSubject }}</span>
+                <span v-if="message.preview && !expanded.has(message.key)" class="conversation-reader__preview">{{ message.preview }}</span>
               </span>
-              <span v-if="message.preview && !expanded.has(message.key)" class="conversation-reader__preview">{{ message.preview }}</span>
-            </span>
-            <time v-if="message.date" :datetime="message.dateTime" class="conversation-reader__date">{{ message.date }}</time>
-            <ChevronDown :size="15" aria-hidden="true" class="conversation-reader__chevron" />
-          </button>
-        </h3>
+              <time v-if="message.date" :datetime="message.dateTime" class="conversation-reader__date">{{ message.date }}</time>
+              <ChevronDown :size="15" aria-hidden="true" class="conversation-reader__chevron" />
+            </button>
+          </h3>
+          <div v-if="expanded.has(message.key)" :ref="(element) => setActionTarget(message.key, element)" class="conversation-reader__message-actions" />
+        </div>
         <div v-show="expanded.has(message.key)" :id="panelId(message.key)"
           class="conversation-reader__detail" :aria-labelledby="summaryId(message.key)" role="region">
-          <slot v-if="expanded.has(message.key)" :message-key="message.key" />
+          <slot v-if="expanded.has(message.key)" :message-key="message.key" :actions-target="actionTargets.get(message.key)" />
         </div>
       </li>
     </ol>
@@ -113,6 +127,7 @@ watch(() => props.activeKey, async (key) => {
   background: var(--panel);
   color: var(--text);
 }
+.conversation-reader--inline { grid-template-rows: minmax(0, 1fr); }
 
 .conversation-reader__toolbar {
   display: flex;
@@ -179,9 +194,17 @@ watch(() => props.activeKey, async (key) => {
 }
 
 .conversation-reader__summary-heading {
+  flex: 1 1 auto;
+  min-width: 0;
   margin: 0;
   font: inherit;
 }
+.conversation-reader__heading { display: flex; align-items: center; }
+.conversation-reader__message--expanded .conversation-reader__heading {
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel2);
+}
+.conversation-reader__message-actions { flex: 0 0 auto; padding-inline-end: 8px; }
 
 .conversation-reader__summary {
   display: flex;
@@ -207,11 +230,6 @@ watch(() => props.activeKey, async (key) => {
   background: var(--control-hover-bg);
 }
 
-.conversation-reader__summary[aria-expanded="true"] {
-  border-bottom: 1px solid var(--border-soft);
-  background: var(--panel2);
-}
-
 .conversation-reader__summary[aria-expanded="true"] .conversation-reader__chevron {
   rotate: 180deg;
 }
@@ -229,11 +247,13 @@ watch(() => props.activeKey, async (key) => {
 }
 
 .conversation-reader__sender,
+.conversation-reader__subject,
 .conversation-reader__preview {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.conversation-reader__subject { font-size: 13px; }
 
 .conversation-reader__sender--unread {
   font-weight: 650;

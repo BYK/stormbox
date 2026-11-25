@@ -114,9 +114,10 @@ const stackSubjects = computed(() => new Map(visibleBundles.value.filter(({ mess
 ])));
 const visibleMessages = computed(() => visibleBundles.value.flatMap(({ messages }) => messages.map(({ message }) => message)));
 const chronologicalItems = (bundle: TriageBundle) => [...bundle.messages].reverse();
+const showMembers = (bundle: TriageBundle) => expandedBundles.value.has(bundle.id) && inlineKey.value !== bundleKey(bundle);
 const selectionRows = computed(() => visibleBundles.value.flatMap((bundle) => [
   { key: bundleKey(bundle), row: bundle, messages: bundle.messages.map(({ message }) => message) },
-  ...(expandedBundles.value.has(bundle.id) && bundle.messages.length > 1
+  ...(showMembers(bundle) && bundle.messages.length > 1
     ? chronologicalItems(bundle).map(({ message }) => ({ key: messageKey(message), row: message, messages: [message] })) : []),
 ]));
 const selectionIndex = computed(() => new Map(selectionRows.value.map(({ row }, index) => [row, index])));
@@ -385,7 +386,7 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
             </InlineMailReader>
             <ul
               v-if="bundle.messages.length > 1"
-              v-show="expandedBundles.has(bundle.id)"
+              v-show="showMembers(bundle)"
               :id="detailId(bundle)"
               class="attention-inbox__messages msg-list__items"
               aria-label="Messages in bundle"

@@ -299,7 +299,11 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     await flushPromises();
     const inline = wrapper.get('[data-inline-mail-reader]');
     expect(inline.findAll('ol[aria-label="Messages in conversation"] > li')).toHaveLength(3);
-    await inline.get('button[aria-label="Delete conversation"]').trigger('click');
+    expect(inline.find('.conversation-reader__toolbar').exists()).toBe(false);
+    expect(wrapper.findAll('.imap-mail__nested')).toHaveLength(0);
+    const conversationMenu = wrapper.get('summary[aria-label="Conversation actions"]');
+    await conversationMenu.trigger('click');
+    await wrapper.get('.msg-list__row-controls').findAll('button').find((button) => button.text() === 'Move to Trash')!.trigger('click');
     expect(mutateImap).toHaveBeenLastCalledWith(1, { accountId: 'work', mailbox: 'INBOX', uidValidity: '7', uid: 41 },
       { type: 'trash' }, true, expect.any(Number));
     expect(destroyJmap).toHaveBeenCalledWith([40, 42], expect.objectContaining({ sourceFolderId: 23 }));

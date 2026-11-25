@@ -31,6 +31,7 @@ import { disableWebPush, enableWebPush, getWebPushPublicKey, isWebPushEnabled, o
 import type { MessageRow, FolderRow } from '../types';
 import { parseAddressList } from '../utils/address-list';
 import { closeContainingDropdown } from '../utils/dropdown';
+import { threadSubject } from '../utils/mail-threads';
 import { conversationRow, correspondentLabel, type MessageRowLike } from '../utils/message-row-presentation';
 
 const props = defineProps<{
@@ -189,6 +190,7 @@ const conversationMessages = computed(() => activeBundle.value?.messages.map(({ 
   return {
     key,
     sender: correspondentLabel(row ?? { from_text: message.sender }, false),
+    subject: message.subject,
     preview: message.preview,
     timestamp: message.receivedAt,
     unread: Number(row?.is_seen) === 0,
@@ -719,9 +721,10 @@ onBeforeUnmount(() => {
     <Teleport v-if="readerTarget" :to="readerTarget">
       <ConversationReader
         v-if="showConversation && activeBundle && activeMessageKey"
-        :subject="activeBundle.leading.message.subject ?? ''"
+        :subject="threadSubject(activeBundle.messages.at(-1)?.message.subject)"
         :messages="conversationMessages"
         :active-key="activeMessageKey"
+        :inline="inPlace && activeBundle.messages.length > 1"
         :back-label="readerBackLabel"
         @back="closeReader"
       >
@@ -736,9 +739,10 @@ onBeforeUnmount(() => {
             @restore="(bundle, event) => setBundleDisposition(bundle, 'restore', event)"
           />
         </template>
-        <template #default="{ messageKey }">
+        <template #default="{ messageKey, actionsTarget }">
           <ConversationMessage v-if="conversationSources.has(messageKey)"
             :source="conversationSources.get(messageKey)!" :owner-id="ownerId"
+            :actions-target="actionsTarget"
             :repository="repo" :refresh-imap="loadCache" :maximized="maximized"
             @toggle-maximized="readerEvents.toggleMaximized" />
         </template>
