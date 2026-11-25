@@ -78,6 +78,7 @@ const sample = [
 function makeImapSocket({
   mailboxSize = 1, trash = false, junk = false, archive = true, supportsMove = true, oauth = false, gmail = false,
   keywordsAllowed = true, rejectLabelUpdate = false, omitKeywordFetch = false, stall = () => false, additionalUid, rejectFlagUid,
+  keepSourceAfterMove = false, archiveStore = 'apply',
 } = {}) {
   const calls = [];
   const sockets = [];
@@ -156,6 +157,9 @@ function makeImapSocket({
         ok();
       } else if (/^UID STORE 44 ([+-])X-GM-LABELS/i.test(command)) {
         const [, sign, values] = /^UID STORE 44 ([+-])X-GM-LABELS \((.*)\)/i.exec(command);
+        const archiving = sign === '-' && values.toLowerCase() === '\\inbox';
+        if (archiving && archiveStore === 'refuse') return ok('NO label refused');
+        if (archiving && archiveStore === 'ignore') return ok();
         const parts = values.match(/"(?:[^"\\]|\\.)*"|[^ ]+/g) ?? [];
         for (const part of parts) {
           const label = part.startsWith('"') ? JSON.parse(part) : part;
@@ -170,10 +174,12 @@ function makeImapSocket({
           moved = true;
           write('* 1 EXPUNGE\r\n');
         }
-        ok();
+        ok(archiving && archiveStore === 'apply-and-refuse' ? 'NO label refused' : 'OK');
       } else if (/^UID MOVE 44 (?:"Deleted items"|"?Archive"?|"Spam folder")$/i.test(command)) {
-        moved = true;
-        write('* 1 EXPUNGE\r\n');
+        if (!keepSourceAfterMove) {
+          moved = true;
+          write('* 1 EXPUNGE\r\n');
+        }
         ok('OK [COPYUID 8 44 45] moved');
       } else if (/^UID SEARCH UID /i.test(command)) {
         const requested = command.slice('UID SEARCH UID '.length).split(',').map(Number);
@@ -409,6 +415,23 @@ test('archives Gmail by removing only Inbox membership and safely confirms a ret
   assert.equal(fixture.calls.some((line) => / UID MOVE | UID COPY |\\Deleted|EXPUNGE/.test(line)), false);
 });
 
+test('distinguishes a refused Gmail archive from an unconfirmed acknowledgment', async () => {
+  for (const [archiveStore, code] of [['refuse', 'archive_rejected'], ['ignore', 'mail_unavailable']]) {
+    const fixture = makeImapSocket({ gmail: true, archiveStore });
+    const transport = createMailTransport(fixture.connect);
+    await assert.rejects(transport.moveToRole(account, 'INBOX', '7', 44, 'archive'), { code });
+    const store = fixture.calls.findIndex((line) => / UID STORE 44 -X-GM-LABELS /.test(line));
+    assert.ok(store >= 0 && fixture.calls.slice(store + 1).some((line) => / UID FETCH 44 .*X-GM-LABELS/.test(line)));
+  }
+});
+
+test('confirms a Gmail archive if the source UID disappeared despite the STORE response', async () => {
+  const fixture = makeImapSocket({ gmail: true, archiveStore: 'apply-and-refuse' });
+  const transport = createMailTransport(fixture.connect);
+  assert.deepEqual(await transport.moveToRole(account, 'INBOX', '7', 44, 'archive'), { status: 'moved' });
+  assert.ok(fixture.calls.some((line) => / UID SEARCH UID 44$/.test(line)));
+});
+
 test('moves standard IMAP mail only to a selectable archive or junk role', async () => {
   for (const [role, destination] of [['archive', 'Archive'], ['junk', 'Spam folder']]) {
     const fixture = makeImapSocket({ archive: true, junk: true });
@@ -493,6 +516,31 @@ test('updates flags and moves only to IMAP Trash, with a safe retry after a comp
   assert.deepEqual(await transport.trashMessage(account, 'INBOX', '7', 44), { status: 'absent' });
   assert.equal(fixture.calls.filter((line) => / UID MOVE /i.test(line)).length, 1);
   assert.equal(fixture.calls.some((line) => /EXPUNGE|\\Deleted/i.test(line)), false);
+});
+
+test('a move acknowledgment without source removal yields a retryable outcome', async () => {
+  const fixture = makeImapSocket({ trash: true, keepSourceAfterMove: true });
+  const transport = createMailTransport(fixture.connect);
+  const batch = [{ uid: 44, type: 'move', role: 'trash' }];
+  assert.deepEqual(await transport.runMessageBatch(account, 'INBOX', '7', batch, { bodyBytes: 0 }), [
+    { error: 'mail_unavailable' },
+  ]);
+  const move = fixture.calls.findIndex((line) => / UID MOVE /.test(line));
+  assert.ok(move >= 0);
+  assert.ok(fixture.calls.slice(move + 1).some((line) => / UID SEARCH UID 44$/.test(line)));
+});
+
+test('a move with a lost source confirmation reconciles on retry without moving again', async () => {
+  let moved = false;
+  const fixture = makeImapSocket({ trash: true, stall(command) {
+    if (/^UID MOVE /.test(command)) moved = true;
+    return moved && /^UID SEARCH UID 44$/.test(command);
+  } });
+  const transport = createMailTransport(fixture.connect, { operationTimeout: 100 });
+  await assert.rejects(transport.trashMessage(account, 'INBOX', '7', 44), { code: 'mail_timeout' });
+  assert.deepEqual(await transport.trashMessage(account, 'INBOX', '7', 44), { status: 'absent' });
+  assert.equal(fixture.calls.filter((line) => / UID MOVE /.test(line)).length, 1);
+  assert.equal(fixture.calls.filter((line) => / UID SEARCH UID 44$/.test(line)).length, 1);
 });
 
 test('requires a Trash role and UID MOVE support', async () => {

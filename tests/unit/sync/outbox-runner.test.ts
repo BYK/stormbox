@@ -150,6 +150,57 @@ afterEach(async () => {
 });
 
 describe('OutboxRunner auto-drain', () => {
+  it('dispatches and retries edits on another IMAP account while a request is held', async () => {
+    async function stage(relayAccountId: string) {
+      const { id } = await handlers[DB_RPC.PENDING_MUTATION_INSERT]({
+        accountId,
+        mutationType: MUTATION_TYPE.ATTENTION_IMAP,
+        requestJson: JSON.stringify({
+          location: { accountId: relayAccountId, mailbox: 'INBOX', uidValidity: '2', uid: 12 },
+          action: { type: 'star', value: true },
+        }),
+      });
+      return id;
+    }
+
+    const slow = await stage('slow');
+    const releaseSlow = deferred();
+    const started: number[] = [];
+    const runner = new OutboxRunner({
+      accountId,
+      handlers: { ...handlers, ...makeAttentionHandlers(engine, { touch: vi.fn() }) },
+      processRow: async (row) => {
+        started.push(row.id);
+        if (row.id === slow) await releaseSlow.promise;
+        if (JSON.parse(row.request_json).location.accountId === 'fast' && row.attempts === 1) {
+          return { ok: false, error: { type: 'transport' } };
+        }
+        return { ok: true };
+      },
+      options: { backoffBaseMs: 20 },
+    });
+
+    try {
+      runner.notify({ immediate: true });
+      await waitFor(() => started.includes(slow));
+      const sameMessage = await stage('slow');
+      const fast = await stage('fast');
+      runner.notify();
+
+      await waitFor(async () => (await loadRow(fast)) === null);
+      expect(started).toEqual([slow, fast, fast]);
+      expect(await loadRow(slow)).toMatchObject({ local_status: 'in_flight' });
+      expect(await loadRow(sameMessage)).toMatchObject({ local_status: 'pending' });
+
+      releaseSlow.resolve();
+      await runner.drain();
+      expect(started).toEqual([slow, fast, fast, sameMessage]);
+    } finally {
+      releaseSlow.resolve();
+      await runner.stop();
+    }
+  });
+
   it('runs distinct Gmail messages together while preserving alias order and the unknown-identity barrier', async () => {
     async function stage(mailbox: string, uid: number, messageId?: string) {
       const { id } = await handlers[DB_RPC.PENDING_MUTATION_INSERT]({

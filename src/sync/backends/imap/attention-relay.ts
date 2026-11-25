@@ -140,6 +140,14 @@ export class AttentionRelayError extends Error {
   }
 }
 
+export function isTransientImapError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const status = 'status' in error ? error.status : undefined;
+  return typeof status === 'number'
+    ? status === 408 || status === 429 || status >= 500
+    : ['TypeError', 'TimeoutError', 'AbortError', 'NetworkError'].includes(error.name);
+}
+
 function messagePath(location: ImapMessageLocation, suffix = '') {
   const { accountId, mailbox, uidValidity, uid } = location;
   return `/accounts/${encodeURIComponent(accountId)}/messages/${uid}${suffix}?${new URLSearchParams({ mailbox, uidValidity })}`;
@@ -397,7 +405,7 @@ export class AttentionRelay {
       trash_not_configured: 'This account does not have an IMAP Trash folder.',
       archive_not_configured: 'This account does not have an IMAP Archive folder.',
       archive_requires_inbox: 'Open the message from Inbox to archive it.',
-      archive_rejected: 'The mail server did not confirm that the message left Inbox.',
+      archive_rejected: 'The mail server refused to archive this message.',
       junk_not_configured: 'This account does not have an IMAP Junk folder.',
       move_not_supported: 'This mail server does not support moving messages.',
       same_mailbox: 'This message is already in the destination folder.',

@@ -3,14 +3,8 @@
  * JmapBackend. Replaces the "callers must remember to call drainOutbox"
  * contract with a self-driving queue:
  *
- *   - notify() schedules a drain pass; the runner re-queries
- *     pending_mutations every iteration so anything inserted during
- *     the previous wave is picked up before exiting.
- *   - Single-flight: only one drain pass runs per account at a time.
- *     A notify() call during a drain is recorded via _kickPending so
- *     the runner immediately re-kicks once the in-flight pass finishes
- *     (covers the race where a row is enqueued just as the drain is
- *     scheduling its idle wake timer).
+ *   - A single drain per account fills available dispatch slots when
+ *     notified, when a row settles, or when a retry becomes due.
  *   - Per-target serialization via a small in-memory lock map keyed
  *     by target_message_id. Two mutations for the same message id
  *     (mark-read then destroy) chain onto the same Promise tail so
@@ -67,6 +61,7 @@ const DEFAULT_BACKOFF_BASE_MS = 1_000;
 const DEFAULT_BACKOFF_CAP_MS = 60_000;
 const DRAIN_BATCH_SIZE = 50;
 const RECENT_IMAP_SEND_LIMIT = 32;
+const IMAP_ARCHIVE_REFUSAL_LIMIT = 6;
 const REPLAYABLE_MAIL_ACTIONS = new Set<string>([
   MUTATION_TYPE.SET_KEYWORDS, MUTATION_TYPE.MOVE_TO_FOLDERS, MUTATION_TYPE.DESTROY,
   MUTATION_TYPE.CANCEL_SCHEDULED_SEND,
@@ -133,6 +128,7 @@ export class OutboxRunner {
   _kickPending: boolean;
   _notifyTimer: any;
   _wakeTimer: any;
+  private _wakeDrain: (() => void) | null = null;
   _unsafeToReplayTypes: Set<string>;
   _replayablePhases: Set<string>;
   _completedPhases: Set<string>;
@@ -219,18 +215,10 @@ export class OutboxRunner {
 
   /**
    * Schedule a drain pass. Debounced by notifyDelayMs unless
-   * immediate=true. Safe to call concurrently with an in-flight drain:
-   * the call is recorded and a fresh pass will start as soon as the
-   * current one finishes, so a row inserted right as the runner was
-   * scheduling its idle wake timer is not lost.
+   * immediate=true. A running drain can pick up new rows once notified.
    */
   notify({ immediate = false } = {}) {
     if (this._stopped) return;
-    this._kickPending = true;
-    if (this._drainInflight) {
-      // The trailing-kick in _kickDrain.finally will pick this up.
-      return;
-    }
     if (immediate) {
       this._cancelNotifyTimer();
       this._kickDrain();
@@ -503,6 +491,7 @@ export class OutboxRunner {
       this._clearTimeout(this._wakeTimer);
       this._wakeTimer = null;
     }
+    this._wakeDrain?.();
     if (this._drainInflight) {
       await this._drainInflight.catch(() => {});
     }
@@ -563,7 +552,10 @@ export class OutboxRunner {
 
   _kickDrain() {
     if (this._stopped) return null;
-    if (this._drainInflight) return this._drainInflight;
+    if (this._drainInflight) {
+      this._requestDrainCheck();
+      return this._drainInflight;
+    }
     this._kickPending = false;
     this._drainInflight = this._drainLoop()
       .catch((err) => {
@@ -580,19 +572,38 @@ export class OutboxRunner {
     return this._drainInflight;
   }
 
+  private _requestDrainCheck() {
+    this._kickPending = true;
+    this._wakeDrain?.();
+  }
+
   async _drainLoop() {
-    while (!this._stopped) {
-      const rows = await this._loadReadyRows();
-      if (rows.length === 0) {
-        await this._scheduleNextWake();
-        return;
+    const dispatched = new Map<number, Promise<void>>();
+    try {
+      while (!this._stopped) {
+        this._kickPending = false;
+        const available = DRAIN_BATCH_SIZE - dispatched.size;
+        if (available > 0) {
+          const rows = await this._loadReadyRows(available, [...dispatched.keys()]);
+          if (this._stopped) break;
+          for (const row of rows) {
+            const id = Number(row.id);
+            const finish = () => {
+              dispatched.delete(id);
+              this._requestDrainCheck();
+            };
+            dispatched.set(id, this._dispatch(row).then(finish, finish));
+          }
+          if (dispatched.size < DRAIN_BATCH_SIZE) await this._scheduleNextWake([...dispatched.keys()]);
+        }
+        if (this._stopped) break;
+        if (this._kickPending) continue;
+        if (dispatched.size === 0) return;
+        await new Promise<void>((resolve) => { this._wakeDrain = resolve; });
+        this._wakeDrain = null;
       }
-      // Dispatch all ready rows in parallel; per-target locks keep
-      // mutations for the same message id from interleaving. Wait for
-      // the whole wave before re-querying so this loop terminates
-      // deterministically when the queue is empty.
-      const tasks = rows.map((row) => this._dispatch(row));
-      await Promise.allSettled(tasks);
+    } finally {
+      await Promise.all(dispatched.values());
     }
   }
 
@@ -741,6 +752,13 @@ export class OutboxRunner {
     const maxAttempts = this._maxAttemptsByType.get(activeRow.mutation_type) ?? this._maxAttempts;
     const replayableMail = stagedMail && REPLAYABLE_MAIL_ACTIONS.has(activeRow.mutation_type);
     let error = result?.error ?? { type: 'unknown' };
+    let archiveRefusals = 0;
+    if (imapAction && errorType === 'archive_rejected') {
+      // ImapFlow's false STORE result can also represent a temporary NO.
+      const previous = JSON.parse(activeRow.error_json ?? '{}');
+      archiveRefusals = previous?.type === errorType ? Number(previous.archiveRefusals ?? 0) + 1 : 1;
+      error = { ...error, archiveRefusals };
+    }
     let nextRequestJson: string | null = null;
     if (replayableMail) {
       const request = JSON.parse(activeRow.request_json);
@@ -760,6 +778,7 @@ export class OutboxRunner {
     const authentication = classifyAuthenticationOrAuthorizationError(result?.error);
     const terminal = result?.error?.terminal === true
       || (authentication ? authentication.terminal : TERMINAL_ERROR_TYPES.has(errorType))
+      || archiveRefusals >= IMAP_ARCHIVE_REFUSAL_LIMIT
       || (!imapAction && !replayableMail && attemptNumber >= maxAttempts);
     if (terminal) {
       if (imapAction) {
@@ -792,7 +811,7 @@ export class OutboxRunner {
     // and will eventually resolve the awaiter when it terminates.
   }
 
-  async _scheduleNextWake() {
+  async _scheduleNextWake(dispatched: number[]) {
     if (this._wakeTimer != null) {
       this._clearTimeout(this._wakeTimer);
       this._wakeTimer = null;
@@ -803,12 +822,13 @@ export class OutboxRunner {
              WHERE account_id = ?
                AND local_status IN ('pending','retry')
                AND not_before IS NOT NULL
+               AND id NOT IN (SELECT value FROM json_each(?))
                AND ${IMAP_ACTION_IS_NEXT}
                AND ${MAIL_ACTION_IS_NEXT}`,
-      params: [this._accountId],
+      params: [this._accountId, JSON.stringify(dispatched)],
     });
     const nextMs = Number(rows?.[0]?.next_ms ?? 0);
-    if (!nextMs) return;
+    if (!nextMs || this._stopped) return;
     const delay = Math.max(0, nextMs - this._now());
     this._wakeTimer = this._setTimeout(() => {
       this._wakeTimer = null;
@@ -816,17 +836,18 @@ export class OutboxRunner {
     }, delay);
   }
 
-  async _loadReadyRows() {
+  async _loadReadyRows(limit: number, dispatched: number[]) {
     return this._handlers[DB_RPC.QUERY]({
       sql: `SELECT * FROM pending_mutations mutation
              WHERE account_id = ?
                AND local_status IN ('pending','retry')
                AND (not_before IS NULL OR not_before <= ?)
+               AND id NOT IN (SELECT value FROM json_each(?))
                AND ${IMAP_ACTION_IS_NEXT}
                AND ${MAIL_ACTION_IS_NEXT}
              ORDER BY created_at, id
              LIMIT ?`,
-      params: [this._accountId, this._now(), DRAIN_BATCH_SIZE],
+      params: [this._accountId, this._now(), JSON.stringify(dispatched), limit],
     });
   }
 

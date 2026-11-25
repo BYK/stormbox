@@ -4,7 +4,7 @@ import type { CachedImapAccount } from '../db/attention';
 import type { Repository } from '../db/repository';
 import { useComposeStore } from '../stores/compose-store';
 import { useImapOptimisticActions } from '../stores/imap-optimistic-actions-store';
-import type { ImapAttentionAction, ImapMessageLocation, RelayMessage, RelayMessageBody } from '../sync/backends/imap/attention-relay';
+import { isTransientImapError, type ImapAttentionAction, type ImapMessageLocation, type RelayMessage, type RelayMessageBody } from '../sync/backends/imap/attention-relay';
 import { formatAddressList } from '../utils/address-parse';
 
 function formatAddresses(list: RelayMessage['from'] = []) {
@@ -30,7 +30,7 @@ export function imapEntry(account: CachedImapAccount, mailbox: string, uidValidi
 }
 
 type ImapEntry = ReturnType<typeof imapEntry>;
-type Reading = { id: string; body?: RelayMessageBody; bodyError?: string };
+type Reading = { id: string; body?: RelayMessageBody; bodyError?: string; retrying: boolean; failures: number };
 
 export function useImapReader(
   ownerId: () => number,
@@ -42,6 +42,8 @@ export function useImapReader(
   const composeStore = useComposeStore();
   const optimistic = useImapOptimisticActions();
   const reading = shallowRef<Reading>();
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let request = 0;
   const current = computed(() => reading.value && find(reading.value.id));
   const view = computed(() => {
     const entry = current.value;
@@ -55,33 +57,76 @@ export function useImapReader(
       gmailLabels: row.gmailLabels ?? labels.length > 0,
       canSend: account.can_send === true,
       seen: row.seen, flagged: row.flagged, disabled: false,
-      ...reading.value,
+      body: reading.value.body, bodyError: reading.value.bodyError, retrying: reading.value.retrying,
     };
   });
 
-  function close() { reading.value = undefined; }
+  function close() {
+    clearTimeout(retryTimer);
+    reading.value = undefined;
+  }
   onScopeDispose(close);
 
   watch(current, (entry) => {
     if (!entry) close();
   });
 
-  async function open(entry: ImapEntry) {
-    const next = shallowReactive<Reading>({ id: entry.id });
-    reading.value = next;
+  async function load(entry: ImapEntry, next: Reading) {
+    const attempt = ++request;
+    const isCurrent = () => reading.value === next && attempt === request;
+    const owner = ownerId();
     try {
       const repo = repository();
-      const cached = await repo.readAttentionImapMessage(ownerId(), entry.location, true);
-      if (reading.value !== next) return;
-      next.body = cached ?? undefined;
-      if (cached?.html != null || (cached && !online.value)) return;
-      if (!online.value) throw new Error('This message body has not been downloaded for offline reading.');
-      next.body = await repo.readAttentionImapMessage(ownerId(), entry.location) ?? undefined;
+      const cached = await repo.readAttentionImapMessage(owner, entry.location, true);
+      if (!isCurrent()) return;
+      next.body = cached ?? next.body;
+      if (next.body?.html != null || !online.value) {
+        next.retrying = false;
+        next.bodyError = !online.value && !next.body ? 'Reconnect to download this message.' : undefined;
+        return;
+      }
+      next.bodyError = undefined;
+      const body = await repo.readAttentionImapMessage(owner, entry.location);
+      if (!isCurrent()) return;
+      next.body = body ?? next.body;
+      next.retrying = false;
+      next.bodyError = undefined;
     } catch (cause) {
-      if (reading.value === next) next.bodyError = cause instanceof Error
-        ? cause.message : 'Could not open this message.';
+      if (!isCurrent()) return;
+      if (!online.value) {
+        next.retrying = false;
+        if (!next.body) next.bodyError = 'Reconnect to download this message.';
+      } else if (isTransientImapError(cause)) {
+        next.retrying = true;
+        const delay = Math.min(1_000 * 2 ** Math.min(next.failures++, 6), 60_000);
+        retryTimer = setTimeout(() => { if (isCurrent()) void load(entry, next); }, delay);
+      } else {
+        next.retrying = false;
+        next.bodyError = cause instanceof Error ? cause.message : 'Could not open this message.';
+      }
     }
   }
+
+  function open(entry: ImapEntry) {
+    clearTimeout(retryTimer);
+    const next = shallowReactive<Reading>({ id: entry.id, retrying: false, failures: 0 });
+    reading.value = next;
+    return load(entry, next);
+  }
+
+  watch(online, (connected) => {
+    clearTimeout(retryTimer);
+    const next = reading.value;
+    const entry = current.value;
+    if (!entry || !next || next.body?.html != null) return;
+    if (connected) {
+      next.failures = 0;
+      void load(entry, next);
+    } else {
+      next.retrying = false;
+      if (!next.body) next.bodyError = 'Reconnect to download this message.';
+    }
+  });
 
   function runAction(entry: ImapEntry, action: ImapAttentionAction, { undo }: { undo?: boolean } = {}) {
     return optimistic.run(ownerId(), repository(), [{ entry, action }], { undo, refresh });

@@ -19,6 +19,50 @@ beforeEach(() => {
   window.history.replaceState(null, '', '/');
 });
 
+it('shows a cached preview immediately and retries an open message after a timeout', async () => {
+  const account: CachedImapAccount = {
+    relay_id: 'work', address: 'work@example.org', name: 'Work', mailbox: 'INBOX', uid_validity: '7',
+    messages: [{ uid: 12, subject: 'Project update', preview: 'From the cached message list.',
+      receivedAt: '2026-11-23T09:00:00Z', seen: true, flagged: false, from: [], to: [],
+      messageId: 'project-update@example.org', references: [], inReplyTo: null }],
+  };
+  let attempts = 0;
+  const read = vi.fn(async (_owner: number, _location: ImapMessageLocation, cachedOnly?: boolean) => {
+    if (cachedOnly) return null;
+    if (++attempts === 1) throw Object.assign(new Error('The IMAP server took too long to respond. Try again.'), { status: 504 });
+    return { text: 'The downloaded message.', html: '' };
+  });
+  __setRepositoryForTests({
+    subscribe: () => () => {}, getAttentionCache: async () => ({ paired: true, accounts: [account], states: {} }),
+    folderByRole: async () => null, refreshAttentionRelay: async () => [], readAttentionImapMessage: read,
+  });
+  localStorage.setItem('stormbox:mail-view:1', '{"kind":"unified"}');
+  const target = document.createElement('div');
+  document.body.append(target);
+  const wrapper = mount(ImapMail, { attachTo: document.body, props: { ownerId: 1, search: '', folderTarget: target },
+    global: { plugins: [createPinia()] },
+  });
+  try {
+    await flushPromises();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    await wrapper.get('[aria-label^="Open message: Project update"]').trigger('click');
+    await flushPromises();
+    const reader = wrapper.get('.message-view__body');
+    expect(reader.get('.message-view__loading-preview').text()).toBe('From the cached message list.');
+    expect(reader.get('[role="status"]').text()).toBe('Download interrupted. Retrying…');
+    await vi.advanceTimersByTimeAsync(999);
+    expect(attempts).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(attempts).toBe(2);
+    expect(reader.text()).toContain('The downloaded message.');
+    expect(reader.find('.message-view__loading-preview').exists()).toBe(false);
+  } finally {
+    wrapper.unmount();
+    vi.useRealTimers();
+    target.remove();
+  }
+});
+
 it('shows a failed Google account in Mail and makes its messages available after refresh', async () => {
   const account: CachedImapAccount = {
     relay_id: 'work', address: 'work@example.org', name: 'Work', mailbox: null, uid_validity: null,

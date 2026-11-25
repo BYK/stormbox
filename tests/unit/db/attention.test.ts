@@ -21,11 +21,13 @@ afterEach(async () => engine.close());
 function fakeRelay() {
   const notify = vi.fn();
   const touch = vi.fn();
+  const receivedAt = Date.now();
   const server = { online: true, uidValidity: '3', accountTwoOnline: true, lastToken: '',
     flags: { seen: true, flagged: false }, trashed: false, archived: false, labels: ['Read later'],
     homeWindowGate: undefined as Promise<void> | undefined, workWindowGate: undefined as Promise<void> | undefined,
     workBodyGate: undefined as Promise<void> | undefined, homeActionGate: undefined as Promise<void> | undefined,
-    actionFailure: 0, actionFailureCode: '',
+    actionFailure: 0, actionFailureCode: '', inboxSize: 1, folderSize: 1,
+    workBodyFailures: new Map<number, [status: number, code: string]>(),
     attemptedPatches: [] as unknown[],
     sends: [] as { url: string; draft: AttentionImapDraft }[] };
   const fetcher = vi.fn(async (url: string, init: RequestInit) => {
@@ -45,8 +47,9 @@ function fakeRelay() {
       return Response.json({ mailboxes: [{ path: 'Clients & Projects', name: 'Clients & Projects', specialUse: null, delimiter: '/' }] });
     }
     if (new URL(url, 'https://relay.example').searchParams.get('mailbox') === 'Clients & Projects' && !url.includes('/messages/')) {
-      return Response.json({ mailbox: 'Clients & Projects', uidValidity: '9', total: 1,
-        messages: [{ uid: 12, subject: 'Client update', seen: false, flagged: false }] });
+      return Response.json({ mailbox: 'Clients & Projects', uidValidity: '9', total: server.folderSize,
+        messages: Array.from({ length: server.folderSize }, (_, index) =>
+          ({ uid: 12 + index, subject: 'Client update', seen: false, flagged: false })) });
     }
     if (url.endsWith('/send')) {
       server.sends.push({ url, draft: JSON.parse(String(init.body)) });
@@ -67,14 +70,25 @@ function fakeRelay() {
         return Response.json({ uid: 12, ...server.flags });
       }
       if (init.method === 'POST' && url.includes('/trash?')) {
+        if (server.actionFailure) return Response.json({ error: server.actionFailureCode }, { status: server.actionFailure });
         server.trashed = true;
         return Response.json({ status: 'moved' });
       }
       if (init.method === 'POST' && url.includes('/archive?')) {
+        if (server.actionFailure) return Response.json({ error: server.actionFailureCode }, { status: server.actionFailure });
         server.archived = true;
         return Response.json({ status: 'moved' });
       }
-      if (url.includes('/work/')) await server.workBodyGate;
+      if (url.includes('/work/')) {
+        await server.workBodyGate;
+        const uid = Number(/\/messages\/(\d+)/.exec(url)?.[1]);
+        const failure = server.workBodyFailures.get(uid);
+        if (failure) {
+          server.workBodyFailures.delete(uid);
+          const [status, error] = failure;
+          return Response.json({ error }, { status });
+        }
+      }
       const text = `Body from ${url.split('/')[5]}`;
       return Response.json({ text, html: `<p>${text}</p>` });
     }
@@ -82,7 +96,9 @@ function fakeRelay() {
     const work = url.includes('/work/');
     if (!work) await server.homeWindowGate;
     const snapshot = { mailbox: 'INBOX', uidValidity: server.uidValidity, canSend: work,
-      messages: work && (server.trashed || server.archived) ? [] : [{ uid: 12, subject: url, ...server.flags, labels: server.labels }] };
+      messages: work && (server.trashed || server.archived) ? [] : Array.from({ length: work ? server.inboxSize : 1 },
+        (_, index) => ({ uid: 12 + index, subject: url, ...server.flags, labels: server.labels,
+          receivedAt: new Date(receivedAt - (index + 1) * 3_600_000).toISOString() })) };
     if (work) await server.workWindowGate;
     return Response.json(snapshot);
   });
@@ -94,6 +110,157 @@ const ownerId = 1;
 const workMessage = { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid: 12 };
 
 describe('Attention cache', () => {
+  it('warms Inbox and opened folder bodies beyond the first batch for offline reads', async () => {
+    const { handlers, server, fetcher } = fakeRelay();
+    server.inboxSize = 15;
+    server.folderSize = 10;
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const folder = { ...workMessage, mailbox: 'Clients & Projects', uidValidity: '9', uid: 21 };
+    await handlers[DB_RPC.IMAP_FOLDER_GET]({ ownerId, ...folder, refresh: true });
+    const read = (location: typeof workMessage) => handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location, cachedOnly: true });
+    await vi.waitFor(async () => expect(await read({ ...workMessage, uid: 26 })).toMatchObject({ text: 'Body from work' }));
+    await vi.waitFor(async () => expect(await read(folder)).toMatchObject({ text: 'Body from work' }));
+    server.online = false;
+    fetcher.mockClear();
+    expect(await read(folder)).toMatchObject({ html: '<p>Body from work</p>' });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('warms the saved Inbox while its fresh window is still waiting on the relay', async () => {
+    const { handlers, server, fetcher } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const location = { ...workMessage, uid: 99 };
+    await engine.run('UPDATE attention_imap_accounts SET messages_json = ? WHERE owner_account_id = ? AND relay_id = ?',
+      [JSON.stringify([{ uid: location.uid }]), ownerId, location.accountId]);
+    let release!: () => void;
+    server.workWindowGate = new Promise<void>((resolve) => { release = resolve; });
+    const reopened = makeAttentionHandlers(engine, { touch: vi.fn() }, fetcher as unknown as typeof fetch);
+    const refresh = reopened[DB_RPC.ATTENTION_REFRESH]({ ownerId });
+    try {
+      await vi.waitFor(async () => expect(await reopened[DB_RPC.ATTENTION_BODY]({ ownerId, location, cachedOnly: true }))
+        .toMatchObject({ text: 'Body from work' }));
+    } finally {
+      release();
+      await refresh;
+    }
+  });
+
+  it('backs off and warms later bodies after a timed-out and an oversized message', async () => {
+    const { handlers, server, fetcher } = fakeRelay();
+    server.inboxSize = 8;
+    server.workBodyFailures.set(12, [504, 'mail_timeout']);
+    server.workBodyFailures.set(13, [413, 'message_too_large']);
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const read = (uid: number) => handlers[DB_RPC.ATTENTION_BODY]({ ownerId, location: { ...workMessage, uid }, cachedOnly: true });
+    await vi.waitFor(async () => expect(await read(19)).toMatchObject({ text: 'Body from work' }), { timeout: 3_000 });
+    await vi.waitFor(async () => expect(await read(12)).toMatchObject({ text: 'Body from work' }), { timeout: 3_000 });
+    expect(await read(13)).toBeNull();
+    expect(fetcher.mock.calls.filter(([url]) => url.includes('/work/messages/12?'))).toHaveLength(2);
+    expect(fetcher.mock.calls.filter(([url]) => url.includes('/work/messages/13?'))).toHaveLength(1);
+  });
+
+  it('retains recently received mail and skips evicted background candidates under cache pressure', async () => {
+    const { handlers, server, fetcher } = fakeRelay();
+    server.inboxSize = 0;
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    await engine.run(`WITH RECURSIVE cached(uid) AS (
+        SELECT 1000 UNION ALL SELECT uid + 1 FROM cached WHERE uid < 1097
+      ) INSERT INTO attention_imap_bodies (owner_account_id, relay_id, mailbox, uid_validity, uid, body_text, body_html, cached_at)
+      SELECT ?, 'work', 'INBOX', '3', uid, '', '', ? FROM cached`, [ownerId, Date.now()]);
+    server.inboxSize = 8;
+    await handlers[DB_RPC.ATTENTION_REFRESH]({ ownerId });
+    const saved = () => engine.all("SELECT uid FROM attention_imap_bodies WHERE relay_id = 'work' AND uid < 1000 ORDER BY uid");
+    await vi.waitFor(async () => expect(await saved()).toEqual([{ uid: 12 }, { uid: 13 }]));
+    await handlers[DB_RPC.ATTENTION_REFRESH]({ ownerId });
+    expect(await saved()).toEqual([{ uid: 12 }, { uid: 13 }]);
+    expect(fetcher.mock.calls.filter(([url]) => /\/work\/messages\/\d+\?/.test(url))).toHaveLength(6);
+  });
+
+  it('does not resurrect a rejected old-generation delete before the folder is recovered', async () => {
+    const { handlers, server, fetcher } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const { mutationIds: [mutationId] } = await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]({
+      ownerId, location: workMessage, action: { type: 'trash' },
+    });
+    let release!: () => void;
+    server.workWindowGate = new Promise<void>((resolve) => { release = resolve; });
+    server.uidValidity = '4';
+    const work = async () => (await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts
+      .find(({ relay_id }: { relay_id: string }) => relay_id === 'work');
+    try {
+      await handlers[DB_RPC.ATTENTION_SETTLE_IMAP_ACTION]({ mutationId, error: { type: 'imapMailboxChanged' } });
+      expect(await work()).toMatchObject({ uid_validity: '3', messages: [] });
+    } finally {
+      release();
+    }
+    await vi.waitFor(async () => expect(await work()).toMatchObject({ uid_validity: '4', messages: [{ uid: 12 }] }));
+    expect(fetcher.mock.calls.filter(([url]) => url.includes('/trash?'))).toHaveLength(0);
+  });
+
+  it.each([
+    { action: 'trash', status: 504, code: 'mail_timeout' },
+    { action: 'archive', status: 502, code: 'mail_unavailable' },
+    { action: 'archive', status: 422, code: 'archive_rejected' },
+  ])('keeps $action projected during backoff and settles when the source UID disappears', async ({ action, status, code }) => {
+    const { handlers, server } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const allHandlers = { ...makeHandlers(engine, { touch: vi.fn() }), ...handlers };
+    let now = Date.now();
+    const runner = new OutboxRunner({ accountId: ownerId, handlers: allHandlers, options: { now: () => now },
+      processRow: (row) => processMutationRow({ account: { id: ownerId }, transport: null, handlers: allHandlers, row }),
+    });
+    const workMessages = async () => (await handlers[DB_RPC.ATTENTION_GET]({ ownerId })).accounts
+      .find(({ relay_id }: { relay_id: string }) => relay_id === 'work').messages;
+    try {
+      server.actionFailure = status;
+      server.actionFailureCode = code;
+      await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]({ ownerId, location: workMessage, action: { type: action } });
+      expect(await workMessages()).toEqual([]);
+      expect(await runner.drain()).toMatchObject({ failed: 0 });
+      expect(await engine.get('SELECT local_status, not_before FROM pending_mutations'))
+        .toEqual({ local_status: 'retry', not_before: now + 1_000 });
+      await handlers[DB_RPC.ATTENTION_REFRESH]({ ownerId });
+      expect(await workMessages()).toEqual([]);
+      now += 1_000;
+      server.actionFailure = 404;
+      server.actionFailureCode = 'message_not_found';
+      if (action === 'trash') server.trashed = true;
+      else server.archived = true;
+      expect(await runner.drain()).toMatchObject({ succeeded: 1 });
+      expect(await workMessages()).toEqual([]);
+      expect(await engine.get('SELECT id FROM pending_mutations')).toBeFalsy();
+    } finally {
+      await runner.stop();
+    }
+  });
+
+  it('surfaces a repeated IMAP archive refusal after backing off', async () => {
+    const { handlers, server } = fakeRelay();
+    await handlers[DB_RPC.ATTENTION_PAIR]({ ownerId, accessToken: 'test' });
+    const allHandlers = { ...makeHandlers(engine, { touch: vi.fn() }), ...handlers };
+    let now = Date.now();
+    const runner = new OutboxRunner({ accountId: ownerId, handlers: allHandlers, options: { now: () => now },
+      processRow: (row) => processMutationRow({ account: { id: ownerId }, transport: null, handlers: allHandlers, row }),
+    });
+    try {
+      server.actionFailure = 422;
+      server.actionFailureCode = 'archive_rejected';
+      await handlers[DB_RPC.ATTENTION_ENQUEUE_IMAP_ACTION]({ ownerId, location: workMessage, action: { type: 'archive' } });
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        expect(await runner.drain()).toMatchObject({ failed: 0 });
+        const row = await engine.get('SELECT local_status, not_before FROM pending_mutations');
+        expect(row).toEqual({ local_status: 'retry', not_before: now + 1_000 * 2 ** attempt });
+        now = Number(row.not_before);
+      }
+      expect(await runner.drain()).toMatchObject({ failed: 1 });
+      const [failure] = await handlers[DB_RPC.ATTENTION_IMAP_ACTION_FAILURES]({ ownerId });
+      expect(failure.message).toContain('server refused to archive');
+      expect(failure.canRetry).toBe(true);
+    } finally {
+      await runner.stop();
+    }
+  });
+
   it('opens a prefetched message without waiting for the rest of its batch', async () => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });

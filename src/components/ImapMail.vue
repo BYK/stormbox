@@ -951,13 +951,24 @@ function onVisible() {
   void refreshJmap();
 }
 
+let moveRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+function scheduleMoveRefresh() {
+  clearTimeout(moveRefreshTimer);
+  moveRefreshTimer = setTimeout(() => {
+    moveRefreshTimer = undefined;
+    if (document.visibilityState !== 'visible') return;
+    if (unified.value || isInbox.value) void refreshInboxes();
+    else void refreshFolder();
+  }, 1000);
+}
+
 onMounted(async () => {
   mounted = true;
   try {
     repo = await getRepositoryAsync();
     if (!mounted) return;
     unsubscribe = repo.subscribe((tables) => {
-      if (tables.includes(TABLE_FAMILIES.IMAP_MUTATIONS)) onVisible();
+      if (tables.includes(TABLE_FAMILIES.IMAP_MUTATIONS)) scheduleMoveRefresh();
       if (tables.includes(TABLE_FAMILIES.ATTENTION)) {
         void Promise.all([loadCache(), loadSelectedFolder()]).catch((cause) => { accountError.value = errorMessage(cause); });
       }
@@ -996,6 +1007,7 @@ watch(online, (value) => {
 });
 onBeforeUnmount(() => {
   mounted = false;
+  clearTimeout(moveRefreshTimer);
   resetView();
   emit('folder-selected', false);
   emit('detail-visible', false);

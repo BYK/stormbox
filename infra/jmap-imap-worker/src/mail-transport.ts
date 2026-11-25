@@ -507,12 +507,23 @@ export function createMailTransport(openSocket: SmtpConnect = connect, {
     });
   }
 
+  async function sourceUidPresent(client: ImapFlow, uid: number) {
+    const source = client.mailbox;
+    if (!source) throw new MailTransportError('mail_unavailable');
+    const { path, uidValidity } = source;
+    const remaining = await client.search({ uid: String(uid) }, { uid: true });
+    if (!client.mailbox || client.mailbox.path !== path) throw new MailTransportError('mail_unavailable');
+    if (client.mailbox.uidValidity !== uidValidity) throw new MailTransportError('mailbox_changed');
+    if (!Array.isArray(remaining)) throw new MailTransportError('mail_unavailable');
+    return remaining.length > 0;
+  }
+
   async function moveSelectedMessage(client: ImapFlow, mailbox: string, uid: number, destination: string) {
     if (mailbox === destination) throw new MailTransportError('same_mailbox');
     if (!client.capabilities.has('MOVE')) throw new MailTransportError('move_not_supported');
     if (!await client.fetchOne(uid, { uid: true }, { uid: true })) return { status: 'absent' as const };
     const moved = await client.messageMove(uid, destination, { uid: true });
-    if (!moved) throw new MailTransportError('mail_unavailable');
+    if (!moved || await sourceUidPresent(client, uid)) throw new MailTransportError('mail_unavailable');
     return {
       status: 'moved' as const,
       destination,
@@ -535,14 +546,13 @@ export function createMailTransport(openSocket: SmtpConnect = connect, {
     const byUid = { uid: true };
     if (!await client.fetchOne(uid, byUid, byUid)) return { status: 'absent' as const };
     // Gmail archive removes Inbox membership while retaining All Mail and every other label.
-    if (!await client.messageFlagsRemove(uid, ['\\Inbox'], { ...byUid, useLabels: true })) {
-      throw new MailTransportError('archive_rejected');
-    }
+    const accepted = await client.messageFlagsRemove(uid, ['\\Inbox'], { ...byUid, useLabels: true });
     const updated = await client.fetchOne(uid, { labels: true }, byUid);
-    if (updated && (!updated.labels || [...updated.labels].some((label) => label.toLowerCase() === '\\inbox'))) {
-      throw new MailTransportError('archive_rejected');
-    }
-    return { status: 'moved' as const };
+    if (!updated && !await sourceUidPresent(client, uid)) return { status: 'moved' as const };
+    const labels = updated && updated.labels;
+    if (!labels) throw new MailTransportError('mail_unavailable');
+    if (![...labels].some((label) => label.toLowerCase() === '\\inbox')) return { status: 'moved' as const };
+    throw new MailTransportError(accepted ? 'mail_unavailable' : 'archive_rejected');
   }
 
   type FolderList = Awaited<ReturnType<ImapFlow['list']>>;

@@ -104,6 +104,8 @@ const props = withDefaults(defineProps<{
     canTrash?: boolean;
     body?: RelayMessageBody;
     bodyError?: string;
+    retrying?: boolean;
+    preview?: string | null;
     actionError?: string;
   };
 }>(), { maximized: false, showBack: true });
@@ -1221,6 +1223,9 @@ function closeMessageView() {
       </section>
       <div ref="bodyScrollEl" class="message-view__body" tabindex="0" aria-label="Message body">
         <p v-if="imap?.actionError" class="message-view__placeholder" role="alert">{{ imap.actionError }}</p>
+        <p v-if="!bodyLoaded && imap?.preview" class="message-view__placeholder message-view__loading-preview">
+          {{ imap.preview }}
+        </p>
         <div
           v-if="iframeSrcDoc"
           ref="htmlShellRef"
@@ -1242,8 +1247,8 @@ function closeMessageView() {
         <div v-else-if="textHtml" class="message-view__text" v-html="textHtml" />
         <p v-else-if="imap?.bodyError" class="message-view__placeholder" role="alert">{{ imap.bodyError }}</p>
         <p v-else-if="jmap?.error" class="message-view__placeholder" role="alert">{{ jmap.error }}</p>
-        <p v-else-if="!bodyLoaded" class="message-view__placeholder">
-          {{ authStore.isOfflineSession && message?.body_fetched_at == null
+        <p v-else-if="!bodyLoaded" class="message-view__placeholder" role="status">
+          {{ imap?.retrying ? 'Download interrupted. Retrying…' : authStore.isOfflineSession && message?.body_fetched_at == null
             ? 'Reconnect to download this message.'
             : 'Loading message…' }}
         </p>
@@ -1601,6 +1606,7 @@ function closeMessageView() {
   border-inline-start-color: rgb(233, 185, 110); /* Chocolate 1 */
 }
 .message-view__placeholder { margin: 0; padding: 0 22px 18px; color: var(--muted); }
+.message-view__loading-preview { color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 @media (max-width: 639px) {
   .message-view__article {
