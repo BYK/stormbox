@@ -245,6 +245,9 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     expect(wrapper.findAll('.imap-mail__rows > li')).toHaveLength(4);
     expect(wrapper.findAll('.msg-list__item--stack')).toHaveLength(1);
     expect(pill.element.parentElement?.classList.contains('msg-list__stack-edge--expanded')).toBe(true);
+    expect(wrapper.get('.msg-list__item--stack .msg-list__subject').text()).toBe('Conversation');
+    expect(wrapper.findAll('.imap-mail__rows .msg-list__from').map((sender) => sender.text()))
+      .toEqual(['Earlier sender', 'First sender', 'Reply sender']);
     const newest = wrapper.get<HTMLInputElement>('input[aria-label^="Select message: Re: Planning"]');
     await newest.trigger('click');
     expect(headCheckbox.element.indeterminate).toBe(true);

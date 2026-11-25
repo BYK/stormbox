@@ -131,9 +131,12 @@ const dateText = computed(() => fmtDate(rowTimestamp(props.message, props.sort))
 const preview = computed(() => [props.context, props.message.preview].filter(Boolean).join(' · '));
 const rowKind = computed(() => props.conversationCount && props.conversationCount > 1 ? 'conversation' : 'message');
 const hasStack = computed(() => inFlow.value && props.stackExpanded !== undefined && rowKind.value === 'conversation');
+const expandedStack = computed(() => hasStack.value && props.stackExpanded);
+const subject = computed(() => props.message.subject || '(no subject)');
+const rowTitle = computed(() => expandedStack.value ? subject.value : `${subject.value}, ${label.value}`);
 const rowLabel = computed(() => [
   label.value,
-  props.message.subject || '(no subject)',
+  subject.value,
   dateText.value,
   isUnread.value ? 'Unread' : '',
   isFlagged.value ? 'Starred' : '',
@@ -160,7 +163,7 @@ const rowLabel = computed(() => [
       'is-unselectable': !selectable,
       'msg-list__row--stack': hasStack,
     }"
-    :style="inFlow ? { minHeight: size + 'px', '--message-stack-height': hasStack ? `${size}px` : undefined } : {
+    :style="inFlow ? { minHeight: expandedStack ? undefined : size + 'px', '--message-stack-height': hasStack ? `${size}px` : undefined } : {
       position: 'absolute',
       top: '0px',
       left: '0px',
@@ -176,6 +179,7 @@ const rowLabel = computed(() => [
         'msg-list__item--row-controls': $slots.controls,
         'msg-list__item--in-flow': inFlow,
         'msg-list__item--stack': hasStack,
+        'msg-list__item--stack-expanded': expandedStack,
         'msg-list__item--avatar-unread': avatarUnread,
         'msg-list__item--avatar-selection': avatarUnread && selectable,
         'has-tag-menu': tagMenuOpen,
@@ -195,8 +199,8 @@ const rowLabel = computed(() => [
         :aria-current="inFlow && focused ? true : undefined"
         :aria-expanded="expanded"
         :aria-controls="readerControls"
-        :aria-label="`Open ${rowKind}: ${message.subject || '(no subject)'}, ${label}${avatarUnread && isUnread ? ', unread' : ''}`"
-        :title="context ? preview : undefined"
+        :aria-label="`Open ${rowKind}: ${rowTitle}${avatarUnread && isUnread ? ', unread' : ''}`"
+        :title="expandedStack ? `Open conversation: ${subject}` : context ? preview : undefined"
       />
       <div v-if="selectable || !avatarUnread" class="msg-list__state">
         <label v-if="selectable" class="msg-list__check" draggable="false" @click.stop>
@@ -204,7 +208,7 @@ const rowLabel = computed(() => [
             type="checkbox"
             data-message-control
             :tabindex="controlTabIndex"
-            :aria-label="`Select ${rowKind}: ${message.subject || '(no subject)'}, ${label}`"
+            :aria-label="`Select ${rowKind}: ${rowTitle}`"
             :checked="selected"
             :indeterminate.prop="Boolean(selectionMixed)"
             @click="emit('checkbox-click', $event)"
@@ -217,6 +221,7 @@ const rowLabel = computed(() => [
         />
       </div>
       <div
+        v-if="!expandedStack"
         class="msg-list__avatar"
         :class="{ 'msg-list__avatar--unread': avatarUnread && isUnread }"
         :style="avatar.style"
@@ -236,9 +241,9 @@ const rowLabel = computed(() => [
       </div>
       <div class="msg-list__content">
         <div class="msg-list__summary">
-          <span class="msg-list__from">{{ label }}</span>
-          <span class="msg-list__subject">{{ message.subject || '(no subject)' }}</span>
-          <span class="msg-list__icons">
+          <span v-if="!expandedStack" class="msg-list__from">{{ label }}</span>
+          <span class="msg-list__subject">{{ expandedStack ? 'Conversation' : subject }}</span>
+          <span v-if="!expandedStack" class="msg-list__icons">
             <Star v-if="isFlagged && !hoverActions" :size="13" :stroke-width="2" class="msg-list__star" />
             <Paperclip v-if="Number(message.has_attachment) === 1" :size="13" :stroke-width="1.75" class="msg-list__attach" />
             <MessageTagStack
@@ -248,7 +253,7 @@ const rowLabel = computed(() => [
               data-row-tags
             />
           </span>
-          <span class="msg-list__date">{{ dateText }}</span>
+          <span v-if="!expandedStack" class="msg-list__date">{{ dateText }}</span>
           <div
             v-if="hoverActions"
             class="msg-list__actions"
@@ -318,7 +323,7 @@ const rowLabel = computed(() => [
             <slot name="actions" />
           </div>
         </div>
-        <p v-if="preview" class="msg-list__preview">
+        <p v-if="preview && !expandedStack" class="msg-list__preview">
           {{ preview }}
         </p>
       </div>
@@ -874,6 +879,22 @@ const rowLabel = computed(() => [
 .msg-list--card .msg-list__preview {
   margin-top: 3px;
   -webkit-line-clamp: 1;
+}
+
+/* The expanded stack keeps its group controls above the individual messages. */
+.msg-list__item.msg-list__item--stack-expanded {
+  min-height: 36px;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  padding-block: 0;
+}
+.msg-list__item.msg-list__item--stack-expanded.msg-list__item--row-controls {
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+}
+.msg-list__item--stack-expanded .msg-list__check { opacity: 1; }
+.msg-list__item--stack-expanded .msg-list__summary {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: 'subject';
 }
 
 @media (max-width: 639px) {

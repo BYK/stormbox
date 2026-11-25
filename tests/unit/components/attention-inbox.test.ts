@@ -90,6 +90,9 @@ describe('AttentionInbox', () => {
     expect(expand.attributes('aria-label')).toBe('Hide 2 messages');
     expect(expand.find('.lucide-chevron-up').exists()).toBe(true);
     expect(members.isVisible()).toBe(true);
+    expect(wrapper.findAll('.msg-list__subject').map((subject) => subject.text()))
+      .toEqual(['Conversation', 'Review these changes', 'Progress update']);
+    expect(head.element.closest('.msg-list__item')?.querySelector('.msg-list__from, .msg-list__date, .msg-list__preview')).toBeNull();
     const [older, child] = members.findAll('[aria-label^="Open message"]');
     expect(older.attributes('aria-label')).toContain('Review these changes');
     expect(child.attributes('aria-label')).toContain('Progress update');
