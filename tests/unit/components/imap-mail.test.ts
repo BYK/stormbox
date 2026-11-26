@@ -239,7 +239,7 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     await headCheckbox.trigger('click');
     expect(wrapper.get('.msg-list__header').text()).toContain('3 selected');
     const pill = wrapper.get('.msg-list__stack-toggle');
-    expect(pill.attributes('aria-label')).toBe('Show 3 messages');
+    expect(pill.attributes('aria-label')).toBe('Show conversation messages');
     expect(pill.element.parentElement?.previousElementSibling?.classList.contains('msg-list__item--stack')).toBe(true);
     await pill.trigger('click');
     expect(wrapper.findAll('.imap-mail__rows > li')).toHaveLength(4);
@@ -257,7 +257,7 @@ it('treats a Unified Inbox conversation as one unit while sync is pending', asyn
     await wrapper.get('input[aria-label^="Select message: Planning"]').trigger('click');
     expect(headCheckbox.element.indeterminate).toBe(true);
     expect(wrapper.get('.msg-list__header').text()).toContain('2 selected');
-    expect(pill.attributes('aria-label')).toBe('Hide 3 messages');
+    expect(pill.attributes('aria-label')).toBe('Hide conversation messages');
     await pill.trigger('click');
     expect(wrapper.get('.msg-list__header').text()).toContain('2 selected');
     await wrapper.get('button[aria-label="Clear selection"]').trigger('click');

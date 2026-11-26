@@ -1323,6 +1323,10 @@ function closeMessageView() {
               <template #iconLeft><span class="message-view__toolbar-icon" aria-hidden="true" v-html="replyAllIcon" /></template>
               Reply all
             </AppButton>
+            <AppButton variant="outline" @click="forward">
+              <template #iconLeft><span class="message-view__toolbar-icon" aria-hidden="true" v-html="forwardIcon" /></template>
+              Forward
+            </AppButton>
           </div>
           <div ref="inlineReplyTarget" />
         </div>
@@ -1368,7 +1372,7 @@ function closeMessageView() {
 .message-view__conversation-actions { display: flex; align-items: center; }
 .message-view__menu-item { grid-template-columns: minmax(0, 1fr); }
 .message-view__quick-reply { margin: 12px var(--message-content-trailing-inset) 14px var(--message-content-inset); }
-.message-view__quick-reply-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.message-view__quick-reply-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .message-view__empty {
   display: grid;
   flex: 1 1 auto;

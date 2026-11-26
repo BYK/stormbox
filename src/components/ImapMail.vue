@@ -29,7 +29,7 @@ import { folderCapabilities } from '../utils/folder-capabilities';
 import { folderCompare, folderPresentation } from '../utils/folder-presentation';
 import { gmailLabelTags } from '../utils/imap-message-tags';
 import { groupMailThreads, parseThreadHeaders, threadSubject, type MailThread, type ThreadMessage } from '../utils/mail-threads';
-import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, conversationRow, correspondentLabel, folderShowsRecipients } from '../utils/message-row-presentation';
+import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, conversationRow, correspondentLabel, folderShowsRecipients, recipientLabel } from '../utils/message-row-presentation';
 import { tagKeywordsOf } from '../utils/message-tags';
 import { isScheduledMessage } from '../utils/scheduled-message';
 import AppIconButton from './AppIconButton.vue';
@@ -345,8 +345,6 @@ const canSyncJmap = computed(() => online.value && !authStore.isOfflineSession);
 const canShowMore = computed(() => filteredThreads.value.length > visibleThreadLimit.value);
 const canLoadMore = computed(() => canShowMore.value || (canSyncJmap.value
   && jmapFolders.value.some(({ total_emails }) => Number(total_emails) > jmapLimit.value)));
-const jmapAccountName = computed(() => new Map(mailStore.accounts
-  .map(({ id, primary_email, display_name }) => [id, primary_email ?? display_name])));
 const folderKey = computed(() => unified.value ? unifiedFolderId : threadedFolder.value?.id
   ?? (selected.value && JSON.stringify([selected.value.accountId, selected.value.path])) ?? null);
 const totalCount = computed(() => {
@@ -486,7 +484,7 @@ function toggleImapThreads() {
 
 function rowContext(entry: ThreadEntry) {
   if (!unified.value) return undefined;
-  return entry.kind === 'imap' ? entry.entry.account.address : jmapAccountName.value.get(entry.row.account_id) ?? undefined;
+  return recipientLabel(entry.row);
 }
 
 function toggleThread(key: string) {

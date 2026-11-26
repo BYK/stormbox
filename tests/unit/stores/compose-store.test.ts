@@ -153,6 +153,32 @@ describe('compose-store reply and forward prefills', () => {
     expect(composeStore.fromIdentity?.remote_id).toBe('chosen');
   });
 
+  it('preserves the addressed identity from cached To when the structured addresses are unavailable', async () => {
+    const { composeStore } = await storeWithParentAddresses([], [
+      identity({ id: 1, email: 'primary@example.com', may_delete: 0 }),
+      identity({ id: 2, email: 'ben@example.com' }),
+    ]);
+
+    await composeStore.prepareReplyAll(sourceMessage({ to_text: 'Ben <BEN@example.com>' }), {});
+
+    expect(composeStore.fromIdentity?.email).toBe('ben@example.com');
+    expect(composeStore.draft.to).toEqual([{ name: 'Alice', email: 'alice@example.com' }]);
+    expect(composeStore.draft.cc).toEqual([]);
+  });
+
+  it('uses an alias in Cc when no authorized identity is named in To', async () => {
+    const { composeStore } = await storeWithParentAddresses([
+      { kind: 'from', position: 0, name: 'Alice', email: 'alice@example.com' },
+      { kind: 'to', position: 0, name: 'Bob', email: 'bob@example.com' },
+      { kind: 'cc', position: 0, name: 'Ben', email: 'ben@example.com' },
+    ], [identity({ id: 1, email: 'primary@example.com', may_delete: 0 }), identity({ id: 2, email: 'ben@example.com' })]);
+
+    await composeStore.prepareReplyAll(sourceMessage(), {});
+
+    expect(composeStore.fromIdentity?.email).toBe('ben@example.com');
+    expect(composeStore.draft.cc).toEqual([{ name: 'Bob', email: 'bob@example.com' }]);
+  });
+
   it('adopts a matching reply identity when it arrives after the reply opens', async () => {
     const { composeStore, repo } = await storeWithParentAddresses(
       sourceAddresses(),

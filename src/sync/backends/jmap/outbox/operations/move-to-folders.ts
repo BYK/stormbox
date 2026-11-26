@@ -54,6 +54,11 @@ async function runMoveToFolders({ transport, handlers, row, request, useWebSocke
     const removeRemote = removeLocalIds.map((id) => folderContexts.get(id)!.remote_id);
     const reachedDestination = (email) => {
       if (!email) return false;
+      if (addKeywords.length || removeKeywords.length) {
+        if (!addRemote.every((id) => email.mailboxIds?.[id] === true)
+          || !addKeywords.every((key) => email.keywords?.[key] === true)
+          || removeKeywords.some((key) => email.keywords?.[key] === true)) return false;
+      }
       if (!replaceExisting) return !removeRemote.some((id) => email.mailboxIds?.[id] === true);
       const memberships = Object.keys(email.mailboxIds ?? {}).filter((id) => email.mailboxIds[id] === true);
       return memberships.length === addRemote.length && addRemote.every((id) => memberships.includes(id));

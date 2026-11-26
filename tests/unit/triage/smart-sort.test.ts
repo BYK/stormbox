@@ -73,7 +73,7 @@ describe('bundling and ranking', () => {
     expect(bundledIds).toContainEqual([1, 2]);
   });
 
-  it('preserves priority buckets across the age decay and keeps the outstanding request in front', () => {
+  it('ranks by age-adjusted score while keeping the outstanding request as the thread lead', () => {
     expect([80, 60, 35, 34].map(priorityForScore)).toEqual(['P0', 'P1', 'P2', 'P3']);
     expect(timeAdjustedScore(84, NOW - 72 * HOUR, NOW)).toBe(42);
     const messages = [
@@ -82,9 +82,21 @@ describe('bundling and ranking', () => {
       mail(3, { threadId: 'b', subject: 'Please reply', receivedAt: NOW }),
     ];
     const [first, second] = buildTriageBundles(messages, {}, NOW);
-    expect([first.priority, second.priority]).toEqual(['P0', 'P1']);
-    expect(first.leading.message.id).toBe(1);
-    expect(first.latestAt).toBe(NOW);
+    expect([first.priority, second.priority]).toEqual(['P1', 'P0']);
+    expect(second.leading.message.id).toBe(1);
+    expect(second.latestAt).toBe(NOW);
+  });
+
+  it('lets recent incoming mail outrank an old star without losing the star as a signal', () => {
+    const messages = [
+      mail(1, { subject: 'Weekly newsletter', receivedAt: NOW - 7 * 24 * HOUR, isFlagged: true }),
+      mail(2, { subject: 'Documents for completion', receivedAt: NOW, directRecipient: true }),
+      mail(3, { subject: 'Important update', receivedAt: NOW - 6 * HOUR, isFlagged: true }),
+      mail(4, { subject: 'Other update', receivedAt: NOW - 6 * HOUR }),
+    ];
+    const bundles = buildTriageBundles(messages, {}, NOW);
+    expect(bundles.map(({ leading }) => leading.message.id)).toEqual([2, 3, 4, 1]);
+    expect(bundles.at(-1)).toMatchObject({ status: 'uncertain', priority: 'P2', reason: 'Flagged by you' });
   });
 });
 

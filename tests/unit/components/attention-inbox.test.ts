@@ -42,7 +42,9 @@ describe('AttentionInbox', () => {
           bundle('accepted', 'done', 'Already approved'),
           bundle('later', 'snoozed', 'Discuss next week'),
         ],
-        accountLabels: { 1: 'Work' },
+        rows: new Map([[browserTriageMessageKey({ id: 'req', accountId: 1 }), {
+          id: 'req', subject: 'Approval requested', to_text: 'Burak <ben@example.org>',
+        }]]),
       },
     });
 
@@ -54,8 +56,12 @@ describe('AttentionInbox', () => {
     expect(attention.attributes('aria-pressed')).toBe('true');
     expect(wrapper.text()).toContain('Approval requested');
     expect(wrapper.text()).toContain('Can you check?');
-    expect(wrapper.text()).toContain('Work');
+    expect(wrapper.text()).toContain('ben@example.org');
     expect(wrapper.text()).not.toContain('Price update');
+
+    await wrapper.setProps({ error: 'Could not refresh. Showing saved mail.' });
+    expect(wrapper.get('.attention-inbox__header [role="status"]').text()).toContain('Showing saved mail.');
+    expect(wrapper.get('.attention-inbox__scroll').text()).not.toContain('Showing saved mail.');
 
     await updates.trigger('click');
     expect(wrapper.text()).toContain('Price update');
@@ -81,16 +87,16 @@ describe('AttentionInbox', () => {
     await head.trigger('click');
     const expand = wrapper.get('.msg-list__stack-toggle');
     const members = wrapper.get('[aria-label="Messages in bundle"]');
-    expect(expand.attributes('aria-label')).toBe('Show 3 messages');
-    expect(expand.find('.lucide-chevron-down').exists()).toBe(true);
+    expect(expand.attributes('aria-label')).toBe('Show conversation messages');
+    expect(expand.text()).toBe('');
     expect(head.element.closest('.msg-list__item--stack')?.nextElementSibling).toBe(expand.element.parentElement);
     expect(expand.element.parentElement?.nextElementSibling).toBe(members.element);
     expect(expand.attributes('aria-controls')).toBe(members.attributes('id'));
     expect(members.isVisible()).toBe(false);
     await expand.trigger('click');
     expect(expand.attributes('aria-expanded')).toBe('true');
-    expect(expand.attributes('aria-label')).toBe('Hide 3 messages');
-    expect(expand.find('.lucide-chevron-up').exists()).toBe(true);
+    expect(expand.attributes('aria-label')).toBe('Hide conversation messages');
+    expect(expand.text()).toBe('');
     expect(members.isVisible()).toBe(true);
     expect(wrapper.findAll('.msg-list__subject').map((subject) => subject.text()))
       .toEqual(['Review these changes', 'Progress update']);
@@ -128,6 +134,8 @@ describe('AttentionInbox', () => {
     expect(row.get('.msg-list__preview').text()).toContain('Message preview');
     expect(row.get('.msg-list__avatar').classes()).toContain('msg-list__avatar--unread');
     expect(row.get('.msg-list__item').classes()).toContain('msg-list__item--avatar-selection');
+    expect(row.get('.msg-list__item').classes()).toContain('msg-list__item--overlay-controls');
+    expect(row.get('.msg-list__item').classes()).not.toContain('msg-list__item--row-controls');
     expect(row.find('.msg-list__unread-dot').exists()).toBe(false);
     expect(row.get('.msg-list__open').attributes('aria-label')).toMatch(/, unread$/);
 

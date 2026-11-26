@@ -66,9 +66,10 @@ const TICKET = /\b(ticket|case|incident|order|invoice|shipment|siparis|fatura|ka
 
 const HALF_LIFE_MS = 72 * 60 * 60 * 1000;
 const DISPOSITION_ORDER: Record<TriageBundle['status'], number> = {
-  action: 0, uncertain: 1, update: 2, snoozed: 3, done: 4,
+  action: 0, uncertain: 0, update: 1, snoozed: 2, done: 3,
 };
 const PRIORITIES: readonly TriagePriority[] = ['P0', 'P1', 'P2', 'P3'];
+const STAR_BOOST = 8;
 
 function foldText(value: string): string {
   return value.toLowerCase().normalize('NFD').replace(/\p{M}/gu, '').replace(/ı/g, 'i');
@@ -85,7 +86,15 @@ export function triageExcerpt(message: TriageMessage): string {
 }
 
 export function classifyTriageMessage(message: TriageMessage): TriageClassification {
-  if (message.isFlagged) return { disposition: 'action', baseScore: 85, reason: 'Flagged by you' };
+  const classification = classifyContent(message);
+  if (!message.isFlagged) return classification;
+  if (classification.disposition === 'update') {
+    return { disposition: 'uncertain', baseScore: 48 + STAR_BOOST, reason: 'Flagged by you' };
+  }
+  return { ...classification, baseScore: boundedScore(classification.baseScore + STAR_BOOST) };
+}
+
+function classifyContent(message: TriageMessage): TriageClassification {
   if (message.isAnswered) return { disposition: 'update', baseScore: 30, reason: 'Already replied' };
 
   const subject = foldText(message.subject ?? '');
@@ -228,8 +237,7 @@ export function buildTriageBundles(
     group.items.sort(recency);
 
     const nextItems = actions.length ? actions : pending;
-    nextItems.sort((left, right) => priorityIndex(left.classification.baseScore) - priorityIndex(right.classification.baseScore)
-      || timeAdjustedScore(right.classification.baseScore, right.message.receivedAt, now)
+    nextItems.sort((left, right) => timeAdjustedScore(right.classification.baseScore, right.message.receivedAt, now)
         - timeAdjustedScore(left.classification.baseScore, left.message.receivedAt, now)
       || recency(left, right));
     const leading = nextItems[0] ?? group.items[0];
@@ -254,7 +262,6 @@ export function buildTriageBundles(
   });
 
   return bundles.sort((left, right) => DISPOSITION_ORDER[left.status] - DISPOSITION_ORDER[right.status]
-    || PRIORITIES.indexOf(left.priority) - PRIORITIES.indexOf(right.priority)
     || right.score - left.score || right.latestAt - left.latestAt || left.id.localeCompare(right.id));
 }
 

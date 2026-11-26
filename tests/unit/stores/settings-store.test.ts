@@ -107,6 +107,24 @@ describe('settings store account safety', () => {
     expect(repo.applySettingsPatch).toHaveBeenCalledWith(2, { theme: 'system' });
   });
 
+  it('keeps the From preference with the cached account when offline', async () => {
+    const repo = makeRepo({ 1: {}, 2: { primaryIdentityRemoteId: 'other-account' } });
+    __setRepositoryForTests(repo as any);
+    const auth = useAuthStore();
+    auth.accountId = 1;
+    auth.isOfflineSession = true;
+    const store = useSettingsStore();
+    await store.attach();
+    await flushPromises();
+
+    await store.update({ primaryIdentityRemoteId: 'alias' });
+    expect(repo.applySettingsPatch).toHaveBeenCalledExactlyOnceWith(1, { primaryIdentityRemoteId: 'alias' });
+    auth.accountId = 2;
+    await flushPromises();
+
+    expect(store.get('primaryIdentityRemoteId')).toBe('other-account');
+  });
+
   it('claims anonymous pre-auth changes for the first connected account', async () => {
     const repo = makeRepo({ 7: { density: 'compact' } });
     __setRepositoryForTests(repo as any);

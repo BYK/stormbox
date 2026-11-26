@@ -20,12 +20,14 @@ import { useComposeStore } from '../../../src/stores/compose-store';
 import { useFeatureBeaconsStore } from '../../../src/stores/feature-beacons-store';
 import { useFeatureFlagsStore } from '../../../src/stores/feature-flags-store';
 import { useSettingsStore } from '../../../src/stores/settings-store';
+import type { IdentityRow } from '../../../src/types';
 import {
   __resetRepositoryForTests,
   __setRepositoryForTests,
 } from '../../../src/composables/useRepository';
+import { identityRow } from '../_fixtures/rows';
 
-function makeRepo() {
+function makeRepo(identities: IdentityRow[] = []) {
   // Onboarding done: Welcome dismissed and every beacon seen.
   let settings: Record<string, unknown> = { onboarding: { beaconsSeenThrough: LATEST_BEACON_SEQ } };
   const doc = () => ({
@@ -51,7 +53,7 @@ function makeRepo() {
     async ensureFolderTree() { return { count: 0 }; },
     async listAddressbooks() { return []; },
     async listContacts() { return []; },
-    async listIdentities() { return []; },
+    async listIdentities(accountId) { return identities.filter(({ account_id }) => account_id === accountId); },
     async ensureIdentities() {},
   };
 }
@@ -114,6 +116,32 @@ afterEach(() => {
 });
 
 describe('settings gear and dialog', () => {
+  it('sets the default From identity for new messages on the signed-in account', async () => {
+    const identities = [
+      identityRow({ id: 1, account_id: 1, remote_id: 'primary', email: 'primary@example.com', may_delete: 0 }),
+      identityRow({ id: 2, account_id: 1, remote_id: 'alias', email: 'ben@example.com' }),
+      identityRow({ id: 3, account_id: 2, remote_id: 'elsewhere', email: 'elsewhere@example.com' }),
+    ];
+    __setRepositoryForTests(makeRepo(identities));
+    const wrapper = mountApp();
+    await flushPromises();
+    const panel = await openSettings(wrapper);
+    const summary = panel.querySelector<HTMLElement>('summary[aria-label="Default From address"]')!;
+    expect(summary.textContent).toContain('primary@example.com');
+    summary.click();
+
+    const options = [...panel.querySelectorAll<HTMLButtonElement>('[aria-label="Sending identities"] button')];
+    expect(options.map((option) => option.textContent?.trim())).toEqual(['primary@example.com', 'ben@example.com']);
+    options[1].click();
+    await flushPromises();
+
+    expect(summary.textContent).toContain('ben@example.com');
+    expect(useSettingsStore().get('primaryIdentityRemoteId')).toBe('alias');
+    const composeStore = useComposeStore();
+    composeStore.open();
+    expect(composeStore.fromIdentity?.email).toBe('ben@example.com');
+  });
+
   it('every signed-in user gets a Settings gear that opens a titled dialog', async () => {
     const wrapper = mountApp();
     await flushPromises();

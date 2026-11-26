@@ -275,7 +275,7 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   async function update(patch: Partial<Settings>): Promise<void> {
-    const accountId = authStore.isConnected ? authStore.accountId : null;
+    const accountId = authStore.isConnected || authStore.isOfflineSession ? authStore.accountId : null;
     settings.value = { ...settings.value, ...patch };
     stateRevision += 1;
     writeMirror(settings.value, accountId);

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Archive, Check, Clock, Flame, Mail, MailOpen, RotateCcw, Star, Tags, Trash2 } from '@lucide/vue';
+import { Archive, Check, Clock, Flame, Layers, Mail, MailOpen, RotateCcw, Star, Tags, Trash2 } from '@lucide/vue';
 import { computed, shallowRef } from 'vue';
 
 import type { ImapAttentionAction } from '../sync/backends/imap/attention-relay';
@@ -20,6 +20,7 @@ const props = withDefaults(defineProps<{
   canJunk?: boolean;
   canTag?: boolean;
   quick?: boolean;
+  stackAction?: string;
 }>(), { canTrash: true });
 const emit = defineEmits<{
   action: [action: ImapAttentionAction, event: MouseEvent];
@@ -27,6 +28,7 @@ const emit = defineEmits<{
   done: [bundle: TriageBundle, event: MouseEvent];
   restore: [bundle: TriageBundle, event: MouseEvent];
   snooze: [bundle: TriageBundle, until: number, trigger: HTMLElement];
+  'toggle-stack': [];
 }>();
 const flagged = computed(() => Number(props.row.is_flagged) === 1);
 const unread = computed(() => Number(props.row.is_seen) === 0);
@@ -50,9 +52,14 @@ function chooseTag(event: MouseEvent): void {
 function openSnooze(event: MouseEvent) {
   const target = event.currentTarget;
   if (!(target instanceof HTMLElement)) return;
-  snoozeTrigger.value = target.closest('details')?.querySelector('summary') ?? target;
+  showSnooze(target.closest('details')?.querySelector('summary') ?? target);
   closeContainingDropdown(event, true);
 }
+
+function showSnooze(trigger: HTMLElement) {
+  if (canSnooze.value) snoozeTrigger.value = trigger;
+}
+defineExpose({ showSnooze });
 
 function snooze(until: number) {
   const trigger = snoozeTrigger.value;
@@ -79,6 +86,11 @@ function snooze(until: number) {
       </AppIconButton>
     </template>
     <AttentionActionMenu class="attention-row-menu" :label="label ?? 'Message actions'">
+      <button v-if="stackAction" class="app-dropdown__item" type="button"
+        @click="closeContainingDropdown($event, true); emit('toggle-stack')">
+        <Layers :size="16" aria-hidden="true" />
+        {{ stackAction }}
+      </button>
       <button
         v-if="canTag"
         class="app-dropdown__item"

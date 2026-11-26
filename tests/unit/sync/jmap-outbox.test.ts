@@ -591,6 +591,35 @@ describe('drainOutbox', () => {
     expect(inboxWindow.total).toBe(moved ? 0 : 1);
   });
 
+  it.each([
+    { archived: true, read: true, complete: true },
+    { archived: true, read: false, complete: false },
+    { archived: false, read: true, complete: false },
+  ])('reconciles a refused read and archive only when both were applied ($archived, $read)', async ({ archived, read, complete }) => {
+    await handlers[DB_RPC.FOLDER_UPSERT_MANY]({
+      accountId: account.id,
+      folders: [
+        { remoteId: 'mb-archive', name: 'Archive', role: 'archive' },
+        { remoteId: 'mb-other', name: 'Other' },
+      ],
+    });
+    const destination = await engine.get("SELECT id FROM folders WHERE remote_id = 'mb-archive'");
+    const transport = new MockTransport();
+    transport.handle('Email/set', () => ({ notUpdated: { 'e-1': { type: 'forbidden' } } }));
+    transport.handle('Email/get', () => ({ list: [{ ...emailFixture('e-1'),
+      mailboxIds: archived ? { 'mb-archive': true } : { 'mb-other': true },
+      keywords: read ? { $seen: true } : {},
+    }] }));
+    const result = await processMutationRow({
+      transport, account, handlers,
+      row: { mutation_type: MUTATION_TYPES.MOVE_TO_FOLDERS, request_json: JSON.stringify({
+        messageIds: [messageId], addFolderIds: [destination.id], removeFolderIds: [inbox.id], add: ['$seen'],
+      }) },
+    });
+    expect(result.ok).toBe(complete);
+    expect(result.result?.succeededIds ?? []).toEqual(complete ? [messageId] : []);
+  });
+
   it('preserves unrelated memberships when a numeric mailbox id requires replacement', async () => {
     await handlers[DB_RPC.FOLDER_UPSERT_MANY]({
       accountId: account.id,

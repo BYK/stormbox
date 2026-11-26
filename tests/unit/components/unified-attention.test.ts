@@ -30,7 +30,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void; reject: (err
   return { promise, resolve, reject };
 }
 
-function mountBundleActions() {
+function mountBundleActions(overrides: object = {}) {
   const subjects = ['Please review the release', 'Please approve the estimate'];
   const arrived = Date.now();
   const pinia = createPinia();
@@ -56,6 +56,7 @@ function mountBundleActions() {
     }], states }),
     refreshAttentionRelay: async () => [],
     changeAttentionBundleStates,
+    ...overrides,
   });
   const wrapper = mount(UnifiedAttention, {
     attachTo: document.body,
@@ -81,7 +82,44 @@ function mountBundleActions() {
   };
 }
 
-it('moves a bundle and lets Undo restore it before a single SQLite write settles', async () => {
+it('marks a bundle read and archives it with one early Undo, without writing disposition state', async () => {
+  const pending = deferred();
+  const mutateAttentionImapMessages = vi.fn(async () => {
+    await pending.promise;
+    return { mutationIds: [10, 11] };
+  });
+  const undoAttentionImapActions = vi.fn(async () => ({ canceledIds: [10, 11] }));
+  const fixture = mountBundleActions({ mutateAttentionImapMessages, undoAttentionImapActions });
+  const { feedback, subjects: [first, second], currentSubjects, act, changeAttentionBundleStates } = fixture;
+  try {
+    await flushPromises();
+    const before = currentSubjects();
+    await act(first, 'Mark done');
+    expect(currentSubjects()).toEqual([second]);
+    const entry = feedback.entries.find(({ action }) => action === 'Undo')!;
+    expect(feedback.entries).toHaveLength(1);
+    const location = { accountId: 'work', mailbox: 'INBOX', uidValidity: '3', uid: 1 };
+    expect(mutateAttentionImapMessages).toHaveBeenCalledExactlyOnceWith(1, [
+      { location, action: { type: 'seen', value: true } },
+      { location, action: { type: 'archive' } },
+    ], true, entry.expiresAt);
+    fixture.notify();
+    await flushPromises();
+    expect(currentSubjects()).toEqual([second]);
+    const undoing = feedback.run(entry.id);
+    await flushPromises();
+    expect(currentSubjects()).toEqual(before);
+    pending.resolve();
+    await undoing;
+    expect(undoAttentionImapActions).toHaveBeenCalledExactlyOnceWith(1, [10, 11], true);
+    expect(changeAttentionBundleStates).not.toHaveBeenCalled();
+  } finally {
+    pending.resolve();
+    fixture.dispose();
+  }
+});
+
+it('snoozes a bundle and lets Undo restore it before a single SQLite write settles', async () => {
   const fixture = mountBundleActions();
   const { feedback, persist, subjects: [first, second], currentSubjects, act, changeAttentionBundleStates } = fixture;
   const done = deferred();
@@ -91,7 +129,7 @@ it('moves a bundle and lets Undo restore it before a single SQLite write settles
   try {
     await flushPromises();
     const order = currentSubjects();
-    await act(first, 'Mark done');
+    await act(first, 'Snooze');
     expect(currentSubjects()).toEqual([second]);
     expect(fixture.currentStates()).toEqual({});
     fixture.notify();
@@ -128,7 +166,7 @@ it('rolls back only the failed bundle, offers Retry, and makes Snooze and Restor
   persist.mockReturnValueOnce(pending.promise);
   try {
     await flushPromises();
-    await act(first, 'Mark done');
+    await act(first, 'Snooze');
     await act(second, 'Snooze');
     expect(currentSubjects()).toEqual([]);
     pending.reject(new Error('SQLite write failed'));
@@ -141,9 +179,7 @@ it('rolls back only the failed bundle, offers Retry, and makes Snooze and Restor
     expect(currentSubjects()).toEqual([]);
     await select(/^Done & snoozed/);
     expect(currentSubjects()).toEqual(expect.arrayContaining([first, second]));
-    const doneRow = fixture.wrapper.findAll('.attention-inbox__bundle').find((row) => row.text().includes(first))!;
-    expect(doneRow.find('[aria-label="Snooze"]').exists()).toBe(false);
-    expect(Object.values(fixture.currentStates()).map(({ disposition }) => disposition)).toEqual(expect.arrayContaining(['done', 'snoozed']));
+    expect(Object.values(fixture.currentStates()).map(({ disposition }) => disposition)).toEqual(['snoozed', 'snoozed']);
     const restore = deferred();
     persist.mockReturnValueOnce(restore.promise);
     try {
@@ -155,7 +191,7 @@ it('rolls back only the failed bundle, offers Retry, and makes Snooze and Restor
       expect(currentSubjects()).toEqual(expect.arrayContaining([first, second]));
       restore.resolve();
       await undoing;
-      expect(Object.values(fixture.currentStates()).map(({ disposition }) => disposition)).toEqual(expect.arrayContaining(['done', 'snoozed']));
+      expect(Object.values(fixture.currentStates()).map(({ disposition }) => disposition)).toEqual(['snoozed', 'snoozed']);
     } finally {
       restore.resolve();
     }
@@ -539,10 +575,8 @@ it('batches a conversation action and advances the stacked reader after deleting
     expect(Object.values(states)[0].observed).toHaveLength(2);
     expect(wrapper.get('[aria-label="Messages in conversation"]').element).toBe(stack.element);
     await chooseAction('Cancel snooze');
-    await chooseAction('Mark bundle done');
-    expect(changeAttentionBundleStates).toHaveBeenCalledTimes(3);
-    expect(Object.values(states)[0]).toMatchObject({ disposition: 'done', resolved: expect.any(Array) });
-    expect(Object.values(states)[0].resolved).toHaveLength(2);
+    expect(changeAttentionBundleStates).toHaveBeenCalledTimes(2);
+    expect(states).toEqual({});
     await chooseAction('Unstar');
     expect(mutateAttentionImapMessages).toHaveBeenCalledOnce();
     expect(mutateAttentionImapMessages.mock.calls[0][1]).toEqual([

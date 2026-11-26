@@ -57,7 +57,7 @@ import {
   parseAddressList,
   type ParsedAddress,
 } from '../utils/address-parse';
-import { buildReplyAudience, buildThreadHeaders, type MessageAddress } from '../utils/reply';
+import { buildReplyAudience, buildThreadHeaders, replyIdentityEmails, type MessageAddress } from '../utils/reply';
 import { addressKey } from '../utils/address-key';
 import { sanitizeAttachmentFilename } from '../utils/attachment-presentation';
 import { isInlineImageType } from '../utils/message-html';
@@ -820,16 +820,16 @@ export const useComposeStore = defineStore('compose', () => {
   }
 
   async function refreshAccount(): Promise<void> {
-    if (!repo || authStore.accountId == null) {
+    const accountId = authStore.accountId;
+    const currentRepo = repo;
+    if (accountId == null || typeof currentRepo?.getAccount !== 'function') {
       accountPrimaryEmail.value = null;
       return;
     }
-    if (typeof repo.getAccount !== 'function') {
-      accountPrimaryEmail.value = null;
-      return;
+    const account = await currentRepo.getAccount(accountId);
+    if (currentRepo === repo && accountId === authStore.accountId) {
+      accountPrimaryEmail.value = account?.primary_email ?? null;
     }
-    const account = await repo.getAccount(authStore.accountId);
-    accountPrimaryEmail.value = account?.primary_email ?? null;
   }
 
   /**
@@ -915,6 +915,8 @@ export const useComposeStore = defineStore('compose', () => {
       primaryIdentityRemoteId: settingsStore.get('primaryIdentityRemoteId'),
     });
   }
+
+  const defaultFromIdentity = computed(() => identities.value[defaultFromIdx()] ?? null);
 
   function replyFromIdx(preferredIdentityEmails: readonly string[]): number {
     return resolveReplyIdentityIndex(identities.value, preferredIdentityEmails, {
@@ -1457,13 +1459,16 @@ export const useComposeStore = defineStore('compose', () => {
   }
 
   async function refreshIdentities(): Promise<void> {
-    if (!repo || authStore.accountId == null) return;
+    const accountId = authStore.accountId;
+    const currentRepo = repo;
+    if (!currentRepo || accountId == null) return;
     const previousIdentities = identities.value;
     const snapshots = new Map(sessions.value.map((session) => {
       const canonical = canonicalSessionJson(session);
       return [session.id, { canonical, clean: canonical === session.seedJson }];
     }));
-    const refreshed = await repo.listIdentities(authStore.accountId);
+    const refreshed = await currentRepo.listIdentities(accountId);
+    if (currentRepo !== repo || accountId !== authStore.accountId) return;
     const stillClean = new Set(sessions.value
       .filter((session) => {
         const snapshot = snapshots.get(session.id);
@@ -2527,7 +2532,7 @@ export const useComposeStore = defineStore('compose', () => {
       MessageRow,
       'id' | 'from_text' | 'subject' | 'received_at' | 'rfc822_message_id'
       | 'references_json' | 'in_reply_to_json'
-    >,
+    > & Partial<Pick<MessageRow, 'to_text'>>,
     body: QuoteContent | Promise<QuoteContent>,
     all: boolean,
     inlineTarget?: HTMLElement,
@@ -2537,13 +2542,10 @@ export const useComposeStore = defineStore('compose', () => {
     // Another reply, a forward, or a logout happened while this one was
     // reading the parent. Whatever replaced it is what the user asked for.
     if (gesture !== prefillGeneration || (inlineTarget && !inlineTarget.isConnected)) return;
-    const audience = addresses
+    const audience = addresses?.length
       ? buildReplyAudience({ addresses, ownedEmails: ownedEmails(), all })
       : { to: parseAddressList(message.from_text ?? '').addresses, cc: [] };
-    const preferredIdentityEmails = (addresses ?? [])
-      .filter((address) => address.kind === 'to' && address.email)
-      .sort((left, right) => left.position - right.position)
-      .map((address) => address.email as string);
+    const preferredIdentityEmails = replyIdentityEmails(addresses ?? [], message.to_text);
     const { inReplyTo, references } = buildThreadHeaders(message);
     open({
       to: audience.to,
@@ -3304,6 +3306,7 @@ export const useComposeStore = defineStore('compose', () => {
     rejectedRecipients,
     recipientCount,
     fromIdentity,
+    defaultFromIdentity,
     $reset,
     attach,
     detach,

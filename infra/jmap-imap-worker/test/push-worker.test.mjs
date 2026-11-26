@@ -131,9 +131,10 @@ export default { async fetch(request, env) {
   } }]);
   const revised = await plan([unrelated, { ...routine, keywords: { $flagged: true } }, newReply], 3);
   assert.equal(revised.notifications[0].bundleUid, 3);
-  assert.equal(revised.notifications[0].uid, 3);
-  assert.equal(revised.notifications[0].notification.messageKey, messageKey(3));
-  assert.equal(revised.notifications[0].notification.preview, 'Newsletter');
+  assert.equal(revised.notifications[0].uid, 4);
+  assert.equal(revised.notifications[0].notification.messageKey, messageKey(4));
+  assert.equal(revised.notifications[0].notification.preview, 'Please confirm the new date.');
+  assert.equal(revised.notifications[0].notification.confirmed, true);
   assert.deepEqual(await arrive('v7:10:10', [message(10, 'Weekly digest', { preview: 'Here are the highlights.' })]), []);
   assert.equal(sent.length, 0);
   const actionable = message(11, 'Schedule');

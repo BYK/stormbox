@@ -14,7 +14,8 @@ export type MailListSource =
 export type MailListAction = Exclude<ImapAttentionAction, { type: 'tags' | 'trash' }>
   | { type: 'tag'; keyword: string; value: boolean }
   | { type: 'delete' }
-  | { type: 'clear-tags' };
+  | { type: 'clear-tags' }
+  | { type: 'read-and-archive' };
 
 type ImapSource = Extract<MailListSource, { kind: 'imap' }>;
 
@@ -22,7 +23,8 @@ export function usesGmailLabels(source: MailListSource): source is ImapSource {
   return source.kind === 'imap' && (source.entry.row.gmailLabels ?? Boolean(source.entry.row.labels?.length));
 }
 
-function imapAction(source: ImapSource, action: MailListAction, definitions: ReadonlyArray<MessageTagDefinition>): ImapAttentionAction {
+function imapAction(source: ImapSource, action: Exclude<MailListAction, { type: 'read-and-archive' }>,
+  definitions: ReadonlyArray<MessageTagDefinition>): ImapAttentionAction {
   const { entry } = source;
   const labels = entry.row.labels ?? [];
   switch (action.type) {
@@ -62,6 +64,7 @@ export function useMailListActions(ownerId: () => number, repository: () => Repo
       case 'star': return mail.markManyFlagged(ids, action.value, source);
       case 'seen': return mail.markManySeen(ids, action.value, source);
       case 'archive': return mail.archiveMessages(ids, source);
+      case 'read-and-archive': return mail.archiveMessages(ids, { ...source, markRead: true });
       case 'junk': return mail.junkMessages(ids, source);
       case 'delete': return mail.destroyMessages(ids, source);
       case 'tag': return mail.setTagsMany(ids, action.value ? { add: [action.keyword] } : { remove: [action.keyword] }, source);
@@ -73,10 +76,14 @@ export function useMailListActions(ownerId: () => number, repository: () => Repo
     { undoLabel }: { undoLabel?: string } = {}) {
     if (sources.length === 0) return;
     const folders = new Map<number, MessageRow[]>();
-    const imap = [];
+    const imap: Array<{ entry: ImapSource['entry']; action: ImapAttentionAction }> = [];
     for (const source of sources) {
       if (source.kind === 'imap') {
-        imap.push({ entry: source.entry, action: imapAction(source, action, definitions) });
+        if (action.type === 'read-and-archive') {
+          const { entry } = source;
+          if (!entry.row.seen) imap.push({ entry, action: { type: 'seen', value: true } });
+          imap.push({ entry, action: { type: 'archive' } });
+        } else imap.push({ entry: source.entry, action: imapAction(source, action, definitions) });
       } else {
         const rows = folders.get(source.folder.id) ?? [];
         rows.push(source.row);

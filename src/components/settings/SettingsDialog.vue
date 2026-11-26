@@ -14,8 +14,13 @@ import { X } from '@lucide/vue';
 import { useModalFocus } from '../../composables/useModalFocus';
 import { shortcutHint, type ShortcutAction } from '../../constants/shortcuts';
 import { useAuthStore } from '../../stores/auth-store';
+import { useComposeStore } from '../../stores/compose-store';
 import { useSettingsStore } from '../../stores/settings-store';
+import type { IdentityRow } from '../../types/db';
+import { formatAddressList } from '../../utils/address-parse';
+import { closeContainingDropdown } from '../../utils/dropdown';
 import { isComposingKeyEvent } from '../../utils/keyboard';
+import AppDropdown from '../AppDropdown.vue';
 import ShortcutSchemePicker from './ShortcutSchemePicker.vue';
 
 const StaffSettingsSection = defineAsyncComponent(
@@ -34,6 +39,7 @@ const emit = defineEmits<{
 }>();
 
 const authStore = useAuthStore();
+const composeStore = useComposeStore();
 const settingsStore = useSettingsStore();
 const dialogEl = ref<HTMLElement | null>(null);
 
@@ -41,6 +47,25 @@ useModalFocus(dialogEl, { containTab: true });
 
 const followSystemTheme = computed(() => settingsStore.get('theme') === 'system');
 const shortcutScheme = computed(() => settingsStore.get('shortcutScheme'));
+const identities = computed(() => composeStore.identities.filter(({ account_id }) => account_id === authStore.accountId));
+const defaultFrom = computed(() => {
+  const identity = composeStore.defaultFromIdentity;
+  return identity?.account_id === authStore.accountId ? identity : null;
+});
+const defaultFromError = ref('');
+
+async function selectDefaultFrom(identity: IdentityRow, event: MouseEvent) {
+  closeContainingDropdown(event, true);
+  defaultFromError.value = '';
+  if (identity.id === defaultFrom.value?.id) return;
+  try {
+    await settingsStore.update({ primaryIdentityRemoteId: identity.remote_id });
+  } catch {
+    if (authStore.accountId === identity.account_id && settingsStore.get('primaryIdentityRemoteId') === identity.remote_id) {
+      defaultFromError.value = 'Could not save the default From address.';
+    }
+  }
+}
 
 const SAMPLE_ACTIONS: ReadonlyArray<{ action: ShortcutAction; label: string }> = [
   { action: 'compose', label: 'new message' },
@@ -102,6 +127,25 @@ onBeforeUnmount(() => {
         </header>
 
         <div class="settings-dialog__section">
+          <div v-if="defaultFrom" class="settings-dialog__row">
+            <div class="settings-dialog__row-text">
+              <span class="settings-dialog__row-title">Default From</span>
+              <span class="settings-dialog__row-hint">Sending identity for this account</span>
+            </div>
+            <AppDropdown v-if="identities.length > 1" class="settings-dialog__identity-picker">
+              <summary class="app-dropdown__summary app-dropdown__summary--control" aria-label="Default From address">
+                <span>{{ defaultFrom.email }}</span>
+              </summary>
+              <div class="app-dropdown__menu" aria-label="Sending identities" role="group">
+                <button v-for="identity in identities" :key="identity.id" type="button" class="app-dropdown__item"
+                  :aria-pressed="defaultFrom.id === identity.id" @click="selectDefaultFrom(identity, $event)">
+                  {{ formatAddressList([identity]) }}
+                </button>
+              </div>
+            </AppDropdown>
+            <span v-else class="settings-dialog__identity-value">{{ defaultFrom.email }}</span>
+          </div>
+          <p v-if="defaultFromError" class="settings-dialog__error" role="alert">{{ defaultFromError }}</p>
           <div class="settings-dialog__row">
             <div class="settings-dialog__row-text">
               <span id="settings-shortcuts-label" class="settings-dialog__row-title">Keyboard shortcuts</span>
@@ -313,6 +357,21 @@ onBeforeUnmount(() => {
   font-size: 12px;
   color: var(--muted);
 }
+.settings-dialog__identity-picker,
+.settings-dialog__identity-value { min-width: 0; }
+.settings-dialog__identity-picker summary { display: flex; }
+.settings-dialog__identity-picker summary span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.settings-dialog__identity-picker .app-dropdown__menu { inset-inline: auto 0; max-width: min(300px, 75vw); }
+.settings-dialog__identity-picker .app-dropdown__item {
+  grid-template-columns: minmax(0, 1fr);
+  overflow-wrap: anywhere;
+}
+.settings-dialog__identity-picker .app-dropdown__item[aria-pressed="true"] { font-weight: 600; }
+.settings-dialog__identity-value { overflow-wrap: anywhere; font-size: 13px; }
 .settings-dialog__switch {
   position: relative;
   flex-shrink: 0;

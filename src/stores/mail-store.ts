@@ -2272,6 +2272,7 @@ export const useMailStore = defineStore('mail', () => {
     ids: number[],
     role: 'trash' | 'archive' | 'junk',
     options: BulkSourceOptions,
+    markRead = false,
   ): Promise<MoveResult> {
     const messageIds = normalizeMessageIds(ids);
     if (!repo || authStore.accountId == null || messageIds.length === 0) {
@@ -2303,7 +2304,8 @@ export const useMailStore = defineStore('mail', () => {
     const liveIds = mutable.ids;
     if (liveIds.length === 0) return { succeeded: 0, failed: 0, skipped: messageIds.length };
     if (mailActions.enabled()) {
-      const keywordPatch = role === 'junk' ? { add: ['$junk'], remove: ['$notjunk'] } : {};
+      const keywordPatch = role === 'junk' ? { add: ['$junk'], remove: ['$notjunk'] }
+        : markRead ? { add: ['$seen'] } : {};
       const label = role === 'junk' ? 'Marked as junk' : role === 'archive' ? 'Archived' : 'Moved to Trash';
       const accepted = await stageTransfer({
         accountId, mutationType: MUTATION_TYPE.MOVE_TO_FOLDERS,
@@ -2358,6 +2360,7 @@ export const useMailStore = defineStore('mail', () => {
             messageIds: chunkIds,
             addFolderIds: [destination.id],
             replaceExisting: true,
+            ...(markRead && { add: ['$seen'] }),
           }),
         }),
         failureAction: 'move',
@@ -2376,13 +2379,14 @@ export const useMailStore = defineStore('mail', () => {
     return { succeeded: succeeded.length, failed: 0, skipped: messageIds.length - liveIds.length };
   }
 
-  async function archiveMessages(ids: number[], options: BulkSourceOptions = {}) {
+  async function archiveMessages(ids: number[], options: BulkSourceOptions & { markRead?: boolean } = {}) {
     const messageIds = normalizeMessageIds(ids);
     if (isTagViewId(options.sourceFolderId ?? currentFolderId.value)) {
-      return fileTagMessages(messageIds, 'archive', options);
+      return fileTagMessages(messageIds, 'archive', options, options.markRead);
     }
     const source = resolveSourceFolder(options.sourceFolderId);
     if (!source) {
+      if (options.markRead) throwMoveError('Cannot archive messages because the current folder is no longer available.');
       error.value = 'Cannot archive messages because the current folder is no longer available.';
       return { succeeded: 0, failed: messageIds.length, skipped: 0 };
     }
@@ -2390,10 +2394,18 @@ export const useMailStore = defineStore('mail', () => {
       (folder) => folder.account_id === source.account_id && folder.role === 'archive',
     );
     if (!archive?.id) {
+      if (options.markRead) throwMoveError('No archive folder is configured.');
       error.value = 'No archive folder is configured.';
       return { succeeded: 0, failed: 0, skipped: 0 };
     }
-    return moveMessages(ids, archive.id, { ...options, sourceFolderId: source.id });
+    return moveMessages(ids, archive.id, {
+      ...options,
+      sourceFolderId: source.id,
+      ...(options.markRead && {
+        keywords: { add: ['$seen'], remove: [] },
+        label: 'Marked as read and archived', failureAction: 'mark as read and archive',
+      }),
+    });
   }
 
   /**
@@ -3122,12 +3134,15 @@ export const useMailStore = defineStore('mail', () => {
     }
 
     const mode = source.account_id === target.account_id ? 'move' : 'copy';
-    if (mailActions.enabled()) {
-      const input = buildMoveMutation(liveIds, target.id, source.id);
+    function buildTransferMutation(chunkIds: number[]) {
+      const input = buildMoveMutation(chunkIds, target.id, source.id);
       if (options.keywords) {
         input.requestJson = JSON.stringify({ ...JSON.parse(input.requestJson), ...options.keywords });
       }
-      const accepted = await stageTransfer(input, {
+      return input;
+    }
+    if (mailActions.enabled()) {
+      const accepted = await stageTransfer(buildTransferMutation(liveIds), {
         mailAction: true, messageIds: liveIds, sourceFolderId: source.id,
         removeFrom: mode === 'move' ? 'source' : undefined,
         destinationFolderId: mode === 'move' ? target.id : undefined,
@@ -3145,7 +3160,7 @@ export const useMailStore = defineStore('mail', () => {
         label: target.name
           ? `${mode === 'copy' ? 'Copying' : 'Moving'} messages to ${target.name}`
           : `${mode === 'copy' ? 'Copying' : 'Moving'} messages`,
-        buildMutation: (chunkIds) => buildMoveMutation(chunkIds, target.id, source.id),
+        buildMutation: buildTransferMutation,
         failureAction: mode,
       });
     } catch (err: any) {

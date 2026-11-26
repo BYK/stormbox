@@ -10,7 +10,7 @@
  */
 
 import { addressKey } from './address-key';
-import type { ParsedAddress } from './address-parse';
+import { parseAddressList, type ParsedAddress } from './address-parse';
 
 /** A `message_addresses` row, as the repository returns it. */
 export interface MessageAddress {
@@ -35,6 +35,7 @@ const KIND = {
   FROM: 'from',
   TO: 'to',
   CC: 'cc',
+  BCC: 'bcc',
   REPLY_TO: 'replyTo',
 } as const;
 
@@ -46,6 +47,12 @@ function pick(addresses: readonly MessageAddress[], kind: string): ParsedAddress
       ...(row.name?.trim() ? { name: row.name.trim() } : {}),
       email: row.email as string,
     }));
+}
+
+export function replyIdentityEmails(addresses: readonly MessageAddress[], toText: string | null | undefined): string[] {
+  const to = pick(addresses, KIND.TO);
+  const recipients = to.length ? to : parseAddressList(toText ?? '').addresses;
+  return [...recipients, ...pick(addresses, KIND.CC), ...pick(addresses, KIND.BCC)].map(({ email }) => email);
 }
 
 function key(address: ParsedAddress): string {

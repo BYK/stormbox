@@ -358,6 +358,58 @@ describe('staged JMAP actions', () => {
     }) };
   }
 
+  it('marks read and archives in one native move and one ordered IMAP batch with shared Undo', async () => {
+    const row = makeRow(1, { is_seen: 0 }) as MessageRow;
+    const { mailStore, authStore, repo } = await setupStore({
+      folders: [makeFolder(1, { total_emails: 1 }), makeFolder(2, { role: 'archive' })],
+      views: { 1: { rows: [row], total: 1 }, 2: { rows: [], total: 0 } },
+    });
+    await mailStore.ensureLoaded(0, 1);
+    const releaseArchive = mailStore.bindFolderView(2);
+    await flush();
+    const queued = [];
+    repo.listMailActions = async () => queued.slice();
+    repo.insertPendingMutation = vi.fn(async (input) => {
+      const mutation = { id: 1, request_json: input.requestJson, mutation_type: input.mutationType,
+        optimistic_patch_json: input.optimisticPatchJson, local_status: 'pending', not_before: input.notBefore, error_json: null };
+      queued.push(mutation);
+      return mutation;
+    });
+    repo.cancelMailAction = vi.fn(async () => { queued.length = 0; return { canceled: true }; });
+    repo.mutateAttentionImapMessages = vi.fn(async () => ({ mutationIds: [101, 102, 103] }));
+    repo.undoAttentionImapActions = vi.fn(async () => ({ canceledIds: [101, 102, 103] }));
+    const relay = [relaySource(12), relaySource(13)];
+    relay[1].entry.row.seen = true;
+    const listActions = useMailListActions(() => authStore.accountId, () => repo as unknown as Repository, vi.fn());
+    const feedback = useMailActionFeedbackStore();
+    const project = () => useImapOptimisticActions().projectFolder(1, 'work', 'INBOX', '2', relay.map(({ entry }) => entry.row));
+
+    try {
+      await listActions([{ kind: 'jmap', folder: { id: 1 }, row }, ...relay], { type: 'read-and-archive' }, [],
+        { undoLabel: 'Marked as read and archived' });
+      expect(queued).toHaveLength(1);
+      expect(JSON.parse(queued[0].request_json)).toMatchObject({ messageIds: [1], addFolderIds: [2], removeFolderIds: [1], add: ['$seen'] });
+      expect(mailStore.messages).toEqual([]);
+      expect(mailStore.folderView(2).messages[0]).toMatchObject({ id: 1, is_seen: 1 });
+      expect(feedback.entries).toHaveLength(1);
+      expect(repo.mutateAttentionImapMessages).toHaveBeenCalledExactlyOnceWith(1, [
+        { location: relay[0].entry.location, action: { type: 'seen', value: true } },
+        { location: relay[0].entry.location, action: { type: 'archive' } },
+        { location: relay[1].entry.location, action: { type: 'archive' } },
+      ], true, feedback.entries[0].expiresAt);
+      expect(project()).toEqual([]);
+
+      await feedback.run(feedback.entries[0].id);
+      expect(mailStore.messages[0]).toMatchObject({ id: 1, is_seen: 0 });
+      expect(mailStore.folderView(2).messages).toEqual([]);
+      expect(project().map(({ seen }) => seen)).toEqual([false, true]);
+      expect(repo.undoAttentionImapActions).toHaveBeenCalledExactlyOnceWith(1, [101, 102, 103], true);
+    } finally {
+      releaseArchive();
+      feedback.$reset();
+    }
+  });
+
   it('shares one Undo deadline across native folders and an IMAP batch, reporting partial cancellation once', async () => {
     const inbox = [makeRow(1), makeRow(2)] as MessageRow[];
     const more = [makeRow(3)] as MessageRow[];

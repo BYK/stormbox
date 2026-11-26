@@ -5,6 +5,7 @@
  */
 
 import type { JmapViewSort } from '../constants/states';
+import { parseAddressList } from './address-list';
 import { shortFrom } from './sender-avatar';
 
 export const CARD_LAYOUT_WIDTH = 480;
@@ -24,6 +25,11 @@ export interface MessageRowLike {
   has_attachment?: number | string | null;
   keywords_json?: string | null;
   scheduled_undo_status?: string | null;
+}
+
+export function recipientLabel(row: Pick<MessageRowLike, 'to_text'>): string {
+  const to = row.to_text?.trim() ?? '';
+  return parseAddressList(to).map(({ email }) => email).join(', ') || to;
 }
 
 /** Give a conversation row the unread and starred state of its members. */

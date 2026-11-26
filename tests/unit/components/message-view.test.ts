@@ -103,6 +103,8 @@ describe('MessageView with a sparse messages array', () => {
     const manager = mount(ComposeManager, { attachTo: document.body });
 
     try {
+      expect(reader.findAll('.message-view__quick-reply-actions button').map((button) => button.text()))
+        .toEqual(['Reply', 'Reply all', 'Forward']);
       await reader.get('[aria-label="Quick reply all"]').trigger('click');
       await flushPromises();
       const inline = reader.get('.compose-dialog--inline');

@@ -12,7 +12,7 @@ import ImapAccountsDialog from './ImapAccountsDialog.vue';
 import MessageView from './MessageView.vue';
 import { imapEntry, useImapReader } from '../composables/useImapReader';
 import { useInlineReading } from '../composables/useInlineReading';
-import { useMailListActions, type MailListSource } from '../composables/useMailListActions';
+import { useMailListActions, type MailListAction, type MailListSource } from '../composables/useMailListActions';
 import { useMessageTags } from '../composables/useMessageTags';
 import { getRepositoryAsync } from '../composables/useRepository';
 import { TABLE_FAMILIES } from '../db/protocol';
@@ -21,6 +21,7 @@ import type { AttentionCache } from '../db/attention';
 import type { Repository } from '../db/repository';
 import { useAttentionBundleActionsStore } from '../stores/attention-bundle-actions-store';
 import { useAuthStore } from '../stores/auth-store';
+import { useComposeStore } from '../stores/compose-store';
 import { useImapOptimisticActions } from '../stores/imap-optimistic-actions-store';
 import { useMailStore } from '../stores/mail-store';
 import { browserSessionEnabled } from '../services/browser-session';
@@ -57,6 +58,7 @@ const imapActions = useImapOptimisticActions();
 const jmapRows = computed(() => jmapFolder.value
   ? mailStore.projectMailRows(jmapFolder.value.id, cachedJmapRows.value) : cachedJmapRows.value);
 const authStore = useAuthStore();
+const composeStore = useComposeStore();
 const bundleActions = useAttentionBundleActionsStore().forOwner(props.ownerId);
 const { definitions: tagDefinitions } = useMessageTags();
 const reading = shallowRef<Reading>();
@@ -90,6 +92,17 @@ let ranker: ReturnType<typeof createBrowserTriageRanker> | undefined;
 let modelRunning = false;
 let modelNeedsPass = false;
 
+const ownJmapAddresses = computed(() => new Set([
+  props.address.toLowerCase(),
+  ...composeStore.identities.filter((identity) => identity.account_id === props.ownerId)
+    .map((identity) => identity.email.toLowerCase()),
+]));
+const statusText = computed(() => {
+  if (modelProgress.value) return modelProgress.value.phase === 'preparing' ? 'Preparing local model…' : 'Ranking mail locally…';
+  if (localModelEnabled.value && modelFailed.value) return 'Local model unavailable. Showing rules-based rankings.';
+  return busy.value ? 'Refreshing…' : '';
+});
+
 function jmapMessage(row: MessageRow): TriageMessage {
   return {
     id: row.id,
@@ -103,7 +116,7 @@ function jmapMessage(row: MessageRow): TriageMessage {
     inReplyTo: parseHeaderList(row.in_reply_to_json),
     sender: parseAddressList(row.from_text ?? '')[0]?.email,
     directRecipient: parseAddressList(row.to_text ?? '').some((recipient) =>
-      recipient.email.toLowerCase() === props.address.toLowerCase()),
+      ownJmapAddresses.value.has(recipient.email.toLowerCase())),
     isFlagged: Boolean(row.is_flagged),
     isAnswered: Boolean(row.is_answered),
   };
@@ -169,7 +182,8 @@ const bundles = computed(() => {
   const query = props.search?.trim().toLowerCase();
   return query ? unfilteredBundles.value.filter((bundle) =>
     bundle.messages.some(({ message }) =>
-      [message.subject, message.sender, message.preview, accountLabels.value[String(message.accountId)]]
+      [message.subject, message.sender, message.preview, rows.value.get(browserTriageMessageKey(message))?.to_text,
+        accountLabels.value[String(message.accountId)]]
         .some((value) => value?.toLowerCase().includes(query)))) : unfilteredBundles.value;
 });
 
@@ -468,8 +482,7 @@ function openBundle(bundle: TriageBundle, trigger: EventTarget | null) {
   focusReader(trigger);
 }
 
-async function runBatchAction(messages: readonly TriageMessage[], action: ImapAttentionAction, undoLabel?: string) {
-  if (action.type === 'tags') return;
+async function runBatchAction(messages: readonly TriageMessage[], action: MailListAction | { type: 'trash' }, undoLabel?: string) {
   const targets: MailListSource[] = [];
   for (const message of messages) {
     if (typeof message.id === 'number') {
@@ -483,7 +496,9 @@ async function runBatchAction(messages: readonly TriageMessage[], action: ImapAt
   const listAction = action.type === 'trash' ? { type: 'delete' as const } : action;
   error.value = '';
   try {
-    await runListAction(targets, listAction, tagDefinitions.value, { undoLabel: targets.length > 1 ? undoLabel : undefined });
+    await runListAction(targets, listAction, tagDefinitions.value, {
+      undoLabel: targets.length > 1 || listAction.type === 'read-and-archive' ? undoLabel : undefined,
+    });
   } catch (cause) {
     report(cause);
   }
@@ -502,6 +517,7 @@ function runBundleAction(bundle: TriageBundle, action: ImapAttentionAction) {
 }
 
 function runSelectionAction(messages: TriageMessage[], action: ImapAttentionAction) {
+  if (action.type === 'tags') return;
   const label = action.type === 'trash' ? `Move ${messages.length} messages to Trash` : `Update ${messages.length} messages`;
   return runBatchAction(messages, action, label);
 }
@@ -543,6 +559,9 @@ watch([() => mailStore.selectedMessageId, jmapRowsById, imap, activeBundle], () 
 
 function setBundleDisposition(bundle: TriageBundle, disposition: Parameters<typeof bundleActions.save>[2], event?: MouseEvent) {
   if (event) closeContainingDropdown(event, true);
+  if (disposition === 'done') {
+    return runBatchAction(bundle.messages.map(({ message }) => message), { type: 'read-and-archive' }, 'Marked as read and archived');
+  }
   return bundleActions.save(repo, bundle, disposition);
 }
 
@@ -623,9 +642,9 @@ onBeforeUnmount(() => {
     <div ref="list" v-show="!maximized" class="unified-attention__list">
       <AttentionInbox
         :bundles="bundles"
-        :account-labels="accountLabels"
         :loading="loading"
         :error="error"
+        :status="statusText"
         :inline-reading="inPlace"
         :open-bundle-id="activeBundle?.id"
         :open-message="reading?.message"
@@ -693,14 +712,6 @@ onBeforeUnmount(() => {
               </button>
             </AttentionActionMenu>
           </div>
-        </template>
-        <template #progress>
-          <p v-if="modelProgress" role="status" class="unified-attention__progress">
-            {{ modelProgress.phase === 'preparing' ? 'Preparing local model…' : 'Ranking mail locally…' }}
-          </p>
-          <p v-else-if="localModelEnabled && modelFailed" role="status" class="unified-attention__progress">
-            Local model unavailable. Showing rules-based rankings.
-          </p>
         </template>
       </AttentionInbox>
     </div>
@@ -801,14 +812,9 @@ onBeforeUnmount(() => {
     border-inline-start: 0;
   }
 }
-.unified-attention__progress {
-  margin: 0;
-  padding: 8px 18px;
-  color: var(--muted);
-  font-size: .8rem;
-}
 .unified-attention__tools {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 2px;
 }

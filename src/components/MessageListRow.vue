@@ -6,7 +6,7 @@
  * is emitted back to the owner.
  */
 import { computed, ref } from 'vue';
-import { ChevronDown, ChevronUp, Paperclip, Star, Trash2 } from '@lucide/vue';
+import { Paperclip, Star, Trash2 } from '@lucide/vue';
 
 import archiveIcon from '../assets/icons/tb-folder-archive.svg?raw';
 import type { JmapViewSort } from '../constants/states';
@@ -39,6 +39,7 @@ const props = withDefaults(defineProps<{
   stackExpanded?: boolean;
   stackControls?: string;
   stackSubject?: string;
+  overlayControls?: boolean;
   dragging?: boolean;
   showsRecipients?: boolean;
   sort?: JmapViewSort;
@@ -186,7 +187,8 @@ const rowLabel = computed(() => [
       class="msg-list__item"
       :class="{
         'msg-list__item--hover-actions': hoverActions,
-        'msg-list__item--row-controls': $slots.controls,
+        'msg-list__item--row-controls': $slots.controls && !overlayControls,
+        'msg-list__item--overlay-controls': $slots.controls && overlayControls,
         'msg-list__item--in-flow': inFlow,
         'msg-list__item--stack': hasStack,
         'msg-list__item--stack-expanded': expandedStack,
@@ -345,14 +347,10 @@ const rowLabel = computed(() => [
       'msg-list__stack-edge--deep': (conversationCount ?? 0) > 2,
     }">
       <button type="button" class="msg-list__stack-toggle" data-message-control
-        :aria-label="readingStack ? 'Collapse conversation' : `${stackExpanded ? 'Hide' : 'Show'} ${conversationCount} messages`"
+        :aria-label="readingStack ? 'Collapse conversation' : `${stackExpanded ? 'Hide' : 'Show'} conversation messages`"
+        :title="readingStack ? 'Collapse conversation' : `${stackExpanded ? 'Hide' : 'Show'} conversation messages`"
         :aria-expanded="expandedStack" :aria-controls="readingStack ? readerControls : stackControls"
-        @click.stop="readingStack ? emit('row-click', $event, openButton) : emit('toggle-stack')">
-        <span aria-hidden="true">
-          {{ conversationCount }}
-          <component :is="expandedStack ? ChevronUp : ChevronDown" :size="11" />
-        </span>
-      </button>
+        @click.stop="readingStack ? emit('row-click', $event, openButton) : emit('toggle-stack')" />
     </div>
     <slot name="after-row" />
   </li>
@@ -409,6 +407,7 @@ const rowLabel = computed(() => [
 .msg-list__item:hover,
 .msg-list__item:focus-within,
 .msg-list__item.has-tag-menu { background: var(--rowHover); }
+.msg-list__item--overlay-controls { background: var(--panel); }
 .msg-list__item--in-flow {
   min-height: inherit;
 }
@@ -451,40 +450,17 @@ const rowLabel = computed(() => [
 .msg-list__stack-toggle {
   position: absolute;
   z-index: 1;
-  inset: 0 0 auto;
-  margin-inline: auto;
-  width: max-content;
-  min-width: 52px;
-  min-height: 24px;
-  display: grid;
-  place-items: center;
+  inset: 0 12px auto;
+  height: 10px;
   padding: 0;
   border: 0;
-  border-radius: 4px;
-  background: none;
-  color: var(--muted);
-  font: inherit;
-  font-size: .6875rem;
-  font-variant-numeric: tabular-nums;
+  border-radius: 6px 6px 0 0;
+  background: transparent;
   cursor: pointer;
   pointer-events: auto;
 }
-.msg-list__stack-toggle span {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding-inline: 4px;
-  background: var(--panel);
-  line-height: 13px;
-  transform: translateY(-5px);
-}
-.msg-list__stack-toggle:hover { color: var(--text); }
-.msg-list__stack-toggle:focus-visible { outline: none; }
-.msg-list__stack-toggle:focus-visible span {
-  border-radius: 3px;
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
+.msg-list__stack-toggle:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.msg-list__stack-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .msg-list__scroller:focus-visible .is-cursor .msg-list__item {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -632,6 +608,33 @@ const rowLabel = computed(() => [
   align-self: center;
   align-items: center;
   gap: 4px;
+}
+.msg-list__item--overlay-controls > :slotted(.msg-list__row-controls) {
+  position: absolute;
+  z-index: 2;
+  inset-inline-end: var(--row-padding-end);
+  inset-block-start: 50%;
+  translate: 0 -50%;
+  border-radius: 6px;
+  background: inherit;
+}
+.msg-list__item--overlay-controls:has(.msg-list__preview) > :slotted(.msg-list__row-controls) {
+  inset-block-start: calc(50% - 10px);
+}
+.msg-list--card .msg-list__item--overlay-controls:has(.msg-list__preview) > :slotted(.msg-list__row-controls) {
+  inset-block-start: var(--row-padding-block);
+  translate: none;
+}
+@media (hover: hover) and (pointer: fine) {
+  .msg-list__item--overlay-controls:not(:hover, :focus-within, :has(details[open])) > :slotted(.msg-list__row-controls) {
+    opacity: 0;
+    pointer-events: none;
+  }
+}
+@media (max-width: 639px) and (pointer: coarse) {
+  .msg-list--card .msg-list__item--overlay-controls:has(.msg-list__preview) > :slotted(.msg-list__row-controls) {
+    inset-block: auto 3px;
+  }
 }
 .msg-list__action-icon--folder {
   display: block;

@@ -3,6 +3,7 @@ import { Bell, Check, CircleAlert, Mail, MailOpen, Star, Trash2 } from '@lucide/
 import { useElementSize } from '@vueuse/core';
 import { computed, nextTick, ref, shallowReactive, useId, watch, watchPostEffect } from 'vue';
 
+import { useAttentionRowSwipe } from '../composables/useAttentionRowSwipe';
 import { useListSelection } from '../composables/useListSelection';
 import { provideSenderAvatars } from '../composables/useSenderAvatars';
 import type { ImapAttentionAction } from '../sync/backends/imap/attention-relay';
@@ -11,19 +12,20 @@ import { UNTIL_NEW_ACTIVITY } from '../triage/snooze-time';
 import type { TriageBundle, TriageMessage } from '../triage/smart-sort';
 import { closeContainingDropdown } from '../utils/dropdown';
 import { threadSubject } from '../utils/mail-threads';
-import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, conversationRow, type MessageRowLike } from '../utils/message-row-presentation';
+import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, conversationRow, recipientLabel, type MessageRowLike } from '../utils/message-row-presentation';
 import type { MessageTagDefinition } from '../utils/message-tags';
 import AppIconButton from './AppIconButton.vue';
 import AttentionRowMenu from './AttentionRowMenu.vue';
+import AttentionSwipeActions from './AttentionSwipeActions.vue';
 import InlineMailReader from './InlineMailReader.vue';
 import MessageListRow from './MessageListRow.vue';
 import SelectableListHeader from './SelectableListHeader.vue';
 
 const props = withDefaults(defineProps<{
   bundles: readonly TriageBundle[];
-  accountLabels?: Readonly<Record<string, string>>;
   loading?: boolean;
   error?: string | null;
+  status?: string;
   inlineReading?: boolean;
   openBundleId?: string;
   openMessage?: TriageMessage;
@@ -31,7 +33,6 @@ const props = withDefaults(defineProps<{
   disabledActions?: ReadonlySet<string>;
   tagDefinitions?: ReadonlyArray<MessageTagDefinition>;
 }>(), {
-  accountLabels: () => ({}),
   loading: false,
   error: null,
 });
@@ -130,6 +131,16 @@ const selection = useListSelection({
 });
 const { selectionCount, hasSelection } = selection;
 const selectedMessages = computed(() => visibleMessages.value.filter(messageChecked));
+const swipeMenus = new Map<string, InstanceType<typeof AttentionRowMenu>>();
+const { activeKey: swipeKey, offset: swipeOffset, dragging: swipeDragging, armed: swipeArmed,
+  handlers: swipeHandlers, onClick: onSwipeClick, close: closeSwipe } = useAttentionRowSwipe((key, row) => {
+  const bundle = visibleBundles.value.find(({ id }) => id === key);
+  if (!bundle || !canSwipe(bundle)) return;
+  emit('done', bundle);
+  void keepFilterFocus(row.querySelector('.msg-list__open'));
+});
+watch(() => swipeKey.value == null || visibleBundles.value.some((bundle) => bundle.id === swipeKey.value && canSwipe(bundle)),
+  (available) => { if (!available) closeSwipe(); });
 const allSelected = computed(() => hasSelection.value && selectionCount.value === visibleMessages.value.length);
 const selectionUnread = computed(() => selectedMessages.value.some((message) => Number(rowFor(message).is_seen) === 0));
 const selectionStarred = computed(() => selectedMessages.value.some((message) => Number(rowFor(message).is_flagged) === 1));
@@ -141,6 +152,7 @@ watch(hasSelection, (hasSelection, hadSelection) => {
   if (listEl.value?.contains(focus) && focus?.closest('.attention-inbox__header')) void keepFilterFocus(focus);
 });
 const emptyMessage = computed(() => filters.find(({ key }) => key === selectedFilter.value)?.empty);
+const statusText = computed(() => props.error || (props.loading ? 'Loading mail…' : props.status) || '');
 
 function messageChecked(message: TriageMessage): boolean {
   return selection.isSelected(browserTriageMessageKey(message));
@@ -206,11 +218,30 @@ function actionDisabled(message: TriageMessage): boolean {
   return props.disabledActions?.has(browserTriageMessageKey(message)) ?? false;
 }
 
+function canSwipe(bundle: TriageBundle): boolean {
+  return bundle.status !== 'done' && bundle.status !== 'snoozed'
+    && !hasSelection.value && !showMembers(bundle) && inlineKey.value !== bundleKey(bundle)
+    && !bundle.messages.some(({ message }) => actionDisabled(message));
+}
+
+function setSwipeMenu(key: string, menu: unknown) {
+  if (menu) swipeMenus.set(key, menu as InstanceType<typeof AttentionRowMenu>);
+  else swipeMenus.delete(key);
+}
+
+function swipeSnooze(bundle: TriageBundle, event: MouseEvent) {
+  const anchor = event.currentTarget instanceof HTMLElement
+    ? event.currentTarget.closest('.attention-inbox__bundle')?.querySelector<HTMLElement>('.msg-list__open')
+    : undefined;
+  closeSwipe();
+  if (anchor) swipeMenus.get(bundle.id)?.showSnooze(anchor);
+}
+
 function bundleContext(bundle: TriageBundle): string {
   const status = bundle.status === 'snoozed' ? snoozeLabel(bundle.snoozedUntil)
     : bundle.status === 'done' ? 'Done' : bundle.reason;
   return [
-    props.accountLabels[String(bundle.accountId)],
+    recipientLabel(rowFor(bundle.messages[0].message)),
     bundle.status === 'action' ? bundle.priority : '',
     status,
   ].filter(Boolean).join(' · ');
@@ -223,6 +254,17 @@ function detailId(bundle: TriageBundle): string {
 function toggleBundle(bundle: TriageBundle): void {
   if (expandedBundles.value.has(bundle.id)) expandedBundles.value.delete(bundle.id);
   else expandedBundles.value.add(bundle.id);
+}
+
+function stackAction(bundle: TriageBundle): string | undefined {
+  if (bundle.messages.length < 2) return undefined;
+  if (inlineKey.value === bundleKey(bundle)) return 'Collapse conversation';
+  return expandedBundles.value.has(bundle.id) ? 'Hide conversation messages' : 'Show conversation messages';
+}
+
+function activateStackAction(bundle: TriageBundle) {
+  if (inlineKey.value === bundleKey(bundle)) emit('open-bundle', bundle, null);
+  else toggleBundle(bundle);
 }
 
 function dateTime(timestamp: number): string | undefined {
@@ -325,24 +367,28 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
           <Trash2 :size="16" aria-hidden="true" />
         </AppIconButton>
       </template>
-      <template #trailing><slot v-if="!hasSelection" name="actions" /></template>
+      <template #trailing>
+        <div v-if="!hasSelection" class="attention-inbox__tools">
+          <p class="attention-inbox__sync-status" :class="{ 'attention-inbox__sync-status--error': error }"
+            role="status" :title="statusText || undefined">{{ statusText }}</p>
+          <slot name="actions" />
+        </div>
+      </template>
     </SelectableListHeader>
-    <slot name="progress" />
-    <div class="attention-inbox__scroll" :aria-busy="loading">
-      <p v-if="error" class="attention-inbox__status attention-inbox__status--error" role="status">
-        {{ error }}
-      </p>
-      <p v-if="loading && visibleBundles.length === 0" class="attention-inbox__status" role="status">
-        Loading mail…
-      </p>
-      <p v-else-if="visibleBundles.length === 0" class="attention-inbox__status">
+    <div class="attention-inbox__scroll" :aria-busy="loading" @scroll="closeSwipe">
+      <p v-if="!loading && visibleBundles.length === 0" class="attention-inbox__status">
         {{ emptyMessage }}
       </p>
-      <ul v-else class="attention-inbox__bundles msg-list__items">
+      <ul v-if="visibleBundles.length > 0" class="attention-inbox__bundles msg-list__items"
+        v-on="swipeHandlers" @click.capture="onSwipeClick">
         <MessageListRow
           v-for="bundle in visibleBundles"
           :key="bundle.id"
           class="attention-inbox__bundle"
+          :class="{ 'attention-inbox__bundle--swiping': swipeKey === bundle.id,
+            'attention-inbox__bundle--dragging': swipeKey === bundle.id && swipeDragging }"
+          :data-attention-swipe="canSwipe(bundle) ? bundle.id : undefined"
+          :style="swipeKey === bundle.id ? { '--attention-swipe-offset': `${swipeOffset}px` } : undefined"
           :message="bundleRow(bundle)"
           :conversation-count="bundle.messages.length"
           :stack-expanded="expandedBundles.has(bundle.id)"
@@ -356,6 +402,7 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
           :selected="bundleChecked(bundle)"
           :selection-mixed="bundleMixed(bundle)"
           unread-on-avatar
+          overlay-controls
           :draggable="false"
           :context="bundleContext(bundle)"
           :tag-definitions="tagDefinitions"
@@ -366,19 +413,25 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
           <template #controls>
             <div class="msg-list__row-controls" draggable="false" @click.stop>
               <AttentionRowMenu
+                :ref="(menu) => setSwipeMenu(bundle.id, menu)"
                 :row="bundleRow(bundle)"
                 :bundle="bundle"
                 quick
+                :stack-action="stackAction(bundle)"
                 :label="bundle.messages.length > 1 ? 'Conversation actions' : undefined"
                 :disabled="bundle.messages.some(({ message }) => actionDisabled(message))"
                 @action="(action, event) => applyBundleAction(bundle, action, event)"
                 @done="complete"
                 @restore="restore"
                 @snooze="snooze"
+                @toggle-stack="activateStackAction(bundle)"
               />
             </div>
           </template>
           <template #after-row>
+            <AttentionSwipeActions v-if="swipeKey === bundle.id" :armed="swipeArmed" :dragging="swipeDragging"
+              @delete="closeSwipe(); applyBundleAction(bundle, { type: 'trash' }, $event)"
+              @snooze="swipeSnooze(bundle, $event)" />
             <InlineMailReader v-if="inlineKey === bundleKey(bundle)" :id="inlinePanelId(bundleKey(bundle))">
               <div
                 :ref="(element) => setInlineTarget(bundleKey(bundle), element)"
@@ -406,8 +459,9 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
                   ? inlinePanelId(messageKey(item.message)) : undefined"
                 :selected="messageChecked(item.message)"
                 unread-on-avatar
+                overlay-controls
                 :draggable="false"
-                :context="item.classification.reason"
+                :context="[recipientLabel(rowFor(item.message)), item.classification.reason].filter(Boolean).join(' · ')"
                 :tag-definitions="tagDefinitions"
                 @row-click="(_event, trigger) => emit('open', item.message, trigger)"
                 @checkbox-click="toggleSelection(item.message, $event)"
@@ -462,6 +516,30 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
   white-space: nowrap;
 }
 
+.attention-inbox__bundle[data-attention-swipe] > :deep(.msg-list__item) {
+  touch-action: pan-y pinch-zoom;
+  transition: background .06s ease, translate 150ms ease-out;
+}
+
+.attention-inbox__bundle--swiping {
+  position: relative;
+  overflow-x: clip;
+}
+
+.attention-inbox__bundle--swiping.msg-list__row--stack { --attention-swipe-card-inset: 10px; }
+.attention-inbox__bundle--swiping > :deep(.msg-list__item) {
+  z-index: 1;
+  translate: calc(-1 * var(--attention-swipe-offset));
+  background: var(--panel);
+}
+.attention-inbox__bundle--swiping.is-focused > :deep(.msg-list__item) { background: var(--rowActive); }
+.attention-inbox__bundle--swiping > :deep(.msg-list__item .msg-list__row-controls) { visibility: hidden; }
+.attention-inbox__bundle--dragging > :deep(.msg-list__item) { transition: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .attention-inbox__bundle[data-attention-swipe] > :deep(.msg-list__item) { transition: none; }
+}
+
 .attention-inbox__header {
   flex: 0 0 auto;
   min-width: 0;
@@ -470,6 +548,7 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
 .attention-inbox__header :deep(.selectable-list-header__count--total) {
   display: none;
 }
+.attention-inbox__header :deep(.selectable-list-header__normal-actions) { flex: 1 0 auto; }
 
 .attention-inbox__filters {
   display: flex;
@@ -516,9 +595,17 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
   color: var(--muted);
 }
 
-.attention-inbox__status--error {
-  color: var(--error-fg);
+.attention-inbox__tools { display: flex; min-width: 0; max-width: 55%; align-items: center; gap: 4px; }
+.attention-inbox__sync-status {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 12px;
 }
+.attention-inbox__sync-status--error { color: var(--error-fg); }
 
 .attention-inbox__bundles,
 .attention-inbox__messages {
