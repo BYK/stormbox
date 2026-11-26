@@ -2,7 +2,7 @@
 import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia } from 'pinia';
 import { expect, it, vi } from 'vitest';
-import { shallowRef, watch } from 'vue';
+import { nextTick, shallowRef, watch } from 'vue';
 
 import UnifiedAttention from '../../../src/components/UnifiedAttention.vue';
 import { __resetRepositoryForTests, __setRepositoryForTests } from '../../../src/composables/useRepository';
@@ -68,8 +68,11 @@ function mountBundleActions() {
     .find((button) => label.test(button.attributes('aria-label')))?.trigger('click');
   const act = async (subject: string, label: string) => {
     const row = wrapper.findAll('.attention-inbox__bundle').find((node) => node.text().includes(subject))!;
-    await row.get('summary[aria-label="Message actions"]').trigger('click');
-    await row.findAll('button').find((button) => button.text() === label)!.trigger('click');
+    await row.get(`button[aria-label="${label}"]`).trigger('click');
+    if (label === 'Snooze') {
+      document.querySelector<HTMLButtonElement>('.attention-snooze button[aria-label="1 hour"]')!.click();
+      await nextTick();
+    }
   };
   return {
     wrapper, feedback, persist, subjects, currentSubjects, select, act, changeAttentionBundleStates,
@@ -88,7 +91,7 @@ it('moves a bundle and lets Undo restore it before a single SQLite write settles
   try {
     await flushPromises();
     const order = currentSubjects();
-    await act(first, 'Mark bundle done');
+    await act(first, 'Mark done');
     expect(currentSubjects()).toEqual([second]);
     expect(fixture.currentStates()).toEqual({});
     fixture.notify();
@@ -125,8 +128,8 @@ it('rolls back only the failed bundle, offers Retry, and makes Snooze and Restor
   persist.mockReturnValueOnce(pending.promise);
   try {
     await flushPromises();
-    await act(first, 'Mark bundle done');
-    await act(second, 'Snooze for one hour');
+    await act(first, 'Mark done');
+    await act(second, 'Snooze');
     expect(currentSubjects()).toEqual([]);
     pending.reject(new Error('SQLite write failed'));
     await flushPromises();
@@ -138,6 +141,8 @@ it('rolls back only the failed bundle, offers Retry, and makes Snooze and Restor
     expect(currentSubjects()).toEqual([]);
     await select(/^Done & snoozed/);
     expect(currentSubjects()).toEqual(expect.arrayContaining([first, second]));
+    const doneRow = fixture.wrapper.findAll('.attention-inbox__bundle').find((row) => row.text().includes(first))!;
+    expect(doneRow.find('[aria-label="Snooze"]').exists()).toBe(false);
     expect(Object.values(fixture.currentStates()).map(({ disposition }) => disposition)).toEqual(expect.arrayContaining(['done', 'snoozed']));
     const restore = deferred();
     persist.mockReturnValueOnce(restore.promise);
@@ -523,11 +528,12 @@ it('batches a conversation action and advances the stacked reader after deleting
     const chooseAction = async (label: string) => {
       await toolbar.get('summary[aria-label="Conversation actions"]').trigger('click');
       await toolbar.findAll('button').find((button) => button.text() === label)!.trigger('click');
+      if (label === 'Snooze') document.querySelector<HTMLButtonElement>('.attention-snooze button[aria-label="1 hour"]')!.click();
       await flushPromises();
     };
     expect(toolbar.text()).toContain('Mark bundle done');
-    expect(toolbar.text()).toContain('Snooze for one hour');
-    await chooseAction('Snooze for one hour');
+    expect(toolbar.text()).toContain('Snooze');
+    await chooseAction('Snooze');
     expect(changeAttentionBundleStates).toHaveBeenCalledOnce();
     expect(Object.values(states)[0]).toMatchObject({ disposition: 'snoozed', observed: expect.any(Array) });
     expect(Object.values(states)[0].observed).toHaveLength(2);

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { UNTIL_NEW_ACTIVITY } from '../../../src/triage/snooze-time';
 import {
   buildTriageBundles,
   classifyTriageMessage,
@@ -116,5 +117,10 @@ describe('bundle actions', () => {
     expect(sleeping).toMatchObject({ status: 'snoozed', snoozedUntil: NOW + HOUR });
     expect(buildTriageBundles([request, newestRoutine], states, NOW + HOUR)[0].status).toBe('action');
     expect(buildTriageBundles([request, delayedRequest], states, NOW)[0].status).toBe('action');
+
+    const indefinite = { [original.id]: snoozeBundle(original, UNTIL_NEW_ACTIVITY, NOW) };
+    const farFuture = NOW + 365 * 24 * HOUR;
+    expect(buildTriageBundles([request, newestRoutine], indefinite, farFuture)[0].status).toBe('snoozed');
+    expect(buildTriageBundles([request, delayedRequest], indefinite, farFuture)[0].status).toBe('action');
   });
 });

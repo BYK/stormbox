@@ -735,7 +735,7 @@ onBeforeUnmount(() => {
             label="Conversation actions"
             @action="(action) => activeBundle && runBundleAction(activeBundle, action)"
             @done="(bundle, event) => setBundleDisposition(bundle, 'done', event)"
-            @snooze="(bundle, until, event) => setBundleDisposition(bundle, { snoozeUntil: until }, event)"
+            @snooze="(bundle, until) => setBundleDisposition(bundle, { snoozeUntil: until })"
             @restore="(bundle, event) => setBundleDisposition(bundle, 'restore', event)"
           />
         </template>

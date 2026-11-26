@@ -7,6 +7,7 @@ import { useListSelection } from '../composables/useListSelection';
 import { provideSenderAvatars } from '../composables/useSenderAvatars';
 import type { ImapAttentionAction } from '../sync/backends/imap/attention-relay';
 import { browserTriageMessageKey } from '../triage/browser-model';
+import { UNTIL_NEW_ACTIVITY } from '../triage/snooze-time';
 import type { TriageBundle, TriageMessage } from '../triage/smart-sort';
 import { closeContainingDropdown } from '../utils/dropdown';
 import { threadSubject } from '../utils/mail-threads';
@@ -230,6 +231,7 @@ function dateTime(timestamp: number): string | undefined {
 }
 
 function snoozeLabel(until: number | undefined): string {
+  if (until === UNTIL_NEW_ACTIVITY) return 'Snoozed until new mail needs attention';
   if (!until || !dateTime(until)) return 'Snoozed';
   const formatted = new Intl.DateTimeFormat(undefined, {
     dateStyle: 'medium',
@@ -258,10 +260,9 @@ function restore(bundle: TriageBundle, event: MouseEvent): void {
   void keepFilterFocus(event.currentTarget);
 }
 
-function snooze(bundle: TriageBundle, until: number, event: MouseEvent): void {
-  closeContainingDropdown(event);
+function snooze(bundle: TriageBundle, until: number, trigger: HTMLElement): void {
   emit('snooze', bundle, until);
-  void keepFilterFocus(event.currentTarget);
+  void keepFilterFocus(trigger);
 }
 
 function applyMessageAction(message: TriageMessage, action: ImapAttentionAction, event: MouseEvent): void {
@@ -367,6 +368,7 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
               <AttentionRowMenu
                 :row="bundleRow(bundle)"
                 :bundle="bundle"
+                quick
                 :label="bundle.messages.length > 1 ? 'Conversation actions' : undefined"
                 :disabled="bundle.messages.some(({ message }) => actionDisabled(message))"
                 @action="(action, event) => applyBundleAction(bundle, action, event)"
