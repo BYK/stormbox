@@ -178,18 +178,12 @@ function snooze(until: number) {
 <style scoped>
 .attention-row-actions { display: flex; align-items: center; }
 .app-dropdown__item.attention-row-actions__overflow-fallback { display: none; }
-@media (hover: hover) and (pointer: fine) {
-  :global(.msg-list__item:not(:hover, :focus-within) .attention-row-actions--quick:not(:has(details[open]))) {
-    opacity: 0;
-    pointer-events: none;
-  }
-  :global(.msg-list__item:not(:hover, :focus-within) .attention-row-menu:not([open])) {
-    opacity: 0;
-    pointer-events: none;
-  }
-}
 @media (max-width: 639px) and (pointer: coarse) {
-  .attention-row-actions--quick > :deep(.app-icon-button) { width: 44px; height: 44px; flex-basis: 44px; }
+  .attention-row-actions--quick > :deep(.app-icon-button) {
+    width: 44px;
+    height: var(--row-touch-action-height, 44px);
+    flex-basis: 44px;
+  }
   .attention-row-actions--quick > .attention-row-actions__secondary { display: none; }
   .app-dropdown__item.attention-row-actions__overflow-fallback { display: grid; }
 }

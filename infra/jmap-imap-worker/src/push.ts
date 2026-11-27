@@ -157,11 +157,23 @@ export async function handlePush(request: Request, env: PushEnv, paired: boolean
   }
 }
 
-export async function notifyArrival(env: PushEnv, account: string, event: string, detail: AttentionNotification): Promise<boolean> {
+export async function notifyArrival(
+  env: PushEnv, account: string, event: string, detail: AttentionNotification, aliases?: string[],
+): Promise<boolean> {
   if (!env.PUSH_SUBSCRIPTIONS || !vapid(env)) return true;
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(account) || !/^[A-Za-z0-9_:-]{1,128}$/.test(event)) return false;
   try {
-    await subscriptionRegistry(env)!.enqueue(account, event, detail);
+    await subscriptionRegistry(env)!.enqueue(account, event, detail, aliases);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function observePushConversations(env: PushEnv, account: string, observations: string[][]): Promise<boolean> {
+  if (!observations.length || !env.PUSH_SUBSCRIPTIONS || !vapid(env)) return true;
+  try {
+    await subscriptionRegistry(env)!.observeConversations(account, observations);
     return true;
   } catch {
     return false;
@@ -180,6 +192,11 @@ export async function hasPushSubscribers(env: PushEnv): Promise<boolean> {
 
 function subscriptionValue(recipient: PendingRecipient): Subscription {
   return { endpoint: recipient.endpoint, keys: { auth: recipient.auth, p256dh: recipient.p256dh } };
+}
+
+async function pushDigest(value: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 async function send(
@@ -226,6 +243,10 @@ export class PushSubscriptions extends DurableObject<PushEnv> {
       CREATE TABLE IF NOT EXISTS push_attention_states (
         account TEXT NOT NULL, id TEXT NOT NULL, changed_at INTEGER NOT NULL, state TEXT,
         PRIMARY KEY(account, id)
+      );
+      CREATE TABLE IF NOT EXISTS push_notified_aliases (
+        account TEXT NOT NULL, digest TEXT NOT NULL,
+        PRIMARY KEY(account, digest)
       );
     `);
     const eventColumns = new Set(this.sql.exec<{ name: string }>('PRAGMA table_info(push_events)').toArray().map(({ name }) => name));
@@ -315,21 +336,47 @@ export class PushSubscriptions extends DurableObject<PushEnv> {
     this.sql.exec('DELETE FROM push_subscriptions WHERE endpoint = ?', endpoint);
   }
 
-  async enqueue(account: string, event: string, detail: AttentionNotification): Promise<void> {
+  async enqueue(account: string, event: string, detail: AttentionNotification, aliases = [detail.messageKey]): Promise<void> {
+    if (!detail.confirmed || !detail.messageKey) return;
     const key = `${account}:${event}`;
-    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key)));
-    const tag = `stormbox-${Array.from(digest.subarray(0, 10), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+    const tag = `stormbox-${(await pushDigest(key)).slice(0, 20)}`;
+    // No subject, message ID or preview needs to survive in the deduplication ledger.
+    const digests = JSON.stringify(await Promise.all(aliases.map(pushDigest)));
     const now = Date.now();
     this.ctx.storage.transactionSync(() => {
       this.sql.exec('DELETE FROM push_events WHERE created_at < ?', now - RETENTION);
+      if (this.isNotifiedConversation(account, digests)) {
+        this.rememberConversation(account, digests);
+        return;
+      }
+      const states = this.attentionStates(account);
+      if (!states || notificationHandled(detail, states, now)) return;
       const inserted = this.sql.exec(`INSERT OR IGNORE INTO push_events (event_key,tag,created_at,detail,confirmed) VALUES (?, ?, ?, ?, ?)`,
         key, tag, now, JSON.stringify(detail), Number(detail.confirmed)).rowsWritten;
-      const states = this.attentionStates(account);
-      if (inserted && states && !notificationHandled(detail, states, now)) this.sql.exec(`INSERT INTO push_pending (event_key, endpoint, due_at)
+      if (inserted) this.sql.exec(`INSERT INTO push_pending (event_key, endpoint, due_at)
         SELECT ?, endpoint, ? FROM push_subscriptions WHERE confirmed_only = 0 OR ? = 1`, key, now, Number(detail.confirmed));
+      this.rememberConversation(account, digests);
       this.pruneDeliveredDetails();
     });
     await this.schedule();
+  }
+
+  async observeConversations(account: string, observations: string[][]): Promise<void> {
+    const groups = await Promise.all(observations.map(async (aliases) => JSON.stringify(await Promise.all(aliases.map(pushDigest)))));
+    this.ctx.storage.transactionSync(() => {
+      for (const digests of groups) {
+        if (this.isNotifiedConversation(account, digests)) this.rememberConversation(account, digests);
+      }
+    });
+  }
+
+  private isNotifiedConversation(account: string, digests: string): boolean {
+    return this.sql.exec(`SELECT 1 FROM json_each(?) AS alias JOIN push_notified_aliases AS known
+      ON known.account = ? AND known.digest = alias.value LIMIT 1`, digests, account).toArray().length > 0;
+  }
+
+  private rememberConversation(account: string, digests: string): void {
+    this.sql.exec('INSERT OR IGNORE INTO push_notified_aliases SELECT ?, value FROM json_each(?)', account, digests);
   }
 
   private pruneDeliveredDetails() {
@@ -363,7 +410,7 @@ export class PushSubscriptions extends DurableObject<PushEnv> {
       const notification = JSON.parse(recipient.detail) as AttentionNotification;
       const account = recipient.event_key.split(':', 1)[0];
       if (!statesByAccount.has(account)) statesByAccount.set(account, this.attentionStates(account) ?? {});
-      if (!notification.messageKey || notificationHandled(notification, statesByAccount.get(account)!, now)) {
+      if (!notification.confirmed || !notification.messageKey || notificationHandled(notification, statesByAccount.get(account)!, now)) {
         this.sql.exec('DELETE FROM push_pending WHERE event_key = ? AND endpoint = ?', recipient.event_key, recipient.endpoint);
         return;
       }

@@ -115,7 +115,7 @@ it('shows a failed Google account in Mail and makes its messages available after
     expect(wrapper.get('.msg-list__scroller').element).toBe(scroller);
     expect(wrapper.find('.attention-row-menu').exists()).toBe(false);
     expect(wrapper.findAll('.msg-list__check input')).toHaveLength(2);
-    expect(wrapper.findAll('.msg-list__state .msg-list__unread-dot')).toHaveLength(2);
+    expect(wrapper.findAll('.msg-list__avatar--unread')).toHaveLength(2);
 
     await wrapper.get('.msg-list__select-all input').trigger('change');
     await wrapper.get('[data-bulk-action="mark-read"]').trigger('click');

@@ -113,7 +113,7 @@ onBeforeUnmount(removeViewportListeners);
 @media (pointer: coarse) {
   .attention-action-menu__trigger {
     width: 44px;
-    height: 44px;
+    height: var(--row-touch-action-height, 44px);
   }
 }
 </style>

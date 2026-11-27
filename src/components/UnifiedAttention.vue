@@ -32,6 +32,7 @@ import { disableWebPush, enableWebPush, getWebPushPublicKey, isWebPushEnabled, o
 import type { MessageRow, FolderRow } from '../types';
 import { parseAddressList } from '../utils/address-list';
 import { closeContainingDropdown } from '../utils/dropdown';
+import { gmailLabelTags } from '../utils/imap-message-tags';
 import { threadSubject } from '../utils/mail-threads';
 import { conversationRow, correspondentLabel, type MessageRowLike } from '../utils/message-row-presentation';
 
@@ -155,6 +156,9 @@ const imap = computed(() => cache.value.accounts.flatMap((account) => {
 }));
 const imapById = computed(() => new Map(imap.value.map((entry) => [entry.id, entry])));
 const imapByMessage = computed(() => new Map(imap.value.map((entry) => [browserTriageMessageKey(entry.message), entry])));
+const additionalTags = computed(() => new Map(imap.value.map(({ message, row }) => [
+  browserTriageMessageKey(message), gmailLabelTags(row.labels ?? [], tagDefinitions.value),
+])));
 const imapReading = useImapReader(() => props.ownerId, () => repo, (id) => imapById.value.get(id), loadCache);
 const imapReader = imapReading.view;
 const runListAction = useMailListActions(() => props.ownerId, () => repo, loadCache);
@@ -650,6 +654,7 @@ onBeforeUnmount(() => {
         :open-message="reading?.message"
         :rows="rows"
         :tag-definitions="tagDefinitions"
+        :additional-tags="additionalTags"
         @open-bundle="openBundle"
         @open="openMessage"
         @bundle-action="runBundleAction"

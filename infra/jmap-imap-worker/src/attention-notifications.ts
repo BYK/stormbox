@@ -1,4 +1,4 @@
-import { buildTriageBundles, triageExcerpt, type BundleState, type TriageBundle, type TriageMessage } from '../../../src/triage/smart-sort';
+import { buildTriageBundles, timeAdjustedScore, triageExcerpt, type BundleState, type TriageBundle, type TriageMessage } from '../../../src/triage/smart-sort';
 import type { StoredMessage } from './account';
 import type { MailAccount } from './mail-transport';
 
@@ -11,9 +11,12 @@ export interface AttentionNotification {
 }
 
 interface AttentionDeliveryPlan {
-  notifications: { uid: number; bundleUid: number; notification: AttentionNotification }[];
+  notifications: { uid: number; bundleUid: number; aliases: string[]; notification: AttentionNotification }[];
+  observations: string[][];
   missingPreviews: StoredMessage[];
 }
+
+const MIN_ATTENTION_PUSH_SCORE = 60;
 
 function visibleText(text: string, size: number): string {
   const clean = text.replace(/[\p{Cc}\p{Cf}\s]+/gu, ' ').trim();
@@ -21,8 +24,8 @@ function visibleText(text: string, size: number): string {
   return characters.length > size ? `${characters.slice(0, size - 1).join('')}…` : clean;
 }
 
-function isActive(bundle: TriageBundle): boolean {
-  return bundle.status === 'action' || bundle.status === 'uncertain';
+function qualifiesForPush(bundle: TriageBundle): boolean {
+  return bundle.status === 'action' && bundle.score >= MIN_ATTENTION_PUSH_SCORE;
 }
 
 function localKey(message: TriageMessage): string {
@@ -65,9 +68,10 @@ export function newAttentionNotifications(
       isFlagged: message.keywords.$flagged === true,
     } satisfies TriageMessage;
   });
-  const activeAliases = new Set(buildTriageBundles(triageMessages.filter(({ id }) => !candidates.has(id)), states, now)
-    .filter(isActive).flatMap(({ aliases }) => aliases));
+  const previousEligibleAliases = new Set(buildTriageBundles(triageMessages.filter(({ id }) => !candidates.has(id)), states, now)
+    .filter(qualifiesForPush).flatMap(({ aliases }) => aliases));
   const notifications: AttentionDeliveryPlan['notifications'] = [];
+  const observations: AttentionDeliveryPlan['observations'] = [];
   const missingPreviews: StoredMessage[] = [];
   for (const bundle of buildTriageBundles(triageMessages, states, now)) {
     const arrivals = bundle.messages.filter(({ message }) => candidates.has(String(message.id)));
@@ -78,21 +82,35 @@ export function newAttentionNotifications(
       missingPreviews.push(...missing);
       continue;
     }
-    if (!isActive(bundle) || bundle.aliases.some((alias) => activeAliases.has(alias))) continue;
+    // The relay's thread identity survives when the original references and messages leave the cache.
+    const threadAliases = bundle.messages.flatMap(({ message }) => {
+      const threadId = byId.get(String(message.id))?.threadId;
+      return threadId ? [JSON.stringify([String(message.accountId), '0-thread', threadId])] : [];
+    });
+    const aliases = [...new Set([...bundle.aliases, ...threadAliases])];
+    if (!qualifiesForPush(bundle) || bundle.aliases.some((alias) => previousEligibleAliases.has(alias))) {
+      observations.push(aliases);
+      continue;
+    }
     const resolved = new Set(bundle.resolved);
-    const items = [bundle.leading, ...arrivals];
-    const fresh = items.find(({ message, classification }) => candidates.has(String(message.id))
-      && classification.disposition !== 'update' && !resolved.has(localKey(message)));
-    if (!fresh) continue;
+    const [fresh] = arrivals.filter(({ message, classification }) => classification.disposition === 'action'
+      && !resolved.has(localKey(message)))
+      .map((item) => ({ ...item, score: timeAdjustedScore(item.classification.baseScore, item.message.receivedAt, now) }))
+      .filter(({ score }) => score >= MIN_ATTENTION_PUSH_SCORE)
+      .sort((left, right) => right.score - left.score);
+    if (!fresh) {
+      observations.push(aliases);
+      continue;
+    }
     const envelope = byId.get(String(fresh.message.id))!;
     const bundleUid = Math.min(...arrivals.map(({ message }) => byId.get(String(message.id))!.uid));
     const from = envelope.from[0];
     const sender = visibleText(from?.name || from?.email || '', 100) || 'Unknown sender';
     const subject = visibleText(envelope.subject ?? '', 150) || '(No subject)';
     const preview = visibleText(triageExcerpt(fresh.message), 200);
-    notifications.push({ uid: envelope.uid, bundleUid, notification: {
-      confirmed: fresh.classification.disposition === 'action', messageKey: localKey(fresh.message), sender, subject, preview,
+    notifications.push({ uid: envelope.uid, bundleUid, aliases, notification: {
+      confirmed: true, messageKey: localKey(fresh.message), sender, subject, preview,
     } });
   }
-  return { notifications, missingPreviews };
+  return { notifications, observations, missingPreviews };
 }

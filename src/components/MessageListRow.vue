@@ -39,29 +39,19 @@ const props = withDefaults(defineProps<{
   stackExpanded?: boolean;
   stackControls?: string;
   stackSubject?: string;
-  overlayControls?: boolean;
+  nested?: boolean;
   dragging?: boolean;
   showsRecipients?: boolean;
   sort?: JmapViewSort;
   /** False on surfaces without multi-select: no checkbox is rendered. */
   selectable?: boolean;
-  /** Keep the unread and optional checkbox in the avatar column. */
-  unreadOnAvatar?: boolean;
   /**
    * Prefix of the row's DOM id (`${domIdPrefix}${message.id}`). Lists
    * that can show one folder side by side pass a per-list prefix so
    * `aria-activedescendant` and row anchors stay unique in the page.
    */
   domIdPrefix?: string;
-  /**
-   * Overlay tag / star / archive / delete at the row's inline-end on
-   * hover. The star keeps its slot when the row is not hovered so a
-   * starred message shows its star in the same place; the summary
-   * reserves a slot for tag and star and the date sits under archive and
-   * delete. The grid manages keyboard focus for these buttons. The
-   * single-column layout has no hover menu; it always shows the star
-   * (set or not) and never tag, archive or delete.
-   */
+  /** Use the standard Mail quick actions. Other views provide their own controls in the same overlay. */
   hoverActions?: boolean;
   context?: string;
   /** False where archiving is a no-op (the Archive folder): the overlay drops its Archive button. */
@@ -119,7 +109,6 @@ const openButton = ref<HTMLButtonElement | null>(null);
 const inFlow = computed(() => props.start === undefined);
 const controlTabIndex = computed(() => inFlow.value ? undefined : -1);
 const isUnread = computed(() => Number(props.message.is_seen) === 0);
-const avatarUnread = computed(() => props.unreadOnAvatar);
 const isFlagged = computed(() => Number(props.message.is_flagged) === 1);
 const tags = computed(() => [
   ...resolveMessageTags(props.message.keywords_json, props.tagDefinitions),
@@ -173,6 +162,7 @@ const rowLabel = computed(() => [
       'is-unread': isUnread,
       'is-unselectable': !selectable,
       'msg-list__row--stack': hasStack,
+      'msg-list__row--nested': nested,
     }"
     :style="inFlow ? { minHeight: minRowHeight, '--message-stack-height': hasStack ? `${size}px` : undefined } : {
       position: 'absolute',
@@ -186,15 +176,11 @@ const rowLabel = computed(() => [
     <div
       class="msg-list__item"
       :class="{
-        'msg-list__item--hover-actions': hoverActions,
-        'msg-list__item--row-controls': $slots.controls && !overlayControls,
-        'msg-list__item--overlay-controls': $slots.controls && overlayControls,
+        'msg-list__item--with-controls': hoverActions || $slots.controls,
         'msg-list__item--in-flow': inFlow,
         'msg-list__item--stack': hasStack,
         'msg-list__item--stack-expanded': expandedStack,
         'msg-list__item--shared-subject': sharedSubject,
-        'msg-list__item--avatar-unread': avatarUnread,
-        'msg-list__item--avatar-selection': avatarUnread && selectable,
         'has-tag-menu': tagMenuOpen,
       }"
       :role="inFlow ? undefined : 'gridcell'"
@@ -212,11 +198,11 @@ const rowLabel = computed(() => [
         :aria-current="inFlow && focused ? true : undefined"
         :aria-expanded="expanded"
         :aria-controls="readerControls"
-        :aria-label="`Open ${rowKind}: ${rowTitle}${avatarUnread && isUnread ? ', unread' : ''}`"
+        :aria-label="`Open ${rowKind}: ${rowTitle}${isUnread ? ', unread' : ''}`"
         :title="expandedStack ? `Open conversation: ${displaySubject}` : context ? preview : undefined"
       />
-      <div v-if="selectable || !avatarUnread" class="msg-list__state">
-        <label v-if="selectable" class="msg-list__check" draggable="false" @click.stop>
+      <div v-if="selectable" class="msg-list__state">
+        <label class="msg-list__check" draggable="false" @click.stop>
           <input
             type="checkbox"
             data-message-control
@@ -227,16 +213,11 @@ const rowLabel = computed(() => [
             @click="emit('checkbox-click', $event)"
           />
         </label>
-        <span
-          v-if="isUnread && !avatarUnread"
-          class="msg-list__unread-dot"
-          aria-hidden="true"
-        />
       </div>
       <div
         v-if="!expandedStack"
         class="msg-list__avatar"
-        :class="{ 'msg-list__avatar--unread': avatarUnread && isUnread }"
+        :class="{ 'msg-list__avatar--unread': isUnread }"
         :style="avatar.style"
         aria-hidden="true"
       >
@@ -257,90 +238,82 @@ const rowLabel = computed(() => [
           <span v-if="!expandedStack" class="msg-list__from">{{ label }}</span>
           <span v-if="!sharedSubject" class="msg-list__subject">{{ displaySubject }}</span>
           <span v-if="!expandedStack" class="msg-list__icons">
-            <Star v-if="isFlagged && !hoverActions" :size="13" :stroke-width="2" class="msg-list__star" />
+            <Star v-if="isFlagged" :size="13" :stroke-width="2" class="msg-list__star" />
             <Paperclip v-if="Number(message.has_attachment) === 1" :size="13" :stroke-width="1.75" class="msg-list__attach" />
             <MessageTagStack
-              v-if="!hoverActions && tags.length > 0"
+              v-if="tags.length > 0"
               :tags="tags"
               :title="tagStackLabel"
               data-row-tags
             />
           </span>
           <span v-if="!expandedStack" class="msg-list__date">{{ dateText }}</span>
-          <div
-            v-if="hoverActions"
-            class="msg-list__actions"
-            draggable="false"
-            @click.stop
-          >
-            <!-- The row's tag control (MK-6.5): the tag stack, shown at
-                 rest while the row carries tags and on hover otherwise;
-                 clicking opens the tag menu. -->
-            <button
-              v-if="hoverActions"
-              type="button"
-              class="msg-list__action msg-list__action--tag"
-              :class="{ 'is-tagged': tags.length > 0 }"
-              :tabindex="controlTabIndex"
-              data-message-control
-              :title="tagStackLabel"
-              :aria-label="tagStackLabel"
-              aria-haspopup="dialog"
-              :aria-expanded="tagMenuOpen"
-              :disabled="actionsDisabled"
-              data-row-tags
-              @click="emit('tag', $event)"
-            >
-              <MessageTagStack :tags="tags" />
-            </button>
-            <button
-              type="button"
-              class="msg-list__action msg-list__action--star"
-              :class="{ 'msg-list__action--starred': isFlagged }"
-              :tabindex="controlTabIndex"
-              data-message-control
-              :title="isFlagged ? 'Unstar' : 'Star'"
-              :aria-label="isFlagged ? 'Unstar' : 'Star'"
-              :aria-pressed="isFlagged"
-              :disabled="actionsDisabled"
-              @click="emit('star', !isFlagged)"
-            >
-              <Star :size="17" :stroke-width="1.75" :fill="isFlagged ? '#facc15' : 'none'" />
-            </button>
-            <button
-              v-if="archiveAction"
-              type="button"
-              class="msg-list__action"
-              :tabindex="controlTabIndex"
-              data-message-control
-              title="Archive"
-              aria-label="Archive"
-              :disabled="actionsDisabled"
-              @click="emit('archive')"
-            >
-              <span class="msg-list__action-icon--folder" aria-hidden="true" v-html="archiveIcon" />
-            </button>
-            <button
-              v-if="deleteAction"
-              type="button"
-              class="msg-list__action msg-list__action--danger"
-              :tabindex="controlTabIndex"
-              data-message-control
-              title="Delete"
-              aria-label="Delete"
-              :disabled="actionsDisabled"
-              @click="emit('delete')"
-            >
-              <Trash2 :size="18" :stroke-width="1.65" />
-            </button>
-            <slot name="actions" />
-          </div>
         </div>
         <p v-if="preview && !expandedStack" class="msg-list__preview">
           {{ preview }}
         </p>
       </div>
-      <slot name="controls" />
+      <div v-if="hoverActions || $slots.controls" class="msg-list__row-controls" draggable="false" @click.stop>
+        <div v-if="hoverActions" class="msg-list__actions">
+          <button
+            type="button"
+            class="msg-list__action msg-list__action--tag"
+            :class="{ 'is-tagged': tags.length > 0 }"
+            :tabindex="controlTabIndex"
+            data-message-control
+            :title="tagStackLabel"
+            :aria-label="tagStackLabel"
+            aria-haspopup="dialog"
+            :aria-expanded="tagMenuOpen"
+            :disabled="actionsDisabled"
+            data-row-tags
+            @click="emit('tag', $event)"
+          >
+            <MessageTagStack :tags="tags" />
+          </button>
+          <button
+            type="button"
+            class="msg-list__action msg-list__action--star"
+            :class="{ 'msg-list__action--starred': isFlagged }"
+            :tabindex="controlTabIndex"
+            data-message-control
+            :title="isFlagged ? 'Unstar' : 'Star'"
+            :aria-label="isFlagged ? 'Unstar' : 'Star'"
+            :aria-pressed="isFlagged"
+            :disabled="actionsDisabled"
+            @click="emit('star', !isFlagged)"
+          >
+            <Star :size="17" :stroke-width="1.75" :fill="isFlagged ? '#facc15' : 'none'" />
+          </button>
+          <button
+            v-if="archiveAction"
+            type="button"
+            class="msg-list__action"
+            :tabindex="controlTabIndex"
+            data-message-control
+            title="Archive"
+            aria-label="Archive"
+            :disabled="actionsDisabled"
+            @click="emit('archive')"
+          >
+            <span class="msg-list__action-icon--folder" aria-hidden="true" v-html="archiveIcon" />
+          </button>
+          <button
+            v-if="deleteAction"
+            type="button"
+            class="msg-list__action msg-list__action--danger"
+            :tabindex="controlTabIndex"
+            data-message-control
+            title="Delete"
+            aria-label="Delete"
+            :disabled="actionsDisabled"
+            @click="emit('delete')"
+          >
+            <Trash2 :size="18" :stroke-width="1.65" />
+          </button>
+        </div>
+        <slot name="controls" />
+      </div>
     </div>
     <div v-if="hasStack" class="msg-list__stack-edge" :class="{
       'msg-list__stack-edge--expanded': expandedStack,
@@ -384,7 +357,7 @@ const rowLabel = computed(() => [
   --row-padding-end: 14px;
   position: relative;
   display: grid;
-  grid-template-columns: 34px 34px minmax(0, 1fr);
+  grid-template-columns: 34px minmax(0, 1fr);
   align-items: center;
   column-gap: 10px;
   width: 100%;
@@ -407,7 +380,7 @@ const rowLabel = computed(() => [
 .msg-list__item:hover,
 .msg-list__item:focus-within,
 .msg-list__item.has-tag-menu { background: var(--rowHover); }
-.msg-list__item--overlay-controls { background: var(--panel); }
+.msg-list__item--with-controls { background: var(--panel); }
 .msg-list__item--in-flow {
   min-height: inherit;
 }
@@ -415,6 +388,7 @@ const rowLabel = computed(() => [
   position: relative;
   padding-block-start: 10px;
 }
+.msg-list__row--nested { margin-inline-start: 14px; border-inline-start: 1px solid var(--border); }
 .msg-list__item.msg-list__item--stack {
   min-height: calc(var(--message-stack-height) - 10px);
   width: auto;
@@ -461,9 +435,16 @@ const rowLabel = computed(() => [
 }
 .msg-list__stack-toggle:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .msg-list__stack-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.msg-list__scroller:focus-visible .is-cursor .msg-list__item {
+.msg-list__scroller:focus-visible .is-cursor .msg-list__item::after,
+.msg-list__item:has(> .msg-list__open:focus-visible)::after {
+  content: '';
+  position: absolute;
+  z-index: 3;
+  inset: 0;
+  border-radius: inherit;
   outline: 2px solid var(--accent);
   outline-offset: -2px;
+  pointer-events: none;
 }
 .msg-list__open {
   position: absolute;
@@ -481,159 +462,109 @@ const rowLabel = computed(() => [
 .msg-list__content {
   pointer-events: none;
 }
-.msg-list__check,
-.msg-list__content [data-row-tags] {
-  pointer-events: auto;
-}
+.msg-list__check { pointer-events: auto; }
 .msg-list__content {
+  grid-column: 2;
   min-width: 0;
 }
-.msg-list__open:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-:where(.msg-list__actions) :deep(.msg-list__action:focus-visible),
+.msg-list__open:focus-visible { outline: none; }
+.msg-list__action:focus-visible,
 .msg-list__check input:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-.msg-list__item.has-tag-menu .msg-list__action--tag,
-.msg-list__item:focus-within .msg-list__action--tag {
-  visibility: visible;
-}
-.msg-list__item:focus-within .msg-list__check {
-  opacity: 1;
-}
-.msg-list__item:focus-within .msg-list__unread-dot {
-  opacity: 0;
-}
+.msg-list__item:focus-within .msg-list__check { opacity: 1; }
 
-/* The action overlay is centred on the summary line, over its last three
-   columns: star over its 34px slot, archive and delete over the 64px date
-   (34 + 8 + 64 = 106 ≥ 3 × 34 + 2 × 2), and the tag stack first, 2px
-   before the star like every other action. The overlay is anchored at its
-   end, so a wider stack grows leftward into the reserved 56px slot and the
-   8px gap after it. The preview line below stays uncovered. At rest only a set star and a tagged row's
-   stack are visible; hovering the row shows all four on the row's own
-   background. The single-column layout (App.vue SINGLE_COLUMN_WIDTH) has
-   no hover: the star and a tagged stack are always visible in their slots
-   and archive and delete are not rendered. */
-.msg-list__actions {
-  position: absolute;
-  inset-inline-end: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  pointer-events: none;
-}
-:where(.msg-list__actions) :deep(.msg-list__action) {
-  position: relative;
-  display: inline-grid;
-  place-items: center;
-  width: 34px;
-  height: 28px;
-  padding: 0;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-  font: inherit;
-  flex-shrink: 0;
-  visibility: hidden;
-  pointer-events: auto;
-}
-.msg-list__action--starred,
-.msg-list__action--tag.is-tagged {
-  visibility: visible;
-}
-/* Sized to its stack; 55px at most for three icons and "+N". */
-.msg-list__action--tag {
-  width: auto;
-  min-width: 34px;
-  padding: 0 6px;
-}
-@media (min-width: 640px) {
-  /* Inherit down the chain so the overlay matches hover, focused and
-     selected row fills alike. */
-  .msg-list__item--hover-actions.has-tag-menu .msg-list__content,
-  .msg-list__item--hover-actions.has-tag-menu .msg-list__summary,
-  .msg-list__item--hover-actions.has-tag-menu .msg-list__actions,
-  .msg-list__item--hover-actions:focus-within .msg-list__content,
-  .msg-list__item--hover-actions:focus-within .msg-list__summary,
-  .msg-list__item--hover-actions:focus-within .msg-list__actions,
-  .msg-list__item--hover-actions:hover .msg-list__content,
-  .msg-list__item--hover-actions:hover .msg-list__summary,
-  .msg-list__item--hover-actions:hover .msg-list__actions {
-    background: inherit;
-  }
-  .msg-list__item--hover-actions:focus-within .msg-list__action,
-  .msg-list__item--hover-actions:hover .msg-list__action {
-    visibility: visible;
-  }
-}
-@media (max-width: 639px) {
-  .msg-list__actions {
-    /* Sit on the star slot only: the date column and the gap before it. */
-    inset-inline-end: 72px;
-  }
-  .msg-list__action--star {
-    visibility: visible;
-  }
-  .msg-list__action:not(.msg-list__action--star, .msg-list__action--tag) {
-    display: none;
-  }
-}
-:where(.msg-list__actions) :deep(.msg-list__action:hover:where(:not(:disabled))) {
-  background: var(--control-hover-bg);
-  color: var(--text);
-}
-.msg-list__action--starred,
-.msg-list__action--starred:hover {
-  color: var(--folder-icon-color);
-}
-:where(.msg-list__actions) :deep(.msg-list__action--danger:hover:where(:not(:disabled))) {
-  background: var(--error-bg);
-  color: var(--error-fg);
-}
-:where(.msg-list__actions) :deep(.msg-list__action:disabled) {
-  opacity: 0.35;
-  cursor: default;
-}
-:slotted(.msg-list__row-controls) {
-  position: relative;
-  display: flex;
-  align-self: center;
-  align-items: center;
-  gap: 4px;
-}
-.msg-list__item--overlay-controls > :slotted(.msg-list__row-controls) {
+/* Both Mail and Attention place their controls over the summary. This
+   keeps the same text layout regardless of which commands are present. */
+.msg-list__row-controls {
   position: absolute;
   z-index: 2;
+  display: flex;
+  align-items: center;
   inset-inline-end: var(--row-padding-end);
   inset-block-start: 50%;
   translate: 0 -50%;
   border-radius: 6px;
   background: inherit;
 }
-.msg-list__item--overlay-controls:has(.msg-list__preview) > :slotted(.msg-list__row-controls) {
+.msg-list__item--stack > .msg-list__row-controls {
+  inset-inline-end: calc(var(--row-padding-end) - 7px);
+}
+.msg-list__row-controls::before {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  inset-inline-end: 100%;
+  width: 12px;
+  background: inherit;
+  mask-image: linear-gradient(to right, transparent, #000);
+  pointer-events: none;
+}
+.msg-list__row-controls:dir(rtl)::before {
+  mask-image: linear-gradient(to left, transparent, #000);
+}
+.msg-list__item:has(.msg-list__preview) > .msg-list__row-controls {
   inset-block-start: calc(50% - 10px);
 }
-.msg-list--card .msg-list__item--overlay-controls:has(.msg-list__preview) > :slotted(.msg-list__row-controls) {
+.msg-list--card .msg-list__item:has(.msg-list__preview) > .msg-list__row-controls {
   inset-block-start: var(--row-padding-block);
   translate: none;
 }
 @media (hover: hover) and (pointer: fine) {
-  .msg-list__item--overlay-controls:not(:hover, :focus-within, :has(details[open])) > :slotted(.msg-list__row-controls) {
+  .msg-list__item:not(:hover, :focus-within, .has-tag-menu, :has(details[open])) > .msg-list__row-controls {
     opacity: 0;
     pointer-events: none;
   }
+  /* Mail enters the row through the checkbox with F2, then exposes these
+     arrow-key controls. Attention's slotted buttons stay in the Tab order. */
+  .msg-list__item:not(:hover, :focus-within, .has-tag-menu) .msg-list__actions {
+    visibility: hidden;
+  }
+  .msg-list__item--with-controls:is(:hover, :focus-within, .has-tag-menu, :has(details[open]))
+    .msg-list__summary :is(.msg-list__icons, .msg-list__date) {
+    visibility: hidden;
+  }
 }
+.msg-list__actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.msg-list__action {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+}
+.msg-list__action--tag { width: auto; min-width: 34px; padding: 0 6px; }
+.msg-list__action:hover:where(:not(:disabled)) { background: var(--control-hover-bg); color: var(--text); }
+.msg-list__action--starred, .msg-list__action--starred:hover { color: var(--folder-icon-color); }
+.msg-list__action--danger:hover:where(:not(:disabled)) { background: var(--error-bg); color: var(--error-fg); }
+.msg-list__action:disabled { opacity: 0.35; cursor: default; }
 @media (max-width: 639px) and (pointer: coarse) {
-  .msg-list--card .msg-list__item--overlay-controls:has(.msg-list__preview) > :slotted(.msg-list__row-controls) {
-    inset-block: auto 3px;
+  .msg-list--card .msg-list__item--stack:not(.msg-list__item--stack-expanded) {
+    min-height: var(--message-stack-height);
+  }
+  .msg-list--card .msg-list__item:not(.msg-list__item--stack-expanded) > .msg-list__row-controls {
+    inset-block: auto 2px;
+    translate: none;
+    --row-touch-action-height: 28px;
+  }
+  .msg-list__action { min-width: 44px; height: var(--row-touch-action-height, 44px); }
+  .msg-list__action:not(.msg-list__action--star, .msg-list__action--tag) {
+    display: none;
+  }
+  .msg-list__item:has(.msg-list__actions) .msg-list__summary :is(.msg-list__star, [data-row-tags]) {
+    visibility: hidden;
   }
 }
 .msg-list__action-icon--folder {
@@ -678,28 +609,9 @@ const rowLabel = computed(() => [
   accent-color: var(--accent);
 }
 
-.msg-list__unread-dot {
-  display: block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--accent);
-  transition: opacity 0.08s ease;
-  /* Pure visual indicator: never intercept clicks meant for the
-   * underlying checkbox (which has inset: 0 within .msg-list__state). */
-  pointer-events: none;
-}
 .msg-list__item:hover .msg-list__check,
 .msg-list__items li.is-selected > .msg-list__item .msg-list__check,
 .msg-list__items li.is-partially-selected > .msg-list__item .msg-list__check {
-  opacity: 1;
-}
-.msg-list__item:hover .msg-list__unread-dot,
-.msg-list__items li.is-selected > .msg-list__item .msg-list__unread-dot {
-  opacity: 0;
-}
-/* Without a checkbox there is nothing for the dot to make room for. */
-.msg-list__items li.is-unselectable > .msg-list__item .msg-list__unread-dot {
   opacity: 1;
 }
 .msg-list__avatar {
@@ -709,7 +621,6 @@ const rowLabel = computed(() => [
   width: 34px;
   height: 34px;
   border-radius: 999px;
-  overflow: hidden;
   color: #fff;
   font-size: 11px;
   font-weight: 700;
@@ -722,11 +633,6 @@ const rowLabel = computed(() => [
   width: 100%;
   height: 100%;
   object-fit: cover;
-}
-.msg-list__item--avatar-unread .msg-list__avatar {
-  overflow: visible;
-}
-.msg-list__item--avatar-unread .msg-list__avatar-image {
   border-radius: inherit;
 }
 .msg-list__avatar--unread::after {
@@ -748,16 +654,6 @@ const rowLabel = computed(() => [
   grid-template-areas: "from subject icons date";
   align-items: baseline;
   column-gap: 8px;
-}
-/* Reserve the tag stack and star overlay slots and pin the date to the
-   width archive and delete cover (see .msg-list__actions). */
-.msg-list__item--hover-actions .msg-list__summary {
-  position: relative;
-  grid-template-columns: clamp(86px, 28%, 200px) minmax(0, 1fr) auto 56px 34px 64px;
-  grid-template-areas: "from subject icons tag star date";
-}
-.msg-list__item--hover-actions .msg-list__date {
-  text-align: end;
 }
 .msg-list__from {
   grid-area: from;
@@ -813,42 +709,21 @@ const rowLabel = computed(() => [
   --row-padding-block: 10px;
   --row-padding-start: 12px;
   --row-padding-end: 12px;
-  grid-template-columns: 24px 34px minmax(0, 1fr);
   align-items: start;
   column-gap: 9px;
 }
-.msg-list__item--row-controls {
-  grid-template-columns: 34px 34px minmax(0, 1fr) auto;
-}
-.msg-list--card .msg-list__item--row-controls {
-  grid-template-columns: 24px 34px minmax(0, 1fr) auto;
-}
-.msg-list__item.msg-list__item--avatar-unread {
-  grid-template-columns: 34px minmax(0, 1fr);
-}
-.msg-list__item--avatar-unread.msg-list__item--row-controls {
-  grid-template-columns: 34px minmax(0, 1fr) auto;
-}
-.msg-list--card .msg-list__state {
-  width: 24px;
-}
-.msg-list__item--avatar-selection .msg-list__state,
-.msg-list__item--avatar-selection .msg-list__avatar {
-  grid-area: 1 / 1;
-  width: 34px;
-}
-.msg-list__item--avatar-selection .msg-list__state { z-index: 1; }
-.msg-list__item--avatar-selection .msg-list__check input { justify-self: end; align-self: end; }
+.msg-list__state, .msg-list__avatar { grid-area: 1 / 1; }
+.msg-list__state { z-index: 1; }
+.msg-list__check input { justify-self: start; align-self: end; }
 @media (hover: hover) and (min-width: 640px) {
-  .msg-list__item--avatar-selection .msg-list__check input { justify-self: center; align-self: center; }
-  .msg-list__item--avatar-selection:hover .msg-list__avatar,
-  .msg-list__item--avatar-selection:focus-within .msg-list__avatar,
-  li:is(.is-selected, .is-partially-selected) .msg-list__item--avatar-selection .msg-list__avatar {
+  .msg-list__check input { justify-self: center; align-self: center; }
+  .msg-list__item:has(.msg-list__check):is(:hover, :focus-within) .msg-list__avatar,
+  li:is(.is-selected, .is-partially-selected) .msg-list__item:has(.msg-list__check) .msg-list__avatar {
     opacity: 0.2;
   }
 }
 @media (hover: none) {
-  .msg-list__item--avatar-selection .msg-list__check { opacity: 1; }
+  .msg-list__check { opacity: 1; }
 }
 .msg-list--card .msg-list__summary {
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -856,28 +731,6 @@ const rowLabel = computed(() => [
     "from icons date"
     "subject subject subject";
   row-gap: 2px;
-}
-/* Stacked rows keep the tag stack and star slots on the sender line so
-   the overlay never sits on the wrapped subject. */
-.msg-list--card .msg-list__item--hover-actions .msg-list__summary {
-  grid-template-columns: minmax(0, 1fr) auto 56px 34px 64px;
-  grid-template-areas:
-    "from icons tag star date"
-    "subject subject subject subject subject";
-}
-.msg-list--card .msg-list__actions {
-  top: 9px;
-}
-.msg-list--card :where(.msg-list__actions) :deep(.msg-list__action:focus-visible) {
-  outline: none;
-}
-.msg-list--card :where(.msg-list__actions) :deep(.msg-list__action:focus-visible)::after {
-  content: '';
-  position: absolute;
-  inset: 4px 0;
-  border: 2px solid var(--accent);
-  border-radius: 4px;
-  pointer-events: none;
 }
 .msg-list--card .msg-list__from,
 .msg-list--card .msg-list__subject {
@@ -907,25 +760,18 @@ const rowLabel = computed(() => [
   align-items: center;
   padding-block: 0;
 }
-.msg-list__item.msg-list__item--stack-expanded.msg-list__item--row-controls {
-  grid-template-columns: 34px minmax(0, 1fr) auto;
-}
 .msg-list__item--stack-expanded .msg-list__check { opacity: 1; }
 .msg-list__item.msg-list__item--stack-expanded .msg-list__summary {
-  grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-areas: 'subject actions';
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: 'subject';
   align-items: center;
   row-gap: 0;
 }
 .msg-list__item--stack-expanded .msg-list__subject { display: block; white-space: nowrap; }
-.msg-list__item--stack-expanded .msg-list__actions { grid-area: actions; position: static; transform: none; }
 
 @media (max-width: 639px) {
   .msg-list__check {
     opacity: 1;
-  }
-  .msg-list__unread-dot {
-    opacity: 0;
   }
 }
 </style>

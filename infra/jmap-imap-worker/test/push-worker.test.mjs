@@ -32,7 +32,7 @@ test('Workers isolate pairs browsers and sends encrypted, deduplicated notificat
   const fixture = join(directory, 'fixture.ts');
   const source = fileURLToPath(new URL('../src/push.ts', import.meta.url));
   const classifier = fileURLToPath(new URL('../src/attention-notifications.ts', import.meta.url));
-  await writeFile(fixture, `import { PushSubscriptions as Registry, handlePush, notifyArrival, pushAttentionStates } from ${JSON.stringify(source)};
+  await writeFile(fixture, `import { PushSubscriptions as Registry, handlePush, notifyArrival, observePushConversations, pushAttentionStates } from ${JSON.stringify(source)};
 import { newAttentionNotifications } from ${JSON.stringify(classifier)};
 export class PushSubscriptions extends Registry {
   async flush() {
@@ -50,10 +50,11 @@ export default { async fetch(request, env) {
       const { event, messages, firstUid } = await request.json();
       const id = 'account-1';
       const states = await pushAttentionStates(env, id) ?? {};
-      const { notifications, missingPreviews } = newAttentionNotifications({ id, email: 'me@example.test' }, messages, firstUid, states);
+      const { notifications, observations, missingPreviews } = newAttentionNotifications({ id, email: 'me@example.test' }, messages, firstUid, states);
       if (pathname === '/test/plan') return Response.json({ notifications, missing: missingPreviews.map(({ uid }) => uid) });
-      const results = await Promise.all(notifications.map(({ bundleUid, notification }) => notifyArrival(env, id, event + ':' + bundleUid, notification)));
-      return Response.json(notifications.map(({ uid }) => uid), { status: results.every(Boolean) ? 200 : 503 });
+      const observed = await observePushConversations(env, id, observations);
+      const results = await Promise.all(notifications.map(({ bundleUid, aliases, notification }) => notifyArrival(env, id, event + ':' + bundleUid, notification, aliases)));
+      return Response.json(notifications.map(({ uid }) => uid), { status: observed && results.every(Boolean) ? 200 : 503 });
     }
     return handlePush(request, env, request.headers.get('X-Test-Paired') === 'yes');
   } };`);
@@ -95,9 +96,10 @@ export default { async fetch(request, env) {
     body: body && JSON.stringify(body),
   });
   const status = () => request('/api/push/subscriptions/status', { method: 'POST', body: { endpoint } });
+  const receivedAt = Date.now() - 60_000;
   const message = (uid, subject, patch = {}) => ({
     id: `stored-${uid}`, path: 'INBOX', uidValidity: '7', uid,
-    receivedAt: new Date(2026, 10, 21, 10, uid).toISOString(),
+    receivedAt: new Date(receivedAt + uid * 1000).toISOString(),
     subject, from: [{ email: 'sam@example.test', name: 'Sam' }], to: [{ email: 'me@example.test' }],
     preview: 'Please confirm the new date.\n\nOn Friday Sam wrote:\n> Old text',
     messageId: [`message-${uid}@example.test`], keywords: {}, ...patch,
@@ -126,7 +128,7 @@ export default { async fetch(request, env) {
   const newReply = message(4, 'Re: Weekly digest', { path: 'Inbox', references: routine.messageId });
   const partial = await plan([unrelated, related, routine, newReply, incompleteReply], 3);
   assert.deepEqual(partial.missing, [2]);
-  assert.deepEqual(partial.notifications, [{ uid: 4, bundleUid: 3, notification: {
+  assert.deepEqual(partial.notifications.map(({ uid, bundleUid, notification }) => ({ uid, bundleUid, notification })), [{ uid: 4, bundleUid: 3, notification: {
     messageKey: messageKey(4), confirmed: true, sender: 'Sam', subject: newReply.subject, preview: 'Please confirm the new date.',
   } }]);
   const revised = await plan([unrelated, { ...routine, keywords: { $flagged: true } }, newReply], 3);
@@ -135,9 +137,14 @@ export default { async fetch(request, env) {
   assert.equal(revised.notifications[0].notification.messageKey, messageKey(4));
   assert.equal(revised.notifications[0].notification.preview, 'Please confirm the new date.');
   assert.equal(revised.notifications[0].notification.confirmed, true);
+  const uncertain = message(6, 'An urgent thought', { preview: 'I thought you might be interested.' });
+  const qualifiedReply = message(7, 'Re: An urgent thought', { references: uncertain.messageId });
+  assert.deepEqual((await plan([uncertain, qualifiedReply], 7)).notifications.map(({ uid }) => uid), [7]);
+  assert.deepEqual((await plan([uncertain], 6)).notifications, []);
+  assert.deepEqual((await plan([message(8, 'Urgent signature required', { receivedAt: new Date(receivedAt - 7 * 86_400_000).toISOString() })], 8)).notifications, []);
   assert.deepEqual(await arrive('v7:10:10', [message(10, 'Weekly digest', { preview: 'Here are the highlights.' })]), []);
   assert.equal(sent.length, 0);
-  const actionable = message(11, 'Schedule');
+  const actionable = message(11, 'Schedule', { threadId: 'schedule-thread' });
   const routineReply = message(12, 'Weekly digest', { preview: 'Here are the highlights.', references: actionable.messageId });
   const actionReply = message(13, 'Re: Schedule', { references: actionable.messageId });
   assert.deepEqual(await arrive('v7:11:12', [actionable, routineReply]), [11]);
@@ -157,6 +164,15 @@ export default { async fetch(request, env) {
   assert.deepEqual(await arrive('v7:11:12', [actionable, routineReply]), [11]);
   assert.deepEqual(await arrive('v7:12:12', [actionable, routineReply], 12), []);
   assert.deepEqual(await arrive('v7:13:13', [actionable, actionReply], 13), []);
+  // The same group after the original message and direct reply are outside the cached Inbox window.
+  const windowedReply = message(16, 'Re: Schedule', { threadId: 'schedule-thread', references: ['removed-reply@example.test'] });
+  assert.deepEqual(await arrive('v7:16:16', [windowedReply], 16), [16]);
+  const bridgeReply = message(18, 'Weekly digest', { preview: 'Here are the highlights.', references: actionable.messageId });
+  assert.deepEqual(await arrive('v7:18:18', [actionable, bridgeReply], 18), []);
+  const laterReply = message(19, 'Confirm the date', { references: bridgeReply.messageId });
+  assert.deepEqual(await arrive('v7:19:19', [laterReply], 19), [19]);
+  assert.equal((await request('/test/flush')).status, 204);
+  assert.equal(sent.length, 1);
 
   const alias = aliasKey(actionable);
   const observed = [messageKey(11)];
@@ -169,8 +185,12 @@ export default { async fetch(request, env) {
   assert.equal((await updateState(snoozed)).status, 204);
   assert.deepEqual(await arrive('v7:12:12', [actionable, routineReply], 12), []);
 
-  upstreamStatus = 307;
   assert.deepEqual(await arrive('v7:13:13', [actionable, actionReply], 13), [13]);
+  assert.equal((await request('/test/flush')).status, 204);
+  assert.equal(sent.length, 1);
+
+  upstreamStatus = 307;
+  assert.deepEqual(await arrive('v7:14:14', [message(14, 'Separate schedule')], 14), [14]);
   await until(() => sent.length >= 2);
   assert.notEqual(sent[0].headers.topic, sent[1].headers.topic);
 
@@ -182,7 +202,7 @@ export default { async fetch(request, env) {
     method: 'POST', body: { endpoint, confirmedOnly: true },
   });
   assert.deepEqual(await statusWithLocalModel.json(), { enabled: true });
-  assert.deepEqual(await arrive('v7:14:14', [message(14, 'Another thread', { preview: 'Some thoughts.' })], 14), [14]);
+  assert.deepEqual(await arrive('v7:17:17', [message(17, 'Another thread', { preview: 'Some thoughts.' })], 17), []);
   upstreamStatus = 410;
   assert.deepEqual(await arrive('v7:15:15', [message(15, 'Approve a new date')], 15), [15]);
   await until(async () => !(await (await status()).json()).enabled);

@@ -377,13 +377,7 @@ const additionalTagsByEntry = computed(() => new Map(imapEntries.value.map((entr
 
 function rowPresentation({ entry, stack, targets }: ListRow) {
   if (!stack) return entry.row;
-  const members = targets.map(({ row }) => row);
-  const tags = new Set(members.flatMap(({ keywords_json }) => tagKeywordsOf(keywords_json, definitions.value)));
-  return {
-    ...conversationRow(entry.row, members),
-    has_attachment: Number(members.some(({ has_attachment }) => has_attachment === 1)),
-    keywords_json: JSON.stringify(Object.fromEntries([...tags].map((keyword) => [keyword, true]))),
-  };
+  return conversationRow(entry.row, targets.map(({ row }) => row), definitions.value);
 }
 
 function rowAdditionalTags(targets: readonly ThreadEntry[]) {
@@ -1093,7 +1087,7 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
         <ul v-if="visibleRows.length" class="imap-mail__rows msg-list__items" aria-label="Messages">
           <MessageListRow v-for="(item, index) in visibleRows" :key="item.key"
             :message="rowPresentation(item)" :index="index" :size="cardLayout ? CARD_ROW_HEIGHT : ROW_HEIGHT"
-            :class="{ 'imap-mail__nested': item.nested }" :context="rowContext(item.entry)"
+            :class="{ 'imap-mail__nested': item.nested }" :nested="item.nested" :context="rowContext(item.entry)"
             :dom-id-prefix="item.stack ? 'account-mail-conversation-' : 'account-mail-row-'"
             :focused="rowFocused(item)" :cursor="focusedId === item.key" :selected="rowChecked(item)"
             :expanded="inlineReading ? readingInline && inlineAnchorKey === item.key : undefined"
@@ -1117,11 +1111,9 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
             @toggle-stack="item.stack && toggleThread(item.stack.key)"
           >
             <template v-if="item.stack && item.key === inlineConversationKey" #controls>
-              <div class="msg-list__row-controls" @click.stop>
-                <AttentionRowMenu :row="rowPresentation(item)" label="Conversation actions" can-tag
-                  :can-archive="item.targets.every(canArchiveEntry)" :can-trash="item.targets.every(canDeleteEntry)"
-                  @tag="openTagMenu(item, $event)" @action="runConversationAction(item.targets, $event)" />
-              </div>
+              <AttentionRowMenu :row="rowPresentation(item)" label="Conversation actions" can-tag
+                :can-archive="item.targets.every(canArchiveEntry)" :can-trash="item.targets.every(canDeleteEntry)"
+                @tag="openTagMenu(item, $event)" @action="runConversationAction(item.targets, $event)" />
             </template>
             <template #after-row>
               <InlineMailReader v-if="readingInline && inlineAnchorKey === item.key" :id="inlineReaderId">
@@ -1208,7 +1200,6 @@ defineExpose({ canCompose, clearFolder, openJmapFolder, startCompose });
 .imap-mail__more:disabled { cursor: default; opacity: .6; }
 .imap-mail__scroll { container-type: size; flex: 1; min-height: 0; overflow: auto; }
 .imap-mail__rows { padding: 0; margin: 0; list-style: none; }
-.imap-mail__nested { margin-inline-start: 14px; border-inline-start: 2px solid var(--border); }
 .imap-mail__reader { min-height: 0; min-width: 0; border-inline-start: 1px solid var(--border); outline: none; }
 .imap-mail__inline-target, .imap-mail__reader--inline { height: 100%; }
 .imap-mail__reader--inline { border-inline-start: 0; }

@@ -13,7 +13,7 @@ import type { TriageBundle, TriageMessage } from '../triage/smart-sort';
 import { closeContainingDropdown } from '../utils/dropdown';
 import { threadSubject } from '../utils/mail-threads';
 import { CARD_LAYOUT_WIDTH, CARD_ROW_HEIGHT, ROW_HEIGHT, conversationRow, recipientLabel, type MessageRowLike } from '../utils/message-row-presentation';
-import type { MessageTagDefinition } from '../utils/message-tags';
+import type { MessageTagDefinition, ResolvedTag } from '../utils/message-tags';
 import AppIconButton from './AppIconButton.vue';
 import AttentionRowMenu from './AttentionRowMenu.vue';
 import AttentionSwipeActions from './AttentionSwipeActions.vue';
@@ -32,6 +32,7 @@ const props = withDefaults(defineProps<{
   rows?: ReadonlyMap<string, MessageRowLike & { id: number | string }>;
   disabledActions?: ReadonlySet<string>;
   tagDefinitions?: ReadonlyArray<MessageTagDefinition>;
+  additionalTags?: ReadonlyMap<string, readonly ResolvedTag[]>;
 }>(), {
   loading: false,
   error: null,
@@ -207,7 +208,12 @@ function rowFor(message: TriageMessage): MessageRowLike & { id: number | string 
 
 function bundleRow(bundle: TriageBundle) {
   const rows = bundle.messages.map(({ message }) => rowFor(message));
-  return conversationRow(rows[0], rows);
+  return conversationRow(rows[0], rows, props.tagDefinitions);
+}
+
+function bundleAdditionalTags(bundle: TriageBundle) {
+  const tags = bundle.messages.flatMap(({ message }) => props.additionalTags?.get(browserTriageMessageKey(message)) ?? []);
+  return [...new Map(tags.map((tag) => [tag.keyword, tag])).values()];
 }
 
 function isOpen(message: TriageMessage): boolean {
@@ -401,32 +407,29 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
           :reader-controls="inlineKey === bundleKey(bundle) ? inlinePanelId(bundleKey(bundle)) : undefined"
           :selected="bundleChecked(bundle)"
           :selection-mixed="bundleMixed(bundle)"
-          unread-on-avatar
-          overlay-controls
           :draggable="false"
           :context="bundleContext(bundle)"
           :tag-definitions="tagDefinitions"
+          :additional-tags="bundleAdditionalTags(bundle)"
           @row-click="(_event, trigger) => emit('open-bundle', bundle, trigger)"
           @checkbox-click="toggleSelection(bundle, $event)"
           @toggle-stack="toggleBundle(bundle)"
         >
           <template #controls>
-            <div class="msg-list__row-controls" draggable="false" @click.stop>
-              <AttentionRowMenu
-                :ref="(menu) => setSwipeMenu(bundle.id, menu)"
-                :row="bundleRow(bundle)"
-                :bundle="bundle"
-                quick
-                :stack-action="stackAction(bundle)"
-                :label="bundle.messages.length > 1 ? 'Conversation actions' : undefined"
-                :disabled="bundle.messages.some(({ message }) => actionDisabled(message))"
-                @action="(action, event) => applyBundleAction(bundle, action, event)"
-                @done="complete"
-                @restore="restore"
-                @snooze="snooze"
-                @toggle-stack="activateStackAction(bundle)"
-              />
-            </div>
+            <AttentionRowMenu
+              :ref="(menu) => setSwipeMenu(bundle.id, menu)"
+              :row="bundleRow(bundle)"
+              :bundle="bundle"
+              quick
+              :stack-action="stackAction(bundle)"
+              :label="bundle.messages.length > 1 ? 'Conversation actions' : undefined"
+              :disabled="bundle.messages.some(({ message }) => actionDisabled(message))"
+              @action="(action, event) => applyBundleAction(bundle, action, event)"
+              @done="complete"
+              @restore="restore"
+              @snooze="snooze"
+              @toggle-stack="activateStackAction(bundle)"
+            />
           </template>
           <template #after-row>
             <AttentionSwipeActions v-if="swipeKey === bundle.id" :armed="swipeArmed" :dragging="swipeDragging"
@@ -458,22 +461,20 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
                 :reader-controls="inlineKey === messageKey(item.message) && expandedBundles.has(bundle.id)
                   ? inlinePanelId(messageKey(item.message)) : undefined"
                 :selected="messageChecked(item.message)"
-                unread-on-avatar
-                overlay-controls
+                nested
                 :draggable="false"
                 :context="[recipientLabel(rowFor(item.message)), item.classification.reason].filter(Boolean).join(' · ')"
                 :tag-definitions="tagDefinitions"
+                :additional-tags="additionalTags?.get(browserTriageMessageKey(item.message))"
                 @row-click="(_event, trigger) => emit('open', item.message, trigger)"
                 @checkbox-click="toggleSelection(item.message, $event)"
               >
                 <template #controls>
-                  <div class="msg-list__row-controls" draggable="false" @click.stop>
-                    <AttentionRowMenu
-                      :row="rowFor(item.message)"
-                      :disabled="actionDisabled(item.message)"
-                      @action="(action, event) => applyMessageAction(item.message, action, event)"
-                    />
-                  </div>
+                  <AttentionRowMenu
+                    :row="rowFor(item.message)"
+                    :disabled="actionDisabled(item.message)"
+                    @action="(action, event) => applyMessageAction(item.message, action, event)"
+                  />
                 </template>
                 <template #after-row>
                   <InlineMailReader v-if="expandedBundles.has(bundle.id) && inlineKey === messageKey(item.message)"
@@ -617,11 +618,6 @@ function applyBundleAction(bundle: TriageBundle, action: ImapAttentionAction, ev
 .attention-inbox__reader-host {
   height: 100%;
   min-height: 0;
-}
-
-.attention-inbox__messages {
-  margin-inline-start: 27px;
-  border-inline-start: 1px solid var(--control-border);
 }
 
 @media (pointer: coarse) {

@@ -5,7 +5,7 @@ import { HttpError } from './http';
 import { jmapKeywords, type KeywordError, type KeywordUpdate, type KeywordWriteOutcome } from './keywords';
 import { listMailboxWindows, listMessages, MailTransportError, patchMailboxKeywords, readMessagePreviews, type ImapKeywordResult, type ImapMessage, type ImapWindow, type MailAccount, type MailTransportErrorCode } from './mail-transport';
 import { getManagedAccount } from './managed-accounts';
-import { hasPushSubscribers, notifyArrival, pushAttentionStates } from './push';
+import { hasPushSubscribers, notifyArrival, observePushConversations, pushAttentionStates } from './push';
 
 export interface Address {
   email: string;
@@ -668,10 +668,12 @@ export class AccountState extends DurableObject<Env> {
       plan = newAttentionNotifications(account, messages, firstUid, states);
     }
 
-    let delivered = plan.missingPreviews.length === 0;
-    for (const { bundleUid, notification } of plan.notifications) {
+    if (this.forgotten) return true;
+    const observed = await observePushConversations(this.env, account.id, plan.observations);
+    let delivered = observed && plan.missingPreviews.length === 0;
+    for (const { bundleUid, aliases, notification } of plan.notifications) {
       if (this.forgotten) return true;
-      if (!await notifyArrival(this.env, account.id, `${eventId}:${bundleUid}`, notification)) delivered = false;
+      if (!await notifyArrival(this.env, account.id, `${eventId}:${bundleUid}`, notification, aliases)) delivered = false;
     }
     return delivered;
   }

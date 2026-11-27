@@ -6,6 +6,7 @@
 
 import type { JmapViewSort } from '../constants/states';
 import { parseAddressList } from './address-list';
+import { tagKeywordsOf, type MessageTagDefinition } from './message-tags';
 import { shortFrom } from './sender-avatar';
 
 export const CARD_LAYOUT_WIDTH = 480;
@@ -32,12 +33,17 @@ export function recipientLabel(row: Pick<MessageRowLike, 'to_text'>): string {
   return parseAddressList(to).map(({ email }) => email).join(', ') || to;
 }
 
-/** Give a conversation row the unread and starred state of its members. */
-export function conversationRow<T extends MessageRowLike>(leading: T, members: readonly MessageRowLike[]): T {
+/** Give a conversation row the state and indicators of its members. */
+export function conversationRow<T extends MessageRowLike>(leading: T, members: readonly MessageRowLike[],
+  definitions?: ReadonlyArray<MessageTagDefinition>): T {
+  const keywords = definitions && members.length > 1
+    ? new Set(members.flatMap(({ keywords_json }) => tagKeywordsOf(keywords_json, definitions))) : undefined;
   return {
     ...leading,
     is_seen: Number(members.every((row) => Number(row.is_seen) !== 0)),
     is_flagged: Number(members.some((row) => Number(row.is_flagged) === 1)),
+    has_attachment: Number(members.some((row) => Number(row.has_attachment) === 1)),
+    ...(keywords && { keywords_json: JSON.stringify(Object.fromEntries([...keywords].map((key) => [key, true]))) }),
   };
 }
 

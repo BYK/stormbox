@@ -25,6 +25,7 @@ before(async () => {
     './push': `
       export const hasPushSubscribers = () => true;
       export const notifyArrival = () => true;
+      export const observePushConversations = () => true;
       export const pushAttentionStates = () => null;
     `,
   };

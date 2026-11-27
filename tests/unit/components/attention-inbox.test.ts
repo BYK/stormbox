@@ -133,9 +133,8 @@ describe('AttentionInbox', () => {
     expect(row.get('.msg-list__subject').text()).toBe('Please review');
     expect(row.get('.msg-list__preview').text()).toContain('Message preview');
     expect(row.get('.msg-list__avatar').classes()).toContain('msg-list__avatar--unread');
-    expect(row.get('.msg-list__item').classes()).toContain('msg-list__item--avatar-selection');
-    expect(row.get('.msg-list__item').classes()).toContain('msg-list__item--overlay-controls');
-    expect(row.get('.msg-list__item').classes()).not.toContain('msg-list__item--row-controls');
+    expect(row.get('.msg-list__item').classes()).toContain('msg-list__item--with-controls');
+    expect(row.findAll('.msg-list__row-controls')).toHaveLength(1);
     expect(row.find('.msg-list__unread-dot').exists()).toBe(false);
     expect(row.get('.msg-list__open').attributes('aria-label')).toMatch(/, unread$/);
 
